@@ -134,6 +134,7 @@ pub(super) fn range_corrections_m(
     let ocean_loading_m = ocean_loading_correction_m(pred, obs, epoch_idx, &corrections.ppp)?;
     let satellite_antenna_m =
         satellite_antenna_correction_m(pred, obs, epoch_idx, &corrections.ppp)?;
+    let code_bias_m = code_bias_correction_m(obs, epoch_idx, &corrections.ppp)?;
     Ok(applied_troposphere_m(tropo_model, state)
         + receiver_antenna_m
         + sat_clock_relativity_correction_m(pred, corrections.sat_clock_relativity)
@@ -141,7 +142,8 @@ pub(super) fn range_corrections_m(
         + tide_m
         + pole_tide_m
         + ocean_loading_m
-        + satellite_antenna_m)
+        + satellite_antenna_m
+        + code_bias_m)
 }
 
 pub(super) fn satellite_clock_m(
@@ -229,6 +231,21 @@ fn satellite_antenna_correction_m(
         .copied()
         .ok_or_else(|| missing_correction(obs, MissingCorrection::SatelliteAntennaPcv))?;
     Ok(dot3(*pco, pred.los_unit) + pcv_m)
+}
+
+fn code_bias_correction_m(
+    obs: &FloatObservation,
+    epoch_idx: usize,
+    corrections: &PppCorrectionLookup,
+) -> Result<f64, FloatSolveError> {
+    if !corrections.code_bias_enabled {
+        return Ok(0.0);
+    }
+    corrections
+        .code_bias_m
+        .get(&(obs.sat, epoch_idx))
+        .copied()
+        .ok_or_else(|| missing_correction(obs, MissingCorrection::CodeBias))
 }
 
 pub(super) fn phase_windup_m(

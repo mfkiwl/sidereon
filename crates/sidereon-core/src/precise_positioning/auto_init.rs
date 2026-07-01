@@ -523,6 +523,7 @@ mod tests {
                     phase_m: code_m + ambiguity_m,
                     freq1_hz: 0.0,
                     freq2_hz: 0.0,
+                    glonass_channel: None,
                 }
             })
             .collect();

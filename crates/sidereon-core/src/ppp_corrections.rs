@@ -8,14 +8,17 @@
 use crate::astro::angles::beta_angle_from_cos_rad;
 use crate::astro::bodies::{sun_moon_ecef, SunMoon};
 use crate::astro::math::vec3::{add3, cross3, dot3, neg3, norm3, scale3, sub3, unit3};
+use crate::astro::time::model::{Instant, JulianDateSplit, TimeScale};
 use crate::astro::time::{CoverageError, TimeScaleInputErrorKind, TimeScales, ValidityMode};
 use crate::validate;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 
 use crate::antenna;
-use crate::constants::{C_M_S, F_L1_HZ, OMEGA_E_DOT_RAD_S, RAD_TO_DEG};
+use crate::bias::{BiasError, BiasSet, ClockReferenceObservables};
+use crate::constants::{C_M_S, F_L1_HZ, J2000_JD, OMEGA_E_DOT_RAD_S, RAD_TO_DEG, SECONDS_PER_DAY};
 use crate::ephemeris::Sp3;
+use crate::frequencies;
 use crate::observables::{
     predict, ObservablesError, ObservablesInputErrorKind, PredictOptions, PredictedObservables,
 };
@@ -24,14 +27,14 @@ use crate::tides::{ocean_tide_loading, solid_earth_pole_tide, solid_earth_tide, 
 // The ocean-loading types live in `tides` (the displacement math owns them), but
 // `PppCorrectionsOptions::ocean_loading` is the public entry point that consumes
 // them. Re-export them here so a caller configuring PPP corrections can name and
-// build the option's type — and size the BLQ block with `NUM_OCEAN_CONSTITUENTS`
-// rather than a hardcoded `11` — without reaching into `tides`. The pole-tide
+// build the option's type, and size the BLQ block with `NUM_OCEAN_CONSTITUENTS`
+// rather than a hardcoded `11`, without reaching into `tides`. The pole-tide
 // option (`PoleTideOptions`) is defined in this module because it is a
 // PPP-correction switch with no role in the tide math itself; this keeps the
 // `PppCorrectionsOptions` surface coherent from one module.
 pub use crate::tides::{OceanLoadingBlq, NUM_OCEAN_CONSTITUENTS};
 use crate::tolerances::{FREQUENCY_DENOMINATOR_EPS_HZ, YAW_SINGULARITY_EPS_RAD};
-use crate::GnssSatelliteId;
+use crate::{GnssSatelliteId, GnssSystem};
 
 const TWO_PI: f64 = 2.0 * PI;
 
@@ -52,6 +55,7 @@ pub struct PppCorrectionObservation {
     pub sat: GnssSatelliteId,
     pub freq1_hz: f64,
     pub freq2_hz: f64,
+    pub glonass_channel: Option<i8>,
 }
 
 /// One receiver epoch and its visible satellite rows.
@@ -89,6 +93,15 @@ pub struct SatelliteAntennaOptions {
     pub antennas: Vec<SatelliteAntenna>,
 }
 
+/// Offline code-bias correction options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeBiasOptions {
+    pub bias_set: BiasSet,
+    pub used_observables_per_sat: BTreeMap<GnssSatelliteId, (String, String)>,
+    pub used_observables_default: BTreeMap<GnssSystem, (String, String)>,
+    pub clock_reference: Option<ClockReferenceObservables>,
+}
+
 /// Solid-Earth pole tide correction options.
 ///
 /// The pole tide needs the epoch's IERS polar motion, which the engine's
@@ -116,6 +129,7 @@ pub struct PppCorrectionsOptions {
     pub ocean_loading: Option<OceanLoadingBlq>,
     pub phase_windup: bool,
     pub satellite_antenna: Option<SatelliteAntennaOptions>,
+    pub code_bias: Option<CodeBiasOptions>,
 }
 
 /// Indexed vector result. The epoch index refers to the input epoch slice.
@@ -150,6 +164,8 @@ pub struct PppCorrections {
     pub windup_m: Vec<SatScalarCorrection>,
     pub sat_pco_ecef: Vec<SatVectorCorrection>,
     pub sat_pcv_m: Vec<SatScalarCorrection>,
+    pub code_bias_m: Vec<SatScalarCorrection>,
+    pub diagnostics: crate::format::Diagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -197,6 +213,18 @@ pub enum PppCorrectionsError {
         field: &'static str,
         reason: &'static str,
     },
+    #[error("code-bias correction failed: {source}")]
+    Bias {
+        #[source]
+        source: BiasError,
+    },
+    #[error("invalid code-bias observable at epoch {epoch_index} for {sat}: {field} {reason}")]
+    CodeBiasObservable {
+        epoch_index: usize,
+        sat: GnssSatelliteId,
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// Build static PPP correction tables for a precise-orbit arc.
@@ -214,6 +242,7 @@ pub fn build(
         && options.ocean_loading.is_none()
         && !options.phase_windup
         && options.satellite_antenna.is_none()
+        && options.code_bias.is_none()
     {
         return Ok(corrections);
     }
@@ -290,6 +319,28 @@ pub fn build(
                 epoch_index,
                 vector_m: d,
             });
+        }
+
+        if let Some(code_bias) = options.code_bias.as_ref() {
+            for observation in &epoch_row.observations {
+                if let Some(value_m) =
+                    code_bias_correction_m(code_bias, observation, epoch_row, epoch_index)?
+                {
+                    corrections.code_bias_m.push(SatScalarCorrection {
+                        sat: observation.sat,
+                        epoch_index,
+                        value_m,
+                    });
+                } else {
+                    corrections
+                        .diagnostics
+                        .push_warning(crate::format::Warning {
+                            at: crate::format::RecordRef::at_record(epoch_index)
+                                .with_satellite(observation.sat.to_string()),
+                            kind: crate::format::WarningKind::MissingMetadata,
+                        });
+                }
+            }
         }
 
         if !need_obs_loop {
@@ -436,6 +487,146 @@ fn validate_satellite_antenna_options(
     let frequencies_hz = validate_satellite_antenna_frequency_pair(options)?;
     validate_satellite_antenna_pcv_samples(options)?;
     Ok(frequencies_hz)
+}
+
+fn code_bias_correction_m(
+    options: &CodeBiasOptions,
+    observation: &PppCorrectionObservation,
+    epoch_row: &PppCorrectionEpoch,
+    epoch_index: usize,
+) -> Result<Option<f64>, PppCorrectionsError> {
+    let Some(used) = options
+        .used_observables_per_sat
+        .get(&observation.sat)
+        .or_else(|| {
+            options
+                .used_observables_default
+                .get(&observation.sat.system)
+        })
+    else {
+        return Ok(None);
+    };
+    validate_code_observable_frequency(
+        observation,
+        epoch_index,
+        "used observable 1",
+        &used.0,
+        observation.freq1_hz,
+        observation_glonass_channel(observation),
+    )?;
+    validate_code_observable_frequency(
+        observation,
+        epoch_index,
+        "used observable 2",
+        &used.1,
+        observation.freq2_hz,
+        observation_glonass_channel(observation),
+    )?;
+    let reference = options
+        .clock_reference
+        .as_ref()
+        .unwrap_or(&options.bias_set.clock_reference);
+    if reference.per_system.is_empty() {
+        return Err(PppCorrectionsError::Bias {
+            source: BiasError::MissingClockReference,
+        });
+    }
+    let Some(clock_pair) = reference.per_system.get(&observation.sat.system) else {
+        return Err(PppCorrectionsError::Bias {
+            source: BiasError::MissingClockReference,
+        });
+    };
+    let epoch = code_bias_epoch(epoch_row.t_rx_j2000_s, options.bias_set.time_scale)
+        .map_err(|source| PppCorrectionsError::Bias { source })?;
+    Ok(options.bias_set.code_bias_model_m(
+        observation.sat,
+        (&used.0, &used.1),
+        (observation.freq1_hz, observation.freq2_hz),
+        observation_glonass_channel(observation),
+        (&clock_pair.0, &clock_pair.1),
+        epoch,
+    ))
+}
+
+fn code_bias_epoch(t_rx_j2000_s: f64, time_scale: TimeScale) -> Result<Instant, BiasError> {
+    validate::finite(t_rx_j2000_s, "t_rx_j2000_s").map_err(|error| BiasError::InvalidInput {
+        field: error.field(),
+        reason: error.reason(),
+    })?;
+    let days_since_j2000 = t_rx_j2000_s / SECONDS_PER_DAY;
+    let whole_days = days_since_j2000.floor();
+    let fraction = days_since_j2000 - whole_days;
+    let jd = JulianDateSplit::new(J2000_JD + whole_days, fraction)
+        .map_err(|_| BiasError::InvalidEpoch)?;
+    Ok(Instant::from_julian_date(time_scale, jd))
+}
+
+fn validate_code_observable_frequency(
+    observation: &PppCorrectionObservation,
+    epoch_index: usize,
+    field: &'static str,
+    obs: &str,
+    actual_hz: f64,
+    glonass_channel: Option<i8>,
+) -> Result<(), PppCorrectionsError> {
+    validate::finite_positive(actual_hz, field).map_err(|error| {
+        PppCorrectionsError::CodeBiasObservable {
+            epoch_index,
+            sat: observation.sat,
+            field: error.field(),
+            reason: error.reason(),
+        }
+    })?;
+    let Some(expected_hz) = frequencies::rinex_observation_frequency_hz(
+        observation.sat.system,
+        obs,
+        3.04,
+        glonass_channel,
+    ) else {
+        return Ok(());
+    };
+    let tol_hz = (expected_hz.abs().max(actual_hz.abs()) * 1.0e-12).max(1.0e-3);
+    if (expected_hz - actual_hz).abs() > tol_hz {
+        return Err(PppCorrectionsError::CodeBiasObservable {
+            epoch_index,
+            sat: observation.sat,
+            field,
+            reason: "frequency mismatch",
+        });
+    }
+    Ok(())
+}
+
+fn observation_glonass_channel(observation: &PppCorrectionObservation) -> Option<i8> {
+    observation.glonass_channel.or_else(|| {
+        infer_glonass_channel(observation.sat, observation.freq1_hz, observation.freq2_hz)
+    })
+}
+
+fn infer_glonass_channel(sat: GnssSatelliteId, freq1_hz: f64, freq2_hz: f64) -> Option<i8> {
+    if sat.system != GnssSystem::Glonass {
+        return None;
+    }
+    (-7..=6).find(|&channel| {
+        let g1 = frequencies::rinex_observation_frequency_hz(
+            GnssSystem::Glonass,
+            "C1C",
+            3.04,
+            Some(channel),
+        );
+        let g2 = frequencies::rinex_observation_frequency_hz(
+            GnssSystem::Glonass,
+            "C2C",
+            3.04,
+            Some(channel),
+        );
+        matches!(
+            (g1, g2),
+            (Some(expected1), Some(expected2))
+                if (expected1 - freq1_hz).abs() <= 1.0e-3
+                    && (expected2 - freq2_hz).abs() <= 1.0e-3
+        )
+    })
 }
 
 fn validate_satellite_antenna_pcv_samples(
@@ -781,6 +972,11 @@ mod tests {
     use crate::observables::j2000_seconds_from_split;
     use crate::GnssSystem;
 
+    const REAL_CODE_BIA: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bias/CODE.BIA"
+    ));
+
     fn sp3_fixture() -> Sp3 {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -849,6 +1045,7 @@ mod tests {
                 sat,
                 freq1_hz,
                 freq2_hz,
+                glonass_channel: None,
             }],
         }
     }
@@ -868,6 +1065,7 @@ mod tests {
                 sat,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             }],
         }];
         let options = PppCorrectionsOptions {
@@ -876,6 +1074,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: true,
             satellite_antenna: Some(fake_antenna_options(sat)),
+            code_bias: None,
         };
 
         let got = build(&sp3, &epochs, receiver, &options).expect("valid PPP corrections");
@@ -911,6 +1110,7 @@ mod tests {
                 sat,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             }],
         }];
         let pole = PoleTideOptions {
@@ -923,6 +1123,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
 
         let got = build(&sp3, &epochs, receiver, &options).expect("valid PPP corrections");
@@ -992,6 +1193,7 @@ mod tests {
                 sat,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             }],
         }];
         let blq = zim2_blq();
@@ -1001,6 +1203,7 @@ mod tests {
             ocean_loading: Some(blq),
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
 
         let got = build(&sp3, &epochs, receiver, &options).expect("valid PPP corrections");
@@ -1035,6 +1238,7 @@ mod tests {
                 sat,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             }],
         }];
 
@@ -1053,6 +1257,7 @@ mod tests {
                 ocean_loading: None,
                 phase_windup: false,
                 satellite_antenna: None,
+                code_bias: None,
             },
         )
         .expect("pole-only build must not touch the Sun/Moon or predict paths");
@@ -1075,6 +1280,7 @@ mod tests {
                 ocean_loading: Some(blq),
                 phase_windup: false,
                 satellite_antenna: None,
+                code_bias: None,
             },
         )
         .expect("ocean-only build must not touch the Sun/Moon or predict paths");
@@ -1097,6 +1303,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: true,
             satellite_antenna: None,
+            code_bias: None,
         };
         let cases = [
             (0.0, F_L2_HZ, "phase wind-up freq1_hz", "not positive"),
@@ -1137,6 +1344,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: true,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![windup_epoch(sat, F_L1_HZ, F_L2_HZ)];
 
@@ -1145,6 +1353,207 @@ mod tests {
 
         assert_eq!(got.windup_m.len(), 1);
         assert!(got.windup_m[0].value_m.is_finite());
+    }
+
+    fn code_bias_product() -> crate::bias::BiasSet {
+        let text = "\
+%=BIA 1.00 TST
++FILE/REFERENCE
+ DESCRIPTION TEST
+-FILE/REFERENCE
++BIAS/DESCRIPTION
+ BIAS_MODE ABSOLUTE
+ TIME_SYSTEM G
+ SATELLITE_CLOCK_REFERENCE_OBSERVABLES G C1W C2W
+-BIAS/DESCRIPTION
++BIAS/SOLUTION 3
+ OSB  G021 G21           C1C       2020:176:00000 2020:177:00000 ns     -1.234567890000E+00 2.00000E-02
+ OSB  G021 G21           C1W       2020:176:00000 2020:177:00000 ns      5.600000000000E-01 2.00000E-02
+ OSB  G021 G21           C2W       2020:176:00000 2020:177:00000 ns     -3.000000000000E-01 2.00000E-02
+-BIAS/SOLUTION
+";
+        crate::bias::BiasSet::parse_bias_sinex(text.as_bytes())
+            .expect("parse code-bias product")
+            .value
+    }
+
+    fn real_code_bias_product() -> crate::bias::BiasSet {
+        crate::bias::BiasSet::parse_bias_sinex(REAL_CODE_BIA)
+            .expect("parse real CODE Bias-SINEX product")
+            .value
+    }
+
+    fn code_bias_epoch(sat: GnssSatelliteId) -> Vec<PppCorrectionEpoch> {
+        let epoch = civil(2020, 6, 24, 12, 0, 0.0);
+        let (jd_whole, jd_fraction) = split_jd(epoch);
+        vec![PppCorrectionEpoch {
+            epoch,
+            t_rx_j2000_s: j2000_seconds_from_split(jd_whole, jd_fraction)
+                .expect("valid split Julian date"),
+            observations: vec![PppCorrectionObservation {
+                sat,
+                freq1_hz: F_L1_HZ,
+                freq2_hz: F_L2_HZ,
+                glonass_channel: None,
+            }],
+        }]
+    }
+
+    fn code_bias_options(bias_set: crate::bias::BiasSet, used: (&str, &str)) -> CodeBiasOptions {
+        let mut used_observables_default = BTreeMap::new();
+        used_observables_default.insert(GnssSystem::Gps, (used.0.to_string(), used.1.to_string()));
+        CodeBiasOptions {
+            bias_set,
+            used_observables_per_sat: BTreeMap::new(),
+            used_observables_default,
+            clock_reference: None,
+        }
+    }
+
+    #[test]
+    fn code_bias_builds_exact_zero_for_matched_clock_datum() {
+        let sp3 = sp3_fixture();
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 21).expect("valid satellite id");
+        let receiver = [3_512_900.0, 780_500.0, 5_248_700.0];
+        let epochs = code_bias_epoch(sat);
+        let options = PppCorrectionsOptions {
+            solid_earth_tide: false,
+            pole_tide: None,
+            ocean_loading: None,
+            phase_windup: false,
+            satellite_antenna: None,
+            code_bias: Some(code_bias_options(code_bias_product(), ("C1W", "C2W"))),
+        };
+
+        let got = build(&sp3, &epochs, receiver, &options).expect("code-bias build");
+
+        assert_eq!(got.code_bias_m.len(), 1);
+        assert_eq!(got.code_bias_m[0].value_m.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn code_bias_builds_mismatched_pair_scalar() {
+        let sp3 = sp3_fixture();
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 21).expect("valid satellite id");
+        let receiver = [3_512_900.0, 780_500.0, 5_248_700.0];
+        let epochs = code_bias_epoch(sat);
+        let options = PppCorrectionsOptions {
+            solid_earth_tide: false,
+            pole_tide: None,
+            ocean_loading: None,
+            phase_windup: false,
+            satellite_antenna: None,
+            code_bias: Some(code_bias_options(code_bias_product(), ("C1C", "C2W"))),
+        };
+
+        let got = build(&sp3, &epochs, receiver, &options).expect("code-bias build");
+        let alpha = F_L1_HZ * F_L1_HZ / (F_L1_HZ * F_L1_HZ - F_L2_HZ * F_L2_HZ);
+        let beta = -(F_L2_HZ * F_L2_HZ) / (F_L1_HZ * F_L1_HZ - F_L2_HZ * F_L2_HZ);
+        let used_if =
+            alpha * (-1.234567890000_f64 * 1.0e-9) + beta * (-0.300000000000_f64 * 1.0e-9);
+        let ref_if = alpha * (0.560000000000_f64 * 1.0e-9) + beta * (-0.300000000000_f64 * 1.0e-9);
+        let expected = (used_if - ref_if) * C_M_S;
+
+        assert_eq!(got.code_bias_m.len(), 1);
+        assert_eq!(got.code_bias_m[0].value_m.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn code_bias_build_applies_real_glonass_osb_with_fdma_channel() {
+        let sp3 = sp3_fixture();
+        let sat = GnssSatelliteId::new(GnssSystem::Glonass, 2).expect("valid satellite id");
+        let receiver = [3_512_900.0, 780_500.0, 5_248_700.0];
+        let channel = -4;
+        let freq1_hz = frequencies::rinex_observation_frequency_hz(
+            GnssSystem::Glonass,
+            "C1C",
+            3.04,
+            Some(channel),
+        )
+        .expect("GLONASS G1 frequency");
+        let freq2_hz = frequencies::rinex_observation_frequency_hz(
+            GnssSystem::Glonass,
+            "C2C",
+            3.04,
+            Some(channel),
+        )
+        .expect("GLONASS G2 frequency");
+        let epoch = civil(2026, 6, 24, 12, 0, 0.0);
+        let (jd_whole, jd_fraction) = split_jd(epoch);
+        let epochs = vec![PppCorrectionEpoch {
+            epoch,
+            t_rx_j2000_s: j2000_seconds_from_split(jd_whole, jd_fraction)
+                .expect("valid split Julian date"),
+            observations: vec![PppCorrectionObservation {
+                sat,
+                freq1_hz,
+                freq2_hz,
+                glonass_channel: Some(channel),
+            }],
+        }];
+        let mut used_observables_default = BTreeMap::new();
+        used_observables_default
+            .insert(GnssSystem::Glonass, ("C1C".to_string(), "C2C".to_string()));
+        let options = PppCorrectionsOptions {
+            solid_earth_tide: false,
+            pole_tide: None,
+            ocean_loading: None,
+            phase_windup: false,
+            satellite_antenna: None,
+            code_bias: Some(CodeBiasOptions {
+                bias_set: real_code_bias_product(),
+                used_observables_per_sat: BTreeMap::new(),
+                used_observables_default,
+                clock_reference: None,
+            }),
+        };
+
+        let got = build(&sp3, &epochs, receiver, &options).expect("GLONASS code-bias build");
+        let (alpha, beta) = crate::bias::ionosphere_free_coefficients(freq1_hz, freq2_hz).unwrap();
+        let used_if = alpha * (0.2114_f64 * 1.0e-9) + beta * (2.6597_f64 * 1.0e-9);
+        let ref_if = alpha * (1.7840_f64 * 1.0e-9) + beta * (2.9490_f64 * 1.0e-9);
+        let expected = (used_if - ref_if) * C_M_S;
+
+        assert_eq!(got.code_bias_m.len(), 1);
+        assert_eq!(got.code_bias_m[0].sat, sat);
+        assert_eq!(got.code_bias_m[0].value_m.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn code_bias_build_requires_clock_reference() {
+        let sp3 = sp3_fixture();
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 21).expect("valid satellite id");
+        let receiver = [3_512_900.0, 780_500.0, 5_248_700.0];
+        let epochs = code_bias_epoch(sat);
+        let dcb = crate::bias::BiasSet::parse_code_dcb(
+            b"# DCB P1-C1 2020-06 G\n G21 1.000 0.100\n",
+            Some(crate::bias::CodeDcbOptions {
+                pair: ("P1".to_string(), "C1".to_string()),
+                year: 2020,
+                month: 6,
+                time_scale: crate::astro::time::model::TimeScale::Gpst,
+                receiver_system: None,
+            }),
+        )
+        .expect("parse DCB")
+        .value;
+        let options = PppCorrectionsOptions {
+            solid_earth_tide: false,
+            pole_tide: None,
+            ocean_loading: None,
+            phase_windup: false,
+            satellite_antenna: None,
+            code_bias: Some(code_bias_options(dcb, ("C1C", "C2W"))),
+        };
+
+        let err = build(&sp3, &epochs, receiver, &options)
+            .expect_err("missing clock reference must error");
+        assert!(matches!(
+            err,
+            PppCorrectionsError::Bias {
+                source: BiasError::MissingClockReference
+            }
+        ));
     }
 
     #[test]
@@ -1184,6 +1593,7 @@ mod tests {
                 ocean_loading: None,
                 phase_windup: false,
                 satellite_antenna: Some(antenna),
+                code_bias: None,
             };
             let epochs = vec![windup_epoch(sat, F_L1_HZ, F_L2_HZ)];
 
@@ -1208,6 +1618,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: Some(fake_antenna_options(sat)),
+            code_bias: None,
         };
         let epochs = vec![windup_epoch(sat, F_L1_HZ, F_L2_HZ)];
 
@@ -1237,6 +1648,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: Some(antenna),
+            code_bias: None,
         };
         let epochs = vec![windup_epoch(sat, F_L1_HZ, F_L2_HZ)];
 
@@ -1267,6 +1679,7 @@ mod tests {
                 sat,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             }],
         }];
         let mut antenna = fake_antenna_options(sat);
@@ -1277,6 +1690,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: Some(antenna),
+            code_bias: None,
         };
 
         let got = build(&sp3, &epochs, receiver, &options).expect("valid PPP corrections");
@@ -1295,6 +1709,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: true,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![PppCorrectionEpoch {
             epoch: civil(2020, 6, 24, 12, 0, 0.0),
@@ -1303,6 +1718,7 @@ mod tests {
                 sat,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             }],
         }];
 
@@ -1341,6 +1757,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
 
         for (receiver, field, reason) in [
@@ -1367,6 +1784,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![PppCorrectionEpoch {
             epoch: civil(2021, 2, 29, 12, 0, 0.0),
@@ -1403,6 +1821,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![PppCorrectionEpoch {
             epoch: civil(2020, 6, 24, 12, 0, f64::NAN),
@@ -1439,6 +1858,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![PppCorrectionEpoch {
             epoch: civil(2100, 1, 1, 0, 0, 0.0),
@@ -1474,6 +1894,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![PppCorrectionEpoch {
             epoch: civil(2020, 6, 24, 12, 0, 0.0),
@@ -1502,6 +1923,7 @@ mod tests {
             ocean_loading: None,
             phase_windup: false,
             satellite_antenna: None,
+            code_bias: None,
         };
         let epochs = vec![PppCorrectionEpoch {
             epoch,

@@ -93,6 +93,7 @@
 //! #             phase_m: code_m + ambiguity_m,
 //! #             freq1_hz: 0.0,
 //! #             freq2_hz: 0.0,
+//! #             glonass_channel: None,
 //! #         })
 //! #     })
 //! #     .collect::<Result<Vec<_>, ObservablesError>>()?;
@@ -276,6 +277,7 @@ pub fn build_ppp_lookup(
                     sat: obs.sat,
                     freq1_hz: obs.freq1_hz,
                     freq2_hz: obs.freq2_hz,
+                    glonass_channel: obs.glonass_channel,
                 })
                 .collect(),
         })

@@ -29,6 +29,8 @@ pub struct FloatObservation {
     /// no explicit satellite ANTEX frequency pair is configured.
     pub freq1_hz: f64,
     pub freq2_hz: f64,
+    /// GLONASS FDMA frequency-channel number for this satellite, when known.
+    pub glonass_channel: Option<i8>,
 }
 
 /// One static PPP epoch.
@@ -342,11 +344,13 @@ pub struct PppCorrectionLookup {
     pub windup_m: BTreeMap<(GnssSatelliteId, usize), f64>,
     pub sat_pco_ecef: BTreeMap<(GnssSatelliteId, usize), [f64; 3]>,
     pub sat_pcv_m: BTreeMap<(GnssSatelliteId, usize), f64>,
+    pub code_bias_m: BTreeMap<(GnssSatelliteId, usize), f64>,
     pub tide_enabled: bool,
     pub pole_tide_enabled: bool,
     pub ocean_loading_enabled: bool,
     pub windup_enabled: bool,
     pub satellite_antenna_enabled: bool,
+    pub code_bias_enabled: bool,
 }
 
 impl PppCorrectionLookup {
@@ -358,6 +362,7 @@ impl PppCorrectionLookup {
             options.ocean_loading.is_some(),
             options.phase_windup,
             options.satellite_antenna.is_some(),
+            options.code_bias.is_some(),
         )
     }
 
@@ -368,6 +373,7 @@ impl PppCorrectionLookup {
         ocean_loading_enabled: bool,
         windup_enabled: bool,
         satellite_antenna_enabled: bool,
+        code_bias_enabled: bool,
     ) -> Self {
         Self {
             tide: value
@@ -400,11 +406,17 @@ impl PppCorrectionLookup {
                 .into_iter()
                 .map(|c| ((c.sat, c.epoch_index), c.value_m))
                 .collect(),
+            code_bias_m: value
+                .code_bias_m
+                .into_iter()
+                .map(|c| ((c.sat, c.epoch_index), c.value_m))
+                .collect(),
             tide_enabled,
             pole_tide_enabled,
             ocean_loading_enabled,
             windup_enabled,
             satellite_antenna_enabled,
+            code_bias_enabled,
         }
     }
 }
@@ -417,6 +429,7 @@ impl From<PppCorrections> for PppCorrectionLookup {
         let windup_enabled = !value.windup_m.is_empty();
         let satellite_antenna_enabled =
             !value.sat_pco_ecef.is_empty() || !value.sat_pcv_m.is_empty();
+        let code_bias_enabled = !value.code_bias_m.is_empty();
         Self::from_parts(
             value,
             tide_enabled,
@@ -424,6 +437,7 @@ impl From<PppCorrections> for PppCorrectionLookup {
             ocean_loading_enabled,
             windup_enabled,
             satellite_antenna_enabled,
+            code_bias_enabled,
         )
     }
 }
@@ -533,6 +547,7 @@ pub enum MissingCorrection {
     PhaseWindup,
     SatelliteAntennaPco,
     SatelliteAntennaPcv,
+    CodeBias,
     ReceiverAntennaFrequency(String),
     ReceiverAntennaPcv(String),
     ReceiverAntennaGeometry,
@@ -547,6 +562,7 @@ impl core::fmt::Display for MissingCorrection {
             Self::PhaseWindup => write!(f, "phase wind-up correction"),
             Self::SatelliteAntennaPco => write!(f, "satellite antenna PCO"),
             Self::SatelliteAntennaPcv => write!(f, "satellite antenna PCV"),
+            Self::CodeBias => write!(f, "code-bias correction"),
             Self::ReceiverAntennaFrequency(label) => {
                 write!(f, "receiver antenna frequency {label}")
             }

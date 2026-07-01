@@ -17,3 +17,4 @@ categories = ["science", "simulation"]
 # own; every function delegates to a sidereon-core reference entry point. The
 # default features (gnss + serde) carry the SP3/SPP/RTK/PPP API this wraps.
 sidereon-core = { path = "../sidereon-core", version = "0.9.2" }
+flate2 = "1"

@@ -85,6 +85,7 @@
 //! #             phase_m: prediction.geometric_range_m + clock_m + ambiguity_m,
 //! #             freq1_hz: 0.0,
 //! #             freq2_hz: 0.0,
+//! #             glonass_channel: None,
 //! #         })
 //! #     })
 //! #     .collect::<Result<Vec<_>, ObservablesError>>()?;
@@ -1379,6 +1380,7 @@ mod tests {
                     phase_m: prediction.geometric_range_m + clock_m + ambiguity_m,
                     freq1_hz: 0.0,
                     freq2_hz: 0.0,
+                    glonass_channel: None,
                 }
             })
             .collect::<Vec<_>>();
