@@ -163,14 +163,16 @@
 //! ```
 
 use core::fmt;
+use flate2::read::GzDecoder;
+use std::io::Read;
 use std::path::Path;
 
 // Re-export core domain modules whose public helpers are intentionally part of
 // the ergonomic crate surface.
 pub use sidereon_core::{
-    antex, astro, atmosphere, broadcast_comparison, carrier_phase, combinations, constants, dgnss,
-    ephemeris, frequencies, geometry, navigation, observables, orbit, positioning, quality, rinex,
-    rtcm, signal, velocity,
+    antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
+    dgnss, ephemeris, frequencies, geometry, navigation, observables, orbit, positioning, quality,
+    rinex, rtcm, signal, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
@@ -258,6 +260,7 @@ pub mod least_squares {
 }
 
 use sidereon_core::antex::{Antex, AntexError};
+use sidereon_core::bias::{BiasError, BiasSet, CodeDcbOptions, Parsed as BiasParsed};
 use sidereon_core::ephemeris::{BroadcastEphemeris, Sp3};
 use sidereon_core::observables::ObservableEphemerisSource;
 use sidereon_core::positioning::{
@@ -298,6 +301,8 @@ pub enum Error {
     RinexObs(sidereon_core::Error),
     /// [`parse_rinex_clock`] or [`load_rinex_clock`] failed to parse the clock product.
     RinexClock(RinexClockError),
+    /// Bias-SINEX or CODE DCB parsing failed.
+    Bias(BiasError),
     /// [`decode_crinex`] or [`load_crinex`] failed to decode the CRINEX product.
     Crinex(sidereon_core::Error),
     /// A product file could not be read.
@@ -324,6 +329,7 @@ impl fmt::Display for Error {
             Error::RinexNav(e) => write!(f, "RINEX NAV parse failed: {e}"),
             Error::RinexObs(e) => write!(f, "RINEX OBS parse failed: {e}"),
             Error::RinexClock(e) => write!(f, "RINEX clock parse failed: {e}"),
+            Error::Bias(e) => write!(f, "bias product parse failed: {e}"),
             Error::Crinex(e) => write!(f, "CRINEX decode failed: {e}"),
             Error::Io(e) => write!(f, "product file read failed: {e}"),
             Error::Spp(e) => write!(f, "{e}"),
@@ -344,6 +350,7 @@ impl std::error::Error for Error {
             Error::RinexNav(e) => Some(e),
             Error::RinexObs(e) => Some(e),
             Error::RinexClock(e) => Some(e),
+            Error::Bias(e) => Some(e),
             Error::Crinex(e) => Some(e),
             Error::Io(e) => Some(e),
             Error::Spp(e) => Some(e),
@@ -371,6 +378,12 @@ impl From<NavParseError> for Error {
 impl From<RinexClockError> for Error {
     fn from(e: RinexClockError) -> Self {
         Error::RinexClock(e)
+    }
+}
+
+impl From<BiasError> for Error {
+    fn from(e: BiasError) -> Self {
+        Error::Bias(e)
     }
 }
 
@@ -699,6 +712,58 @@ pub fn load_rinex_clock_lossy(path: impl AsRef<Path>) -> Result<RinexClock> {
     Ok(parse_rinex_clock_lossy(&text))
 }
 
+/// Parse Bias-SINEX bytes into an offline bias set.
+pub fn parse_bias_sinex(bytes: &[u8]) -> Result<BiasSet> {
+    Ok(parse_bias_sinex_lossy(bytes)?.value)
+}
+
+/// Parse Bias-SINEX bytes and return non-fatal diagnostics with the bias set.
+pub fn parse_bias_sinex_lossy(bytes: &[u8]) -> Result<BiasParsed<BiasSet>> {
+    BiasSet::parse_bias_sinex(bytes).map_err(Error::Bias)
+}
+
+/// Read and parse a Bias-SINEX product. Files ending in `.gz` are decompressed.
+pub fn load_bias_sinex(path: impl AsRef<Path>) -> Result<BiasSet> {
+    let bytes = read_maybe_gzip(path)?;
+    parse_bias_sinex(&bytes)
+}
+
+/// Read and parse a Bias-SINEX product, retaining non-fatal diagnostics.
+/// Files ending in `.gz` are decompressed.
+pub fn load_bias_sinex_lossy(path: impl AsRef<Path>) -> Result<BiasParsed<BiasSet>> {
+    let bytes = read_maybe_gzip(path)?;
+    parse_bias_sinex_lossy(&bytes)
+}
+
+/// Parse CODE DCB bytes into an offline bias set.
+pub fn parse_code_dcb(bytes: &[u8], options: Option<CodeDcbOptions>) -> Result<BiasSet> {
+    Ok(parse_code_dcb_lossy(bytes, options)?.value)
+}
+
+/// Parse CODE DCB bytes and return non-fatal diagnostics with the bias set.
+pub fn parse_code_dcb_lossy(
+    bytes: &[u8],
+    options: Option<CodeDcbOptions>,
+) -> Result<BiasParsed<BiasSet>> {
+    BiasSet::parse_code_dcb(bytes, options).map_err(Error::Bias)
+}
+
+/// Read and parse a CODE DCB product. Files ending in `.gz` are decompressed.
+pub fn load_code_dcb(path: impl AsRef<Path>, options: Option<CodeDcbOptions>) -> Result<BiasSet> {
+    let bytes = read_maybe_gzip(path)?;
+    parse_code_dcb(&bytes, options)
+}
+
+/// Read and parse a CODE DCB product, retaining non-fatal diagnostics.
+/// Files ending in `.gz` are decompressed.
+pub fn load_code_dcb_lossy(
+    path: impl AsRef<Path>,
+    options: Option<CodeDcbOptions>,
+) -> Result<BiasParsed<BiasSet>> {
+    let bytes = read_maybe_gzip(path)?;
+    parse_code_dcb_lossy(&bytes, options)
+}
+
 /// Decode Compact RINEX (Hatanaka) OBS text into plain RINEX OBS text.
 pub fn decode_crinex(text: &str) -> Result<String> {
     rinex::decode_crinex(text).map_err(Error::Crinex)
@@ -708,6 +773,18 @@ pub fn decode_crinex(text: &str) -> Result<String> {
 pub fn load_crinex(path: impl AsRef<Path>) -> Result<String> {
     let text = std::fs::read_to_string(path)?;
     decode_crinex(&text)
+}
+
+fn read_maybe_gzip(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    if path.extension().and_then(|ext| ext.to_str()) != Some("gz") {
+        return Ok(bytes);
+    }
+    let mut decoder = GzDecoder::new(&bytes[..]);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+    Ok(decoded)
 }
 
 /// Run single-point positioning under the public validation/orchestration
@@ -1032,6 +1109,9 @@ mod tests {
     );
     const RINEX_CLOCK_TEXT: &str =
         include_str!("../../sidereon-core/tests/fixtures/clk/synthetic_rinex_clock.clk");
+    const BIAS_BYTES: &[u8] = include_bytes!("../../sidereon-core/tests/fixtures/bias/CODE.BIA");
+    const DCB_BYTES: &[u8] =
+        include_bytes!("../../sidereon-core/tests/fixtures/bias/P1C1_RINEX.DCB");
     const CRINEX_TEXT: &str = include_str!(
         "../../sidereon-core/tests/fixtures/obs/ESBC00DNK_R_20201770000_01D_30S_MO_trim.crx"
     );
@@ -1222,6 +1302,26 @@ mod tests {
             clock.series_rows().len()
         );
 
+        let bias = parse_bias_sinex(BIAS_BYTES).expect("parse Bias-SINEX fixture");
+        assert_eq!(bias.records().len(), 351);
+        let loaded_bias = load_bias_sinex(fixture_path(&[
+            "bias",
+            "COD0OPSFIN_20261330000_01D_01D_OSB.BIA.gz",
+        ]))
+        .expect("load gzip Bias-SINEX");
+        assert!(!loaded_bias.records().is_empty());
+        let lossy_bias = parse_bias_sinex_lossy(BIAS_BYTES).expect("lossy Bias-SINEX parse");
+        assert_eq!(lossy_bias.value.records().len(), bias.records().len());
+
+        let dcb = parse_code_dcb(DCB_BYTES, None).expect("parse CODE DCB fixture");
+        assert_eq!(dcb.records().len(), 496);
+        let loaded_dcb =
+            load_code_dcb(fixture_path(&["bias", "P1C1_RINEX.DCB"]), None).expect("load CODE DCB");
+        assert_eq!(loaded_dcb.records().len(), dcb.records().len());
+        let lossy_dcb = load_code_dcb_lossy(fixture_path(&["bias", "P1C1_RINEX.DCB"]), None)
+            .expect("load lossy CODE DCB");
+        assert_eq!(lossy_dcb.value.records().len(), dcb.records().len());
+
         let decoded = decode_crinex(CRINEX_TEXT).expect("decode CRINEX fixture");
         assert!(decoded.contains("RINEX VERSION / TYPE"));
         let loaded_decoded = load_crinex(fixture_path(&[
@@ -1257,6 +1357,10 @@ mod tests {
 
         let err = parse_rinex_clock("AS malformed").unwrap_err();
         assert!(matches!(err, Error::RinexClock(_)));
+        assert!(std::error::Error::source(&err).is_some());
+
+        let err = parse_code_dcb(b"not a DCB file", None).unwrap_err();
+        assert!(matches!(err, Error::Bias(_)));
         assert!(std::error::Error::source(&err).is_some());
 
         let err = decode_crinex("not a CRINEX file\n").unwrap_err();

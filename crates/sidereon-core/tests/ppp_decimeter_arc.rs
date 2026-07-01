@@ -21,6 +21,10 @@
 //!     (IGS final 30 s; trimmed to AS records through 01:30:00).
 //!   * Antenna: files.igs.org/pub/station/general/igs20.atx (IGS20; trimmed to the
 //!     ZIM2 receiver block + the observed-GPS satellite blocks valid at the epoch).
+//!   * Bias: ftp.aiub.unibe.ch/CODE/2026/COD0OPSFIN_20261330000_01D_01D_OSB.BIA.gz
+//!     (CODE final day-133 OSB Bias-SINEX; decompressed sha256
+//!     d8dd4fdb1ae510b65499c99db8d2bdb813c00bab97be80251df8ea0ce1687202,
+//!     public CODE/IGS product, citation requested by product text).
 //!   * Truth: itrf.ign.fr/.../ITRF2020-IGS-TRF.SSC, ZIM2 soln 3 (ref epoch 2015.0)
 //!     propagated to 2026-05-13; see `ZIM2_TRUTH_ECEF_M`.
 //!
@@ -37,14 +41,15 @@ use sidereon_core::astro::time::civil::civil_from_split_julian_date;
 use sidereon_core::astro::time::model::JulianDateSplit;
 use sidereon_core::astro::time::split_julian_date;
 use sidereon_core::atmosphere::troposphere::Met;
+use sidereon_core::bias::BiasSet;
 use sidereon_core::combinations::{ionosphere_free, ionosphere_free_phase_cycles};
 use sidereon_core::constants::{F_L1_HZ, F_L2_HZ};
 use sidereon_core::ephemeris::Sp3;
 use sidereon_core::frame::{itrf_to_geodetic, ItrfPositionM};
 use sidereon_core::observables::{j2000_seconds_from_split, predict, PredictOptions};
 use sidereon_core::ppp_corrections::{
-    self, CivilDateTime, PppCorrectionEpoch, PppCorrectionObservation, PppCorrectionsOptions,
-    SatelliteAntenna, SatelliteAntennaFrequency, SatelliteAntennaOptions,
+    self, CivilDateTime, CodeBiasOptions, PppCorrectionEpoch, PppCorrectionObservation,
+    PppCorrectionsOptions, SatelliteAntenna, SatelliteAntennaFrequency, SatelliteAntennaOptions,
 };
 use sidereon_core::precise_positioning::{
     solve_float_epochs, FloatEpoch, FloatObservation, FloatSolveConfig, FloatSolveOptions,
@@ -163,6 +168,14 @@ fn load_antex() -> Antex {
     Antex::parse(&load_text(&["antex", "igs20_zim2_gps_trim.atx"])).expect("parse ANTEX fixture")
 }
 
+fn load_bias() -> BiasSet {
+    let path = fixture_path(&["bias", "COD0OPSFIN_20261330000_01D_01D_OSB.BIA"]);
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("read fixture {path:?}: {err}"));
+    BiasSet::parse_bias_sinex(&bytes)
+        .unwrap_or_else(|err| panic!("parse CODE OSB bias fixture {path:?}: {err}"))
+        .value
+}
+
 fn civil_to_julian_split(epoch: ObsEpochTime) -> JulianDateSplit {
     let (jd_whole, fraction) = split_julian_date(
         epoch.year,
@@ -230,6 +243,7 @@ fn float_observations(epoch: &ObsEpoch, obs: &RinexObs) -> Vec<FloatObservation>
                 phase_m,
                 freq1_hz: F_L1_HZ,
                 freq2_hz: F_L2_HZ,
+                glonass_channel: None,
             })
         })
         .collect::<Vec<_>>();
@@ -452,6 +466,7 @@ fn ppp_correction_epochs(epochs: &[FloatEpoch]) -> Vec<PppCorrectionEpoch> {
                     sat: o.sat,
                     freq1_hz: F_L1_HZ,
                     freq2_hz: F_L2_HZ,
+                    glonass_channel: o.glonass_channel,
                 })
                 .collect(),
         })
@@ -488,6 +503,17 @@ fn full_corrections(
     epochs: &[FloatEpoch],
     receiver_ecef_m: [f64; 3],
 ) -> RangeCorrections {
+    full_corrections_with_code_bias(sp3, antex, clock, epochs, receiver_ecef_m, None)
+}
+
+fn full_corrections_with_code_bias(
+    sp3: &Sp3,
+    antex: &Antex,
+    clock: &RinexClock,
+    epochs: &[FloatEpoch],
+    receiver_ecef_m: [f64; 3],
+    code_bias: Option<CodeBiasOptions>,
+) -> RangeCorrections {
     let prns = observed_prns(epochs);
     let options = PppCorrectionsOptions {
         solid_earth_tide: true,
@@ -500,6 +526,7 @@ fn full_corrections(
         ocean_loading: Some(ZIM2_OCEAN_LOADING_BLQ),
         phase_windup: true,
         satellite_antenna: Some(satellite_antenna_options(antex, &prns)),
+        code_bias,
     };
     let precomputed = ppp_corrections::build(
         sp3,
@@ -532,6 +559,17 @@ fn station_met(ecef_m: [f64; 3]) -> Met {
 
 fn full_stack_config(corrections: RangeCorrections, met: Met) -> FloatSolveConfig {
     full_stack_config_mapping(corrections, met, TropoMapping::Niell)
+}
+
+fn code_bias_options(used: (&str, &str)) -> CodeBiasOptions {
+    let mut used_observables_default = BTreeMap::new();
+    used_observables_default.insert(GnssSystem::Gps, (used.0.to_string(), used.1.to_string()));
+    CodeBiasOptions {
+        bias_set: load_bias(),
+        used_observables_per_sat: BTreeMap::new(),
+        used_observables_default,
+        clock_reference: None,
+    }
 }
 
 fn full_stack_config_mapping(
@@ -642,6 +680,50 @@ fn zim2_full_stack_ppp_static_reaches_decimeter_truth() {
         rtklib_err < SIDEREON_VS_RTKLIB_BOUND_M,
         "full-stack PPP vs RTKLIB ppp-static {rtklib_err} m exceeded {SIDEREON_VS_RTKLIB_BOUND_M} m"
     );
+}
+
+#[test]
+fn zim2_ppp_static_with_code_bias_matches_no_bias_on_matched_datum() {
+    let sp3 = load_sp3();
+    let obs = load_obs();
+    let antex = load_antex();
+    let clock = load_clock();
+    let approx = obs
+        .header()
+        .approx_position_m
+        .expect("ZIM2 approx position");
+    let epochs = gps_float_epochs(&sp3, &obs, approx);
+    let met = station_met(approx);
+
+    let solve =
+        |code_bias: Option<CodeBiasOptions>| -> sidereon_core::precise_positioning::FloatSolution {
+            let corrections =
+                full_corrections_with_code_bias(&sp3, &antex, &clock, &epochs, approx, code_bias);
+            solve_float_epochs(
+                &sp3,
+                &epochs,
+                initial_state(&epochs, approx),
+                full_stack_config(corrections, met),
+            )
+            .expect("PPP float solve with code-bias option")
+        };
+
+    let no_bias = solve(None);
+    let matched = solve(Some(code_bias_options(("C1W", "C2W"))));
+    assert_eq!(matched, no_bias);
+
+    let mismatched = solve(Some(code_bias_options(("C1C", "C2W"))));
+    let truth_err = position_error_m(mismatched.position_m, ZIM2_TRUTH_ECEF_M);
+    let residual = mismatched
+        .residuals_m
+        .first()
+        .expect("mismatched solve residuals");
+
+    assert_eq!(residual.satellite_id, "G05");
+    assert_eq!(residual.epoch_index, 0);
+    assert_eq!(residual.code_m.to_bits(), 0x40040fce03000000);
+    assert_eq!(residual.phase_m.to_bits(), 0xbfa1ac9020000000);
+    assert!(truth_err < DECIMETER_TRUTH_BOUND_M);
 }
 
 /// VMF1 mapping (Vienna, driven by the ZIM2 site-wise `a` coefficients) holds

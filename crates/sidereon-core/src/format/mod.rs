@@ -46,83 +46,83 @@ pub(crate) trait FormatWriter {
 
 /// A parsed value plus diagnostics collected while reading it.
 #[derive(Debug, Clone)]
-pub(crate) struct Parsed<T> {
+pub struct Parsed<T> {
     /// The successfully parsed value.
-    pub(crate) value: T,
+    pub value: T,
     /// Non-fatal diagnostics collected while producing the value.
-    pub(crate) diagnostics: Diagnostics,
+    pub diagnostics: Diagnostics,
 }
 
 impl<T> Parsed<T> {
     /// Build a parsed value with caller-supplied diagnostics.
-    pub(crate) fn new(value: T, diagnostics: Diagnostics) -> Self {
+    pub fn new(value: T, diagnostics: Diagnostics) -> Self {
         Self { value, diagnostics }
     }
 
     /// Build a parsed value with no diagnostics.
-    pub(crate) fn clean(value: T) -> Self {
+    pub fn clean(value: T) -> Self {
         Self::new(value, Diagnostics::new())
     }
 
     /// Borrow the parsed value.
-    pub(crate) fn value(&self) -> &T {
+    pub fn value(&self) -> &T {
         &self.value
     }
 
     /// Borrow the diagnostics.
-    pub(crate) fn diagnostics(&self) -> &Diagnostics {
+    pub fn diagnostics(&self) -> &Diagnostics {
         &self.diagnostics
     }
 
     /// Split this parsed result into its value and diagnostics.
-    pub(crate) fn into_parts(self) -> (T, Diagnostics) {
+    pub fn into_parts(self) -> (T, Diagnostics) {
         (self.value, self.diagnostics)
     }
 }
 
 /// Non-fatal parser diagnostics.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct Diagnostics {
+pub struct Diagnostics {
     /// Records skipped during a forgiving parse.
-    pub(crate) skips: Vec<Skip>,
+    pub skips: Vec<Skip>,
     /// Advisory warnings that did not prevent decoding.
-    pub(crate) warnings: Vec<Warning>,
+    pub warnings: Vec<Warning>,
 }
 
 impl Diagnostics {
     /// Build an empty diagnostics set.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Return `true` when no skips or warnings are present.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.skips.is_empty() && self.warnings.is_empty()
     }
 
     /// Add a skipped-record diagnostic.
-    pub(crate) fn push_skip(&mut self, skip: Skip) {
+    pub fn push_skip(&mut self, skip: Skip) {
         self.skips.push(skip);
     }
 
     /// Add an advisory warning.
-    pub(crate) fn push_warning(&mut self, warning: Warning) {
+    pub fn push_warning(&mut self, warning: Warning) {
         self.warnings.push(warning);
     }
 }
 
 /// A skipped record and the reason it was skipped.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Skip {
+pub struct Skip {
     /// Where the skipped record came from.
-    pub(crate) at: RecordRef,
+    pub at: RecordRef,
     /// Why the record was skipped.
-    pub(crate) reason: SkipReason,
+    pub reason: SkipReason,
 }
 
 /// Typed reasons a forgiving parser may skip a record.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum SkipReason {
+pub enum SkipReason {
     /// The record names a satellite that cannot be represented downstream.
     UnrepresentableSatellite,
     /// The record type is outside the reader's supported subset.
@@ -133,42 +133,54 @@ pub(crate) enum SkipReason {
     OutOfRangeEpoch,
     /// The record ended before all required fields were available.
     Truncated,
+    /// The record names a unit outside the reader's supported set.
+    UnsupportedUnit(String),
+    /// A logical block is not modeled by this reader.
+    UnknownBlock(String),
+    /// The record is internally inconsistent.
+    InconsistentRecord(&'static str),
 }
 
 /// An advisory warning attached to a record.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Warning {
+pub struct Warning {
     /// Where the warning came from.
-    pub(crate) at: RecordRef,
+    pub at: RecordRef,
     /// The warning category.
-    pub(crate) kind: WarningKind,
+    pub kind: WarningKind,
 }
 
 /// Advisory warning categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WarningKind {
+pub enum WarningKind {
     /// A checksum did not match the record body.
     Checksum,
     /// A value was clamped to fit the target range.
     Clamped,
     /// A value lost precision or fidelity during conversion.
     Degraded,
+    /// A declared count or mode did not match decoded records.
+    Mismatch,
+    /// Published validity intervals overlap.
+    Overlap,
+    /// A required-by-format metadata block was absent but recoverable.
+    MissingMetadata,
 }
 
 /// A reference to a record in an input stream.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct RecordRef {
+pub struct RecordRef {
     /// The one-based input line number, when known.
-    pub(crate) line: Option<usize>,
+    pub line: Option<usize>,
     /// The zero- or one-based logical record index chosen by the caller.
-    pub(crate) record_index: Option<usize>,
+    pub record_index: Option<usize>,
     /// A raw satellite token, when known.
-    pub(crate) satellite: Option<String>,
+    pub satellite: Option<String>,
 }
 
 impl RecordRef {
     /// Build a record reference at a one-based line number.
-    pub(crate) fn at_line(line: usize) -> Self {
+    pub fn at_line(line: usize) -> Self {
         Self {
             line: Some(line),
             ..Self::default()
@@ -176,7 +188,7 @@ impl RecordRef {
     }
 
     /// Build a record reference at a logical record index.
-    pub(crate) fn at_record(record_index: usize) -> Self {
+    pub fn at_record(record_index: usize) -> Self {
         Self {
             record_index: Some(record_index),
             ..Self::default()
@@ -184,7 +196,7 @@ impl RecordRef {
     }
 
     /// Attach a raw satellite token to this reference.
-    pub(crate) fn with_satellite(mut self, satellite: impl Into<String>) -> Self {
+    pub fn with_satellite(mut self, satellite: impl Into<String>) -> Self {
         self.satellite = Some(satellite.into());
         self
     }

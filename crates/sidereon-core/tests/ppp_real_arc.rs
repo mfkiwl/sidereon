@@ -145,6 +145,7 @@ fn float_observations(
                 phase_m,
                 freq1_hz: 0.0,
                 freq2_hz: 0.0,
+                glonass_channel: None,
             })
         })
         .collect::<Vec<_>>();
@@ -727,6 +728,7 @@ fn esbc_real_slipped_arcs_can_be_split_before_narrow_lane_search() {
                     phase_m: row.phase_m,
                     freq1_hz: 0.0,
                     freq2_hz: 0.0,
+                    glonass_channel: None,
                 })
                 .collect();
             float_epoch(raw_epoch, observations)

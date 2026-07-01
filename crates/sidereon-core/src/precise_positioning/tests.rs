@@ -4,8 +4,13 @@ use crate::astro::math::vec3::{norm3, sub3};
 use crate::carrier_phase::{CycleSlipOptions, SlipReason};
 use crate::constants::C_M_S;
 use crate::observables::{predict, ObservableState, ObservablesError};
-use crate::ppp_corrections::CivilDateTime;
+use crate::ppp_corrections::{CivilDateTime, CodeBiasOptions, PppCorrectionsOptions};
 use crate::{GnssSatelliteId, GnssSystem};
+
+const REAL_CODE_BIA: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/bias/CODE.BIA"
+));
 
 struct FakeSource {
     states: BTreeMap<GnssSatelliteId, [f64; 3]>,
@@ -72,6 +77,7 @@ fn single_obs_clock_epoch(sat: GnssSatelliteId) -> FloatEpoch {
             phase_m: 23_000_010.0,
             freq1_hz: 0.0,
             freq2_hz: 0.0,
+            glonass_channel: None,
         }],
     }
 }
@@ -171,6 +177,100 @@ fn float_solution_output_validation_rejects_nonfinite_values() {
 fn gps_l2_hz() -> f64 {
     crate::frequencies::frequency_hz(GnssSystem::Gps, crate::frequencies::CarrierBand::L2)
         .expect("canonical GPS L2 carrier exists")
+}
+
+#[test]
+fn ppp_lookup_applies_real_glonass_osb_with_observation_fdma_channel() {
+    let sp3_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sp3/GRG0MGXFIN_20201760000_01D_15M_ORB.SP3"
+    );
+    let sp3_bytes =
+        std::fs::read(sp3_path).unwrap_or_else(|e| panic!("read SP3 fixture {sp3_path}: {e}"));
+    let sp3 = Sp3::parse(&sp3_bytes).expect("parse SP3 fixture");
+    let bias_set = crate::bias::BiasSet::parse_bias_sinex(REAL_CODE_BIA)
+        .expect("parse real CODE Bias-SINEX")
+        .value;
+    let sat = GnssSatelliteId::new(GnssSystem::Glonass, 2).expect("valid GLONASS satellite");
+    let channel = -4;
+    let freq1_hz = crate::frequencies::rinex_observation_frequency_hz(
+        GnssSystem::Glonass,
+        "C1C",
+        3.04,
+        Some(channel),
+    )
+    .expect("GLONASS C1C frequency");
+    let freq2_hz = crate::frequencies::rinex_observation_frequency_hz(
+        GnssSystem::Glonass,
+        "C2C",
+        3.04,
+        Some(channel),
+    )
+    .expect("GLONASS C2C frequency");
+    let epoch = CivilDateTime {
+        year: 2026,
+        month: 6,
+        day: 24,
+        hour: 12,
+        minute: 0,
+        second: 0.0,
+    };
+    let (jd_whole, jd_fraction) = crate::astro::time::split_julian_date(
+        epoch.year,
+        i32::from(epoch.month),
+        i32::from(epoch.day),
+        i32::from(epoch.hour),
+        i32::from(epoch.minute),
+        epoch.second,
+    );
+    let mut used_observables_default = BTreeMap::new();
+    used_observables_default.insert(GnssSystem::Glonass, ("C1C".to_string(), "C2C".to_string()));
+    let epochs = vec![FloatEpoch {
+        epoch,
+        jd_whole,
+        jd_fraction,
+        t_rx_j2000_s: crate::observables::j2000_seconds_from_split(jd_whole, jd_fraction)
+            .expect("valid split Julian date"),
+        observations: vec![FloatObservation {
+            sat,
+            satellite_id: sat.to_string(),
+            ambiguity_id: sat.to_string(),
+            code_m: 0.0,
+            phase_m: 0.0,
+            freq1_hz,
+            freq2_hz,
+            glonass_channel: Some(channel),
+        }],
+    }];
+    let lookup = build_ppp_lookup(
+        &sp3,
+        &epochs,
+        [3_512_900.0, 780_500.0, 5_248_700.0],
+        &PppCorrectionsOptions {
+            solid_earth_tide: false,
+            pole_tide: None,
+            ocean_loading: None,
+            phase_windup: false,
+            satellite_antenna: None,
+            code_bias: Some(CodeBiasOptions {
+                bias_set,
+                used_observables_per_sat: BTreeMap::new(),
+                used_observables_default,
+                clock_reference: None,
+            }),
+        },
+    )
+    .expect("build PPP lookup with real GLONASS OSBs");
+
+    let (alpha, beta) = crate::bias::ionosphere_free_coefficients(freq1_hz, freq2_hz).unwrap();
+    let used_if = alpha * (0.2114_f64 * 1.0e-9) + beta * (2.6597_f64 * 1.0e-9);
+    let ref_if = alpha * (1.7840_f64 * 1.0e-9) + beta * (2.9490_f64 * 1.0e-9);
+    let expected = (used_if - ref_if) * C_M_S;
+
+    assert_eq!(
+        lookup.code_bias_m.get(&(sat, 0)).copied().map(f64::to_bits),
+        Some(expected.to_bits())
+    );
 }
 
 #[test]
@@ -778,6 +878,7 @@ fn static_float_solver_recovers_synthetic_arc() {
                     phase_m: code + ambiguity,
                     freq1_hz: 0.0,
                     freq2_hz: 0.0,
+                    glonass_channel: None,
                 }
             })
             .collect();
@@ -1436,6 +1537,7 @@ fn single_epoch_float_solver_has_frozen_bits_golden() {
                 phase_m: code + ambiguity,
                 freq1_hz: 0.0,
                 freq2_hz: 0.0,
+                glonass_channel: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1618,6 +1720,7 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
                 phase_m: code + ambiguity,
                 freq1_hz: 0.0,
                 freq2_hz: 0.0,
+                glonass_channel: None,
             }
         })
         .collect::<Vec<_>>();
@@ -1757,6 +1860,7 @@ fn static_fixed_solver_has_frozen_bits_golden() {
                     phase_m: code + ambiguity,
                     freq1_hz: 0.0,
                     freq2_hz: 0.0,
+                    glonass_channel: None,
                 }
             })
             .collect();
@@ -2227,6 +2331,7 @@ fn ppp_row_trace_arc() -> (FakeSource, Vec<FloatEpoch>, FloatState, Vec<Ambiguit
                     phase_m: code + ambiguity,
                     freq1_hz: 0.0,
                     freq2_hz: 0.0,
+                    glonass_channel: None,
                 }
             })
             .collect();

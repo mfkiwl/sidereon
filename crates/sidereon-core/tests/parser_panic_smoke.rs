@@ -8,6 +8,7 @@
 //! entropy, so a failure reproduces exactly.
 
 use sidereon_core::astro::spk::{parse_daf_spk, Spk};
+use sidereon_core::bias::BiasSet;
 
 /// splitmix64: a tiny, fully deterministic PRNG so corpora are reproducible.
 struct SplitMix64(u64);
@@ -29,7 +30,7 @@ impl SplitMix64 {
 }
 
 /// A valid little-endian DAF/SPK file-record prefix so a share of the corpus
-/// clears the magic/format/shape gates and reaches the summary + segment readers
+/// clears the magic and format gates and reaches the summary + segment readers
 /// instead of bouncing off the header check.
 fn write_daf_header(buf: &mut [u8], rng: &mut SplitMix64) {
     if buf.len() < 96 {
@@ -71,6 +72,11 @@ fn exercise_spk(bytes: &[u8]) {
     }
 }
 
+fn exercise_bias(bytes: &[u8]) {
+    let _ = BiasSet::parse_bias_sinex(bytes);
+    let _ = BiasSet::parse_code_dcb(bytes, None);
+}
+
 #[test]
 fn spk_parser_survives_hostile_bytes() {
     let mut rng = SplitMix64(0x5151_DE60_0F0F_2026);
@@ -88,15 +94,19 @@ fn spk_parser_survives_hostile_bytes() {
                 write_daf_header(&mut buf, &mut rng);
             }
             exercise_spk(&buf);
+            exercise_bias(&buf);
         }
     }
 
     // All-zero, all-ones, and magic-only buffers as explicit boundary cases.
     exercise_spk(&[0u8; 4096]);
+    exercise_bias(&[0u8; 4096]);
     exercise_spk(&[0xFFu8; 4096]);
+    exercise_bias(&[0xFFu8; 4096]);
     let mut magic_only = vec![0u8; 1024];
     write_daf_header(&mut magic_only, &mut rng);
     exercise_spk(&magic_only);
+    exercise_bias(&magic_only);
 }
 
 #[test]

@@ -26,7 +26,7 @@ pub(crate) struct ArithmeticError {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub(crate) enum FieldError {
+pub enum FieldError {
     #[error("{field} is missing")]
     Missing { field: &'static str },
     #[error("{field} is not a finite number")]
@@ -63,7 +63,7 @@ pub(crate) enum FieldError {
 }
 
 impl FieldError {
-    pub(crate) const fn field(&self) -> &'static str {
+    pub const fn field(&self) -> &'static str {
         match self {
             Self::Missing { field }
             | Self::NonFinite { field }
@@ -77,7 +77,7 @@ impl FieldError {
         }
     }
 
-    pub(crate) const fn reason(&self) -> &'static str {
+    pub const fn reason(&self) -> &'static str {
         match self {
             Self::Missing { .. } => "missing",
             Self::NonFinite { .. } => "not finite",
