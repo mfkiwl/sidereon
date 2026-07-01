@@ -7,6 +7,9 @@
 //! thresholds where sub-degree solar-position accuracy is adequate; SPK-grade
 //! almanac work belongs behind a higher-precision ephemeris source.
 
+use crate::astro::almanac::{
+    meridian_transits, AlmanacError, CulminationKind, EphemerisSource, TransitBody,
+};
 use crate::astro::bodies::observe::moon_az_el;
 use crate::astro::bodies::sun_moon::sun_moon_ecef;
 use crate::astro::constants::units::{MICROSECONDS_PER_SECOND, M_PER_KM};
@@ -239,18 +242,6 @@ pub fn find_moon_elevation_crossings(
 
 /// Find Moon meridian transits (upper and lower culminations) for a station and
 /// UTC window.
-///
-/// A transit is the instant the Moon crosses the observer's local meridian, i.e.
-/// when its topocentric azimuth passes through due south (180 deg, the upper
-/// culmination) or due north (0/360 deg, the lower culmination). This is the
-/// zero-crossing of the meridian offset [`moon_meridian_offset`] (the sine of the
-/// topocentric azimuth), found with [`EventFinder::find_crossings`], the same
-/// refinement machinery as the rise/set finders.
-///
-/// This finds the true meridian crossing, not the elevation extremum: for the
-/// Moon the changing declination and topocentric parallax mean the highest
-/// elevation does not fall at the same instant as meridian passage, so the
-/// azimuth-based crossing is the correct culmination time.
 pub fn find_moon_transits(
     station: &GeodeticStationKm,
     start_time: UtcInstant,
@@ -258,30 +249,29 @@ pub fn find_moon_transits(
     step_seconds: f64,
     time_tolerance_seconds: f64,
 ) -> Result<Vec<MoonTransit>, EventFinderError> {
-    validate_station(station)?;
-    let crossings = meridian_crossings(
+    if end_time <= start_time {
+        return Ok(Vec::new());
+    }
+    let transits = meridian_transits(
+        EphemerisSource::Analytic,
+        TransitBody::Moon,
+        station,
         start_time,
         end_time,
         step_seconds,
         time_tolerance_seconds,
-        |time| moon_meridian_offset(station, time),
-    )?;
+    )
+    .map_err(map_almanac_error)?;
 
-    Ok(crossings
+    Ok(transits
         .into_iter()
-        .map(|crossing| {
-            let time = instant_at_offset_seconds(start_time, crossing.time_seconds);
-            MoonTransit {
-                time,
-                kind: match crossing.direction {
-                    // Azimuth falls through 180 deg (eastern to western sky):
-                    // the Moon is due south, the upper culmination.
-                    CrossingDirection::Falling => MoonTransitKind::Upper,
-                    // Azimuth rises through 0/360 deg: due north, lower.
-                    CrossingDirection::Rising => MoonTransitKind::Lower,
-                },
-                elevation_deg: moon_elevation_deg(station, time),
-            }
+        .map(|transit| MoonTransit {
+            time: transit.time,
+            kind: match transit.kind {
+                CulminationKind::Upper => MoonTransitKind::Upper,
+                CulminationKind::Lower => MoonTransitKind::Lower,
+            },
+            elevation_deg: transit.altitude_deg,
         })
         .collect())
 }
@@ -314,32 +304,6 @@ where
     )
 }
 
-/// Run the event finder's zero-crossing search over a meridian-offset closure.
-/// Shared by the Moon transit finder; the offset is zero on the local meridian,
-/// so its zero-crossings are the meridian transits (see [`moon_meridian_offset`]).
-fn meridian_crossings<F>(
-    start_time: UtcInstant,
-    end_time: UtcInstant,
-    step_seconds: f64,
-    time_tolerance_seconds: f64,
-    offset_fn: F,
-) -> Result<Vec<CrossingEvent>, EventFinderError>
-where
-    F: Fn(UtcInstant) -> f64,
-{
-    if end_time <= start_time {
-        return Ok(Vec::new());
-    }
-    let finder = elevation_finder(start_time, end_time, step_seconds, time_tolerance_seconds)?;
-    finder.find_crossings(
-        ClosurePredicate {
-            start_time,
-            value_fn: offset_fn,
-        },
-        0.0,
-    )
-}
-
 /// Validate the scan cadence and build the finder over `[0, span_seconds]`.
 fn elevation_finder(
     start_time: UtcInstant,
@@ -364,8 +328,7 @@ fn elevation_finder(
 }
 
 /// Scalar predicate backing the event finder, over a closure mapping a UTC
-/// instant to a scalar (a topocentric elevation for the rise/set finders, a
-/// meridian offset for the transit finder).
+/// instant to a topocentric elevation.
 struct ClosurePredicate<F> {
     start_time: UtcInstant,
     value_fn: F,
@@ -384,24 +347,6 @@ fn instant_at_offset_seconds(start_time: UtcInstant, offset_seconds: f64) -> Utc
     UtcInstant::from_unix_microseconds(
         start_time.unix_microseconds() + (offset_seconds * MICROSECONDS_PER_SECOND).floor() as i64,
     )
-}
-
-/// Topocentric meridian offset of the Moon: the sine of its topocentric azimuth.
-///
-/// This is zero exactly when the Moon is on the observer's local meridian (due
-/// south at the upper culmination, due north at the lower), positive in the
-/// eastern sky and negative in the western sky. Its zero-crossings are therefore
-/// the true meridian transits regardless of the Moon's changing declination and
-/// parallax: the upper transit is a falling crossing (azimuth through 180 deg)
-/// and the lower a rising crossing (azimuth through 0/360 deg). The caller
-/// validates the station up front (see [`validate_station`]), so the azimuth
-/// reduction here cannot fail on public input.
-fn moon_meridian_offset(station: &GeodeticStationKm, time: UtcInstant) -> f64 {
-    moon_az_el(station, time)
-        .expect("validated station and finite Moon geometry produce a topocentric azimuth")
-        .azimuth_deg
-        .to_radians()
-        .sin()
 }
 
 /// Validate a ground station's geodetic coordinates up front, returning a typed
@@ -426,6 +371,31 @@ fn map_event_input(error: validate::FieldError) -> EventFinderError {
     EventFinderError::InvalidInput {
         field: error.field(),
         reason: error.reason(),
+    }
+}
+
+fn map_almanac_error(error: AlmanacError) -> EventFinderError {
+    match error {
+        AlmanacError::Finder(error) => error,
+        AlmanacError::InvalidInput { field, reason } => {
+            EventFinderError::InvalidInput { field, reason }
+        }
+        AlmanacError::Frame(reason) => EventFinderError::InvalidInput {
+            field: "frame",
+            reason,
+        },
+        AlmanacError::Spk(_) => EventFinderError::InvalidInput {
+            field: "spk",
+            reason: "unexpected SPK error",
+        },
+        AlmanacError::EphemerisRequired => EventFinderError::InvalidInput {
+            field: "source",
+            reason: "ephemeris required",
+        },
+        AlmanacError::InferiorPlanetOpposition => EventFinderError::InvalidInput {
+            field: "planet",
+            reason: "inferior planet opposition",
+        },
     }
 }
 

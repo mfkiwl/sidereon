@@ -217,6 +217,16 @@ pub mod geoid {
     };
 }
 
+/// Astronomical almanac events re-exported from the core crate.
+pub mod almanac {
+    pub use sidereon_core::astro::almanac::{
+        geocentric_ecliptic, lunar_solar_eclipses, meridian_transits, moon_phase_deg, moon_phases,
+        planetary_events, seasons, AlmanacError, CulminationEvent, CulminationKind, EclipseEvent,
+        EclipseKind, EclipticLonLat, EphemerisSource, MoonPhaseEvent, MoonPhaseKind, Planet,
+        PlanetaryEvent, PlanetaryEventKind, SeasonEvent, SeasonKind, TransitBody,
+    };
+}
+
 /// Stable PPP input, result, option, status, and error types used by the
 /// ergonomic PPP solve wrappers.
 pub mod precise_positioning {
