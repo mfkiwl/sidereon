@@ -14,6 +14,7 @@
 //! maneuver support.
 
 pub mod angles;
+pub mod anomaly;
 pub mod atmosphere;
 pub mod bodies;
 pub mod cdm;
@@ -127,6 +128,10 @@ pub mod sgp4_cpp_oracle {
 #[cfg(all(feature = "sgp4-debug-oracle", sgp4_oracle_built))]
 pub use sgp4_cpp_oracle::cpp_sgp4_step;
 
+pub use anomaly::{
+    eccentric_to_mean, eccentric_to_true, mean_to_eccentric, mean_to_true, propagate_kepler,
+    solve_kepler, true_to_eccentric, true_to_mean, AnomalyError, KeplerSolution,
+};
 pub use elements::{coe2rv, rv2coe, ClassicalElements, ElementsError, OrbitType};
 pub use error::PropagationError;
 pub use state::CartesianState;

@@ -242,6 +242,10 @@ pub mod raw {
 
 // Root-level propagation shortcuts retained for compatibility. The complete
 // astrodynamics module tree is available as `sidereon::astro`.
+pub use sidereon_core::astro::anomaly::{
+    eccentric_to_mean, eccentric_to_true, mean_to_eccentric, mean_to_true, propagate_kepler,
+    solve_kepler, true_to_eccentric, true_to_mean, AnomalyError, KeplerSolution,
+};
 pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
 
 /// Parameter-covariance primitives from the core least-squares substrate.
