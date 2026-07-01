@@ -31,6 +31,11 @@ pub fn rad_to_deg_ref(rad: f64) -> f64 {
     rad * DEGREES_PER_SEMICIRCLE / std::f64::consts::PI
 }
 
+#[inline]
+pub(crate) fn beta_angle_from_cos_rad(cos: f64) -> f64 {
+    std::f64::consts::FRAC_PI_2 - cos.clamp(-1.0, 1.0).acos()
+}
+
 /// Snap a geodetic longitude (radians) off the `-pi` branch cut onto `+pi`.
 ///
 /// WGS84 geodetic longitude is reported on the half-open interval `(-pi, pi]`;
@@ -119,6 +124,33 @@ pub fn phase_angle(
     angle_between(sun_from_sat, "sun_pos", observer_from_sat, "observer_pos")
 }
 
+/// Solar beta angle (degrees, signed, in [-90, 90]): the elevation of the Sun
+/// above the orbit plane, `beta = 90 - angle(orbit_normal, sun)`, computed in
+/// the normative `pi/2 - acos(clamp(cos))` operation order.
+///
+/// `orbit_normal` is the orbit-plane normal, for example `r x v`; `sun` is the
+/// Earth-to-Sun vector. Both must be in the same inertial frame. Only their
+/// directions matter. Sign is positive when the Sun is on the `+orbit_normal`
+/// side of the plane.
+pub fn beta_angle(orbit_normal: [f64; 3], sun: [f64; 3]) -> Result<f64, AngleError> {
+    validate_nonzero_vec3(orbit_normal, "orbit_normal")?;
+    validate_nonzero_vec3(sun, "sun")?;
+    let cos_theta = vec3::dot3(orbit_normal, sun) / (vec3::norm3(orbit_normal) * vec3::norm3(sun));
+    Ok(rad_to_deg_ref(beta_angle_from_cos_rad(cos_theta)))
+}
+
+/// Solar beta angle (degrees) from an inertial Cartesian state.
+///
+/// Computes the orbit normal as `r x v` and delegates to [`beta_angle`]. `r`,
+/// `v`, and `sun` must all be in the same inertial frame. Returns
+/// `AngleError::InvalidInput { field: "orbit_normal", reason: "zero vector" }`
+/// when `r` and `v` are parallel, since no orbit plane is defined.
+pub fn beta_angle_from_state(r: [f64; 3], v: [f64; 3], sun: [f64; 3]) -> Result<f64, AngleError> {
+    validate_finite_vec3(r, "r")?;
+    validate_finite_vec3(v, "v")?;
+    beta_angle(vec3::cross3(r, v), sun)
+}
+
 /// Angular radius (degrees) of the Earth as seen from the satellite:
 /// `asin(R_earth / |sat_pos|)`, clamped to the `asin` domain.
 pub fn earth_angular_radius(sat_pos: [f64; 3]) -> Result<f64, AngleError> {
@@ -138,6 +170,13 @@ fn validate_nonzero_vec3(v: [f64; 3], field: &'static str) -> Result<(), AngleEr
     }
     if !norm.is_finite() {
         return Err(invalid_angle_input(field, "out of range"));
+    }
+    Ok(())
+}
+
+fn validate_finite_vec3(v: [f64; 3], field: &'static str) -> Result<(), AngleError> {
+    if !v.iter().all(|value| value.is_finite()) {
+        return Err(invalid_angle_input(field, "not finite"));
     }
     Ok(())
 }
@@ -242,6 +281,101 @@ mod tests {
     }
 
     #[test]
+    fn beta_angle_reference_r1() {
+        let normal = normal_from_elements(51.6_f64.to_radians(), 90.0_f64.to_radians());
+        let sun = [1.0, 0.0, 0.0];
+        let beta = beta_angle(normal, sun).expect("valid beta geometry");
+        assert_close_deg(beta, 51.6, 1.0e-9);
+    }
+
+    #[test]
+    fn beta_angle_reference_r2_r3() {
+        let alpha = 90.0_f64.to_radians();
+        let delta = 23.4392911_f64.to_radians();
+        let sun = sun_from_ra_dec(alpha, delta);
+
+        for (inclination_deg, raan_deg) in [(51.64_f64, 0.0_f64), (98.0_f64, 30.0_f64)] {
+            let inclination = inclination_deg.to_radians();
+            let raan = raan_deg.to_radians();
+            let normal = normal_from_elements(inclination, raan);
+            let expected = closed_form_beta_deg(inclination, raan, alpha, delta);
+            let actual = beta_angle(normal, sun).expect("valid beta geometry");
+            assert_close_deg(actual, expected, 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn beta_angle_sun_in_plane_is_zero() {
+        let normal = [0.25, -0.5, 0.75];
+        let sun = perpendicular_via_least_parallel_axis(normal);
+        let beta = beta_angle(normal, sun).expect("valid beta geometry");
+        assert_close_deg(beta, 0.0, 1.0e-12);
+    }
+
+    #[test]
+    fn beta_angle_sun_along_normal_is_ninety() {
+        let orbit_normal = [0.0, 0.0, 1.0];
+        let beta_positive = beta_angle(orbit_normal, [0.0, 0.0, 5.0]).expect("valid beta geometry");
+        let beta_negative =
+            beta_angle(orbit_normal, [0.0, 0.0, -5.0]).expect("valid beta geometry");
+        assert_close_deg(beta_positive, 90.0, 1.0e-9);
+        assert_close_deg(beta_negative, -90.0, 1.0e-9);
+    }
+
+    #[test]
+    fn beta_angle_from_state_matches_beta_angle() {
+        let r = [7000.0, -1200.0, 350.0];
+        let v = [1.25, 7.35, -0.42];
+        let sun = [149_597_870.0, 3_000_000.0, 1_000_000.0];
+        let from_state = beta_angle_from_state(r, v, sun).expect("valid beta geometry");
+        let from_normal =
+            beta_angle(vec3::cross3(r, v), sun).expect("valid beta geometry from normal");
+        assert_eq!(from_state.to_bits(), from_normal.to_bits());
+    }
+
+    #[test]
+    fn beta_angle_from_state_rejects_parallel_rv() {
+        assert_invalid_angle_field(
+            beta_angle_from_state([1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 1.0]).unwrap_err(),
+            "orbit_normal",
+            "zero vector",
+        );
+    }
+
+    #[test]
+    fn beta_angle_rejects_invalid_vectors() {
+        assert_invalid_angle_field(
+            beta_angle([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap_err(),
+            "orbit_normal",
+            "zero vector",
+        );
+        assert_invalid_angle_field(
+            beta_angle([f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap_err(),
+            "orbit_normal",
+            "not finite",
+        );
+        assert_invalid_angle_field(
+            beta_angle([0.0, 0.0, 1.0], [0.0, 0.0, 0.0]).unwrap_err(),
+            "sun",
+            "zero vector",
+        );
+        assert_invalid_angle_field(
+            beta_angle([0.0, 0.0, 1.0], [f64::NAN, 0.0, 0.0]).unwrap_err(),
+            "sun",
+            "not finite",
+        );
+    }
+
+    #[test]
+    fn sat_yaw_beta_parity() {
+        let eps = f64::EPSILON;
+        for cos in [-1.0 - eps, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0 + eps] {
+            let old = std::f64::consts::PI / 2.0 - cos.clamp(-1.0, 1.0).acos();
+            assert_eq!(beta_angle_from_cos_rad(cos).to_bits(), old.to_bits());
+        }
+    }
+
+    #[test]
     fn earth_angular_radius_matches_reference_bits() {
         assert_eq!(
             earth_angular_radius([6778.0, 0.0, 0.0])
@@ -305,5 +439,45 @@ mod tests {
         let AngleError::InvalidInput { field, reason } = error;
         assert_eq!(field, expected);
         assert_eq!(reason, expected_reason);
+    }
+
+    fn assert_close_deg(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
+    }
+
+    fn normal_from_elements(inclination: f64, raan: f64) -> [f64; 3] {
+        [
+            inclination.sin() * raan.sin(),
+            -inclination.sin() * raan.cos(),
+            inclination.cos(),
+        ]
+    }
+
+    fn sun_from_ra_dec(alpha: f64, delta: f64) -> [f64; 3] {
+        [
+            delta.cos() * alpha.cos(),
+            delta.cos() * alpha.sin(),
+            delta.sin(),
+        ]
+    }
+
+    fn closed_form_beta_deg(inclination: f64, raan: f64, alpha: f64, delta: f64) -> f64 {
+        let sin_beta = delta.cos() * inclination.sin() * (raan - alpha).sin()
+            + delta.sin() * inclination.cos();
+        rad_to_deg_ref(sin_beta.asin())
+    }
+
+    fn perpendicular_via_least_parallel_axis(v: [f64; 3]) -> [f64; 3] {
+        let axis = if v[0].abs() <= v[1].abs() && v[0].abs() <= v[2].abs() {
+            [1.0, 0.0, 0.0]
+        } else if v[1].abs() <= v[2].abs() {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        vec3::cross3(v, axis)
     }
 }
