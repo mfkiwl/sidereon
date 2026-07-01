@@ -25,6 +25,7 @@ pub mod coverage;
 pub mod data;
 pub mod doppler;
 pub mod elements;
+pub mod equinoctial;
 pub mod error;
 pub mod events;
 pub mod forces;
@@ -134,6 +135,10 @@ pub use anomaly::{
     solve_kepler, true_to_eccentric, true_to_mean, AnomalyError, KeplerSolution,
 };
 pub use elements::{coe2rv, rv2coe, ClassicalElements, ElementsError, OrbitType};
+pub use equinoctial::{
+    coe2eq, coe2mee, eq2coe, eq2mee, eq2rv, mee2coe, mee2eq, mee2rv, rv2eq, rv2mee,
+    EquinoctialElements, EquinoctialError, ModifiedEquinoctialElements, RetrogradeFactor,
+};
 pub use error::PropagationError;
 pub use state::CartesianState;
 pub use time::Time;
