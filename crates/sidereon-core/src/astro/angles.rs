@@ -1,10 +1,10 @@
-//! Satellite angular geometry against celestial bodies.
+//! Angular geometry helpers for sky directions and satellite body geometry.
 //!
-//! Computes nadir/Sun, nadir/Moon, Sun-elevation, phase, and Earth angular
-//! radius angles from GCRS position vectors (km), returning degrees. This is
-//! the authoritative implementation; the Elixir binding is a thin marshaling
-//! layer over it, and the high-level `compute` orchestration (TLE propagation
-//! plus ephemeris lookup) stays caller-side over the already-core kernels.
+//! Computes general angular separation between arbitrary directions or
+//! `(lon, lat)` / `(RA, Dec)` pairs, position angle measured North through East,
+//! and satellite nadir/Sun, nadir/Moon, Sun-elevation, phase, solar beta, and
+//! Earth angular radius angles. Public angle-producing helpers in this module
+//! return degrees unless their names state otherwise.
 
 use crate::astro::constants::earth::WGS84_A_KM;
 use crate::astro::constants::units::DEGREES_PER_SEMICIRCLE;
@@ -67,6 +67,60 @@ fn angle_between(
     // Clamp into the valid cosine domain for numerical safety.
     let cos_theta = cos_theta.clamp(-1.0, 1.0);
     Ok(rad_to_deg_ref(cos_theta.acos()))
+}
+
+/// On-sky angle (degrees) between two direction vectors, via the stable
+/// `atan2(|a x b|, a . b)` form.
+///
+/// Vectors need not be normalized, but each must be finite, non-zero, and have
+/// a finite positive squared norm under `dot3`. Extreme magnitudes whose squared
+/// norm overflows to infinity or underflows to zero are rejected with
+/// `AngleError::InvalidInput`. Fields `"a"` / `"b"` identify the offending
+/// argument.
+pub fn angular_separation(a: [f64; 3], b: [f64; 3]) -> Result<f64, AngleError> {
+    validate_nonzero_vec3(a, "a")?;
+    validate_nonzero_vec3(b, "b")?;
+    let u = vec3::unit3(a).ok_or_else(|| invalid_angle_input("a", "zero vector"))?;
+    let v = vec3::unit3(b).ok_or_else(|| invalid_angle_input("b", "zero vector"))?;
+    let sin_theta = vec3::norm3(vec3::cross3(u, v));
+    let cos_theta = vec3::dot3(u, v);
+    Ok(rad_to_deg_ref(sin_theta.atan2(cos_theta)))
+}
+
+/// On-sky angle (degrees) between two `(lon, lat)` / `(RA, Dec)` pairs in
+/// degrees. The second tuple component is the latitude or declination in
+/// `[-90, 90]`.
+pub fn angular_separation_coords(
+    a_lon_lat_deg: (f64, f64),
+    b_lon_lat_deg: (f64, f64),
+) -> Result<f64, AngleError> {
+    validate_lon_lat_deg(a_lon_lat_deg, "a")?;
+    validate_lon_lat_deg(b_lon_lat_deg, "b")?;
+    angular_separation(
+        unit_from_lon_lat_deg(a_lon_lat_deg),
+        unit_from_lon_lat_deg(b_lon_lat_deg),
+    )
+}
+
+/// Position angle (degrees, `[0, 360)`) of `to` as seen from `from`, measured
+/// from North (`+lat`) through East (`+lon`). Inputs are `(lon, lat)` in degrees.
+pub fn position_angle(
+    from_lon_lat_deg: (f64, f64),
+    to_lon_lat_deg: (f64, f64),
+) -> Result<f64, AngleError> {
+    validate_lon_lat_deg(from_lon_lat_deg, "from")?;
+    validate_lon_lat_deg(to_lon_lat_deg, "to")?;
+
+    let lon1 = reduce_lon_deg(from_lon_lat_deg.0).to_radians();
+    let lat1 = from_lon_lat_deg.1.to_radians();
+    let lon2 = reduce_lon_deg(to_lon_lat_deg.0).to_radians();
+    let lat2 = to_lon_lat_deg.1.to_radians();
+    let dlon = lon2 - lon1;
+
+    let numerator = lat2.cos() * dlon.sin();
+    let denominator = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    let pa = rad_to_deg_ref(numerator.atan2(denominator)).rem_euclid(360.0);
+    Ok(if pa == 360.0 || pa == 0.0 { 0.0 } else { pa })
 }
 
 /// Angle (degrees) between the satellite nadir (toward Earth center) and the
@@ -160,6 +214,32 @@ pub fn earth_angular_radius(sat_pos: [f64; 3]) -> Result<f64, AngleError> {
     Ok(rad_to_deg_ref(ratio.asin()))
 }
 
+fn unit_from_lon_lat_deg(lon_lat_deg: (f64, f64)) -> [f64; 3] {
+    let lon = reduce_lon_deg(lon_lat_deg.0).to_radians();
+    let lat = lon_lat_deg.1.to_radians();
+    let cos_lat = lat.cos();
+    [cos_lat * lon.cos(), cos_lat * lon.sin(), lat.sin()]
+}
+
+fn validate_lon_lat_deg(lon_lat_deg: (f64, f64), field: &'static str) -> Result<(), AngleError> {
+    if !lon_lat_deg.0.is_finite() || !lon_lat_deg.1.is_finite() {
+        return Err(invalid_angle_input(field, "not finite"));
+    }
+    if !(-90.0..=90.0).contains(&lon_lat_deg.1) {
+        return Err(invalid_angle_input(field, "latitude out of range"));
+    }
+    Ok(())
+}
+
+fn reduce_lon_deg(lon: f64) -> f64 {
+    let reduced = lon.rem_euclid(360.0);
+    if reduced == 360.0 || reduced == 0.0 {
+        0.0
+    } else {
+        reduced
+    }
+}
+
 fn validate_nonzero_vec3(v: [f64; 3], field: &'static str) -> Result<(), AngleError> {
     if !v.iter().all(|value| value.is_finite()) {
         return Err(invalid_angle_input(field, "not finite"));
@@ -189,8 +269,291 @@ fn invalid_angle_input(field: &'static str, reason: &'static str) -> AngleError 
 mod tests {
     use super::*;
 
-    // Frozen bits captured from the reference (Elixir) `Sidereon.Angles`
-    // implementation. Cross-language 0-ULP equality.
+    struct ReferenceCase {
+        name: &'static str,
+        a_lon_lat_deg: (f64, f64),
+        b_lon_lat_deg: (f64, f64),
+        expected_sep_deg: f64,
+    }
+
+    #[test]
+    fn angular_separation_matches_reference_catalog_cases() {
+        // Reference values frozen from astropy 7.2.0 and skyfield 1.49 on
+        // Python 3.12.13. Coordinates are ICRS, epoch J2000.0. Mizar, Alcor,
+        // Betelgeuse, and Rigel coordinates are SIMBAD ICRS J2000 entries.
+        // Astropy SkyCoord.separation produced expected_sep_deg; Skyfield
+        // separation_from cross-checked each value within 1e-9 deg.
+        let cases = [
+            ReferenceCase {
+                name: "Mizar-Alcor",
+                a_lon_lat_deg: (200.98141866666666, 54.925_351_972_222_22),
+                b_lon_lat_deg: (201.306_407_638_75, 54.987_959_661_388_89),
+                expected_sep_deg: 0.19682972435842,
+            },
+            ReferenceCase {
+                name: "Betelgeuse-Rigel",
+                a_lon_lat_deg: (88.792_939, 7.407_064),
+                b_lon_lat_deg: (78.634_467_083_333_33, -8.201_638_361_111_11),
+                expected_sep_deg: 18.605960601325172,
+            },
+            ReferenceCase {
+                name: "large angle pair",
+                a_lon_lat_deg: (12.3456789012345, -45.678_901_234_567_8),
+                b_lon_lat_deg: (278.765_432_109_876_5, 62.3456789012345),
+                expected_sep_deg: 130.84062807863208,
+            },
+        ];
+
+        for case in cases {
+            let coord_sep =
+                angular_separation_coords(case.a_lon_lat_deg, case.b_lon_lat_deg).expect(case.name);
+            assert_close_deg(coord_sep, case.expected_sep_deg, 1.0e-9);
+
+            let vector_sep = angular_separation(
+                unit_from_lon_lat_deg(case.a_lon_lat_deg),
+                unit_from_lon_lat_deg(case.b_lon_lat_deg),
+            )
+            .expect(case.name);
+            assert_close_deg(vector_sep, coord_sep, 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn position_angle_uses_north_through_east_convention() {
+        assert_pa_close(
+            position_angle((0.0, 0.0), (0.0, 10.0)).unwrap(),
+            0.0,
+            1.0e-12,
+        );
+        assert_pa_close(
+            position_angle((0.0, 0.0), (10.0, 0.0)).unwrap(),
+            90.0,
+            1.0e-12,
+        );
+        assert_pa_close(
+            position_angle((0.0, 0.0), (0.0, -10.0)).unwrap(),
+            180.0,
+            1.0e-12,
+        );
+        assert_pa_close(
+            position_angle((0.0, 0.0), (-10.0, 0.0)).unwrap(),
+            270.0,
+            1.0e-12,
+        );
+
+        let off_axis = position_angle((15.0, 20.0), (75.0, -10.0)).unwrap();
+        assert_pa_close(off_axis, 111.24565371752205, 1.0e-9);
+    }
+
+    #[test]
+    fn angular_separation_keeps_small_vector_angles_stable() {
+        let theta = 1.0e-8_f64;
+        let expected_deg = rad_to_deg_ref(theta);
+        let axis_a = [1.0, 0.0, 0.0];
+        let axis_b = [theta.cos(), theta.sin(), 0.0];
+
+        let axis_atan2 = angular_separation(axis_a, axis_b).unwrap();
+        let axis_acos = acos_separation_deg(axis_a, axis_b);
+        assert!(
+            relative_error(axis_atan2, expected_deg) <= 1.0e-9,
+            "axis atan2 actual={axis_atan2}, expected={expected_deg}"
+        );
+        assert!(
+            relative_error(axis_acos, expected_deg) >= 1.0e-3,
+            "axis acos actual={axis_acos}, expected={expected_deg}"
+        );
+
+        let oblique_u = vec3::unit3([1.0, 2.0, 3.0]).expect("nonzero vector");
+        let oblique_k =
+            vec3::unit3(vec3::cross3(oblique_u, [0.0, 0.0, 1.0])).expect("nonzero axis");
+        let oblique_v = rotate_about_axis(oblique_u, oblique_k, theta);
+
+        let oblique_atan2 = angular_separation(oblique_u, oblique_v).unwrap();
+        let oblique_acos = acos_separation_deg(oblique_u, oblique_v);
+        assert!(
+            relative_error(oblique_atan2, expected_deg) <= 1.0e-6,
+            "oblique atan2 actual={oblique_atan2}, expected={expected_deg}"
+        );
+        assert!(
+            relative_error(oblique_acos, expected_deg) >= 1.0e-3,
+            "oblique acos actual={oblique_acos}, expected={expected_deg}"
+        );
+    }
+
+    #[test]
+    fn angular_separation_coords_has_absolute_small_angle_accuracy() {
+        let sep = angular_separation_coords((0.0, 0.0), (1.0e-6, 0.0)).unwrap();
+        assert_close_deg(sep, 1.0e-6, 1.0e-9);
+    }
+
+    #[test]
+    fn angular_separation_handles_antipodal_and_near_antipodal_cases() {
+        let exact = angular_separation([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]).unwrap();
+        assert_close_deg(exact, 180.0, 1.0e-12);
+
+        let eps_deg = 1.0e-7_f64;
+        let eps = eps_deg.to_radians();
+        let a = [1.0, 0.0, 0.0];
+        let b = [-eps.cos(), eps.sin(), 0.0];
+        let sep = angular_separation(a, b).unwrap();
+        let complement = 180.0 - sep;
+        assert!(
+            relative_error(complement, eps_deg) <= 1.0e-6,
+            "complement={complement}, expected={eps_deg}, sep={sep}"
+        );
+
+        let acos_sep = acos_separation_deg(a, b);
+        let acos_complement = 180.0 - acos_sep;
+        assert!(
+            relative_error(acos_complement, eps_deg) >= 1.0e-3,
+            "acos complement={acos_complement}, expected={eps_deg}"
+        );
+
+        assert_finite_pa(position_angle((0.0, 0.0), (180.0, 0.0)).unwrap());
+        assert_finite_pa(position_angle((0.0, 90.0), (0.0, -90.0)).unwrap());
+    }
+
+    #[test]
+    fn coincident_inputs_return_zero_separation_and_zero_position_angle() {
+        assert_eq!(
+            angular_separation([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+                .unwrap()
+                .to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            angular_separation_coords((123.0, 45.0), (123.0, 45.0))
+                .unwrap()
+                .to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            position_angle((123.0, 45.0), (123.0, 45.0))
+                .unwrap()
+                .to_bits(),
+            0.0_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn pole_edge_cases_are_finite_and_documented() {
+        assert_close_deg(
+            angular_separation_coords((0.0, 90.0), (0.0, -90.0)).unwrap(),
+            180.0,
+            1.0e-12,
+        );
+        let same_north_pole = angular_separation_coords((0.0, 90.0), (123.0, 90.0)).unwrap();
+        assert!(
+            same_north_pole <= 1.0e-9,
+            "same-pole separation={same_north_pole}"
+        );
+
+        assert_pa_close(
+            position_angle((0.0, 0.0), (123.0, 90.0)).unwrap(),
+            0.0,
+            1.0e-6,
+        );
+        assert_pa_close(
+            position_angle((0.0, 0.0), (123.0, -90.0)).unwrap(),
+            180.0,
+            1.0e-6,
+        );
+
+        assert_finite_pa(position_angle((0.0, 89.999999999999), (90.0, 90.0)).unwrap());
+        assert_finite_pa(position_angle((0.0, 90.0), (45.0, 10.0)).unwrap());
+        assert_finite_pa(position_angle((0.0, 90.0), (90.0, 90.0)).unwrap());
+    }
+
+    #[test]
+    fn general_angle_helpers_reject_invalid_inputs() {
+        assert_invalid_angle_field(
+            angular_separation([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap_err(),
+            "a",
+            "zero vector",
+        );
+        assert_invalid_angle_field(
+            angular_separation([1.0, 0.0, 0.0], [0.0, 0.0, 0.0]).unwrap_err(),
+            "b",
+            "zero vector",
+        );
+        assert_invalid_angle_field(
+            angular_separation([f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap_err(),
+            "a",
+            "not finite",
+        );
+        assert_invalid_angle_field(
+            angular_separation([1.0, 0.0, 0.0], [f64::INFINITY, 0.0, 0.0]).unwrap_err(),
+            "b",
+            "not finite",
+        );
+        assert_invalid_angle_field(
+            angular_separation([1.0e300, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap_err(),
+            "a",
+            "out of range",
+        );
+        assert_invalid_angle_field(
+            angular_separation([1.0e-300, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap_err(),
+            "a",
+            "zero vector",
+        );
+
+        assert_invalid_angle_field(
+            angular_separation_coords((0.0, 91.0), (0.0, 0.0)).unwrap_err(),
+            "a",
+            "latitude out of range",
+        );
+        assert_invalid_angle_field(
+            angular_separation_coords((0.0, 0.0), (0.0, -91.0)).unwrap_err(),
+            "b",
+            "latitude out of range",
+        );
+        assert_invalid_angle_field(
+            angular_separation_coords((f64::NAN, 0.0), (0.0, 0.0)).unwrap_err(),
+            "a",
+            "not finite",
+        );
+        assert_invalid_angle_field(
+            angular_separation_coords((0.0, 0.0), (0.0, f64::INFINITY)).unwrap_err(),
+            "b",
+            "not finite",
+        );
+
+        assert_invalid_angle_field(
+            position_angle((0.0, 91.0), (0.0, 0.0)).unwrap_err(),
+            "from",
+            "latitude out of range",
+        );
+        assert_invalid_angle_field(
+            position_angle((0.0, 0.0), (0.0, -91.0)).unwrap_err(),
+            "to",
+            "latitude out of range",
+        );
+        assert_invalid_angle_field(
+            position_angle((f64::NAN, 0.0), (0.0, 0.0)).unwrap_err(),
+            "from",
+            "not finite",
+        );
+        assert_invalid_angle_field(
+            position_angle((0.0, 0.0), (0.0, f64::INFINITY)).unwrap_err(),
+            "to",
+            "not finite",
+        );
+    }
+
+    #[test]
+    fn longitude_reduction_wraps_and_canonicalizes_zero() {
+        assert_eq!(reduce_lon_deg(-0.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(reduce_lon_deg(360.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(reduce_lon_deg(720.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(reduce_lon_deg(-10.0).to_bits(), 350.0_f64.to_bits());
+        assert_eq!(reduce_lon_deg(123.456).to_bits(), 123.456_f64.to_bits());
+
+        let sep = angular_separation_coords((359.999999, 0.0), (0.000001, 0.0)).unwrap();
+        assert_close_deg(sep, 2.0e-6, 1.0e-9);
+    }
+
+    // Frozen bits captured from the reference Elixir angles implementation.
+    // Cross-language 0-ULP equality.
 
     #[test]
     fn sun_angle_matches_reference_bits() {
@@ -446,6 +809,47 @@ mod tests {
             (actual - expected).abs() <= tolerance,
             "actual={actual}, expected={expected}, tolerance={tolerance}"
         );
+    }
+
+    fn assert_pa_close(actual: f64, expected: f64, tolerance: f64) {
+        assert_finite_pa(actual);
+        let diff = circular_diff_deg(actual, expected);
+        assert!(
+            diff <= tolerance,
+            "actual={actual}, expected={expected}, diff={diff}, tolerance={tolerance}"
+        );
+    }
+
+    fn assert_finite_pa(pa: f64) {
+        assert!(pa.is_finite(), "pa={pa}");
+        assert!((0.0..360.0).contains(&pa), "pa={pa}");
+    }
+
+    fn circular_diff_deg(actual: f64, expected: f64) -> f64 {
+        let diff = (actual - expected).abs();
+        diff.min(360.0 - diff)
+    }
+
+    fn relative_error(actual: f64, expected: f64) -> f64 {
+        ((actual - expected) / expected).abs()
+    }
+
+    fn acos_separation_deg(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let u = vec3::unit3(a).expect("nonzero vector");
+        let v = vec3::unit3(b).expect("nonzero vector");
+        rad_to_deg_ref(vec3::dot3(u, v).clamp(-1.0, 1.0).acos())
+    }
+
+    fn rotate_about_axis(v: [f64; 3], axis: [f64; 3], theta: f64) -> [f64; 3] {
+        let cos_theta = theta.cos();
+        let sin_theta = theta.sin();
+        let cross = vec3::cross3(axis, v);
+        let dot = vec3::dot3(axis, v);
+        [
+            v[0] * cos_theta + cross[0] * sin_theta + axis[0] * dot * (1.0 - cos_theta),
+            v[1] * cos_theta + cross[1] * sin_theta + axis[1] * dot * (1.0 - cos_theta),
+            v[2] * cos_theta + cross[2] * sin_theta + axis[2] * dot * (1.0 - cos_theta),
+        ]
     }
 
     fn normal_from_elements(inclination: f64, raan: f64) -> [f64; 3] {

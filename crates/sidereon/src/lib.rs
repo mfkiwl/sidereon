@@ -1336,6 +1336,12 @@ mod tests {
                 .abs()
                 <= 1.0e-9
         );
+        let sep = astro::angles::angular_separation_coords(
+            (200.98141866666666, 54.925_351_972_222_22),
+            (201.306_407_638_75, 54.987_959_661_388_89),
+        )
+        .expect("valid angular separation");
+        assert!((sep - 0.19682972435842).abs() <= 1.0e-9);
         assert!(astro::covariance::symmetric(&[
             [1.0, 0.1, 0.2],
             [0.1, 2.0, 0.3],
