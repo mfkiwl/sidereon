@@ -30,13 +30,8 @@
 //! requires, so a [`ClassicalElements`] produced by [`rv2coe`] round-trips
 //! through [`coe2rv`] regardless of orbit type.
 
-use crate::astro::math::vec3;
+use crate::astro::math::{normalize_angle, vec3, SMALL, TWO_PI};
 
-/// Vallado degeneracy threshold (`small`) for treating eccentricity or
-/// inclination as zero when classifying the orbit type (Algorithm 9).
-const SMALL: f64 = 1.0e-8;
-
-const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
 const PI: f64 = std::f64::consts::PI;
 const HALF_PI: f64 = std::f64::consts::FRAC_PI_2;
 
@@ -423,14 +418,6 @@ fn classify(ecc: f64, incl: f64) -> OrbitType {
         (false, true) => OrbitType::EllipticalEquatorial,
         (false, false) => OrbitType::EllipticalInclined,
     }
-}
-
-/// Normalize an angle to the documented `[0, 2*pi)` range. Applied after the
-/// retrograde and quadrant corrections so a value driven to exactly `2*pi` at the
-/// boundary wraps back to `0` rather than escaping the half-open range.
-#[inline]
-fn normalize_angle(x: f64) -> f64 {
-    x.rem_euclid(TWO_PI)
 }
 
 /// `acos` with the argument clamped to `[-1, 1]` to absorb round-off that would
