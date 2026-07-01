@@ -1290,6 +1290,7 @@ fn propagate_position_covariance_to_tca(
         force_model: options.force_model,
         integrator: options.integrator,
         options: options.integrator_options,
+        drag: None,
     };
     let (_, covariance_f) = propagator
         .propagate_state_with_covariance(covariance0, span_seconds)
@@ -2747,6 +2748,7 @@ mod tests {
             force_model: options.force_model,
             integrator: options.integrator,
             options: options.integrator_options,
+            drag: None,
         };
         let (_, covariance_f) = propagator
             .propagate_state_with_covariance(covariance0, span_seconds)
@@ -2770,6 +2772,7 @@ mod tests {
             force_model: options.force_model,
             integrator: options.integrator,
             options: options.integrator_options,
+            drag: None,
         };
         let (_, covariance_f) = propagator
             .propagate_state_with_covariance(covariance0, span_seconds)

@@ -22,7 +22,7 @@ use crate::astro::frames::precession::{
     build_icrs_to_j2000, compute_skyfield_precession_matrix_unchecked,
 };
 use crate::astro::math::mat3::{inline_mxmxm, inline_rxr, inline_tr, Mat3};
-use crate::astro::time::scales::TimeScales;
+use crate::astro::time::{civil, scales::TimeScales};
 use crate::astro::{
     constants::astro::AU_KM,
     constants::earth::{WGS84_A_KM, WGS84_E2, WGS84_F},
@@ -313,6 +313,24 @@ pub fn greenwich_mean_sidereal_time_radians(ts: &TimeScales) -> Result<f64, Fram
 fn greenwich_mean_sidereal_time_radians_unchecked(ts: &TimeScales) -> f64 {
     let hours = sidereal_time_hours(ts.jd_whole, ts.ut1_fraction, ts.tdb_fraction);
     hours / 24.0 * TAU
+}
+
+/// IAU-1982 GMST in radians from continuous seconds past J2000.
+///
+/// The input epoch is treated as UT1 for this thin drag helper. It reuses the
+/// same `compute_theta_gmst1982` polynomial as
+/// [`greenwich_mean_sidereal_time_radians`] and adds no new sidereal-time math.
+pub fn greenwich_mean_sidereal_time_radians_from_j2000_seconds(
+    sec: f64,
+) -> Result<f64, FrameTransformError> {
+    validate_finite("sec", sec)?;
+    let (jd_whole, ut1_fraction) = civil::split_julian_date_add_seconds(J2000_JD, 0.0, sec);
+    let mut radians = compute_theta_gmst1982(jd_whole, ut1_fraction) % TAU;
+    if radians < 0.0 {
+        radians += TAU;
+    }
+    validate_finite("gmst_radians", radians)?;
+    Ok(radians)
 }
 
 /// Greenwich Apparent Sidereal Time for an instant, radians in `[0, 2pi)`.
@@ -1445,8 +1463,26 @@ mod tests {
         let eq_eq = diff.min(TAU - diff);
         assert!(eq_eq < 1.0e-3, "equation of equinoxes too large: {eq_eq}");
 
-        // The mean wrapper equals the underlying private hours computation exactly.
+        // The mean wrapper matches the Skyfield-parity IAU-1982 sidereal time.
         let gmst_hours = sidereal_time_hours(ts.jd_whole, ts.ut1_fraction, ts.tdb_fraction);
         assert_eq!(gmst, gmst_hours / 24.0 * TAU);
+    }
+
+    #[test]
+    fn gmst_from_j2000_seconds_matches_gmst1982_polynomial() {
+        // The seconds-based accessor reproduces the GMST-1982 polynomial the TEME
+        // sidereal rotation uses, not the public Skyfield-parity GMST. Tolerance
+        // allows only the roundoff from reducing the UT1 split to one f64.
+        const GMST_TOL_RAD: f64 = 1.0e-11;
+        let ts = TimeScales::from_utc(2020, 6, 24, 12, 34, 56.25).expect("valid UTC instant");
+        let sec = (ts.jd_ut1 - J2000_JD) * SECONDS_PER_DAY;
+        let from_seconds = greenwich_mean_sidereal_time_radians_from_j2000_seconds(sec)
+            .expect("valid sidereal time");
+        let mut expected = compute_theta_gmst1982(ts.jd_whole, ts.ut1_fraction) % TAU;
+        if expected < 0.0 {
+            expected += TAU;
+        }
+
+        assert!((from_seconds - expected).abs() <= GMST_TOL_RAD);
     }
 }

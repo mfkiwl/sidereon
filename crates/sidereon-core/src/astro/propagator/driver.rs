@@ -16,6 +16,7 @@
 
 use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::error::PropagationError;
+use crate::astro::forces::DragParameters;
 use crate::astro::propagator::api::IntegratorOptions;
 use crate::astro::propagator::numerical::{ForceModelKind, IntegratorKind, StatePropagator};
 use crate::astro::state::CartesianState;
@@ -55,6 +56,8 @@ pub struct PropagationConfig {
     pub integrator: IntegratorKind,
     /// Step-size / tolerance controls forwarded to the integrator.
     pub options: IntegratorOptions,
+    /// Optional atmospheric drag perturbation layered on the gravity model.
+    pub drag: Option<DragParameters>,
 }
 
 impl PropagationConfig {
@@ -69,7 +72,14 @@ impl PropagationConfig {
             mu_km3_s2: None,
             integrator: IntegratorKind::Dp54,
             options: IntegratorOptions::default(),
+            drag: None,
         }
+    }
+
+    /// Enable atmospheric drag (builder-style).
+    pub fn with_drag(mut self, drag: DragParameters) -> Self {
+        self.drag = Some(drag);
+        self
     }
 
     /// The gravitational parameter the driver will use: the configured override,
@@ -103,6 +113,7 @@ impl PropagationConfig {
             force_model: self.force_model_kind(),
             integrator: self.integrator,
             options: self.options,
+            drag: self.drag,
         }
     }
 }
@@ -215,6 +226,7 @@ mod tests {
                 max_steps: 1_000_000,
                 dense_output: false,
             },
+            drag: None,
         }
         .ephemeris(&epochs)
         .expect("manual propagation");
@@ -254,6 +266,7 @@ mod tests {
             },
             integrator: IntegratorKind::Rk4,
             options,
+            drag: None,
         }
         .ephemeris(&epochs)
         .expect("manual propagation");

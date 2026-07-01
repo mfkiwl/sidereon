@@ -350,6 +350,7 @@ fn forward_then_back_round_trips_to_start() {
             rel_tol: 1.0e-13,
             ..IntegratorOptions::default()
         },
+        drag: None,
     };
     let home = back.propagate_to(0.0).expect("backward").final_state;
 
@@ -385,6 +386,7 @@ fn dump_propagator() -> StatePropagator {
             max_steps: DUMP_MAX_STEPS,
             dense_output: false,
         },
+        drag: None,
     }
 }
 
