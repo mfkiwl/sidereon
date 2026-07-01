@@ -242,6 +242,7 @@ pub mod raw {
 
 // Root-level propagation shortcuts retained for compatibility. The complete
 // astrodynamics module tree is available as `sidereon::astro`.
+pub use sidereon_core::astro::forces::{DragForce, SpaceWeather};
 pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
 
 /// Parameter-covariance primitives from the core least-squares substrate.

@@ -15,7 +15,9 @@
 use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::covariance::{Covariance6, Covariance6Error};
 use crate::astro::error::PropagationError;
-use crate::astro::forces::{CompositeForceModel, ForceModel, J2Gravity, TwoBodyGravity};
+use crate::astro::forces::{
+    CompositeForceModel, DragParameters, ForceModel, J2Gravity, TwoBodyGravity,
+};
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
 use crate::astro::propagator::dynamics::OrbitalDynamics;
@@ -123,6 +125,8 @@ pub struct StatePropagator {
     pub integrator: IntegratorKind,
     /// Step-size / tolerance controls passed to the integrator.
     pub options: IntegratorOptions,
+    /// Optional atmospheric drag perturbation layered on the gravity model.
+    pub drag: Option<DragParameters>,
 }
 
 impl StatePropagator {
@@ -141,12 +145,19 @@ impl StatePropagator {
             force_model,
             integrator,
             options: IntegratorOptions::default(),
+            drag: None,
         }
     }
 
     /// Replace the integrator options (builder-style).
     pub fn with_options(mut self, options: IntegratorOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Enable atmospheric drag (builder-style).
+    pub fn with_drag(mut self, drag: DragParameters) -> Self {
+        self.drag = Some(drag);
         self
     }
 
@@ -158,7 +169,7 @@ impl StatePropagator {
         &self,
         t_end_tdb_seconds: f64,
     ) -> Result<PropagationResult, PropagationError> {
-        let force = self.force_model.build();
+        let force = self.build_force();
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -222,7 +233,7 @@ impl StatePropagator {
             return Ok(identity_stm());
         }
 
-        let force = self.force_model.build();
+        let force = self.build_force();
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -270,7 +281,7 @@ impl StatePropagator {
         validate_epoch_finite(self.initial.epoch_tdb_seconds, "initial.epoch_tdb_seconds")?;
         validate_ephemeris_epochs(epochs_tdb_seconds)?;
 
-        let force = self.force_model.build();
+        let force = self.build_force();
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -307,6 +318,18 @@ impl StatePropagator {
             IntegratorKind::Dp54 => {
                 DP54.propagate(initial, t_end_tdb_seconds, dynamics, ctx, &self.options)
             }
+        }
+    }
+
+    fn build_force(&self) -> Box<dyn ForceModel> {
+        let gravity = self.force_model.build();
+        if let Some(drag) = self.drag {
+            let mut composite = CompositeForceModel::new();
+            composite.add(gravity);
+            composite.add(Box::new(drag.to_force()));
+            Box::new(composite)
+        } else {
+            gravity
         }
     }
 }
@@ -399,8 +422,11 @@ fn validate_epoch_finite(value: f64, field: &'static str) -> Result<(), Propagat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astro::forces::{DragParameters, SpaceWeather};
+    use crate::astro::integrators::Integrator;
     use nalgebra::Vector3;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct CountingForce<'a> {
         calls: &'a AtomicUsize,
@@ -417,10 +443,44 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct EpochRecordingForce {
+        epochs: Mutex<Vec<f64>>,
+    }
+
+    impl ForceModel for EpochRecordingForce {
+        fn acceleration(
+            &self,
+            state: &CartesianState,
+            _ctx: &PropagationContext,
+        ) -> Result<Vector3<f64>, PropagationError> {
+            self.epochs
+                .lock()
+                .expect("epoch recorder mutex")
+                .push(state.epoch_tdb_seconds);
+            Ok(Vector3::zeros())
+        }
+    }
+
     fn circular_state() -> ([f64; 3], [f64; 3], f64) {
         let r: f64 = 7000.0;
         let v = (MU_EARTH / r).sqrt();
         ([r, 0.0, 0.0], [0.0, v, 0.0], r)
+    }
+
+    fn leo_state(altitude_km: f64) -> CartesianState {
+        let r = RE_EARTH + altitude_km;
+        let v = (MU_EARTH / r).sqrt();
+        CartesianState::new(0.0, [r, 0.0, 0.0], [0.0, v, 0.0])
+    }
+
+    fn test_drag_parameters(bc_factor_m2_kg: f64) -> DragParameters {
+        DragParameters::from_bc_factor_m2_kg(
+            bc_factor_m2_kg,
+            SpaceWeather::default(),
+            crate::astro::forces::DragForce::DEFAULT_REENTRY_ALTITUDE_KM,
+        )
+        .expect("valid drag")
     }
 
     fn rk4_test_options() -> IntegratorOptions {
@@ -436,12 +496,79 @@ mod tests {
             force_model: ForceModelKind::two_body(),
             integrator: IntegratorKind::Rk4,
             options: rk4_test_options(),
+            drag: None,
         }
     }
 
     fn circular_rk4_two_body_propagator() -> StatePropagator {
         let (pos, vel, _) = circular_state();
         rk4_two_body_propagator(CartesianState::new(0.0, pos, vel))
+    }
+
+    #[test]
+    fn two_body_and_j2_bits_unchanged_when_drag_none() {
+        let state = CartesianState::new(0.0, [7000.0, -1210.0, 1300.0], [1.0, 7.2, 0.5]);
+        let options = IntegratorOptions {
+            initial_step: 10.0,
+            ..IntegratorOptions::default()
+        };
+        let two_body = StatePropagator {
+            initial: state,
+            force_model: ForceModelKind::two_body(),
+            integrator: IntegratorKind::Rk4,
+            options,
+            drag: None,
+        }
+        .propagate_to(120.0)
+        .expect("two-body propagation")
+        .final_state;
+        let j2 = StatePropagator {
+            initial: state,
+            force_model: ForceModelKind::two_body_j2(),
+            integrator: IntegratorKind::Rk4,
+            options,
+            drag: None,
+        }
+        .propagate_to(120.0)
+        .expect("J2 propagation")
+        .final_state;
+
+        assert_eq!(
+            [
+                two_body.position_km.x.to_bits(),
+                two_body.position_km.y.to_bits(),
+                two_body.position_km.z.to_bits(),
+                two_body.velocity_km_s.x.to_bits(),
+                two_body.velocity_km_s.y.to_bits(),
+                two_body.velocity_km_s.z.to_bits(),
+            ],
+            [
+                4_664_491_478_405_259_647,
+                13_868_042_866_614_843_437,
+                4_653_651_863_611_153_978,
+                4_592_023_743_103_375_898,
+                4_619_903_732_185_607_459,
+                4_599_631_655_498_578_350,
+            ]
+        );
+        assert_eq!(
+            [
+                j2.position_km.x.to_bits(),
+                j2.position_km.y.to_bits(),
+                j2.position_km.z.to_bits(),
+                j2.velocity_km_s.x.to_bits(),
+                j2.velocity_km_s.y.to_bits(),
+                j2.velocity_km_s.z.to_bits(),
+            ],
+            [
+                4_664_491_415_796_994_328,
+                13_868_042_735_578_520_184,
+                4_653_651_704_383_841_626,
+                4_591_955_084_532_107_724,
+                4_619_903_849_988_711_109,
+                4_599_620_700_962_266_984,
+            ]
+        );
     }
 
     #[test]
@@ -597,6 +724,106 @@ mod tests {
         let stm = propagator.state_transition_matrix_for_span(30.0).unwrap();
 
         assert!(max_symplectic_residual(&stm) < 1.0e-5);
+    }
+
+    #[test]
+    fn stm_with_drag_test() {
+        let initial = leo_state(300.0);
+        let propagator = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::two_body(),
+            IntegratorKind::Rk4,
+        )
+        .with_options(IntegratorOptions {
+            initial_step: 2.0,
+            ..IntegratorOptions::default()
+        })
+        .with_drag(test_drag_parameters(0.2));
+        let stm = propagator
+            .state_transition_matrix_for_span(8.0)
+            .expect("drag STM");
+
+        for row in stm {
+            for value in row {
+                assert!(value.is_finite());
+            }
+        }
+        assert!(stm[0][3] > 0.0);
+        assert!(stm[1][4] > 0.0);
+        assert!(stm[2][5] > 0.0);
+    }
+
+    #[test]
+    fn integrator_presents_advancing_substep_epoch() {
+        let initial = CartesianState::new(10.0, [7000.0, 0.0, 0.0], [0.0, 7.5, 0.0]);
+        let options = IntegratorOptions {
+            initial_step: 10.0,
+            max_step: 10.0,
+            ..IntegratorOptions::default()
+        };
+
+        for integrator in [IntegratorKind::Rk4, IntegratorKind::Dp54] {
+            let force = EpochRecordingForce::default();
+            let dynamics = OrbitalDynamics {
+                force_model: &force,
+            };
+            let ctx = PropagationContext::default();
+            match integrator {
+                IntegratorKind::Rk4 => {
+                    RK4.propagate(initial, 20.0, &dynamics, &ctx, &options)
+                        .expect("RK4 propagation");
+                }
+                IntegratorKind::Dp54 => {
+                    DP54.propagate(initial, 20.0, &dynamics, &ctx, &options)
+                        .expect("DP54 propagation");
+                }
+            }
+            let epochs = force.epochs.lock().expect("epoch recorder mutex");
+            assert!(epochs
+                .iter()
+                .any(|&epoch| epoch > initial.epoch_tdb_seconds));
+            assert!(epochs.contains(&20.0));
+        }
+    }
+
+    #[test]
+    fn stm_with_drag_differs_from_no_drag() {
+        let initial = leo_state(300.0);
+        let options = IntegratorOptions {
+            initial_step: 2.0,
+            ..IntegratorOptions::default()
+        };
+        let no_drag = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::two_body(),
+            IntegratorKind::Rk4,
+        )
+        .with_options(options)
+        .state_transition_matrix_for_span(20.0)
+        .expect("no-drag STM");
+        let with_drag = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::two_body(),
+            IntegratorKind::Rk4,
+        )
+        .with_options(options)
+        .with_drag(test_drag_parameters(0.4))
+        .state_transition_matrix_for_span(20.0)
+        .expect("drag STM");
+
+        let mut max_diff = 0.0_f64;
+        for row in 0..6 {
+            for col in 0..6 {
+                max_diff = max_diff.max((with_drag[row][col] - no_drag[row][col]).abs());
+            }
+        }
+        assert!(max_diff > 1.0e-10, "STM diff {max_diff}");
     }
 
     #[test]
