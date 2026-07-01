@@ -13,8 +13,10 @@
 //! contexts, additional force models, covariance propagation, estimation, and
 //! maneuver support.
 
+pub mod almanac;
 pub mod angles;
 pub mod anomaly;
+pub mod apparent;
 pub mod atmosphere;
 pub mod bodies;
 pub mod cdm;

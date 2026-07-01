@@ -122,6 +122,8 @@ pub mod astro {
     pub const MONTENBRUCK_AU_M: f64 = 149_597_870_691.0;
     /// Solar photosphere radius (km), used by conical eclipse-shadow geometry.
     pub const SOLAR_RADIUS_KM: f64 = 696_340.0;
+    /// Mean lunar radius (km), used by almanac eclipse geometry.
+    pub const MOON_RADIUS_KM: f64 = 1_737.4;
 }
 
 /// Model-specific constants that intentionally differ from WGS84.

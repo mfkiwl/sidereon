@@ -44,6 +44,7 @@ const LIGHT_TIME_REFINEMENTS: usize = 3;
 const SPK_FRAME_J2000: i32 = 1;
 const NAIF_SSB: i32 = 0;
 const NAIF_SUN: i32 = 10;
+const NAIF_MOON: i32 = 301;
 const NAIF_EARTH: i32 = 399;
 const SOLAR_DEFLECTION_DENOM_FLOOR: f64 = 1.0e-6;
 
@@ -242,6 +243,57 @@ pub fn observe_spk_body(
     )
 }
 
+/// Geocentric apparent position of an SPK target in the true equator and equinox
+/// of date, in metres.
+pub(crate) fn apparent_geocentric_spk_true_of_date_m(
+    target_naif: i32,
+    ts: &TimeScales,
+    kernel: &Spk,
+) -> Result<[f64; 3], ObserveError> {
+    let et = (ts.jd_tdb - J2000_JD) * SECONDS_PER_DAY;
+    ensure_finite(et)?;
+
+    let earth = spk_state_j2000(kernel, NAIF_EARTH, NAIF_SSB, et)?;
+    let v_earth_km_s = spk_velocity_j2000(kernel, NAIF_EARTH, NAIF_SSB, et, earth)?;
+    let light_time = solve_spk_light_time(kernel, target_naif, et, earth.position_km)?;
+    let u_astro = unit_checked(light_time.rho_vec_km)?;
+    let u_deflected = if target_naif == NAIF_SUN {
+        u_astro
+    } else {
+        apply_solar_deflection(
+            kernel,
+            light_time.et_emit,
+            earth.position_km,
+            light_time.target_position_km,
+            u_astro,
+        )?
+    };
+    let u_app = apply_aberration(u_deflected, v_earth_km_s)?;
+
+    let tod = gcrs_to_true_of_date_matrix(ts)?;
+    let true_km = mat3_vec3_mul_unchecked(&tod, &scale3(u_app, light_time.distance_km));
+    validate_vec3(true_km)?;
+    Ok(scale_km_to_m(true_km))
+}
+
+/// Geocentric apparent analytic Sun/Moon position in the true equator and
+/// equinox of date, in metres.
+pub(crate) fn apparent_geocentric_analytic_true_of_date_m(
+    target_naif: i32,
+    ts: &TimeScales,
+) -> Result<[f64; 3], ObserveError> {
+    let eci = sun_moon_eci_at(ts)?;
+    let mean_m = match target_naif {
+        NAIF_SUN => eci.sun,
+        NAIF_MOON => eci.moon,
+        _ => return Err(ObserveError::DegenerateGeometry),
+    };
+    let nutation = nutation_matrix(ts)?;
+    let true_m = mat3_vec3_mul_unchecked(&nutation, &mean_m);
+    validate_vec3(true_m)?;
+    Ok(true_m)
+}
+
 /// General topocentric observation with caller-supplied time scales.
 pub fn observe_with_time_scales(
     station: &GeodeticStationKm,
@@ -350,6 +402,10 @@ pub fn moon_illumination(
 
 fn scale_m_to_km(v: [f64; 3]) -> [f64; 3] {
     [v[0] / M_PER_KM, v[1] / M_PER_KM, v[2] / M_PER_KM]
+}
+
+fn scale_km_to_m(v: [f64; 3]) -> [f64; 3] {
+    [v[0] * M_PER_KM, v[1] * M_PER_KM, v[2] * M_PER_KM]
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -693,9 +749,15 @@ fn spk_velocity_j2000(
         return Ok(velocity);
     }
 
-    let before = spk_state_j2000(kernel, target, center, et - 1.0)?.position_km;
-    let after = spk_state_j2000(kernel, target, center, et + 1.0)?.position_km;
-    let velocity = scale3(sub3(after, before), 0.5);
+    let dt = 1.0;
+    let before = spk_state_j2000(kernel, target, center, et - dt);
+    let after = spk_state_j2000(kernel, target, center, et + dt);
+    let velocity = match (before, after) {
+        (Ok(before), Ok(after)) => scale3(sub3(after.position_km, before.position_km), 0.5 / dt),
+        (Ok(before), Err(_)) => scale3(sub3(state.position_km, before.position_km), 1.0 / dt),
+        (Err(_), Ok(after)) => scale3(sub3(after.position_km, state.position_km), 1.0 / dt),
+        (Err(error), Err(_)) => return Err(error),
+    };
     validate_vec3(velocity)?;
     Ok(velocity)
 }
