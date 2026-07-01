@@ -448,6 +448,28 @@ fn teme_to_gcrs_compute_unchecked(
 // GCRS -> ITRS (Earth-fixed / ECEF)
 // ---------------------------------------------------------------------------
 
+/// GCRS to true equator and equinox of date rotation.
+///
+/// This is the Earth-rotation-free `N * P * B` product already used inside the
+/// GCRS to ITRS construction: nutation, precession, and frame bias.
+pub fn gcrs_to_true_of_date_matrix(ts: &TimeScales) -> Result<Mat3, FrameTransformError> {
+    validate_time_scales(ts)?;
+    let (matrix, _dpsi) = gcrs_to_true_of_date_matrix_parts_unchecked(ts);
+    validate_mat3("gcrs_to_true_of_date_matrix", matrix)
+}
+
+fn gcrs_to_true_of_date_matrix_parts_unchecked(ts: &TimeScales) -> (Mat3, f64) {
+    let (dpsi, deps) = skyfield_iau2000a_radians_unchecked(ts.jd_tt);
+    let mean_ob = skyfield_mean_obliquity_radians_unchecked(ts.jd_tdb);
+    let true_ob = mean_ob + deps;
+
+    let n = build_skyfield_nutation_matrix_unchecked(mean_ob, true_ob, dpsi);
+    let p = compute_skyfield_precession_matrix_unchecked(ts.jd_tdb);
+    let b = build_icrs_to_j2000();
+
+    (inline_mxmxm(&n, &p, &b), dpsi)
+}
+
 /// Build the historical GCRS->ITRS rotation matrix for a given time.
 ///
 /// This combines precession, nutation, and Earth rotation with zero polar
@@ -460,17 +482,7 @@ pub fn gcrs_to_itrs_matrix(ts: &TimeScales) -> Result<Mat3, FrameTransformError>
 }
 
 fn gcrs_to_itrs_matrix_unchecked(ts: &TimeScales) -> Mat3 {
-    let (dpsi, deps) = skyfield_iau2000a_radians_unchecked(ts.jd_tt);
-    let mean_ob = skyfield_mean_obliquity_radians_unchecked(ts.jd_tdb);
-    let true_ob = mean_ob + deps;
-
-    let n = build_skyfield_nutation_matrix_unchecked(mean_ob, true_ob, dpsi);
-    let p = compute_skyfield_precession_matrix_unchecked(ts.jd_tdb);
-    let b = build_icrs_to_j2000();
-
-    // Celestial-to-terrestrial: combine precession, nutation, frame bias
-    let m = inline_mxmxm(&n, &p, &b);
-
+    let (m, dpsi) = gcrs_to_true_of_date_matrix_parts_unchecked(ts);
     let gast = gast_radians(ts, dpsi);
 
     // GAST rotation takes us from true-equator-equinox to ITRS

@@ -3,12 +3,13 @@
 bindings/**/target
 **/*.rs.bk
 
-# JPL ephemeris kernels (downloaded at runtime by fixture generators)
+# Ephemeris kernels (downloaded at runtime by fixture generators)
 *.bsp
 # Exception: the small (88 KB) 433 Eros type-21 SPK is a committed parity
 # fixture backing the bit-exact SPK type-21 test. Regenerate with
 # tests/fixtures/spk/gen_eros_type21.py.
 !crates/sidereon-core/tests/fixtures/spk/horizons_eros_type21.bsp
+!crates/sidereon-core/tests/fixtures/bodies/observe_de.bsp
 
 # Local working journal for the iterative dev loop (not shipped).
 PROGRESS.md
