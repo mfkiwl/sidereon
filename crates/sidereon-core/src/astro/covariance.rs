@@ -213,7 +213,7 @@ fn validate_mat3_finite(field: &'static str, values: &Mat3) -> Result<(), RtnFra
 /// Operation order (magnitude before normalize, division not reciprocal
 /// multiply, cross-product component order) is fixed to reproduce the prior
 /// Elixir reference bit-for-bit.
-fn rtn_to_eci_rotation(r: [f64; 3], v: [f64; 3]) -> Result<Mat3, RtnFrameError> {
+pub fn rtn_to_eci_rotation(r: [f64; 3], v: [f64; 3]) -> Result<Mat3, RtnFrameError> {
     validate_vec3("position", r)?;
     validate_vec3("velocity", v)?;
     if vec3::norm3(r) < ZERO_POSITION_EPS {

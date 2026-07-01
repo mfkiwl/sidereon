@@ -39,6 +39,7 @@ pub mod omm;
 pub mod opm;
 pub mod passes;
 pub mod propagator;
+pub mod relative;
 pub mod rf;
 pub mod sgp4;
 pub mod spk;

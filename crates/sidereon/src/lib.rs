@@ -244,6 +244,27 @@ pub mod raw {
 // astrodynamics module tree is available as `sidereon::astro`.
 pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
 
+/// Root-level shortcut for satellite-relative frames and CW propagation.
+///
+/// ```
+/// use sidereon::astro::state::CartesianState;
+/// use sidereon::relative;
+///
+/// let chief = CartesianState::new(0.0, [7000.0, 0.0, 0.0], [0.0, 7.546049108166282, 0.0]);
+/// let deputy = CartesianState::new(
+///     0.0,
+///     [7001.0, 0.2, 0.1],
+///     [0.001, 7.546549108166282, 0.0002],
+/// );
+///
+/// let rel = relative::relative_state(&chief, &deputy).unwrap();
+/// let rebuilt = relative::absolute_from_relative(&chief, &rel).unwrap();
+///
+/// assert!((rebuilt.position_km - deputy.position_km).norm() < 1.0e-9);
+/// assert!((rebuilt.velocity_km_s - deputy.velocity_km_s).norm() < 1.0e-12);
+/// ```
+pub use sidereon_core::astro::relative;
+
 /// Parameter-covariance primitives from the core least-squares substrate.
 ///
 /// [`covariance_from_jacobian`](sidereon_core::astro::math::least_squares::covariance_from_jacobian)
