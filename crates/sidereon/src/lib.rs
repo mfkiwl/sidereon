@@ -27,8 +27,8 @@
 //!   [`broadcast_comparison`], [`constants`], [`navigation`], [`geometry`], and
 //!   [`dgnss`] expose the core helper surface,
 //! - [`astro`] exposes time/frame conversions, Sun/Moon positions, RF link
-//!   budgets, eclipse events, conjunction/covariance utilities, CDM/OMM
-//!   parsing, TCA screening, and orbit propagation,
+//!   budgets, solar beta angles, eclipse events, conjunction/covariance
+//!   utilities, CDM/OMM parsing, TCA screening, and orbit propagation,
 //! - [`tle`], [`sgp4`], [`passes`], and [`tca`] remain root-level shortcuts for
 //!   SGP4/TLE propagation, topocentric az/el/range over a ground station, and
 //!   close-approach screening,
@@ -1309,6 +1309,11 @@ mod tests {
             astro::events::eclipse::status([-7000.0, 0.0, 0.0], sun)
                 .expect("valid eclipse geometry"),
             astro::events::eclipse::EclipseStatus::Umbra
+        );
+        assert!(
+            (astro::angles::beta_angle([1.0, 0.0, 0.0], sun).expect("valid beta geometry") - 90.0)
+                .abs()
+                <= 1.0e-9
         );
         assert!(astro::covariance::symmetric(&[
             [1.0, 0.1, 0.2],

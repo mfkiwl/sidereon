@@ -5,6 +5,7 @@
 //! evaluation, per-satellite carrier-phase wind-up continuity, and satellite
 //! antenna PCO/PCV projection in the satellite body frame.
 
+use crate::astro::angles::beta_angle_from_cos_rad;
 use crate::astro::bodies::{sun_moon_ecef, SunMoon};
 use crate::astro::math::vec3::{add3, cross3, dot3, neg3, norm3, scale3, sub3, unit3};
 use crate::astro::time::{CoverageError, TimeScaleInputErrorKind, TimeScales, ValidityMode};
@@ -623,7 +624,7 @@ fn sat_yaw(rs: [f64; 3], vs: [f64; 3], sun_ecef_m: [f64; 3]) -> Option<([f64; 3]
     let en = unit3(n)?;
     let ep = unit3(p)?;
 
-    let beta = PI / 2.0 - clamp(dot3(esun, en)).acos();
+    let beta = beta_angle_from_cos_rad(dot3(esun, en));
     let ee = clamp(dot3(es, ep)).acos();
     let mut mu = PI / 2.0 + if dot3(es, esun) <= 0.0 { -ee } else { ee };
 
