@@ -116,6 +116,8 @@ pub mod astro {
     pub const AU_KM: f64 = 149_597_870.700;
     /// Astronomical unit in meters, matching [`AU_KM`].
     pub const AU_M: f64 = AU_KM * 1_000.0;
+    /// Solar gravitational parameter (km^3/s^2), IAU 2015 Resolution B3.
+    pub const GM_SUN_KM3_S2: f64 = 132_712_440_041.939_38;
     /// AU value used by the Montenbruck-Gill analytic Sun/Moon series.
     pub const MONTENBRUCK_AU_M: f64 = 149_597_870_691.0;
     /// Solar photosphere radius (km), used by conical eclipse-shadow geometry.

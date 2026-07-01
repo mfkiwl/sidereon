@@ -242,6 +242,11 @@ pub mod raw {
 
 // Root-level propagation shortcuts retained for compatibility. The complete
 // astrodynamics module tree is available as `sidereon::astro`.
+pub use sidereon_core::astro::bodies::{
+    observe, observe_spk_body, Ecliptic, Equatorial, Horizontal, Observation, ObserveOptions,
+    Refraction, Target,
+};
+pub use sidereon_core::astro::frames::transforms::gcrs_to_true_of_date_matrix;
 pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
 
 /// Parameter-covariance primitives from the core least-squares substrate.
@@ -1360,6 +1365,28 @@ mod tests {
         let (_az, el, _range) =
             itrs_to_topocentric([0.0, 0.0, 7000.0], &station).expect("topocentric");
         assert!(el.is_finite());
+
+        let kernel = astro::Spk::from_bytes(include_bytes!(
+            "../../sidereon-core/tests/fixtures/bodies/observe_de.bsp"
+        ))
+        .expect("fixture SPK");
+        let observe_time = UtcInstant::from_utc(2024, 1, 1, 0, 0, 0, 0).expect("valid UTC");
+        let mars = observe_spk_body(&station, observe_time, &kernel, 4).expect("Mars observation");
+        assert!(mars.apparent.right_ascension_deg.is_finite());
+        assert!(!mars.reduced);
+        let target = Target::Spk {
+            kernel: &kernel,
+            naif_id: 4,
+        };
+        let same = observe(&station, observe_time, target, ObserveOptions::default())
+            .expect("generic observation");
+        assert_eq!(
+            same.apparent.right_ascension_deg.to_bits(),
+            mars.apparent.right_ascension_deg.to_bits()
+        );
+        let tod =
+            gcrs_to_true_of_date_matrix(&observe_time.time_scales()).expect("true-of-date matrix");
+        assert!(tod[0][0].is_finite());
     }
 
     #[test]

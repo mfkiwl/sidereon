@@ -22,7 +22,9 @@ pub mod rise_set;
 pub mod sun_moon;
 
 pub use observe::{
-    moon_az_el, moon_illumination, sun_az_el, BodyAzEl, BodyObservationError, MoonIllumination,
+    moon_az_el, moon_illumination, observe, observe_spk_body, observe_with_time_scales, sun_az_el,
+    BodyAzEl, BodyObservationError, Ecliptic, Equatorial, Horizontal, MoonIllumination,
+    Observation, ObserveError, ObserveOptions, Refraction, Target,
 };
 pub use rise_set::{
     find_moon_elevation_crossings, find_moon_transits, find_sun_elevation_crossings,
