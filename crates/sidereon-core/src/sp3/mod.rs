@@ -1068,6 +1068,7 @@ mod combine;
 mod interp;
 mod interpolant;
 mod samples;
+mod verify;
 mod write;
 
 pub use combine::{
@@ -1076,6 +1077,9 @@ pub use combine::{
 };
 pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
 pub use samples::{PreciseEphemerisSample, PreciseEphemerisSamples, PreciseSamplesError};
+pub use verify::{
+    compare_position_series, InterpolationComparison, InterpolationDivergence, ReferenceState,
+};
 
 #[cfg(all(test, sidereon_repo_tests))]
 mod tests;

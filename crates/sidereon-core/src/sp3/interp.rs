@@ -1,5 +1,11 @@
 //! SP3 arbitrary-epoch position/clock interpolation.
 //!
+//! For a consumer-facing summary of the interpolation contract, a utility to
+//! verify sidereon's interpolation against a supplied reference series
+//! ([`compare_position_series`](crate::sp3::compare_position_series)), and the
+//! recommendation on configurable interpolation modes, see that function's
+//! module documentation.
+//!
 //! Two channels with different recipes, each validated against its correct
 //! external reference (the two-bars doctrine: capability vs the deployed
 //! reference, not a bit-exact port of a convenient primitive):
