@@ -27,8 +27,9 @@
 //!   [`broadcast_comparison`], [`constants`], [`navigation`], [`geometry`], and
 //!   [`dgnss`] expose the core helper surface,
 //! - [`astro`] exposes time/frame conversions, Sun/Moon positions, RF link
-//!   budgets, solar beta angles, eclipse events, conjunction/covariance
-//!   utilities, CDM/OMM parsing, TCA screening, and orbit propagation,
+//!   budgets, solar beta angles, equinoctial element transforms, eclipse
+//!   events, conjunction/covariance utilities, CDM/OMM parsing, TCA screening,
+//!   and orbit propagation,
 //! - [`tle`], [`sgp4`], [`passes`], and [`tca`] remain root-level shortcuts for
 //!   SGP4/TLE propagation, topocentric az/el/range over a ground station, and
 //!   close-approach screening,

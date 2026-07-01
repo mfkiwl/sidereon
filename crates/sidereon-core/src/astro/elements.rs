@@ -409,7 +409,7 @@ pub fn coe2rv(coe: &ClassicalElements, mu: f64) -> Result<([f64; 3], [f64; 3]), 
 
 /// Classify an orbit from its eccentricity and inclination per the Vallado
 /// degeneracy thresholds.
-fn classify(ecc: f64, incl: f64) -> OrbitType {
+pub(crate) fn classify(ecc: f64, incl: f64) -> OrbitType {
     let equatorial = incl < SMALL || (incl - PI).abs() < SMALL;
     let circular = ecc < SMALL;
     match (circular, equatorial) {
@@ -423,7 +423,7 @@ fn classify(ecc: f64, incl: f64) -> OrbitType {
 /// `acos` with the argument clamped to `[-1, 1]` to absorb round-off that would
 /// otherwise produce a NaN at the poles of the conversion.
 #[inline]
-fn clamp_acos(x: f64) -> f64 {
+pub(crate) fn clamp_acos(x: f64) -> f64 {
     x.clamp(-1.0, 1.0).acos()
 }
 
