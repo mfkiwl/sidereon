@@ -325,13 +325,31 @@ pub(crate) fn format_lon(longitude_index: i32) -> String {
 pub(crate) fn terrain_block_dir(latitude_index: i32, longitude_index: i32) -> String {
     format!(
         "{}_{}",
-        format_lat(block_origin(latitude_index)),
-        format_lon(block_origin(longitude_index))
+        format_block_lat(latitude_index),
+        format_block_lon(longitude_index)
     )
 }
 
-pub(crate) fn block_origin(index: i32) -> i32 {
-    index.div_euclid(10) * 10
+fn format_block_lat(latitude_index: i32) -> String {
+    let origin = block_origin(latitude_index);
+    if latitude_index >= 0 {
+        format!("n{origin:02}")
+    } else {
+        format!("s{origin:02}")
+    }
+}
+
+fn format_block_lon(longitude_index: i32) -> String {
+    let origin = block_origin(longitude_index);
+    if longitude_index >= 0 {
+        format!("e{origin:03}")
+    } else {
+        format!("w{origin:03}")
+    }
+}
+
+pub(crate) fn block_origin(index: i32) -> u32 {
+    (index.unsigned_abs() / 10) * 10
 }
 
 fn parse_ascii_usize(bytes: &[u8]) -> Result<usize, String> {
@@ -419,12 +437,18 @@ mod tests {
 
     #[test]
     fn terrain_block_dir_matches_reference_bucket_names() {
-        assert_eq!(terrain_block_dir(36, -107), "n30_w110");
-        assert_eq!(terrain_block_dir(32, -117), "n30_w120");
-        assert_eq!(terrain_block_dir(43, -112), "n40_w120");
-        assert_eq!(terrain_block_dir(20, -103), "n20_w110");
+        assert_eq!(terrain_block_dir(36, -107), "n30_w100");
+        assert_eq!(terrain_block_dir(32, -117), "n30_w110");
+        assert_eq!(terrain_block_dir(43, -112), "n40_w110");
+        assert_eq!(terrain_block_dir(20, -103), "n20_w100");
         assert_eq!(terrain_block_dir(36, 107), "n30_e100");
-        assert_eq!(terrain_block_dir(-1, -1), "s10_w010");
+        assert_eq!(terrain_block_dir(-1, -1), "s00_w000");
+        assert_eq!(terrain_block_dir(1, 1), "n00_e000");
+        assert_eq!(terrain_block_dir(-1, 1), "s00_e000");
+        assert_eq!(terrain_block_dir(32, -110), "n30_w110");
+        assert_eq!(terrain_block_dir(32, -111), "n30_w110");
+        assert_eq!(terrain_block_dir(32, -1), "n30_w000");
+        assert_eq!(terrain_block_dir(32, -10), "n30_w010");
     }
 
     #[test]
@@ -437,7 +461,7 @@ mod tests {
             "sidereon-dted-negative-block-{}-{nonce}",
             std::process::id()
         ));
-        let tile_dir = root.join("s10_w010");
+        let tile_dir = root.join("s00_w000");
         let tile_path = tile_dir.join("s01_w001_1arc_v3.dt2");
         fs::create_dir_all(&tile_dir).expect("create nested DTED block dir");
         fs::write(&tile_path, []).expect("create nested DTED tile path");

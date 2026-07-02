@@ -258,32 +258,30 @@ fn skadi_tile_and_dted_derivation_match_known_tile_ids() {
         dted_tile_filename(36, -107).expect("filename"),
         "n36_w107_1arc_v3.dt2"
     );
-    assert_eq!(dted_block_dir(36, -107).expect("block"), "n30_w110");
+    assert_eq!(dted_block_dir(36, -107).expect("block"), "n30_w100");
     assert_eq!(
         dted_cache_relpath(36, -107).expect("relative path"),
-        "n30_w110/n36_w107_1arc_v3.dt2"
+        "n30_w100/n36_w107_1arc_v3.dt2"
     );
 
     assert_eq!(skadi_tile_id(-1, 10).expect("tile id"), "S01E010");
     assert_eq!(skadi_band(-1).expect("band"), "S01");
-    assert_eq!(dted_block_dir(-1, 10).expect("block"), "s10_e010");
+    assert_eq!(dted_block_dir(-1, 10).expect("block"), "s00_e010");
     assert_eq!(
         skadi_archive_url(-1, 10).expect("url"),
         "https://s3.amazonaws.com/elevation-tiles-prod/skadi/S01/S01E010.hgt.gz"
     );
 
-    assert_eq!(dted_block_dir(32, -117).expect("block"), "n30_w120");
-    assert_eq!(dted_block_dir(43, -112).expect("block"), "n40_w120");
-    assert_eq!(dted_block_dir(20, -103).expect("block"), "n20_w110");
+    assert_eq!(dted_block_dir(32, -117).expect("block"), "n30_w110");
+    assert_eq!(dted_block_dir(43, -112).expect("block"), "n40_w110");
+    assert_eq!(dted_block_dir(20, -103).expect("block"), "n20_w100");
 }
 
 #[test]
 fn southern_and_western_hemisphere_tiles_floor_to_sw_corner() {
     // A fractional coordinate names the tile at its floored (south-west) integer
-    // corner, and the ten-degree DTED block floors to its own south-west corner.
-    // The rule is identical in every hemisphere; the negative quadrants are the
-    // load-bearing cases, where the corner is the floor, not a truncation toward
-    // zero (for example latitude -32.83 belongs to tile S33, never S32).
+    // corner. DTED block directories use the signed tile index hemisphere and
+    // truncate the absolute index magnitude to a ten-degree bucket.
 
     // Southern latitude, western longitude.
     assert_eq!(
@@ -300,30 +298,103 @@ fn southern_and_western_hemisphere_tiles_floor_to_sw_corner() {
         dted_tile_filename(-33, -118).expect("filename"),
         "s33_w118_1arc_v3.dt2"
     );
-    assert_eq!(dted_block_dir(-33, -118).expect("block"), "s40_w120");
+    assert_eq!(dted_block_dir(-33, -118).expect("block"), "s30_w110");
     assert_eq!(
         dted_cache_relpath(-33, -118).expect("relpath"),
-        "s40_w120/s33_w118_1arc_v3.dt2"
+        "s30_w110/s33_w118_1arc_v3.dt2"
     );
 
     // Southern latitude, eastern longitude.
     assert_eq!(terrain_tile_index(-33.92, 18.42).expect("index"), (-34, 18));
     assert_eq!(skadi_tile_id(-34, 18).expect("tile id"), "S34E018");
-    assert_eq!(dted_block_dir(-34, 18).expect("block"), "s40_e010");
+    assert_eq!(dted_block_dir(-34, 18).expect("block"), "s30_e010");
     assert_eq!(
         dted_cache_relpath(-34, 18).expect("relpath"),
-        "s40_e010/s34_e018_1arc_v3.dt2"
+        "s30_e010/s34_e018_1arc_v3.dt2"
     );
 
     // Just south and west of the origin: the floored corner is -1, not 0.
     assert_eq!(terrain_tile_index(-0.5, -0.5).expect("index"), (-1, -1));
     assert_eq!(skadi_tile_id(-1, -1).expect("tile id"), "S01W001");
-    assert_eq!(dted_block_dir(-1, -1).expect("block"), "s10_w010");
+    assert_eq!(dted_block_dir(-1, -1).expect("block"), "s00_w000");
 
     // Northern and eastern control: the same flooring rule, no sign flip.
     assert_eq!(terrain_tile_index(45.5, 10.5).expect("index"), (45, 10));
     assert_eq!(skadi_tile_id(45, 10).expect("tile id"), "N45E010");
     assert_eq!(dted_block_dir(45, 10).expect("block"), "n40_e010");
+}
+
+#[test]
+fn dted_block_dir_truncates_signed_indices_to_observed_buckets() {
+    assert_eq!(dted_block_dir(32, -110).expect("block"), "n30_w110");
+    assert_eq!(dted_block_dir(32, -111).expect("block"), "n30_w110");
+    assert_eq!(dted_block_dir(32, -1).expect("block"), "n30_w000");
+    assert_eq!(dted_block_dir(32, -10).expect("block"), "n30_w010");
+    assert_eq!(dted_block_dir(1, 1).expect("block"), "n00_e000");
+    assert_eq!(dted_block_dir(-1, 1).expect("block"), "s00_e000");
+    assert_ne!(
+        dted_block_dir(1, 1).expect("north block"),
+        dted_block_dir(-1, 1).expect("south block")
+    );
+}
+
+#[test]
+fn dted_block_dir_matches_observed_block_layout_fixture() {
+    let mut checked = 0usize;
+    for (line_index, line) in include_str!("fixtures/dted/observed_block_layout.txt")
+        .lines()
+        .enumerate()
+    {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let mut fields = line.split_whitespace();
+        let tile_stem = fields.next().expect("observed tile stem");
+        let observed_block = fields.next().expect("observed block dir");
+        assert!(
+            fields.next().is_none(),
+            "unexpected field in observed layout line {}",
+            line_index + 1
+        );
+
+        let (lat_index, lon_index) = parse_observed_dted_tile_stem(tile_stem);
+        let derived = dted_block_dir(lat_index, lon_index).expect("derived block dir");
+        assert_eq!(
+            derived,
+            observed_block,
+            "observed layout line {}",
+            line_index + 1
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 888);
+}
+
+fn parse_observed_dted_tile_stem(stem: &str) -> (i32, i32) {
+    let mut parts = stem.split('_');
+    let lat = parts.next().expect("latitude token");
+    let lon = parts.next().expect("longitude token");
+    assert_eq!(parts.next(), Some("1arc"));
+    assert_eq!(parts.next(), Some("v3"));
+    assert_eq!(parts.next(), None);
+
+    (
+        parse_signed_index(lat, 'n', 's'),
+        parse_signed_index(lon, 'e', 'w'),
+    )
+}
+
+fn parse_signed_index(token: &str, positive: char, negative: char) -> i32 {
+    let mut chars = token.chars();
+    let hemi = chars.next().expect("hemisphere");
+    let magnitude = chars.as_str().parse::<i32>().expect("index magnitude");
+    match hemi {
+        h if h == positive => magnitude,
+        h if h == negative => -magnitude,
+        _ => panic!("unexpected hemisphere token {token}"),
+    }
 }
 
 #[test]

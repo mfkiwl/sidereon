@@ -54,7 +54,7 @@ fn facade_reexports_terrain_data_derivation_and_conversion() {
     );
     assert_eq!(
         dted_cache_relpath(36, -107).expect("DTED cache path"),
-        "n30_w110/n36_w107_1arc_v3.dt2"
+        "n30_w100/n36_w107_1arc_v3.dt2"
     );
     assert!(hgt_to_dted(36, -107, &[]).is_err());
 }

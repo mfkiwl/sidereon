@@ -198,10 +198,17 @@ impl PreciseEphemerisSamples {
             }
 
             // Node axis: floored to whole seconds, matching the SP3 gather (the
-            // query, at evaluation time, is not floored).
-            let xi = instant_to_j2000_seconds(&sample.epoch)
-                .ok_or(PreciseSamplesError::EpochNotRepresentable(sample.sat))?
-                .floor();
+            // query, at evaluation time, is not floored). A finite `Instant` can
+            // still map to a non-finite J2000 second (an extreme Julian date
+            // overflowing the difference), which would poison the node axis and
+            // slip past the `w[1] <= w[0]` monotonicity check (NaN comparisons are
+            // false); reject it as unrepresentable.
+            let seconds = instant_to_j2000_seconds(&sample.epoch)
+                .ok_or(PreciseSamplesError::EpochNotRepresentable(sample.sat))?;
+            if !seconds.is_finite() {
+                return Err(PreciseSamplesError::EpochNotRepresentable(sample.sat));
+            }
+            let xi = seconds.floor();
 
             // SI -> file-native fit units. The single divide is the correctly
             // rounded inverse of the SP3 parser's `km * KM_TO_M` / `us * US_TO_S`
@@ -218,10 +225,18 @@ impl PreciseEphemerisSamples {
             series.ky.push(sample.position_ecef_m[1] / KM_TO_M);
             series.kz.push(sample.position_ecef_m[2] / KM_TO_M);
             if let Some(clock_s) = sample.clock_s {
+                // A finite `clock_s` can still overflow to a non-finite value in
+                // native microseconds (`clock_s / US_TO_S`); the shared clock
+                // interpolator returns that value unvalidated, so reject it here
+                // rather than emit `Some(inf)`/`Some(NaN)` downstream.
+                let clock_us = clock_s / US_TO_S;
+                if !clock_us.is_finite() {
+                    return Err(PreciseSamplesError::NonFiniteSample(sample.sat));
+                }
                 // Carry the clock-event flag onto the node so the shared
                 // interpolator splits the clock arc at an `E` reset exactly as
                 // the SP3 path does (see `interp::interpolate_clock`).
-                series.clk.push((xi, clock_s / US_TO_S, sample.clock_event));
+                series.clk.push((xi, clock_us, sample.clock_event));
             }
         }
 
@@ -437,6 +452,40 @@ mod tests {
     }
 
     #[test]
+    fn from_samples_rejects_epoch_with_non_finite_j2000_seconds() {
+        let split = JulianDateSplit::new(f64::MAX, 0.0).expect("finite split Julian date");
+        let samples = vec![PreciseEphemerisSample::new(
+            gps(21),
+            Instant {
+                scale: TimeScale::Gpst,
+                repr: InstantRepr::JulianDate(split),
+            },
+            [1.0e7, 2.0e7, 3.0e7],
+            None,
+        )];
+        let err = PreciseEphemerisSamples::from_samples(samples)
+            .expect_err("non-finite J2000 seconds must fail");
+        assert_eq!(err, PreciseSamplesError::EpochNotRepresentable(gps(21)));
+    }
+
+    #[test]
+    fn from_samples_rejects_clock_that_overflows_native_microseconds() {
+        let samples = vec![
+            sample(
+                TimeScale::Gpst,
+                0.0,
+                21,
+                [1.0e7, 2.0e7, 3.0e7],
+                Some(f64::MAX),
+            ),
+            sample(TimeScale::Gpst, 900.0, 21, [1.1e7, 2.1e7, 3.1e7], None),
+        ];
+        let err = PreciseEphemerisSamples::from_samples(samples)
+            .expect_err("overflowed native clock must fail");
+        assert_eq!(err, PreciseSamplesError::NonFiniteSample(gps(21)));
+    }
+
+    #[test]
     fn from_samples_out_of_range_query_errors() {
         let samples = vec![
             sample(
@@ -640,10 +689,10 @@ mod parity_tests {
         sp3
     }
 
-    /// FIX 1 parity: an SP3 product with an `E` clock-event epoch, extracted to
-    /// samples and rebuilt via `from_samples`, must interpolate byte-identical
-    /// clocks across the reset. The clock arc split is only preserved if the
-    /// per-sample `clock_event` flag survives the round trip.
+    /// An SP3 product with an `E` clock-event epoch, extracted to samples and
+    /// rebuilt via `from_samples`, must interpolate byte-identical clocks across
+    /// the reset. The clock arc split is only preserved if the per-sample
+    /// `clock_event` flag survives the round trip.
     #[test]
     fn from_samples_preserves_clock_event_arc_split() {
         let event_idx = 6usize;
