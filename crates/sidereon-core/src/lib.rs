@@ -89,8 +89,8 @@ pub mod frequencies; // canonical GNSS carrier-frequency table
 mod glonass; // GLONASS PZ-90.11 state-vector RK4 propagation
 mod ionex; // Klobuchar broadcast model + IONEX ionospheric maps
 pub mod navigation; // navigation-message bit-level codecs (GPS LNAV)
-pub mod ntrip; // NTRIP client sans-I/O request, response, and stream handling
 pub mod nmea; // NMEA 0183 sentence parsing, stream grouping, and GGA writing
+pub mod ntrip; // NTRIP client sans-I/O request, response, and stream handling
 pub mod observables; // forward GNSS observable prediction
 pub mod ppp_corrections; // static-arc PPP correction tables
 pub mod precise_positioning; // static multi-epoch PPP float solve
