@@ -21,6 +21,7 @@
 //! - [`positioning`] - single-point positioning and DOP diagnostics,
 //! - [`dgnss`] - code-differential pseudorange correction and rover pairing,
 //! - [`quality`] - pseudorange weighting, RAIM, and FDE integrity checks,
+//! - [`observation_qc`] - RINEX observation completeness and signal rollups,
 //! - [`signal`] - GPS C/A code generation, correlation, and acquisition,
 //! - [`ppp_corrections`] - static-arc PPP correction precomputation,
 //! - [`atmosphere`] - ionosphere and troposphere corrections,
@@ -119,6 +120,7 @@ pub mod estimation; // Phase-2 estimation substrate: named operation-order recip
 pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric heights)
 pub mod geometry;
 pub mod ils; // integer least squares ambiguity-resolution kernels
+pub mod observation_qc; // RINEX observation completeness and signal rollups
 pub mod orbit;
 pub mod positioning;
 pub mod prelude;
