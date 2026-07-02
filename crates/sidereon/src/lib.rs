@@ -1682,8 +1682,8 @@ mod tests {
             frequencies::frequency_hz(GnssSystem::Gps, frequencies::CarrierBand::L1),
             Some(constants::F_L1_HZ)
         );
-        assert_eq!(GnssSystem::Gps.as_str(), "gps");
-        assert_eq!(GnssSystem::Gps.to_string(), "gps");
+        assert_eq!(GnssSystem::Gps.as_str(), "GPS");
+        assert_eq!(GnssSystem::Gps.to_string(), "GPS");
         assert_eq!(frequencies::CarrierBand::L1.as_str(), "l1");
         assert_eq!(frequencies::CarrierBand::L1.to_string(), "l1");
         assert!(geometry::visible_at_elevation_mask(5.0, 5.0));

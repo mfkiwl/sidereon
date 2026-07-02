@@ -41,16 +41,17 @@ pub enum GnssSystem {
 }
 
 impl GnssSystem {
-    /// The canonical lower-case display label.
+    /// The canonical display label (constellation acronyms uppercase, proper
+    /// names as styled): GPS, GLONASS, Galileo, BeiDou, QZSS, NavIC, SBAS.
     pub const fn as_str(&self) -> &'static str {
         match *self {
-            GnssSystem::Gps => "gps",
-            GnssSystem::Glonass => "glonass",
-            GnssSystem::Galileo => "galileo",
-            GnssSystem::BeiDou => "beidou",
-            GnssSystem::Qzss => "qzss",
-            GnssSystem::Navic => "navic",
-            GnssSystem::Sbas => "sbas",
+            GnssSystem::Gps => "GPS",
+            GnssSystem::Glonass => "GLONASS",
+            GnssSystem::Galileo => "Galileo",
+            GnssSystem::BeiDou => "BeiDou",
+            GnssSystem::Qzss => "QZSS",
+            GnssSystem::Navic => "NavIC",
+            GnssSystem::Sbas => "SBAS",
         }
     }
 
@@ -224,15 +225,15 @@ mod tests {
     }
 
     #[test]
-    fn system_labels_are_canonical_lowercase() {
+    fn system_labels_are_canonical() {
         let cases = [
-            (GnssSystem::Gps, "gps"),
-            (GnssSystem::Glonass, "glonass"),
-            (GnssSystem::Galileo, "galileo"),
-            (GnssSystem::BeiDou, "beidou"),
-            (GnssSystem::Qzss, "qzss"),
-            (GnssSystem::Navic, "navic"),
-            (GnssSystem::Sbas, "sbas"),
+            (GnssSystem::Gps, "GPS"),
+            (GnssSystem::Glonass, "GLONASS"),
+            (GnssSystem::Galileo, "Galileo"),
+            (GnssSystem::BeiDou, "BeiDou"),
+            (GnssSystem::Qzss, "QZSS"),
+            (GnssSystem::Navic, "NavIC"),
+            (GnssSystem::Sbas, "SBAS"),
         ];
         for (system, label) in cases {
             assert_eq!(system.as_str(), label);
