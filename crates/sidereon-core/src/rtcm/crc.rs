@@ -24,6 +24,23 @@ pub(crate) fn crc24q(data: &[u8]) -> u32 {
     crc24q_with_init(0, data)
 }
 
+/// Compute CRC-24Q over the first `nbits` bits of `data`, MSB first.
+pub(crate) fn crc24q_bits(data: &[u8], nbits: usize) -> u32 {
+    let mut crc: u32 = 0;
+    for bit_pos in 0..nbits {
+        let byte = data[bit_pos / 8];
+        let bit = (byte >> (7 - (bit_pos % 8))) & 1;
+        crc ^= u32::from(bit) << 23;
+        for _ in 0..1 {
+            crc <<= 1;
+            if crc & TOP_BIT != 0 {
+                crc ^= POLYNOMIAL;
+            }
+        }
+    }
+    crc & MASK_24
+}
+
 /// Compute the CRC-24Q of `data` from an arbitrary initial register value.
 ///
 /// RTCM uses an initial value of zero ([`crc24q`]); the parameter exists so the

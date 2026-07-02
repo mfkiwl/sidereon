@@ -110,6 +110,7 @@ fn solve_inputs(observations: Vec<Observation>, initial_guess: [f64; 4]) -> Solv
         },
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met: SurfaceMet {
             pressure_hpa: 1013.25,

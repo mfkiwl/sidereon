@@ -1,0 +1,18 @@
+[
+  { "band": 0, "position": 0, "lat_deg": -75.0, "lon_deg": -180.0 },
+  { "band": 0, "position": 27, "lat_deg": 85.0, "lon_deg": -180.0 },
+  { "band": 0, "position": 28, "lat_deg": -55.0, "lon_deg": -175.0 },
+  { "band": 4, "position": 100, "lat_deg": -75.0, "lon_deg": 0.0 },
+  { "band": 4, "position": 127, "lat_deg": 85.0, "lon_deg": 0.0 },
+  { "band": 8, "position": 199, "lat_deg": 55.0, "lon_deg": 175.0 },
+  { "band": 8, "position": 200 },
+  { "band": 9, "position": 0, "lat_deg": 60.0, "lon_deg": -180.0 },
+  { "band": 9, "position": 71, "lat_deg": 60.0, "lon_deg": 175.0 },
+  { "band": 9, "position": 72, "lat_deg": 65.0, "lon_deg": -180.0 },
+  { "band": 9, "position": 180, "lat_deg": 85.0, "lon_deg": -180.0 },
+  { "band": 9, "position": 191, "lat_deg": 85.0, "lon_deg": 150.0 },
+  { "band": 9, "position": 192 },
+  { "band": 10, "position": 180, "lat_deg": -85.0, "lon_deg": -170.0 },
+  { "band": 10, "position": 191, "lat_deg": -85.0, "lon_deg": 160.0 },
+  { "band": 10, "position": 192 }
+]

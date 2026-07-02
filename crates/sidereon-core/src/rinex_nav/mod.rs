@@ -287,6 +287,8 @@ pub struct BroadcastRecord {
     pub satellite_id: GnssSatelliteId,
     /// The navigation message the record carries.
     pub message: NavMessage,
+    /// GPS issue of data ephemeris, when the message carries one.
+    pub iode: Option<u8>,
     /// Native broadcast week number (from the broadcast record).
     pub week: u32,
     /// Scale-tagged ephemeris reference time (`toe`).
@@ -430,6 +432,7 @@ impl BroadcastRecord {
         Ok(BroadcastRecord {
             satellite_id,
             message: NavMessage::GpsLnav,
+            iode: Some(decoded.iode as u8),
             week: full_week,
             toe,
             toc,
@@ -1301,6 +1304,15 @@ fn parse_keplerian_block(
             _ => NavMessage::GpsLnav,
         }
     };
+    let iode = if system == GnssSystem::Gps {
+        let raw = finite_integral_u32(g(o1[0], "iode")?, "iode", &sat)?;
+        if raw > u32::from(u8::MAX) {
+            return Err(bad("iode"));
+        }
+        Some(raw as u8)
+    } else {
+        None
+    };
 
     let sv_accuracy_m = g(o6[0], "accuracy")?;
     let sv_health = g(o6[1], "health")?;
@@ -1330,6 +1342,7 @@ fn parse_keplerian_block(
     Ok(BroadcastRecord {
         satellite_id,
         message,
+        iode,
         week,
         toe,
         toc,

@@ -42,6 +42,7 @@ pub use tec_grid::{
 };
 
 pub(crate) use klobuchar::klobuchar_l1_components;
+pub(crate) use slant::pierce_point;
 
 pub(crate) fn ionex_epoch_from_j2000_seconds(seconds: i64) -> Instant {
     instant_from_j2000_seconds(TimeScale::Utc, seconds)

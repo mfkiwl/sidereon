@@ -123,6 +123,48 @@ impl BroadcastStore {
         &self.records
     }
 
+    /// Select the valid record for `sat` with a matching GPS issue byte at `t`.
+    pub fn select_by_iode_at(
+        &self,
+        sat: GnssSatelliteId,
+        iode: u8,
+        t_j2000_s: f64,
+    ) -> Option<&BroadcastRecord> {
+        let (t_continuous, _) = query_continuous_time(sat, t_j2000_s)?;
+        self.records
+            .iter()
+            .filter(|r| r.satellite_id == sat)
+            .filter(|r| r.iode == Some(iode))
+            .filter(|r| (t_continuous - Self::toe_continuous_s(r)).abs() <= Self::half_window_s(r))
+            .min_by(|a, b| {
+                let da = (t_continuous - Self::toe_continuous_s(a)).abs();
+                let db = (t_continuous - Self::toe_continuous_s(b)).abs();
+                da.partial_cmp(&db).unwrap_or(core::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Evaluate a matching issue-specific broadcast record at `t`.
+    pub fn state_by_iode_at(
+        &self,
+        sat: GnssSatelliteId,
+        iode: u8,
+        t_j2000_s: f64,
+    ) -> Option<([f64; 3], f64)> {
+        let (t_continuous, is_geo) = query_continuous_time(sat, t_j2000_s)?;
+        let rec = self.select_by_iode_at(sat, iode, t_j2000_s)?;
+        let sow = t_continuous.rem_euclid(SECONDS_PER_WEEK);
+        let state = satellite_state_unchecked(
+            &rec.elements,
+            &rec.clock,
+            &rec.constants(),
+            sow,
+            rec.broadcast_clock_group_delay_s(),
+            is_geo,
+        );
+        let position = state.orbit.position().ok()?;
+        Some((position.as_array(), state.clock.dt_clock_total_s))
+    }
+
     /// Keep only the records matching a predicate (e.g. a custom message/health
     /// policy on a store built with [`new`](BroadcastStore::new)).
     pub fn retain(&mut self, keep: impl FnMut(&BroadcastRecord) -> bool) {
@@ -298,15 +340,7 @@ impl EphemerisSource for BroadcastStore {
         // system's continuous time and seconds of week. BeiDou runs on BDT
         // (= GPST - 14 s) with its week epoch 1356 weeks after the GPS epoch, and
         // its geostationary satellites take the GEO orbit branch.
-        let gpst_continuous = t_j2000_s + GPS_EPOCH_TO_J2000_S;
-        let (t_continuous, is_geo) = if sat.system == GnssSystem::BeiDou {
-            (
-                gpst_continuous - GPST_MINUS_BDT_S - BDS_EPOCH_MINUS_GPS_EPOCH_S,
-                is_beidou_geo(sat),
-            )
-        } else {
-            (gpst_continuous, false)
-        };
+        let (t_continuous, is_geo) = query_continuous_time(sat, t_j2000_s)?;
 
         let rec = self.select(sat, t_continuous)?;
         let sow = t_continuous.rem_euclid(SECONDS_PER_WEEK);
@@ -320,5 +354,23 @@ impl EphemerisSource for BroadcastStore {
         );
         let position = state.orbit.position().ok()?;
         Some((position.as_array(), state.clock.dt_clock_total_s))
+    }
+}
+
+fn query_continuous_time(sat: GnssSatelliteId, t_j2000_s: f64) -> Option<(f64, bool)> {
+    if !matches!(
+        sat.system,
+        GnssSystem::Gps | GnssSystem::Galileo | GnssSystem::BeiDou
+    ) {
+        return None;
+    }
+    let gpst_continuous = t_j2000_s + GPS_EPOCH_TO_J2000_S;
+    if sat.system == GnssSystem::BeiDou {
+        Some((
+            gpst_continuous - GPST_MINUS_BDT_S - BDS_EPOCH_MINUS_GPS_EPOCH_S,
+            is_beidou_geo(sat),
+        ))
+    } else {
+        Some((gpst_continuous, false))
     }
 }

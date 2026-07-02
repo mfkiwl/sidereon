@@ -170,7 +170,7 @@ use std::path::Path;
 pub use sidereon_core::{
     antex, astro, atmosphere, broadcast_comparison, carrier_phase, combinations, constants, dgnss,
     ephemeris, frequencies, geometry, navigation, observables, orbit, positioning, quality, rinex,
-    rtcm, signal, velocity,
+    rtcm, sbas, signal, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
@@ -1469,6 +1469,10 @@ mod tests {
         );
         assert_eq!(navigation::lnav::PREAMBLE, 0b1000_1011);
         assert_eq!(dgnss::CodeObservation::new("G01", 1.0).satellite_id, "G01");
+        assert_eq!(
+            sbas::sat_to_sbas_prn(sbas::sbas_prn_to_sat(120).expect("valid augmentation PRN")),
+            Some(120)
+        );
         assert!(core::mem::size_of::<geometry::VisibilityOptions>() > 0);
         assert!(core::mem::size_of::<broadcast_comparison::EpochInputs>() > 0);
     }
@@ -1502,6 +1506,7 @@ mod tests {
             },
             beidou_klobuchar: None,
             galileo_nequick: None,
+            sbas_iono: None,
             glonass_channels: std::collections::BTreeMap::new(),
             met: SurfaceMet {
                 pressure_hpa: 1013.25,

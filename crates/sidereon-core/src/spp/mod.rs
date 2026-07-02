@@ -90,6 +90,7 @@ use crate::ionex::{
 use crate::quality::{
     validate_receiver_solution, SolutionValidationError, SolutionValidationOptions,
 };
+use crate::sbas::SbasIonoGrid;
 use crate::tropo::slant_components;
 use crate::validate;
 
@@ -100,7 +101,10 @@ use crate::validate;
 /// Galileo broadcast delays are reported on this carrier. GLONASS is resolved
 /// per satellite by [`spp_iono_frequency_hz`] from its FDMA channel instead.
 pub(crate) const fn carrier_frequency_hz(system: GnssSystem) -> Option<f64> {
-    frequencies::default_spp_frequency_hz(system)
+    match system {
+        GnssSystem::Sbas => Some(F_L1_HZ),
+        _ => frequencies::default_spp_frequency_hz(system),
+    }
 }
 
 /// The carrier frequency (Hz) the broadcast ionosphere delay is scaled to for a
@@ -186,6 +190,10 @@ pub enum RejectionReason {
     NoEphemeris,
     /// The satellite is below the elevation mask at the frozen geometry.
     LowElevation,
+    /// The bound augmentation source withdrew the satellite.
+    SbasWithdrawn,
+    /// The augmentation ionosphere grid does not cover the satellite line of sight.
+    SbasIonoUncovered,
 }
 
 /// A rejected satellite paired with its rejection reason.
@@ -408,6 +416,8 @@ pub struct SolveInputs {
     /// of the GPS Klobuchar coefficients. `None` preserves the historical
     /// Klobuchar fallback so existing zero-Galileo goldens stay bit-identical.
     pub galileo_nequick: Option<GalileoNequickCoeffs>,
+    /// Optional augmentation ionosphere grid.
+    pub sbas_iono: Option<SbasIonoGrid>,
     /// GLONASS FDMA channel numbers keyed by GLONASS slot (PRN), from the
     /// broadcast nav `freq_channel` field or the observation header's
     /// `GLONASS SLOT / FRQ #` records. Used only to resolve the per-satellite
@@ -423,6 +433,29 @@ pub struct SolveInputs {
     /// runs the static elevation-weighted solve byte-identically; `Some(_)`
     /// adds the outer reweighting loop described on [`RobustConfig`].
     pub robust: Option<RobustConfig>,
+}
+
+impl Default for SolveInputs {
+    fn default() -> Self {
+        Self {
+            observations: Vec::new(),
+            t_rx_j2000_s: 0.0,
+            t_rx_second_of_day_s: 0.0,
+            day_of_year: 1.0,
+            initial_guess: [0.0; 4],
+            corrections: Corrections::NONE,
+            klobuchar: KlobucharCoeffs {
+                alpha: [0.0; 4],
+                beta: [0.0; 4],
+            },
+            beidou_klobuchar: None,
+            galileo_nequick: None,
+            sbas_iono: None,
+            glonass_channels: BTreeMap::new(),
+            met: SurfaceMet::default(),
+            robust: None,
+        }
+    }
 }
 
 /// Input-validation failure category for SPP public entry points.
@@ -692,11 +725,13 @@ pub(crate) struct SatModel {
 
 /// The broadcast ionosphere correction a satellite's system uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum SppIonosphere {
+pub(crate) enum SppIonosphere<'a> {
     /// GPS/BeiDou Klobuchar alpha/beta model.
     Klobuchar(KlobucharCoeffs),
     /// Galileo NeQuick-G effective-ionisation coefficients.
     GalileoNequick(GalileoNequickCoeffs),
+    /// Augmentation grid delay model.
+    SbasGrid(&'a SbasIonoGrid),
 }
 
 /// The ionosphere coefficients a satellite's system uses: Galileo prefers its
@@ -704,7 +739,14 @@ pub(crate) enum SppIonosphere {
 /// `beidou_klobuchar` (`BDSA`/`BDSB`) set when present; all missing
 /// constellation-specific sets fall back to the shared GPS Klobuchar values to
 /// preserve existing callers.
-fn ionosphere_for(system: GnssSystem, inputs: &SolveInputs) -> SppIonosphere {
+fn ionosphere_for<'a>(system: GnssSystem, inputs: &'a SolveInputs) -> SppIonosphere<'a> {
+    if let Some(grid) = inputs
+        .sbas_iono
+        .as_ref()
+        .filter(|_| inputs.corrections.ionosphere)
+    {
+        return SppIonosphere::SbasGrid(grid);
+    }
     match (system, inputs.galileo_nequick, inputs.beidou_klobuchar) {
         (GnssSystem::Galileo, Some(gal), _) => SppIonosphere::GalileoNequick(gal),
         (GnssSystem::BeiDou, _, Some(bds)) => SppIonosphere::Klobuchar(bds),
@@ -773,7 +815,7 @@ pub(crate) fn sat_model(
     rx_ecef_m: [f64; 3],
     b_m: f64,
     p_meas_m: f64,
-    ionosphere: SppIonosphere,
+    ionosphere: SppIonosphere<'_>,
 ) -> Option<SatModel> {
     let sagnac = env.model.sagnac;
     let frame = env.model.frame;
@@ -886,6 +928,9 @@ pub(crate) fn sat_model(
                     frequency_hz: freq_hz,
                 },
             ),
+            SppIonosphere::SbasGrid(grid) => {
+                grid.slant_delay_m(g.geodetic, g.el_rad, g.az_rad, freq_hz)?
+            }
         };
     }
     if env.corrections.troposphere {
@@ -970,18 +1015,17 @@ pub(crate) fn select_sats(
         model,
     };
     for ob in obs {
-        let model = sat_model(
-            &env,
-            ob.satellite_id,
-            rx0,
-            b0,
-            ob.pseudorange_m,
-            ionosphere_for(ob.satellite_id.system, inputs),
-        );
+        let ionosphere = ionosphere_for(ob.satellite_id.system, inputs);
+        let uses_sbas_grid = matches!(ionosphere, SppIonosphere::SbasGrid(_));
+        let model = sat_model(&env, ob.satellite_id, rx0, b0, ob.pseudorange_m, ionosphere);
         let Some(model) = model else {
             rejected.push(RejectedSat {
                 satellite_id: ob.satellite_id,
-                reason: RejectionReason::NoEphemeris,
+                reason: if uses_sbas_grid {
+                    RejectionReason::SbasIonoUncovered
+                } else {
+                    RejectionReason::NoEphemeris
+                },
             });
             continue;
         };
@@ -1013,7 +1057,13 @@ pub(crate) fn select_sats(
 /// reference. For a single-system solve this is one element and the state is the
 /// classic `[x, y, z, b]`.
 pub(crate) fn clock_systems(used: &[GnssSatelliteId]) -> Vec<GnssSystem> {
-    let mut systems: Vec<GnssSystem> = used.iter().map(|s| s.system).collect();
+    let mut systems: Vec<GnssSystem> = used
+        .iter()
+        .map(|s| match s.system {
+            GnssSystem::Sbas => GnssSystem::Gps,
+            system => system,
+        })
+        .collect();
     systems.sort_unstable();
     systems.dedup();
     systems
@@ -1060,7 +1110,14 @@ pub(crate) fn residual_unweighted(
             .map(|(_, p)| *p)
             .ok_or(sat)?;
         // The clock for this satellite's system (index 0 = reference clock).
-        let sys_idx = systems.iter().position(|s| *s == sat.system).unwrap_or(0);
+        let sat_clock_system = match sat.system {
+            GnssSystem::Sbas => GnssSystem::Gps,
+            system => system,
+        };
+        let sys_idx = systems
+            .iter()
+            .position(|s| *s == sat_clock_system)
+            .unwrap_or(0);
         let b = x[3 + sys_idx];
         let m =
             sat_model(&env, sat, rx, b, p_meas, ionosphere_for(sat.system, inputs)).ok_or(sat)?;
@@ -1777,7 +1834,7 @@ pub(crate) mod test_support {
         rx: [f64; 3],
         b_m: f64,
         p_meas: f64,
-        ionosphere: SppIonosphere,
+        ionosphere: SppIonosphere<'_>,
     ) -> Option<SatModel> {
         sat_model(env, sat, rx, b_m, p_meas, ionosphere)
     }

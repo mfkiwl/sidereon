@@ -7,7 +7,7 @@
 //! Fixture provenance (all under `tests/fixtures/nav/`; the nav-solutions/data
 //! repo redistributes public IGS/MGEX products, original source CDDIS/BKG/IGS):
 //!
-//!   * `ESBC00DNK_R_20201770000_01D_MN.rnx` — IGS MGEX daily merged broadcast nav
+//!   * `ESBC00DNK_R_20201770000_01D_MN.rnx`, IGS MGEX daily merged broadcast nav
 //!     (RINEX 3.05 MIXED, station ESBC00DNK Esbjerg DK, 2020 DOY 177, GPS week
 //!     2111). From
 //!     `https://raw.githubusercontent.com/nav-solutions/data/main/NAV/V3/ESBC00DNK_R_20201770000_01D_MN.rnx.gz`
@@ -19,19 +19,19 @@
 //!     a deterministic awk pass keeping `^[GEC]` records (1452728 B sha256
 //!     069f73afc10e9c1a8b87b7fbbb774f3eb9be94fb4da4ac365cfd4356c6ebfd36; 257 GPS,
 //!     1602 Galileo, 357 BeiDou records; BeiDou C05-C37 exercises GEO/IGSO/MEO).
-//!   * `ESBC00DNK_R_20201770000_01D_RN.rnx` — GLONASS (`^R`) records of the same
+//!   * `ESBC00DNK_R_20201770000_01D_RN.rnx`, GLONASS (`^R`) records of the same
 //!     original ESBC00DNK product (decompressed sha256 ad6af3c2…), header verbatim,
 //!     same awk pass keeping `^R`. 510 GLONASS broadcast records (5-line PZ-90.11
 //!     3.05 layout); header LEAP SECONDS = 18.
-//!   * `KMS300DNK_R_20221591000_01H_MN.rnx` — RINEX 4.00 MIXED nav, 1 hour (2022 DOY
+//!   * `KMS300DNK_R_20221591000_01H_MN.rnx`, RINEX 4.00 MIXED nav, 1 hour (2022 DOY
 //!     159), committed verbatim (decompressed) from nav-solutions/data NAV/V4
 //!     (gz sha256 2bae4217cb71ad4a2b9c0067bd1c5b56915e42d2007a94e91eb408468cc4763f).
 //!     Tests version-4 frame-marker parsing; 174 supported Keplerian records parsed,
 //!     GLONASS/QZSS/SBAS/STO/ION skipped.
-//!   * `BRDC00GOP_R_20210010000_01D_MN.rnx` — merged BRDC header (GOP/Pecny),
+//!   * `BRDC00GOP_R_20210010000_01D_MN.rnx`, merged BRDC header (GOP/Pecny),
 //!     header-only, from nav-solutions/data NAV/V3 (gz sha256
 //!     1bb7bb0ca70fb1e11e366abd9126881d62b238b687ace7fba360002b61a12f09). Carries
-//!     IONOSPHERIC CORR for GPS/Galileo/QZSS/NavIC and — the reason it is committed —
+//!     IONOSPHERIC CORR for GPS/Galileo/QZSS/NavIC, the reason it is committed,
 //!     BeiDou (BDSA/BDSB Klobuchar-8). No orbit records.
 
 use super::*;
@@ -302,6 +302,7 @@ fn spp_solves_from_broadcast_glonass() {
         klobuchar: kl,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -403,6 +404,7 @@ fn beidou_uses_its_own_klobuchar_coefficients() {
         },
         beidou_klobuchar,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -966,6 +968,7 @@ fn spp_solves_from_broadcast_gps() {
         klobuchar: kl,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -1809,6 +1812,7 @@ fn broadcast_store_rejects_unsupported_systems() {
     let rec = BroadcastRecord {
         satellite_id: sat,
         message: NavMessage::GpsLnav,
+        iode: None,
         week: 2111,
         toe: broadcast_time(sat.system, 2111, 0.0),
         toc: broadcast_time(sat.system, 2111, 0.0),
@@ -1897,6 +1901,7 @@ fn gps_fit_interval_bounds_record_validity() {
     let make = |system, fit_interval_s| BroadcastRecord {
         satellite_id: GnssSatelliteId::new(system, 1).expect("valid satellite id"),
         message: NavMessage::GpsLnav,
+        iode: None,
         week: 2111,
         toe: broadcast_time(system, 2111, 0.0),
         toc: broadcast_time(system, 2111, 0.0),
@@ -1986,6 +1991,7 @@ fn select_prefers_a_valid_farther_record_over_an_expired_nearer_one() {
     let rec = |toe_sow, fit_interval_s| BroadcastRecord {
         satellite_id: GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id"),
         message: NavMessage::GpsLnav,
+        iode: None,
         week: 2111,
         toe: broadcast_time(GnssSystem::Gps, 2111, toe_sow),
         toc: broadcast_time(GnssSystem::Gps, 2111, toe_sow),
@@ -2187,6 +2193,7 @@ fn mixed_constellation_solve_recovers_the_receiver() {
         klobuchar: kl,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -2342,6 +2349,7 @@ fn mixed_constellation_solve_recovers_a_nonzero_inter_system_bias() {
         klobuchar: kl,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -2463,6 +2471,7 @@ fn mixed_solve_recovers_with_gps_galileo_and_beidou() {
         klobuchar: kl,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -2576,6 +2585,7 @@ fn ionosphere_correction_is_applied_to_beidou_b1i() {
         klobuchar: kl,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met,
         robust: None,
@@ -2723,6 +2733,7 @@ fn from_lnav_scales_semicircles_to_radians_and_passes_radian_terms_through() {
     assert_eq!(record.week, 2110);
     assert_eq!(record.toe.week, 2110);
     assert_eq!(record.message, NavMessage::GpsLnav);
+    assert_eq!(record.iode, Some(decoded.iode as u8));
     assert_eq!(record.sv_health, 0.0);
     assert_eq!(record.sv_accuracy_m, 2.4); // URA index 0 (IS-GPS-200N 20.3.3.3.1.3)
     assert_eq!(record.fit_interval_s, Some(4.0 * 3600.0));

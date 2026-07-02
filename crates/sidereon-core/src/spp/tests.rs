@@ -144,6 +144,7 @@ fn esbc_first_epoch_inputs(initial_guess: [f64; 4]) -> (SolveInputs, [f64; 3]) {
             },
             beidou_klobuchar: None,
             galileo_nequick: None,
+            sbas_iono: None,
             glonass_channels: std::collections::BTreeMap::new(),
             met: SurfaceMet {
                 pressure_hpa: 1013.25,
@@ -297,6 +298,7 @@ fn solve_inputs(i: &Inputs) -> SolveInputs {
         klobuchar: i.klobuchar,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: std::collections::BTreeMap::new(),
         met: i.met,
         robust: None,
@@ -1479,6 +1481,7 @@ fn degenerate_geometry_case() -> (crate::sp3::Sp3, SolveInputs) {
             },
             beidou_klobuchar: None,
             galileo_nequick: None,
+            sbas_iono: None,
             glonass_channels: std::collections::BTreeMap::new(),
             met: SurfaceMet {
                 pressure_hpa: 1013.25,
@@ -2468,6 +2471,7 @@ fn glonass_validation_inputs(channels: std::collections::BTreeMap<u8, i8>) -> So
         klobuchar: nonzero_klobuchar(),
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: channels,
         met: SurfaceMet {
             pressure_hpa: 1013.25,
