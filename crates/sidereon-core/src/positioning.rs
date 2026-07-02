@@ -1,6 +1,9 @@
 //! Single-point positioning and GNSS geometry diagnostics.
 
 pub use crate::dop::{dop, Dop, DopError, LineOfSight};
+pub use crate::quality::{
+    spp_robust_fde_driver, FdeError, FdeOptions, FdeResult, FdeSppError, FdeSppOptions,
+};
 pub use crate::spp::{
     residual_rms, solve, solve_broadcast, solve_spp_batch_parallel, solve_spp_batch_serial,
     solve_with_fallback, solve_with_policy, solve_with_solver, BroadcastReason, Corrections,

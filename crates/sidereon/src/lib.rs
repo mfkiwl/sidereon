@@ -170,6 +170,7 @@ use std::path::Path;
 
 // Re-export core domain modules whose public helpers are intentionally part of
 // the ergonomic crate surface.
+pub use sidereon_core::quality::spp_robust_fde_driver;
 pub use sidereon_core::{
     antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
     dgnss, ephemeris, frequencies, geometry, navigation, observables, orbit, positioning, quality,
@@ -1758,6 +1759,66 @@ mod tests {
             assert!(err.to_string().contains("SPP solve failed"));
             assert!(std::error::Error::source(&err).is_some());
         }
+    }
+
+    #[test]
+    fn spp_robust_fde_driver_is_reexported_from_facade_root() {
+        let sp3 = load_sp3(DEGENERATE_SP3).expect("the fixture parses");
+        let sat = |prn| GnssSatelliteId::new(GnssSystem::Gps, prn).expect("valid satellite id");
+        let inputs = SolveInputs {
+            observations: vec![
+                Observation {
+                    satellite_id: sat(1),
+                    pseudorange_m: 2.1e7,
+                },
+                Observation {
+                    satellite_id: sat(2),
+                    pseudorange_m: 2.1e7,
+                },
+            ],
+            t_rx_j2000_s: 646_315_200.0,
+            t_rx_second_of_day_s: 0.0,
+            day_of_year: 176.0,
+            initial_guess: [0.0, 0.0, 0.0, 0.0],
+            corrections: Corrections::NONE,
+            klobuchar: KlobucharCoeffs {
+                alpha: [0.0; 4],
+                beta: [0.0; 4],
+            },
+            beidou_klobuchar: None,
+            galileo_nequick: None,
+            sbas_iono: None,
+            glonass_channels: std::collections::BTreeMap::new(),
+            met: SurfaceMet {
+                pressure_hpa: 1013.25,
+                temperature_k: 288.15,
+                relative_humidity: 0.5,
+            },
+            robust: None,
+        };
+        let options = quality::FdeSppOptions {
+            fde: quality::FdeOptions {
+                raim: quality::RaimOptions::default(),
+                max_iterations: 0,
+            },
+            validation: quality::SolutionValidationOptions::default(),
+        };
+
+        let result = spp_robust_fde_driver(
+            &sp3,
+            &inputs,
+            false,
+            positioning::RobustConfig::default(),
+            &options,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(quality::FdeError::Solve(quality::FdeSppError::Spp(_)))
+            ),
+            "got {result:?}"
+        );
     }
 
     #[test]
