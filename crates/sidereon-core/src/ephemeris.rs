@@ -12,14 +12,17 @@
 
 pub use crate::broadcast::{
     eccentric_anomaly, relativistic_clock_correction_s, satellite_clock_offset_s,
-    satellite_position_ecef, satellite_state, ClockOffset, ClockPolynomial, ConstellationConstants,
-    EccentricAnomaly, KeplerianElements, OrbitState, SatelliteState,
+    satellite_position_ecef, satellite_position_ecef_cnav, satellite_state, satellite_state_cnav,
+    ClockOffset, ClockPolynomial, CnavRates, ConstellationConstants, EccentricAnomaly,
+    KeplerianElements, OrbitState, SatelliteState,
 };
 pub use crate::observables::{ObservableEphemerisSource, ObservablesError};
 use crate::observables::{ObservableState, ObservablesInputErrorKind};
 pub use crate::rinex_nav::{
-    is_beidou_geo, BroadcastGroupDelayTerm, BroadcastGroupDelays, BroadcastIssue, BroadcastRecord,
+    cnav_ura_ned_m, cnav_ura_nominal_m, is_beidou_geo, BroadcastGroupDelayTerm,
+    BroadcastGroupDelays, BroadcastIssue, BroadcastRecord, CnavParameters, CnavSignal,
     GlonassRecord, IonoCorrections, KlobucharAlphaBeta, LnavRecordError, NavMessage,
+    NavMessagePreference,
 };
 pub use crate::sp3::{
     align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
@@ -331,6 +334,7 @@ mod tests {
                 toc_sow: 100_000.0,
             },
             group_delays: BroadcastGroupDelays::galileo(1.0e-9, 2.5e-9),
+            cnav: None,
             sv_health: 0.0,
             sv_accuracy_m: 1.0,
             fit_interval_s: None,

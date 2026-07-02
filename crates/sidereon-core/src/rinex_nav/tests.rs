@@ -28,6 +28,13 @@
 //!     (gz sha256 2bae4217cb71ad4a2b9c0067bd1c5b56915e42d2007a94e91eb408468cc4763f).
 //!     Tests version-4 frame-marker parsing; 174 supported Keplerian records parsed,
 //!     GLONASS/QZSS/SBAS/STO/ION skipped.
+//!   * `BRD400DLR_S_20261800000_01H_MN_trim.rnx`: RINEX 4.02 mixed broadcast
+//!     product from
+//!     `https://igs.bkg.bund.de/root_ftp/IGS/BRDC/2026/180/BRD400DLR_S_20261800000_01D_MN.rnx.gz`
+//!     (downloaded 2026-07-02). Trim recipe: header through END OF HEADER plus
+//!     G01/G03 LNAV+CNAV, J02 LNAV+CNAV+CNV2, and C19 CNV2 frames. The public
+//!     product carries no GPS CNV2 frames; GPS CNV2 roster coverage is synthetic
+//!     in this module, while the real fixture exercises QZSS CNV2.
 //!   * `BRDC00GOP_R_20210010000_01D_MN.rnx`: merged BRDC header (GOP/Pecny),
 //!     header-only, from nav-solutions/data NAV/V3 (gz sha256
 //!     1bb7bb0ca70fb1e11e366abd9126881d62b238b687ace7fba360002b61a12f09). Carries
@@ -36,8 +43,12 @@
 
 use super::*;
 use crate::astro::time::model::{GnssWeekTow, TimeScale};
-use crate::broadcast::satellite_state;
-use crate::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_WEEK};
+use crate::broadcast::{
+    satellite_state, satellite_state_cnav, ClockPolynomial, CnavRates, KeplerianElements,
+};
+use crate::constants::{
+    C_M_S, F_L1_HZ, F_L2_HZ, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_WEEK,
+};
 
 fn fixture_text() -> String {
     let path = concat!(
@@ -72,6 +83,19 @@ fn v4_fixture_text() -> String {
         "/tests/fixtures/nav/KMS300DNK_R_20221591000_01H_MN.rnx"
     );
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read v4 NAV fixture {path}: {e}"))
+}
+
+fn cnav_fixture_text() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nav/BRD400DLR_S_20261800000_01H_MN_trim.rnx"
+    );
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read CNAV RINEX 4 fixture {path}: {e}"))
+}
+
+fn cnav_fixture_records() -> Vec<BroadcastRecord> {
+    parse_nav(&cnav_fixture_text()).expect("parse CNAV RINEX 4 fixture")
 }
 
 fn glonass_fixture_text() -> String {
@@ -1139,6 +1163,285 @@ fn replace_orbit_field(line: &str, field_index: usize, value: &str) -> String {
     out
 }
 
+fn blank_orbit_field(line: &str, field_index: usize) -> String {
+    let ranges = [(4, 23), (23, 42), (42, 61), (61, 80)];
+    let (start, end) = ranges[field_index];
+    let mut out = format!("{line:<80}");
+    out.replace_range(start..end, "                   ");
+    out
+}
+
+fn d19_12(value: f64) -> String {
+    let mut out = String::new();
+    write::push_d19_12(&mut out, value);
+    out
+}
+
+fn cnav_orbit_line(values: [Option<f64>; 4]) -> String {
+    let mut line = String::from("    ");
+    for value in values {
+        match value {
+            Some(value) => line.push_str(&d19_12(value)),
+            None => line.push_str("                   "),
+        }
+    }
+    line
+}
+
+fn cnav_clock_line(sat: &str, af0: f64) -> String {
+    let mut line = format!("{sat:<3} 2020 06 25 04 00 00");
+    line.push_str(&d19_12(af0));
+    line.push_str(&d19_12(7.0e-12));
+    line.push_str(&d19_12(0.0));
+    line
+}
+
+fn cnav_lines_with_clock(sat: &str, af0: f64) -> Vec<String> {
+    vec![
+        cnav_clock_line(sat, af0),
+        cnav_orbit_line([
+            Some(0.125),
+            Some(-39.6875),
+            Some(4.304822170265e-9),
+            Some(0.6342094507864),
+        ]),
+        cnav_orbit_line([
+            Some(-2.177432179451e-6),
+            Some(0.01000394229777),
+            Some(1.9371509552e-6),
+            Some(5153.707128525),
+        ]),
+        cnav_orbit_line([
+            Some(360_000.0),
+            Some(-1.508742570877e-7),
+            Some(2.572838528869),
+            Some(1.359730958939e-7),
+        ]),
+        cnav_orbit_line([
+            Some(0.9806518601091),
+            Some(353.96875),
+            Some(0.7941703015008),
+            Some(-8.384634967987e-9),
+        ]),
+        cnav_orbit_line([
+            Some(-5.714523747137e-11),
+            Some(1.0e-18),
+            Some(0.0),
+            Some(2.0),
+        ]),
+        cnav_orbit_line([Some(1.0), Some(0.0), Some(5.122274160385e-9), Some(4.0)]),
+        cnav_orbit_line([Some(1.0e-9), Some(2.0e-9), Some(3.0e-9), Some(4.0e-9)]),
+        cnav_orbit_line([Some(356_106.0), Some(2111.0), Some(5.0), None]),
+    ]
+}
+
+fn cnav_lines(sat: &str) -> Vec<String> {
+    cnav_lines_with_clock(sat, 2.0e-4)
+}
+
+fn cnv2_lines(sat: &str) -> Vec<String> {
+    let mut lines = cnav_lines_with_clock(sat, 3.0e-4);
+    lines[8] = cnav_orbit_line([Some(6.0e-9), Some(7.0e-9), None, None]);
+    lines.push(cnav_orbit_line([
+        Some(356_106.0),
+        Some(2111.0),
+        Some(1.0),
+        None,
+    ]));
+    lines
+}
+
+fn push_owned_lines(out: &mut String, lines: &[String]) {
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+fn find_record(
+    records: &[BroadcastRecord],
+    system: GnssSystem,
+    prn: u8,
+    message: NavMessage,
+) -> &BroadcastRecord {
+    let sat = GnssSatelliteId::new(system, prn).expect("valid satellite id");
+    records
+        .iter()
+        .find(|record| record.satellite_id == sat && record.message == message)
+        .unwrap_or_else(|| panic!("missing {sat} {message:?} record"))
+}
+
+fn cnav_rates_from_record(record: &BroadcastRecord) -> CnavRates {
+    let cnav = record.cnav.expect("CNAV extension");
+    CnavRates {
+        adot_m_s: cnav.adot_m_s,
+        delta_n0_dot_rad_s2: cnav.delta_n0_dot_rad_s2,
+    }
+}
+
+fn distance_m(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn cnav_record_from_legacy(
+    mut record: BroadcastRecord,
+    system: GnssSystem,
+    prn: u8,
+    message: NavMessage,
+) -> BroadcastRecord {
+    record.satellite_id = GnssSatelliteId::new(system, prn).expect("valid satellite id");
+    record.message = message;
+    record.issue_of_data.message = message;
+    record.group_delays = BroadcastGroupDelays::cnav(
+        record.group_delays.gps_tgd_s,
+        Some(0.0),
+        Some(0.0),
+        Some(0.0),
+        Some(0.0),
+        None,
+        None,
+    );
+    record.cnav = Some(CnavParameters {
+        adot_m_s: 0.0,
+        delta_n0_dot_rad_s2: 0.0,
+        top: record.toe,
+        ura_ed_index: 0,
+        ura_ned0_index: 0,
+        ura_ned1_index: 0,
+        ura_ned2_index: 0,
+        transmission_time_sow: record.elements.toe_sow,
+        flags: None,
+    });
+    record.sv_accuracy_m = cnav_ura_nominal_m(0).expect("CNAV URA index 0");
+    record.fit_interval_s = Some(3.0 * SECONDS_PER_HOUR);
+    record
+}
+
+fn synthetic_spp_inputs(store: &BroadcastStore) -> crate::spp::SolveInputs {
+    use crate::spp::{
+        test_support, Corrections, KlobucharCoeffs, Observation, SatModelEnv, SolveInputs,
+        SppModelRecipe, SurfaceMet, ELEVATION_MASK_RAD,
+    };
+
+    let t_rx = 646_358_400.0_f64;
+    let sod = 12.0 * SECONDS_PER_HOUR;
+    let doy = 177.0;
+    let x_true = [3_512_900.0, 780_500.0, 5_248_700.0, 0.0];
+    let corrections = Corrections::NONE;
+    let klobuchar = KlobucharCoeffs {
+        alpha: [0.0; 4],
+        beta: [0.0; 4],
+    };
+    let met = SurfaceMet {
+        pressure_hpa: 1013.25,
+        temperature_k: 288.15,
+        relative_humidity: 0.5,
+    };
+
+    let mut sats: Vec<_> = store
+        .records()
+        .iter()
+        .filter(|record| record.satellite_id.system == GnssSystem::Gps)
+        .map(|record| record.satellite_id)
+        .collect();
+    sats.sort_unstable();
+    sats.dedup();
+
+    let mut observations = Vec::new();
+    for sat in sats {
+        let glonass_channels = std::collections::BTreeMap::<u8, i8>::new();
+        let env = SatModelEnv {
+            eph: store,
+            t_rx_j2000_s: t_rx,
+            t_rx_second_of_day_s: sod,
+            day_of_year: doy,
+            corrections,
+            met: &met,
+            glonass_channels: &glonass_channels,
+            model: SppModelRecipe::reference(),
+        };
+        if let Some(model) = test_support::sat_model_for_test(
+            &env,
+            sat,
+            [x_true[0], x_true[1], x_true[2]],
+            x_true[3],
+            22_000_000.0,
+            &klobuchar,
+        ) {
+            if model.el_rad >= ELEVATION_MASK_RAD {
+                observations.push(Observation {
+                    satellite_id: sat,
+                    pseudorange_m: model.p_hat_m,
+                });
+            }
+        }
+    }
+    assert!(
+        observations.len() >= 4,
+        "need >=4 visible GPS observations, got {}",
+        observations.len()
+    );
+
+    SolveInputs {
+        observations,
+        t_rx_j2000_s: t_rx,
+        t_rx_second_of_day_s: sod,
+        day_of_year: doy,
+        initial_guess: [
+            x_true[0] + 1000.0,
+            x_true[1] - 1000.0,
+            x_true[2] + 1000.0,
+            0.0,
+        ],
+        corrections,
+        klobuchar,
+        beidou_klobuchar: None,
+        galileo_nequick: None,
+        sbas_iono: None,
+        glonass_channels: std::collections::BTreeMap::new(),
+        met,
+        robust: None,
+    }
+}
+
+fn assert_spp_solution_bits_eq(
+    left: &crate::spp::ReceiverSolution,
+    right: &crate::spp::ReceiverSolution,
+) {
+    assert_eq!(left.position.x_m.to_bits(), right.position.x_m.to_bits());
+    assert_eq!(left.position.y_m.to_bits(), right.position.y_m.to_bits());
+    assert_eq!(left.position.z_m.to_bits(), right.position.z_m.to_bits());
+    assert_eq!(left.geodetic, right.geodetic);
+    assert_eq!(left.rx_clock_s.to_bits(), right.rx_clock_s.to_bits());
+    assert_eq!(left.system_clocks_s.len(), right.system_clocks_s.len());
+    for ((left_system, left_clock), (right_system, right_clock)) in left
+        .system_clocks_s
+        .iter()
+        .zip(right.system_clocks_s.iter())
+    {
+        assert_eq!(left_system, right_system);
+        assert_eq!(left_clock.to_bits(), right_clock.to_bits());
+    }
+    assert_eq!(left.dop, right.dop);
+    assert_eq!(
+        left.residuals_m
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        right
+            .residuals_m
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(left.used_sats, right.used_sats);
+    assert_eq!(left.rejected_sats, right.rejected_sats);
+    assert_eq!(left.metadata, right.metadata);
+}
+
 fn replace_fourth_orbit_field(line: &str, value: &str) -> String {
     assert_eq!(line.len(), 80);
     let field = format!("{value:>19}");
@@ -1439,13 +1742,14 @@ fn public_helper_rejects_malformed_leap_seconds() {
 
 #[test]
 fn parses_rinex_v4_eph_frames_and_skips_the_rest() {
-    // One GPS LNAV EPH frame, plus a CNAV EPH frame and an STO frame that must be
-    // skipped (CNAV reorders the orbit columns; STO carries no ephemeris).
+    // One GPS LNAV EPH frame, plus an unsupported BeiDou CNV2 frame and an STO
+    // frame that must be skipped. GPS/QZSS CNV2 is handled in separate tests
+    // because that token is system-overloaded.
     let mut text = String::from(V4_NAV_HEADER);
     text.push_str("> EPH G01 LNAV\n");
     text.push_str(&join(G01_LINES));
-    text.push_str("> EPH G03 CNAV\n");
-    text.push_str(&join(G01_LINES)); // body content is irrelevant; it must be skipped, not parsed
+    text.push_str("> EPH C19 CNV2\n");
+    push_owned_lines(&mut text, &cnav_lines("C19"));
     text.push_str("> STO G01 LNAV\n");
     text.push_str("    2020 06 25 00 00 00 GPUT 0.0 0.0 0 0\n");
 
@@ -1465,6 +1769,1090 @@ fn parses_rinex_v4_eph_frames_and_skips_the_rest() {
     assert_eq!(recs[0].clock, v3[0].clock, "clock differs v4 vs v3");
     assert_eq!(recs[0].week, v3[0].week);
     assert_eq!(recs[0].fit_interval_s, v3[0].fit_interval_s);
+}
+
+#[test]
+fn parses_rinex_v4_gps_qzss_cnav_and_cnv2_records() {
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("G03"));
+    text.push_str("> EPH G04 CNV2\n");
+    push_owned_lines(&mut text, &cnv2_lines("G04"));
+    text.push_str("> EPH J03 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("J03"));
+
+    let recs = parse_nav(&text).expect("parse CNAV-family RINEX 4 records");
+    assert_eq!(recs.len(), 3);
+
+    let g03 = recs
+        .iter()
+        .find(|r| r.satellite_id == GnssSatelliteId::new(GnssSystem::Gps, 3).unwrap())
+        .expect("G03 CNAV record");
+    assert_eq!(g03.message, NavMessage::GpsCnav);
+    assert_eq!(g03.week, 2111);
+    assert_eq!(g03.toe, g03.toc);
+    assert_eq!(g03.elements.toe_sow, 360_000.0);
+    assert_eq!(g03.clock.toc_sow, 360_000.0);
+    assert_eq!(g03.issue_of_data.issue, 1200);
+    assert_eq!(g03.fit_interval_s, Some(3.0 * SECONDS_PER_HOUR));
+    assert_eq!(g03.sv_accuracy_m, cnav_ura_nominal_m(1).unwrap());
+    assert_eq!(
+        g03.broadcast_clock_group_delay_s().to_bits(),
+        (5.122274160385e-9_f64 - 1.0e-9_f64).to_bits()
+    );
+    let cnav = g03.cnav.expect("CNAV extension");
+    assert_eq!(cnav.adot_m_s.to_bits(), 0.125_f64.to_bits());
+    assert_eq!(cnav.delta_n0_dot_rad_s2.to_bits(), 1.0e-18_f64.to_bits());
+    assert_eq!(cnav.top.week, 2111);
+    assert_eq!(cnav.top.tow_s, 360_000.0);
+    assert_eq!(cnav.ura_ed_index, 1);
+    assert_eq!(cnav.ura_ned0_index, 0);
+    assert_eq!(cnav.ura_ned1_index, 2);
+    assert_eq!(cnav.ura_ned2_index, 4);
+    assert_eq!(cnav.transmission_time_sow, 356_106.0);
+    assert_eq!(cnav.flags, Some(5));
+    assert_eq!(g03.group_delays.cnav_isc_l5q5_s, Some(4.0e-9));
+
+    let g04 = recs
+        .iter()
+        .find(|r| r.satellite_id == GnssSatelliteId::new(GnssSystem::Gps, 4).unwrap())
+        .expect("G04 CNV2 record");
+    assert_eq!(g04.message, NavMessage::GpsCnav2);
+    assert_eq!(g04.group_delays.cnav_isc_l1cd_s, Some(6.0e-9));
+    assert_eq!(g04.group_delays.cnav_isc_l1cp_s, Some(7.0e-9));
+    assert_eq!(g04.cnav.expect("CNV2 extension").flags, Some(1));
+
+    let j03 = recs
+        .iter()
+        .find(|r| r.satellite_id == GnssSatelliteId::new(GnssSystem::Qzss, 3).unwrap())
+        .expect("J03 CNAV record");
+    assert_eq!(j03.message, NavMessage::QzssCnav);
+    assert_eq!(j03.time_scale(), TimeScale::Gpst);
+}
+
+#[test]
+fn rinex_v4_skips_unsupported_beidou_cnv_family() {
+    let mut text = String::from(V4_NAV_HEADER);
+    for token in ["CNV1", "CNV2", "CNV3"] {
+        text.push_str(&format!("> EPH C19 {token}\n"));
+        push_owned_lines(&mut text, &cnav_lines("C19"));
+    }
+
+    let recs = parse_nav(&text).expect("unsupported BeiDou CNV frames are skipped");
+    assert!(recs.is_empty());
+}
+
+#[test]
+fn rinex_v4_rejects_cnav_marker_body_satellite_mismatch() {
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("G04"));
+
+    let err = parse_nav(&text).expect_err("marker SV must match CNAV body SV");
+    assert_eq!(
+        err,
+        NavParseError::BadField {
+            satellite: "G03".to_string(),
+            field: "frame marker",
+        }
+    );
+}
+
+#[test]
+fn rinex_v4_rejects_cnav_marker_message_for_body_system_mismatch() {
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH E01 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("E01"));
+
+    let err = parse_nav(&text).expect_err("CNAV token is invalid for Galileo");
+    assert_eq!(
+        err,
+        NavParseError::BadField {
+            satellite: "E01".to_string(),
+            field: "message",
+        }
+    );
+}
+
+#[test]
+fn rinex_v4_cnav_malformed_records_error_not_skip() {
+    let mut truncated = String::from(V4_NAV_HEADER);
+    truncated.push_str("> EPH G03 CNAV\n");
+    for line in cnav_lines("G03").into_iter().take(8) {
+        truncated.push_str(&line);
+        truncated.push('\n');
+    }
+    assert!(matches!(
+        parse_nav(&truncated),
+        Err(NavParseError::TruncatedRecord(s)) if s == "G03"
+    ));
+
+    let mut bad_ura = cnav_lines("G03");
+    bad_ura[6] = replace_orbit_field(&bad_ura[6], 0, "1.600000000000e+01");
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &bad_ura);
+    assert_eq!(
+        parse_nav(&text).expect_err("out-of-range URA_ED must error"),
+        NavParseError::BadField {
+            satellite: "G03".to_string(),
+            field: "ura_ed",
+        }
+    );
+
+    let mut bad_health = cnav_lines("G03");
+    bad_health[6] = replace_orbit_field(&bad_health[6], 1, "5.000000000000e-01");
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &bad_health);
+    assert_eq!(
+        parse_nav(&text).expect_err("non-integral health must error"),
+        NavParseError::BadField {
+            satellite: "G03".to_string(),
+            field: "health",
+        }
+    );
+
+    let mut bad_wn = cnav_lines("G03");
+    bad_wn[8] = replace_orbit_field(&bad_wn[8], 1, "2.111500000000e+03");
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &bad_wn);
+    assert_eq!(
+        parse_nav(&text).expect_err("non-integral WNop must error"),
+        NavParseError::BadField {
+            satellite: "G03".to_string(),
+            field: "wn_op",
+        }
+    );
+}
+
+#[test]
+fn cnav_delay_sentinel_and_blank_fields_parse_as_none() {
+    let mut lines = cnav_lines("G03");
+    let sentinel = d19_12(-4096.0 * 2.0_f64.powi(-35));
+    lines[7] = replace_orbit_field(&lines[7], 2, sentinel.trim());
+    lines[7] = blank_orbit_field(&lines[7], 3);
+
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &lines);
+
+    let recs = parse_nav(&text).expect("parse CNAV with unavailable ISC fields");
+    let rec = &recs[0];
+    assert_eq!(rec.group_delays.cnav_isc_l5i5_s, None);
+    assert_eq!(rec.group_delays.cnav_isc_l5q5_s, None);
+    assert_eq!(
+        rec.group_delays
+            .cnav_single_frequency_correction_s(CnavSignal::L5I5),
+        None
+    );
+}
+
+#[test]
+fn cnav_default_group_delay_falls_back_per_term() {
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("G03"));
+    let mut rec = parse_nav(&text)
+        .expect("parse CNAV")
+        .into_iter()
+        .next()
+        .expect("record");
+
+    rec.group_delays.gps_tgd_s = Some(5.0e-9);
+    rec.group_delays.cnav_isc_l1ca_s = None;
+    assert_eq!(
+        rec.broadcast_clock_group_delay_s().to_bits(),
+        5.0e-9_f64.to_bits()
+    );
+
+    rec.group_delays.gps_tgd_s = None;
+    rec.group_delays.cnav_isc_l1ca_s = Some(2.0e-9);
+    assert_eq!(
+        rec.broadcast_clock_group_delay_s().to_bits(),
+        (-2.0e-9_f64).to_bits()
+    );
+
+    rec.group_delays.gps_tgd_s = None;
+    rec.group_delays.cnav_isc_l1ca_s = None;
+    assert_eq!(
+        rec.broadcast_clock_group_delay_s().to_bits(),
+        0.0_f64.to_bits()
+    );
+    assert_eq!(
+        rec.group_delays
+            .for_message(rec.satellite_id.system, rec.message),
+        Some(0.0)
+    );
+}
+
+#[test]
+fn cnav_ura_nominal_full_index_sweep_matches_spec_table() {
+    for index in -16i8..=15 {
+        let expected = match index {
+            -16 | 15 => None,
+            1 => Some(2.8),
+            3 => Some(5.7),
+            5 => Some(11.3),
+            -15..=6 => Some(2.0_f64.powf(1.0 + f64::from(index) / 2.0)),
+            7..=14 => Some(2.0_f64.powi(i32::from(index) - 2)),
+            _ => None,
+        };
+        assert_eq!(
+            cnav_ura_nominal_m(index).map(f64::to_bits),
+            expected.map(f64::to_bits),
+            "CNAV URA index {index}"
+        );
+    }
+
+    assert_eq!(cnav_ura_nominal_m(1), Some(2.8));
+    assert_eq!(cnav_ura_nominal_m(3), Some(5.7));
+    assert_eq!(cnav_ura_nominal_m(5), Some(11.3));
+    assert_eq!(cnav_ura_nominal_m(-16), None);
+    assert_eq!(cnav_ura_nominal_m(15), None);
+    assert_eq!(cnav_ura_nominal_m(-17), None);
+    assert_eq!(
+        cnav_ura_nominal_m(6).map(f64::to_bits),
+        Some(16.0_f64.to_bits())
+    );
+    assert_eq!(
+        cnav_ura_nominal_m(7).map(f64::to_bits),
+        Some(32.0_f64.to_bits())
+    );
+}
+
+#[test]
+fn cnav_ura_ned_has_93600_second_knee_and_week_rollover() {
+    let mut params = CnavParameters {
+        adot_m_s: 0.0,
+        delta_n0_dot_rad_s2: 0.0,
+        top: broadcast_time(GnssSystem::Gps, 2425, 100_000.0),
+        ura_ed_index: 0,
+        ura_ned0_index: 0,
+        ura_ned1_index: 0,
+        ura_ned2_index: 0,
+        transmission_time_sow: 0.0,
+        flags: None,
+    };
+    let ned0 = cnav_ura_nominal_m(0).expect("URA NED0");
+    let ned1 = 2.0_f64.powi(-14);
+    let ned2 = 2.0_f64.powi(-28);
+
+    let knee = cnav_ura_ned_m(&params, broadcast_time(GnssSystem::Gps, 2425, 193_600.0))
+        .expect("URA at knee");
+    assert_eq!(
+        knee.to_bits(),
+        (ned0 + ned1 * 93_600.0).to_bits(),
+        "the quadratic term starts after the 93600 s knee"
+    );
+
+    let after = cnav_ura_ned_m(&params, broadcast_time(GnssSystem::Gps, 2425, 193_601.0))
+        .expect("URA after knee");
+    assert_eq!(
+        after.to_bits(),
+        (ned0 + ned1 * 93_601.0 + ned2).to_bits(),
+        "one second past the knee includes one squared second of NED2"
+    );
+
+    params.top = broadcast_time(GnssSystem::Gps, 2425, 604_700.0);
+    let rollover = cnav_ura_ned_m(&params, broadcast_time(GnssSystem::Gps, 2426, 100.0))
+        .expect("URA across week rollover");
+    assert_eq!(
+        rollover.to_bits(),
+        (ned0 + ned1 * 200.0).to_bits(),
+        "WNop/TOP rollover must use continuous GPS time"
+    );
+}
+
+#[test]
+fn cnav_isc_all_six_signals_and_dual_frequency_numeric() {
+    let delays = BroadcastGroupDelays::cnav(
+        Some(10.0e-9),
+        Some(1.0e-9),
+        Some(2.0e-9),
+        Some(3.0e-9),
+        Some(4.0e-9),
+        Some(5.0e-9),
+        Some(6.0e-9),
+    );
+
+    for (signal, expected) in [
+        (CnavSignal::L1Ca, 9.0e-9_f64),
+        (CnavSignal::L2C, 8.0e-9_f64),
+        (CnavSignal::L5I5, 7.0e-9_f64),
+        (CnavSignal::L5Q5, 6.0e-9_f64),
+        (CnavSignal::L1Cd, 5.0e-9_f64),
+        (CnavSignal::L1Cp, 4.0e-9_f64),
+    ] {
+        assert_eq!(
+            delays
+                .cnav_single_frequency_correction_s(signal)
+                .map(f64::to_bits),
+            Some(expected.to_bits()),
+            "{signal:?}"
+        );
+    }
+
+    let l1 = delays
+        .cnav_single_frequency_correction_s(CnavSignal::L1Ca)
+        .expect("L1 correction");
+    let l2 = delays
+        .cnav_single_frequency_correction_s(CnavSignal::L2C)
+        .expect("L2 correction");
+    let dual = crate::combinations::ionosphere_free(l1, l2, F_L1_HZ, F_L2_HZ)
+        .expect("dual-frequency ISC correction");
+    let f1sq = F_L1_HZ * F_L1_HZ;
+    let f2sq = F_L2_HZ * F_L2_HZ;
+    let gamma = f1sq / (f1sq - f2sq);
+    let expected = gamma * l1 - (gamma - 1.0) * l2;
+    assert_eq!(dual.to_bits(), expected.to_bits());
+}
+
+#[test]
+fn cnav_no_prediction_ura_records_drop_from_default_store_but_manual_store_keeps_them() {
+    let mut text = String::from(V4_NAV_HEADER);
+    for (sat, ura) in [
+        ("G03", "1.500000000000e+01"),
+        ("G04", "-1.600000000000e+01"),
+    ] {
+        let mut lines = cnav_lines(sat);
+        lines[6] = replace_orbit_field(&lines[6], 0, ura);
+        text.push_str(&format!("> EPH {sat} CNAV\n"));
+        push_owned_lines(&mut text, &lines);
+    }
+
+    let recs = parse_nav(&text).expect("parse no-prediction CNAV records");
+    assert_eq!(recs.len(), 2);
+    assert!(
+        recs.iter().all(|record| record
+            .cnav
+            .map(|cnav| cnav_ura_nominal_m(cnav.ura_ed_index).is_none())
+            .unwrap_or(false)),
+        "both CNAV records carry no-prediction URA indices"
+    );
+
+    let manual = BroadcastStore::new(recs).expect("manual store keeps policy-explicit records");
+    assert_eq!(manual.records().len(), 2);
+
+    let default = BroadcastStore::from_nav(&text).expect("default store parses no-prediction CNAV");
+    assert!(
+        default.records().is_empty(),
+        "from_nav must drop CNAV records with URA index 15 or -16"
+    );
+}
+
+#[test]
+fn select_by_iode_ignores_cnav_issue_collisions() {
+    let lnav = parse_nav(&format!("{V3_NAV_HEADER}{}", join(G01_LINES)))
+        .expect("parse LNAV")
+        .remove(0);
+    let mut cnav = cnav_record_from_legacy(lnav, GnssSystem::Gps, 1, NavMessage::GpsCnav);
+    cnav.issue_of_data.issue = lnav.issue_of_data.issue;
+    cnav.clock.af0 = lnav.clock.af0 + 1.0e-3;
+
+    let store = BroadcastStore::new(vec![cnav, lnav]).expect("manual IODE collision store");
+    let query = toe_as_j2000_s(&lnav);
+    let iode = u8::try_from(lnav.issue_of_data.issue).expect("LNAV IODE fits u8");
+    let selected = store
+        .select_by_iode_at(lnav.satellite_id, iode, query)
+        .expect("select LNAV by IODE");
+    assert_eq!(selected.message, NavMessage::GpsLnav);
+
+    let (position, clock) = store
+        .state_by_iode_at(lnav.satellite_id, iode, query)
+        .expect("state by IODE");
+    let expected = satellite_state(
+        &lnav.elements,
+        &lnav.clock,
+        &lnav.constants(),
+        lnav.elements.toe_sow,
+        lnav.broadcast_clock_group_delay_s(),
+        false,
+    )
+    .expect("LNAV state");
+    let expected_position = expected.orbit.position().expect("LNAV position").as_array();
+    assert_eq!(
+        position.map(f64::to_bits),
+        expected_position.map(f64::to_bits)
+    );
+    assert_eq!(clock.to_bits(), expected.clock.dt_clock_total_s.to_bits());
+}
+
+#[test]
+fn equal_toe_cnav_tie_break_prefers_cnav_over_cnv2() {
+    use crate::spp::EphemerisSource;
+
+    let recs = cnav_fixture_records();
+    let cnav = *find_record(&recs, GnssSystem::Qzss, 2, NavMessage::QzssCnav);
+    let cnv2 = *find_record(&recs, GnssSystem::Qzss, 2, NavMessage::QzssCnav2);
+    assert_eq!(cnav.toe, cnv2.toe, "fixture records must tie on toe");
+
+    let mut store = BroadcastStore::new(recs).expect("manual CNAV/CNV2 store");
+    store.set_message_preference(NavMessagePreference::PreferModern);
+    let query = toe_as_j2000_s(&cnav);
+    let (_, clock) = store
+        .position_clock_at_j2000_s(cnav.satellite_id, query)
+        .expect("QZSS state at tied toe");
+
+    let cnav_expected = satellite_state_cnav(
+        &cnav.elements,
+        &cnav_rates_from_record(&cnav),
+        &cnav.clock,
+        &cnav.constants(),
+        cnav.elements.toe_sow,
+        cnav.broadcast_clock_group_delay_s(),
+    )
+    .expect("QZSS CNAV state");
+    let cnv2_expected = satellite_state_cnav(
+        &cnv2.elements,
+        &cnav_rates_from_record(&cnv2),
+        &cnv2.clock,
+        &cnv2.constants(),
+        cnv2.elements.toe_sow,
+        cnv2.broadcast_clock_group_delay_s(),
+    )
+    .expect("QZSS CNV2 state");
+    assert_eq!(
+        clock.to_bits(),
+        cnav_expected.clock.dt_clock_total_s.to_bits()
+    );
+    assert_ne!(
+        clock.to_bits(),
+        cnv2_expected.clock.dt_clock_total_s.to_bits()
+    );
+}
+
+#[test]
+fn mixed_store_with_cnav_retained_solves_bit_identically_to_default_legacy_store() {
+    use crate::spp::solve;
+
+    let lnav_records: Vec<_> = records()
+        .into_iter()
+        .filter(|record| {
+            record.satellite_id.system == GnssSystem::Gps && record.message == NavMessage::GpsLnav
+        })
+        .collect();
+    let legacy_store = BroadcastStore::new(lnav_records.clone()).expect("legacy GPS store");
+    let mut mixed_records = lnav_records.clone();
+    mixed_records.extend(lnav_records.iter().map(|record| {
+        cnav_record_from_legacy(
+            *record,
+            record.satellite_id.system,
+            record.satellite_id.prn,
+            NavMessage::GpsCnav,
+        )
+    }));
+    let mixed_store = BroadcastStore::new(mixed_records).expect("mixed GPS store");
+    assert_eq!(
+        mixed_store.message_preference(),
+        NavMessagePreference::PreferLegacy
+    );
+
+    let inputs = synthetic_spp_inputs(&legacy_store);
+    let legacy = solve(&legacy_store, &inputs, true).expect("legacy SPP solve");
+    let mixed = solve(&mixed_store, &inputs, true).expect("mixed SPP solve");
+    assert_spp_solution_bits_eq(&legacy, &mixed);
+}
+
+#[test]
+fn qzss_cnav_observable_source_feeds_end_to_end_spp() {
+    use crate::observables::{predict, ObservableEphemerisSource, PredictOptions};
+    use crate::spp::{solve, Corrections, KlobucharCoeffs, Observation, SolveInputs, SurfaceMet};
+
+    let gps_records: Vec<_> = records()
+        .into_iter()
+        .filter(|record| record.satellite_id.system == GnssSystem::Gps)
+        .collect();
+    let gps_store = BroadcastStore::new(gps_records.clone()).expect("GPS source store");
+    let source_sats: Vec<_> = synthetic_spp_inputs(&gps_store)
+        .observations
+        .iter()
+        .take(6)
+        .map(|observation| observation.satellite_id)
+        .collect();
+    assert!(
+        source_sats.len() >= 4,
+        "need >=4 visible GPS source orbits to remap"
+    );
+
+    let mut qzss_records = Vec::new();
+    for (index, source_sat) in source_sats.iter().enumerate() {
+        let qzss_prn = u8::try_from(index + 1).expect("QZSS PRN index");
+        for record in gps_records
+            .iter()
+            .copied()
+            .filter(|record| record.satellite_id == *source_sat)
+        {
+            qzss_records.push(cnav_record_from_legacy(
+                record,
+                GnssSystem::Qzss,
+                qzss_prn,
+                NavMessage::QzssCnav,
+            ));
+        }
+    }
+    let store = BroadcastStore::new(qzss_records).expect("manual QZSS CNAV store");
+    let observable_source: &dyn ObservableEphemerisSource = &store;
+
+    let t_rx = 646_358_400.0_f64;
+    let sod = 12.0 * SECONDS_PER_HOUR;
+    let doy = 177.0;
+    let x_true = [3_512_900.0, 780_500.0, 5_248_700.0];
+    let mut sats: Vec<_> = store
+        .records()
+        .iter()
+        .map(|record| record.satellite_id)
+        .collect();
+    sats.sort_unstable();
+    sats.dedup();
+
+    assert!(
+        sats.iter().any(|&sat| observable_source
+            .observable_state_at_j2000_s(sat, t_rx)
+            .is_ok()),
+        "BroadcastEphemeris must serve at least one QZSS state through ObservableEphemerisSource"
+    );
+
+    let mut observations = Vec::new();
+    for sat in sats {
+        let prediction = match predict(
+            observable_source,
+            sat,
+            x_true,
+            t_rx,
+            PredictOptions::default(),
+        ) {
+            Ok(prediction) => prediction,
+            Err(_) => continue,
+        };
+        if prediction.elevation_deg >= 15.0 {
+            observations.push(Observation {
+                satellite_id: sat,
+                pseudorange_m: prediction.geometric_range_m
+                    - C_M_S * prediction.sat_clock_s.expect("broadcast clock"),
+            });
+        }
+    }
+    assert!(
+        observations.len() >= 4,
+        "need >=4 visible QZSS CNAV observations, got {}",
+        observations.len()
+    );
+
+    let inputs = SolveInputs {
+        observations,
+        t_rx_j2000_s: t_rx,
+        t_rx_second_of_day_s: sod,
+        day_of_year: doy,
+        initial_guess: [
+            x_true[0] + 1000.0,
+            x_true[1] - 1000.0,
+            x_true[2] + 1000.0,
+            0.0,
+        ],
+        corrections: Corrections::NONE,
+        klobuchar: KlobucharCoeffs {
+            alpha: [0.0; 4],
+            beta: [0.0; 4],
+        },
+        beidou_klobuchar: None,
+        galileo_nequick: None,
+        sbas_iono: None,
+        glonass_channels: std::collections::BTreeMap::new(),
+        met: SurfaceMet {
+            pressure_hpa: 1013.25,
+            temperature_k: 288.15,
+            relative_humidity: 0.5,
+        },
+        robust: None,
+    };
+
+    let solution = solve(&store, &inputs, true).expect("QZSS CNAV SPP solve");
+    let err = distance_m(solution.position.as_array(), x_true);
+    assert!(err < 2.0, "QZSS observable-source SPP error {err} m");
+}
+
+#[test]
+fn broadcast_store_prefers_legacy_by_default_and_can_select_cnav() {
+    use crate::spp::EphemerisSource;
+
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G01 LNAV\n");
+    text.push_str(&join(G01_LINES));
+    text.push_str("> EPH G01 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("G01"));
+
+    let mut store = BroadcastStore::from_nav(&text).expect("parse mixed LNAV/CNAV store");
+    let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).unwrap();
+    assert_eq!(
+        store.message_preference(),
+        NavMessagePreference::PreferLegacy
+    );
+    let lnav = *store
+        .records()
+        .iter()
+        .find(|r| r.message == NavMessage::GpsLnav)
+        .expect("LNAV record");
+    let cnav = *store
+        .records()
+        .iter()
+        .find(|r| r.message == NavMessage::GpsCnav)
+        .expect("CNAV record");
+    let query = toe_as_j2000_s(&lnav);
+    let (_, legacy_clock) = store
+        .position_clock_at_j2000_s(sat, query)
+        .expect("default store evaluates LNAV");
+    let legacy_expected = satellite_state(
+        &lnav.elements,
+        &lnav.clock,
+        &lnav.constants(),
+        lnav.elements.toe_sow,
+        lnav.broadcast_clock_group_delay_s(),
+        false,
+    )
+    .expect("LNAV state");
+    assert_eq!(
+        legacy_clock.to_bits(),
+        legacy_expected.clock.dt_clock_total_s.to_bits()
+    );
+
+    store.set_message_preference(NavMessagePreference::PreferModern);
+    let (_, modern_clock) = store
+        .position_clock_at_j2000_s(sat, query)
+        .expect("modern store evaluates CNAV");
+    let cnav_params = cnav.cnav.expect("CNAV extension");
+    let cnav_expected = satellite_state_cnav(
+        &cnav.elements,
+        &CnavRates {
+            adot_m_s: cnav_params.adot_m_s,
+            delta_n0_dot_rad_s2: cnav_params.delta_n0_dot_rad_s2,
+        },
+        &cnav.clock,
+        &cnav.constants(),
+        cnav.elements.toe_sow,
+        cnav.broadcast_clock_group_delay_s(),
+    )
+    .expect("CNAV state");
+    assert_eq!(
+        modern_clock.to_bits(),
+        cnav_expected.clock.dt_clock_total_s.to_bits()
+    );
+}
+
+#[test]
+fn cnav_records_round_trip_through_rinex4_writer() {
+    let mut text = String::from(V4_NAV_HEADER);
+    text.push_str("> EPH G03 CNAV\n");
+    push_owned_lines(&mut text, &cnav_lines("G03"));
+    text.push_str("> EPH G04 CNV2\n");
+    push_owned_lines(&mut text, &cnv2_lines("G04"));
+
+    let recs = parse_nav(&text).expect("parse CNAV records");
+    let encoded = encode_nav(&recs);
+    assert!(
+        encoded
+            .lines()
+            .next()
+            .expect("version line")
+            .trim_start()
+            .starts_with("4.02"),
+        "CNAV output must use RINEX 4.02"
+    );
+    assert!(encoded.contains("> EPH G03 CNAV"));
+    assert!(encoded.contains("> EPH G04 CNV2"));
+    let reparsed = parse_nav(&encoded).expect("reparse encoded CNAV records");
+    assert_eq!(reparsed, recs);
+}
+
+#[test]
+fn real_brdc4_cnav_fixture_counts_and_skips_unsupported_frames() {
+    let recs = cnav_fixture_records();
+    assert_eq!(recs.len(), 6);
+    assert_eq!(
+        recs.iter()
+            .filter(|record| record.message == NavMessage::GpsLnav)
+            .count(),
+        2
+    );
+    assert_eq!(
+        recs.iter()
+            .filter(|record| record.message == NavMessage::GpsCnav)
+            .count(),
+        2
+    );
+    assert_eq!(
+        recs.iter()
+            .filter(|record| record.message == NavMessage::QzssCnav)
+            .count(),
+        1
+    );
+    assert_eq!(
+        recs.iter()
+            .filter(|record| record.message == NavMessage::QzssCnav2)
+            .count(),
+        1
+    );
+    assert!(
+        recs.iter()
+            .all(|record| record.satellite_id.system != GnssSystem::BeiDou),
+        "BeiDou CNV2 frame in the fixture must remain skipped"
+    );
+}
+
+#[test]
+fn real_brdc4_cnav_field_decode_assertions() {
+    let recs = cnav_fixture_records();
+
+    let g01 = find_record(&recs, GnssSystem::Gps, 1, NavMessage::GpsCnav);
+    assert_eq!(g01.week, 2425);
+    assert_eq!(g01.toe, broadcast_time(GnssSystem::Gps, 2425, 91_800.0));
+    assert_eq!(g01.toc, g01.toe);
+    assert_eq!(
+        g01.issue_of_data,
+        BroadcastIssue {
+            issue: 306,
+            message: NavMessage::GpsCnav,
+        }
+    );
+    assert_eq!(
+        g01.elements,
+        KeplerianElements {
+            crs: 9.717187500000e+01,
+            delta_n: 4.521259757188e-09,
+            m0: 3.002905234279e+00,
+            cuc: 4.973262548447e-06,
+            e: 1.797238946892e-03,
+            cus: 1.971609890461e-06,
+            sqrt_a: 5.153605301108e+03,
+            toe_sow: 91_800.0,
+            cic: -1.490116119385e-08,
+            omega0: 1.006204385411e+00,
+            cis: 1.676380634308e-08,
+            i0: 9.570909719607e-01,
+            crc: 3.388320312500e+02,
+            omega: 2.052880215158e-01,
+            omega_dot: -8.278859796934e-09,
+            idot: 2.317953694933e-10,
+        }
+    );
+    assert_eq!(
+        g01.clock,
+        ClockPolynomial {
+            af0: 2.357618359383e-04,
+            af1: -9.851675031314e-12,
+            af2: 0.0,
+            toc_sow: 91_800.0,
+        }
+    );
+    assert_eq!(
+        g01.group_delays,
+        BroadcastGroupDelays::cnav(
+            Some(-8.847564458847e-09),
+            Some(-2.910383045673e-10),
+            Some(5.646143108606e-09),
+            Some(-5.529727786779e-10),
+            Some(-6.693881005049e-10),
+            None,
+            None,
+        )
+    );
+    assert_eq!(
+        g01.broadcast_clock_group_delay_s().to_bits(),
+        (-8.847564458847e-09_f64 - -2.910383045673e-10_f64).to_bits()
+    );
+    assert_eq!(g01.sv_health, 1.0);
+    assert_eq!(g01.sv_accuracy_m, cnav_ura_nominal_m(0).unwrap());
+    assert_eq!(g01.fit_interval_s, Some(3.0 * SECONDS_PER_HOUR));
+    assert_eq!(
+        g01.cnav.expect("CNAV extension"),
+        CnavParameters {
+            adot_m_s: 2.273559570312e-03,
+            delta_n0_dot_rad_s2: -2.846972661500e-14,
+            top: broadcast_time(GnssSystem::Gps, 2424, 603_900.0),
+            ura_ed_index: 0,
+            ura_ned0_index: -2,
+            ura_ned1_index: 3,
+            ura_ned2_index: 2,
+            transmission_time_sow: 86_418.0,
+            flags: Some(0),
+        }
+    );
+
+    let j02_elements = KeplerianElements {
+        crs: 2.412851562500e+02,
+        delta_n: 2.005262098644e-09,
+        m0: -1.627679154799e+00,
+        cuc: 5.682930350304e-06,
+        e: 7.564717344940e-02,
+        cus: 1.508463174105e-05,
+        sqrt_a: 6.493247072229e+03,
+        toe_sow: 86_400.0,
+        cic: 3.566965460777e-07,
+        omega0: -5.759149624270e-01,
+        cis: 6.007030606270e-07,
+        i0: 6.879287396561e-01,
+        crc: -2.813398437500e+02,
+        omega: -1.583659658673e+00,
+        omega_dot: -1.984311889462e-09,
+        idot: -1.055579683417e-09,
+    };
+    let j02_clock = ClockPolynomial {
+        af0: -6.807676982135e-07,
+        af1: -1.776356839400e-13,
+        af2: 0.0,
+        toc_sow: 86_400.0,
+    };
+
+    let j02_cnav = find_record(&recs, GnssSystem::Qzss, 2, NavMessage::QzssCnav);
+    assert_eq!(j02_cnav.week, 2425);
+    assert_eq!(
+        j02_cnav.toe,
+        broadcast_time(GnssSystem::Qzss, 2425, 86_400.0)
+    );
+    assert_eq!(j02_cnav.toc, j02_cnav.toe);
+    assert_eq!(
+        j02_cnav.issue_of_data,
+        BroadcastIssue {
+            issue: 288,
+            message: NavMessage::QzssCnav,
+        }
+    );
+    assert_eq!(j02_cnav.elements, j02_elements);
+    assert_eq!(j02_cnav.clock, j02_clock);
+    assert_eq!(
+        j02_cnav.group_delays,
+        BroadcastGroupDelays::cnav(
+            Some(3.201421350241e-10),
+            Some(0.0),
+            Some(-8.731149137020e-10),
+            Some(-1.455191522837e-10),
+            Some(-4.365574568510e-10),
+            None,
+            None,
+        )
+    );
+    assert_eq!(j02_cnav.sv_health, 0.0);
+    assert_eq!(j02_cnav.sv_accuracy_m, cnav_ura_nominal_m(-8).unwrap());
+    assert_eq!(j02_cnav.fit_interval_s, Some(3.0 * SECONDS_PER_HOUR));
+    assert_eq!(
+        j02_cnav.cnav.expect("CNAV extension"),
+        CnavParameters {
+            adot_m_s: 7.648849487305e-02,
+            delta_n0_dot_rad_s2: -2.609579611854e-13,
+            top: broadcast_time(GnssSystem::Qzss, 2425, 86_400.0),
+            ura_ed_index: -8,
+            ura_ned0_index: -3,
+            ura_ned1_index: 0,
+            ura_ned2_index: 0,
+            transmission_time_sow: 82_806.0,
+            flags: None,
+        }
+    );
+
+    let j02_cnv2 = find_record(&recs, GnssSystem::Qzss, 2, NavMessage::QzssCnav2);
+    assert_eq!(j02_cnv2.elements, j02_elements);
+    assert_eq!(j02_cnv2.clock, j02_clock);
+    assert_eq!(
+        j02_cnv2.group_delays,
+        BroadcastGroupDelays::cnav(
+            Some(2.619344741106e-10),
+            Some(0.0),
+            Some(-8.440110832453e-10),
+            Some(-1.164153218269e-10),
+            Some(-4.074536263943e-10),
+            Some(-2.910383045673e-10),
+            Some(-1.164153218269e-10),
+        )
+    );
+    assert_eq!(
+        j02_cnv2.cnav.expect("CNV2 extension"),
+        CnavParameters {
+            adot_m_s: 7.648849487305e-02,
+            delta_n0_dot_rad_s2: -2.609579611854e-13,
+            top: broadcast_time(GnssSystem::Qzss, 2425, 86_400.0),
+            ura_ed_index: -8,
+            ura_ned0_index: -3,
+            ura_ned1_index: 0,
+            ura_ned2_index: 0,
+            transmission_time_sow: 82_872.0,
+            flags: None,
+        }
+    );
+}
+
+#[test]
+fn real_brdc4_lnav_cnav_cross_check_within_model_bounds() {
+    let recs = cnav_fixture_records();
+    let mut saw_clock_difference = false;
+    for prn in [1, 3] {
+        let lnav = find_record(&recs, GnssSystem::Gps, prn, NavMessage::GpsLnav);
+        let cnav = find_record(&recs, GnssSystem::Gps, prn, NavMessage::GpsCnav);
+        assert_ne!(
+            lnav.clock.af0.to_bits(),
+            cnav.clock.af0.to_bits(),
+            "fixture must compare independently decoded LNAV and CNAV clocks"
+        );
+
+        let lnav_tgd = lnav.group_delays.gps_tgd_s.expect("LNAV TGD");
+        let cnav_tgd = cnav.group_delays.gps_tgd_s.expect("CNAV TGD");
+        assert!(
+            (cnav_tgd - lnav_tgd).abs() <= 4.0e-9,
+            "G{prn:02} TGD difference too large"
+        );
+        assert!(
+            (cnav.broadcast_clock_group_delay_s() - lnav_tgd).abs() <= 6.0e-9,
+            "G{prn:02} L1 C/A correction differs too much from LNAV TGD"
+        );
+
+        for t_sow in [
+            cnav.elements.toe_sow - 1.5 * SECONDS_PER_HOUR,
+            cnav.elements.toe_sow,
+            lnav.elements.toe_sow,
+            cnav.elements.toe_sow + 1.5 * SECONDS_PER_HOUR,
+        ] {
+            let lnav_state = satellite_state(
+                &lnav.elements,
+                &lnav.clock,
+                &lnav.constants(),
+                t_sow,
+                lnav.broadcast_clock_group_delay_s(),
+                false,
+            )
+            .expect("LNAV state");
+            let cnav_state = satellite_state_cnav(
+                &cnav.elements,
+                &cnav_rates_from_record(cnav),
+                &cnav.clock,
+                &cnav.constants(),
+                t_sow,
+                cnav.broadcast_clock_group_delay_s(),
+            )
+            .expect("CNAV state");
+            let position_difference = distance_m(
+                lnav_state
+                    .orbit
+                    .position()
+                    .expect("LNAV position")
+                    .as_array(),
+                cnav_state
+                    .orbit
+                    .position()
+                    .expect("CNAV position")
+                    .as_array(),
+            );
+            assert!(
+                position_difference <= 8.0,
+                "G{prn:02} position differs by {position_difference} m at {t_sow}"
+            );
+            let lnav_clock_model = lnav_state.clock.dt_clock_poly_s + lnav_state.clock.dt_rel_s;
+            let cnav_clock_model = cnav_state.clock.dt_clock_poly_s + cnav_state.clock.dt_rel_s;
+            let clock_difference = (lnav_clock_model - cnav_clock_model).abs();
+            saw_clock_difference |= clock_difference > 0.0;
+            assert!(
+                clock_difference <= 20.0e-9,
+                "G{prn:02} clock model differs by {clock_difference} s at {t_sow}"
+            );
+        }
+    }
+    assert!(
+        saw_clock_difference,
+        "LNAV/CNAV clock comparison must not collapse to identical records"
+    );
+}
+
+#[test]
+fn real_brdc4_store_selects_qzss_cnav_and_keeps_legacy_preference() {
+    use crate::spp::EphemerisSource;
+
+    let text = cnav_fixture_text();
+    let recs = parse_nav(&text).expect("parse real CNAV fixture");
+    let store = BroadcastStore::from_nav(&text).expect("build default store");
+    assert_eq!(
+        store
+            .records()
+            .iter()
+            .filter(|record| record.message == NavMessage::GpsCnav)
+            .count(),
+        0,
+        "real GPS CNAV records in this trim have nonzero health"
+    );
+    assert_eq!(
+        store
+            .records()
+            .iter()
+            .filter(|record| record.message == NavMessage::QzssCnav)
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .records()
+            .iter()
+            .filter(|record| record.message == NavMessage::QzssCnav2)
+            .count(),
+        1
+    );
+
+    let qzss = find_record(&recs, GnssSystem::Qzss, 2, NavMessage::QzssCnav);
+    let query = toe_as_j2000_s(qzss);
+    let (position, clock) = store
+        .position_clock_at_j2000_s(qzss.satellite_id, query)
+        .expect("default store evaluates QZSS CNAV");
+    let expected = satellite_state_cnav(
+        &qzss.elements,
+        &cnav_rates_from_record(qzss),
+        &qzss.clock,
+        &qzss.constants(),
+        qzss.elements.toe_sow,
+        qzss.broadcast_clock_group_delay_s(),
+    )
+    .expect("QZSS CNAV state");
+    let expected_position = expected.orbit.position().expect("QZSS position").as_array();
+    assert_eq!(
+        position.map(f64::to_bits),
+        expected_position.map(f64::to_bits)
+    );
+    assert_eq!(clock.to_bits(), expected.clock.dt_clock_total_s.to_bits());
+
+    let mut all_store = BroadcastStore::new(recs.clone()).expect("manual mixed-message store");
+    let gps = find_record(&recs, GnssSystem::Gps, 1, NavMessage::GpsCnav);
+    let gps_query = toe_as_j2000_s(gps);
+    let (_, legacy_clock) = all_store
+        .position_clock_at_j2000_s(gps.satellite_id, gps_query)
+        .expect("legacy-preferred store evaluates GPS");
+    let lnav = find_record(&recs, GnssSystem::Gps, 1, NavMessage::GpsLnav);
+    let lnav_expected = satellite_state(
+        &lnav.elements,
+        &lnav.clock,
+        &lnav.constants(),
+        gps.elements.toe_sow,
+        lnav.broadcast_clock_group_delay_s(),
+        false,
+    )
+    .expect("LNAV state at CNAV toe");
+    assert_eq!(
+        legacy_clock.to_bits(),
+        lnav_expected.clock.dt_clock_total_s.to_bits()
+    );
+
+    all_store.set_message_preference(NavMessagePreference::PreferModern);
+    let (_, modern_clock) = all_store
+        .position_clock_at_j2000_s(gps.satellite_id, gps_query)
+        .expect("modern-preferred store evaluates GPS CNAV");
+    let cnav_expected = satellite_state_cnav(
+        &gps.elements,
+        &cnav_rates_from_record(gps),
+        &gps.clock,
+        &gps.constants(),
+        gps.elements.toe_sow,
+        gps.broadcast_clock_group_delay_s(),
+    )
+    .expect("GPS CNAV state");
+    assert_eq!(
+        modern_clock.to_bits(),
+        cnav_expected.clock.dt_clock_total_s.to_bits()
+    );
 }
 
 #[test]
@@ -1845,6 +3233,7 @@ fn broadcast_store_rejects_unsupported_systems() {
             toc_sow: 0.0,
         },
         group_delays: BroadcastGroupDelays::default(),
+        cnav: None,
         sv_health: 0.0,
         sv_accuracy_m: 0.0,
         fit_interval_s: None,
@@ -1937,6 +3326,7 @@ fn gps_fit_interval_bounds_record_validity() {
             toc_sow: 0.0,
         },
         group_delays: BroadcastGroupDelays::default(),
+        cnav: None,
         sv_health: 0.0,
         sv_accuracy_m: 0.0,
         fit_interval_s,
@@ -2013,6 +3403,7 @@ fn select_prefers_a_valid_farther_record_over_an_expired_nearer_one() {
             toc_sow: toe_sow,
         },
         group_delays: BroadcastGroupDelays::default(),
+        cnav: None,
         sv_health: 0.0,
         sv_accuracy_m: 0.0,
         fit_interval_s,

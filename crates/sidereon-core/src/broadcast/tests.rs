@@ -90,12 +90,118 @@ fn clock_from(v: &Value) -> ClockPolynomial {
     }
 }
 
+fn cnav_rates_from(v: &Value) -> CnavRates {
+    CnavRates {
+        adot_m_s: b(v, "adot_m_s"),
+        delta_n0_dot_rad_s2: b(v, "delta_n0_dot_rad_s2"),
+    }
+}
+
 fn consts_for(system: &str) -> ConstellationConstants {
     match system {
         "GPS" => ConstellationConstants::GPS,
+        "QZS" => ConstellationConstants::GPS,
         "GAL" => ConstellationConstants::GALILEO,
         "BDS" => ConstellationConstants::BEIDOU,
         other => panic!("unknown system {other}"),
+    }
+}
+
+fn legacy_satellite_position_ecef_reference(
+    elements: &KeplerianElements,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+    is_geo: bool,
+) -> OrbitState {
+    let sqrt_a = elements.sqrt_a;
+    let e = elements.e;
+    let gm = consts.gm_m3_s2;
+    let omega_e = consts.omega_e_rad_s;
+
+    let a = sqrt_a * sqrt_a;
+    let n0 = (gm / (a * a * a)).sqrt();
+    let n = n0 + elements.delta_n;
+
+    let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
+
+    let mk = elements.m0 + n * tk;
+    let kepler = eccentric_anomaly_unchecked(mk, e);
+    let ecc_anom = kepler.value;
+    let sin_e = ecc_anom.sin();
+    let cos_e = ecc_anom.cos();
+
+    let e2 = e * e;
+    let nu = ((1.0 - e2).sqrt() * sin_e).atan2(cos_e - e);
+    let phi = nu + elements.omega;
+
+    let two_phi = 2.0 * phi;
+    let s2 = two_phi.sin();
+    let c2 = two_phi.cos();
+    let du = elements.cus * s2 + elements.cuc * c2;
+    let dr = elements.crs * s2 + elements.crc * c2;
+    let di = elements.cis * s2 + elements.cic * c2;
+
+    let u = phi + du;
+    let r = a * (1.0 - e * cos_e) + dr;
+    let i = elements.i0 + di + elements.idot * tk;
+
+    let xp = r * u.cos();
+    let yp = r * u.sin();
+
+    let omega_k = if is_geo {
+        elements.omega0 + elements.omega_dot * tk - omega_e * elements.toe_sow
+    } else {
+        elements.omega0 + (elements.omega_dot - omega_e) * tk - omega_e * elements.toe_sow
+    };
+
+    let sin_o = omega_k.sin();
+    let cos_o = omega_k.cos();
+    let sin_i = i.sin();
+    let cos_i = i.cos();
+    let xg = xp * cos_o - yp * cos_i * sin_o;
+    let yg = xp * sin_o + yp * cos_i * cos_o;
+    let zg = yp * sin_i;
+
+    let (x, y, z) = if is_geo {
+        let deg5 = 5.0_f64.to_radians();
+        let cos_phi = deg5.cos();
+        let sin_phi = -deg5.sin();
+        let z_ang = omega_e * tk;
+        let cos_z = z_ang.cos();
+        let sin_z = z_ang.sin();
+        let yr = yg * cos_phi + zg * sin_phi;
+        let zr = -yg * sin_phi + zg * cos_phi;
+        (xg * cos_z + yr * sin_z, -xg * sin_z + yr * cos_z, zr)
+    } else {
+        (xg, yg, zg)
+    };
+
+    OrbitState {
+        a,
+        n0,
+        n,
+        tk,
+        mk,
+        eccentric_anomaly: ecc_anom,
+        kepler_iterations: kepler.iterations,
+        sin_e,
+        cos_e,
+        nu,
+        phi,
+        s2,
+        c2,
+        du,
+        dr,
+        di,
+        u,
+        r,
+        i,
+        xp,
+        yp,
+        omega_k,
+        x_m: x,
+        y_m: y,
+        z_m: z,
     }
 }
 
@@ -154,6 +260,26 @@ fn pinned_constants_match_the_recipe() {
             0,
             "{name} dtr_f"
         );
+    }
+}
+
+#[test]
+fn lnav_position_refactor_preserves_legacy_bits() {
+    let doc = read_fixture("broadcast_golden.json");
+    let cases = doc["cases"].as_array().expect("cases array");
+    assert!(!cases.is_empty(), "fixture has no cases");
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let system = case["system"].as_str().unwrap();
+        let consts = consts_for(system);
+        let elems = elements_from(&case["elements_hex"]);
+        let t_sow = bits(case["t_sow_hex"].as_str().unwrap());
+        let is_geo = case["is_geo"].as_bool().unwrap_or(false);
+
+        let before = legacy_satellite_position_ecef_reference(&elems, &consts, t_sow, is_geo);
+        let after = satellite_position_ecef_unchecked(&elems, &consts, t_sow, is_geo);
+        assert_eq!(after, before, "{name}: refactored legacy orbit changed");
     }
 }
 
@@ -271,6 +397,178 @@ fn satellite_state_combines_orbit_and_clock_consistently() {
             combined.clock, split_clock,
             "{name}: combined clock != split"
         );
+    }
+}
+
+#[test]
+fn cnav_rates_drive_time_dependent_axis_and_mean_motion() {
+    let elems = KeplerianElements {
+        sqrt_a: 5153.707128525,
+        e: 0.01000394229777,
+        m0: 0.6342094507864,
+        delta_n: 4.304822170265e-9,
+        omega0: 2.572838528869,
+        i0: 0.9806518601091,
+        omega: 0.7941703015008,
+        omega_dot: -8.384634967987e-9,
+        idot: -5.714523747137e-11,
+        cuc: -2.177432179451e-6,
+        cus: 1.9371509552e-6,
+        crc: 353.96875,
+        crs: -39.6875,
+        cic: -1.508742570877e-7,
+        cis: 1.359730958939e-7,
+        toe_sow: 360_000.0,
+    };
+    let rates = CnavRates {
+        adot_m_s: 0.125,
+        delta_n0_dot_rad_s2: 1.0e-18,
+    };
+    let t_sow = elems.toe_sow + 1800.0;
+    let orbit = satellite_position_ecef_cnav(&elems, &rates, &ConstellationConstants::GPS, t_sow)
+        .expect("valid CNAV orbit");
+
+    let tk = time_from_reference_s(t_sow, elems.toe_sow);
+    let a0 = elems.sqrt_a * elems.sqrt_a;
+    let n0 = (ConstellationConstants::GPS.gm_m3_s2 / (a0 * a0 * a0)).sqrt();
+    let expected_a = a0 + rates.adot_m_s * tk;
+    let expected_delta_n = elems.delta_n + 0.5 * rates.delta_n0_dot_rad_s2 * tk;
+    let expected_n = n0 + expected_delta_n;
+
+    assert_eq!(orbit.tk.to_bits(), tk.to_bits());
+    assert_eq!(orbit.a.to_bits(), expected_a.to_bits());
+    assert_eq!(orbit.n.to_bits(), expected_n.to_bits());
+    assert!(
+        orbit.position().is_ok(),
+        "CNAV evaluation should produce a finite ECEF position"
+    );
+}
+
+#[test]
+fn cnav_broadcast_eval_is_zero_ulp_against_recipe() {
+    let doc = read_fixture("cnav_broadcast_golden.json");
+
+    assert_eq!(
+        ulp_distance(bits(doc["kepler_tol_hex"].as_str().unwrap()), KEPLER_TOL),
+        0
+    );
+    assert_eq!(
+        doc["kepler_max_iter"].as_u64().unwrap() as usize,
+        KEPLER_MAX_ITER
+    );
+    assert_eq!(
+        doc["clock_max_iter"].as_u64().unwrap() as usize,
+        CLOCK_MAX_ITER
+    );
+    assert_eq!(
+        ulp_distance(
+            bits(doc["seconds_per_week_hex"].as_str().unwrap()),
+            SECONDS_PER_WEEK
+        ),
+        0
+    );
+    assert_eq!(
+        ulp_distance(bits(doc["half_week_s_hex"].as_str().unwrap()), HALF_WEEK_S),
+        0
+    );
+
+    for (name, c) in [
+        ("GPS", ConstellationConstants::GPS),
+        ("QZS", ConstellationConstants::GPS),
+    ] {
+        let f = &doc["constellations"][name];
+        assert_eq!(
+            ulp_distance(bits(f["gm_m3_s2_hex"].as_str().unwrap()), c.gm_m3_s2),
+            0,
+            "{name} GM"
+        );
+        assert_eq!(
+            ulp_distance(
+                bits(f["omega_e_rad_s_hex"].as_str().unwrap()),
+                c.omega_e_rad_s
+            ),
+            0,
+            "{name} omega_e"
+        );
+        assert_eq!(
+            ulp_distance(bits(f["dtr_f_hex"].as_str().unwrap()), c.dtr_f),
+            0,
+            "{name} dtr_f"
+        );
+    }
+
+    let cases = doc["cases"].as_array().expect("cases array");
+    assert_eq!(
+        cases.len(),
+        20,
+        "fixture should cover four records at five epochs"
+    );
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let system = case["system"].as_str().unwrap();
+        let consts = consts_for(system);
+        let elems = elements_from(&case["elements_hex"]);
+        let rates = cnav_rates_from(&case["rates_hex"]);
+        let clock = clock_from(&case["clock_hex"]);
+        let t_sow = bits(case["t_sow_hex"].as_str().unwrap());
+        let tgd = bits(case["tgd_s_hex"].as_str().unwrap());
+
+        let orbit = satellite_position_ecef_cnav(&elems, &rates, &consts, t_sow)
+            .expect("valid CNAV orbit inputs");
+        let state = satellite_state_cnav(&elems, &rates, &clock, &consts, t_sow, tgd)
+            .expect("valid CNAV state inputs");
+        assert_eq!(state.orbit, orbit, "{name}: combined orbit != split");
+
+        let ex = &case["expect_hex"];
+        let chk = |key: &str, got: f64| {
+            let want = bits(
+                ex[key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{name}: missing {key}")),
+            );
+            let d = ulp_distance(want, got);
+            assert_eq!(
+                d, 0,
+                "{name}: {key} diverged: got={got:?} want={want:?} ({d} ULP)"
+            );
+        };
+
+        chk("a", orbit.a);
+        chk("n0", orbit.n0);
+        chk("n", orbit.n);
+        chk("tk", orbit.tk);
+        chk("mk", orbit.mk);
+        chk("eccentric_anomaly", orbit.eccentric_anomaly);
+        chk("sin_e", orbit.sin_e);
+        chk("cos_e", orbit.cos_e);
+        chk("nu", orbit.nu);
+        chk("phi", orbit.phi);
+        chk("s2", orbit.s2);
+        chk("c2", orbit.c2);
+        chk("du", orbit.du);
+        chk("dr", orbit.dr);
+        chk("di", orbit.di);
+        chk("u", orbit.u);
+        chk("r", orbit.r);
+        chk("i", orbit.i);
+        chk("xp", orbit.xp);
+        chk("yp", orbit.yp);
+        chk("omega_k", orbit.omega_k);
+        chk("x_m", orbit.x_m);
+        chk("y_m", orbit.y_m);
+        chk("z_m", orbit.z_m);
+
+        assert_eq!(
+            orbit.kepler_iterations,
+            case["kepler_iterations"].as_u64().unwrap() as usize,
+            "{name}: kepler iteration count diverged"
+        );
+
+        chk("dt_clock_poly_s", state.clock.dt_clock_poly_s);
+        chk("dt_rel_s", state.clock.dt_rel_s);
+        chk("tgd_s", state.clock.tgd_s);
+        chk("dt_clock_total_s", state.clock.dt_clock_total_s);
     }
 }
 

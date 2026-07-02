@@ -1144,10 +1144,14 @@ fn nav_sort_key(record: &BroadcastRecord) -> (GnssSystem, u8, u32, u64, u8) {
 const fn nav_message_rank(message: NavMessage) -> u8 {
     match message {
         NavMessage::GpsLnav => 0,
-        NavMessage::GalileoInav => 1,
-        NavMessage::GalileoFnav => 2,
-        NavMessage::BeidouD1 => 3,
-        NavMessage::BeidouD2 => 4,
+        NavMessage::GpsCnav => 1,
+        NavMessage::GpsCnav2 => 2,
+        NavMessage::QzssCnav => 3,
+        NavMessage::QzssCnav2 => 4,
+        NavMessage::GalileoInav => 5,
+        NavMessage::GalileoFnav => 6,
+        NavMessage::BeidouD1 => 7,
+        NavMessage::BeidouD2 => 8,
     }
 }
 
