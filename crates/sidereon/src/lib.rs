@@ -175,9 +175,9 @@ use std::path::Path;
 pub use sidereon_core::quality::spp_robust_fde_driver;
 pub use sidereon_core::{
     antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
-    constellation, data, dgnss, ephemeris, frequencies, geometry, ils, navigation, observables,
-    orbit, positioning, ppp_corrections, quality, rinex, rtcm, rtk, sbas, signal, ssr, staleness,
-    terrain, tides, velocity,
+    constellation, data, dgnss, ephemeris, frequencies, geometry, ils, navigation, nmea,
+    observables, orbit, positioning, ppp_corrections, quality, rinex, rtcm, rtk, sbas, signal, ssr,
+    staleness, terrain, tides, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
@@ -696,6 +696,26 @@ impl<'a> PppFixedConfig<'a> {
 /// ```
 pub fn load_sp3(bytes: &[u8]) -> Result<Sp3> {
     Sp3::parse(bytes).map_err(Error::Sp3)
+}
+
+/// Parse NMEA 0183 bytes into typed sentences with non-fatal diagnostics.
+pub fn parse_nmea(input: &[u8]) -> nmea::Parsed<nmea::NmeaLog> {
+    nmea::parse_nmea(input)
+}
+
+/// Parse and group NMEA 0183 bytes into completed epoch snapshots.
+pub fn nmea_epochs(input: &[u8]) -> (Vec<nmea::EpochSnapshot>, nmea::Diagnostics) {
+    let parsed = nmea::parse_nmea(input);
+    let epochs = nmea::group_epochs(&parsed.value);
+    (epochs, parsed.diagnostics)
+}
+
+/// Serialize a fixed-format, checksummed GGA sentence.
+pub fn write_gga(
+    talker: nmea::NmeaTalker,
+    gga: &nmea::Gga,
+) -> std::result::Result<String, nmea::NmeaError> {
+    nmea::write_gga(talker, gga)
 }
 
 /// Parse ANTEX text into receiver and satellite antenna calibrations.
