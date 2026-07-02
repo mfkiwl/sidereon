@@ -129,8 +129,6 @@ pub enum EquinoctialError {
     ParabolicEquinoctial,
 }
 
-impl Eq for EquinoctialError {}
-
 /// Convert classical elements to mean-longitude equinoctial elements.
 pub fn coe2eq(
     coe: &ClassicalElements,

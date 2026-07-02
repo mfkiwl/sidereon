@@ -50,11 +50,12 @@ pub fn lunar_solar_eclipses(
                 if beta.abs() >= SOLAR_NODE_LIMIT_DEG {
                     continue;
                 }
-                if let Some(time_maximum) =
-                    find_minimum_time(phase.time, time_tolerance_seconds, |time| {
-                        Ok(solar_geometry(source, time)?.gamma)
-                    })?
-                {
+                if let Some(time_maximum) = find_minimum_time(
+                    phase.time,
+                    (padded_start, padded_end),
+                    time_tolerance_seconds,
+                    |time| Ok(solar_geometry(source, time)?.gamma),
+                )? {
                     if time_maximum < start || time_maximum > end {
                         continue;
                     }
@@ -68,11 +69,12 @@ pub fn lunar_solar_eclipses(
                 if beta.abs() >= LUNAR_NODE_LIMIT_DEG {
                     continue;
                 }
-                if let Some(time_maximum) =
-                    find_minimum_time(phase.time, time_tolerance_seconds, |time| {
-                        lunar_sigma(source, time)
-                    })?
-                {
+                if let Some(time_maximum) = find_minimum_time(
+                    phase.time,
+                    (padded_start, padded_end),
+                    time_tolerance_seconds,
+                    |time| lunar_sigma(source, time),
+                )? {
                     if time_maximum < start || time_maximum > end {
                         continue;
                     }
@@ -90,14 +92,29 @@ pub fn lunar_solar_eclipses(
 
 fn find_minimum_time<F>(
     center: UtcInstant,
+    bounds: (UtcInstant, UtcInstant),
     time_tolerance_seconds: f64,
     scalar_fn: F,
 ) -> Result<Option<UtcInstant>, AlmanacError>
 where
     F: Fn(UtcInstant) -> Result<f64, AlmanacError>,
 {
-    let start = offset_instant(center, -ECLIPSE_PAD_SECONDS);
-    let end = offset_instant(center, ECLIPSE_PAD_SECONDS);
+    // Clamp the extremum sub-window to the range the moon-phase scan already
+    // proved in-coverage. A phase within ECLIPSE_PAD_SECONDS of an SPK segment
+    // edge would otherwise push a sample past the kernel coverage and raise a
+    // spurious error for an eclipse whose maximum is itself in coverage.
+    let window_start = offset_instant(center, -ECLIPSE_PAD_SECONDS);
+    let window_end = offset_instant(center, ECLIPSE_PAD_SECONDS);
+    let start = if window_start > bounds.0 {
+        window_start
+    } else {
+        bounds.0
+    };
+    let end = if window_end < bounds.1 {
+        window_end
+    } else {
+        bounds.1
+    };
     let finder = event_finder(
         start,
         end,

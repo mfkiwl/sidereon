@@ -262,7 +262,6 @@ impl BroadcastStore {
             None
         }
     }
-
 }
 
 fn validate_manual_record(record: &BroadcastRecord) -> CoreResult<()> {
