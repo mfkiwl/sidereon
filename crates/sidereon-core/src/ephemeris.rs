@@ -16,8 +16,8 @@ pub use crate::broadcast::{
     EccentricAnomaly, KeplerianElements, OrbitState, SatelliteState,
 };
 pub use crate::rinex_nav::{
-    is_beidou_geo, BroadcastGroupDelayTerm, BroadcastGroupDelays, BroadcastRecord, GlonassRecord,
-    IonoCorrections, KlobucharAlphaBeta, LnavRecordError, NavMessage,
+    is_beidou_geo, BroadcastGroupDelayTerm, BroadcastGroupDelays, BroadcastIssue, BroadcastRecord,
+    GlonassRecord, IonoCorrections, KlobucharAlphaBeta, LnavRecordError, NavMessage,
 };
 pub use crate::sp3::{
     align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
@@ -109,7 +109,10 @@ mod tests {
             satellite_id: crate::GnssSatelliteId::new(GnssSystem::Galileo, 1)
                 .expect("valid satellite"),
             message: NavMessage::GalileoInav,
-            iode: None,
+            issue_of_data: BroadcastIssue {
+                issue: 0,
+                message: NavMessage::GalileoInav,
+            },
             week: 2_400,
             toe: crate::astro::time::model::GnssWeekTow::new(
                 crate::astro::time::model::TimeScale::Gst,

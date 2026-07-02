@@ -8,7 +8,7 @@
 //!
 //! Round-trip scope. The canonical IR is the parsed [`BroadcastRecord`] set, not
 //! the original bytes: fields the record does not retain (a Galileo data-source
-//! word, IODC, transmission time) are written as canonical values that
+//! word and transmission time) are written as canonical values that
 //! re-decode to the same record - e.g. the data-source word is emitted as the
 //! one bit pattern that classifies the stored [`super::NavMessage`]. Numeric
 //! fields use the RINEX `D19.12` width, the same 13-significant-figure grid the
@@ -72,7 +72,7 @@ fn write_record(out: &mut String, record: &BroadcastRecord) {
     write_orbit(
         out,
         [
-            record.iode.map(f64::from).unwrap_or(0.0),
+            f64::from(record.issue_of_data.issue),
             e.crs,
             e.delta_n,
             e.m0,

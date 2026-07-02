@@ -11,8 +11,8 @@ use crate::spp::EphemerisSource;
 
 use super::{
     is_beidou_geo, parse_glonass, parse_iono_corrections_checked, parse_leap_seconds_checked,
-    parse_nav, BroadcastGroupDelays, BroadcastRecord, GlonassRecord, IonoCorrections, NavMessage,
-    NavParseError, GLONASS_MAX_AGE_S, MAX_EPHEMERIS_AGE_S,
+    parse_nav, BroadcastGroupDelays, BroadcastIssue, BroadcastRecord, GlonassRecord,
+    IonoCorrections, NavMessage, NavParseError, GLONASS_MAX_AGE_S, MAX_EPHEMERIS_AGE_S,
 };
 
 /// A queryable set of parsed broadcast records, usable as an SPP
@@ -134,7 +134,7 @@ impl BroadcastStore {
         self.records
             .iter()
             .filter(|r| r.satellite_id == sat)
-            .filter(|r| r.iode == Some(iode))
+            .filter(|r| r.issue_of_data.issue == u32::from(iode))
             .filter(|r| (t_continuous - Self::toe_continuous_s(r)).abs() <= Self::half_window_s(r))
             .min_by(|a, b| {
                 let da = (t_continuous - Self::toe_continuous_s(a)).abs();
@@ -207,6 +207,34 @@ impl BroadcastStore {
             })
     }
 
+    /// Select the broadcast record matching a specific issue and message at the
+    /// query epoch.
+    pub fn select_by_issue_at(
+        &self,
+        sat: GnssSatelliteId,
+        issue: BroadcastIssue,
+        nav_message: NavMessage,
+        t_j2000_s: f64,
+    ) -> Option<&BroadcastRecord> {
+        if issue.message != nav_message {
+            return None;
+        }
+        let (t_continuous_s, _) = query_continuous_time(sat, t_j2000_s)?;
+        self.records
+            .iter()
+            .filter(|r| {
+                r.satellite_id == sat
+                    && r.message == nav_message
+                    && r.issue_of_data == issue
+                    && (t_continuous_s - Self::toe_continuous_s(r)).abs() <= Self::half_window_s(r)
+            })
+            .min_by(|a, b| {
+                let da = (t_continuous_s - Self::toe_continuous_s(a)).abs();
+                let db = (t_continuous_s - Self::toe_continuous_s(b)).abs();
+                da.partial_cmp(&db).unwrap_or(core::cmp::Ordering::Equal)
+            })
+    }
+
     /// The GLONASS record for `sat` nearest the GPST-aligned query `t_j2000_s`
     /// (within [`GLONASS_MAX_AGE_S`]), with `tk` = query − the record's reference
     /// epoch in GPS time. Returns `None` if no leap-second offset was parsed (the
@@ -234,6 +262,7 @@ impl BroadcastStore {
             None
         }
     }
+
 }
 
 fn validate_manual_record(record: &BroadcastRecord) -> CoreResult<()> {
@@ -329,17 +358,11 @@ impl EphemerisSource for BroadcastStore {
         // QZSS/SBAS) reports no ephemeris rather than being evaluated with the
         // wrong model. (`from_nav` already restricts records, but `new` accepts
         // arbitrary ones.)
-        if !matches!(
-            sat.system,
-            GnssSystem::Gps | GnssSystem::Galileo | GnssSystem::BeiDou
-        ) {
-            return None;
-        }
-
         // Map the receive instant (J2000, GPST-aligned) onto the satellite
         // system's continuous time and seconds of week. BeiDou runs on BDT
         // (= GPST - 14 s) with its week epoch 1356 weeks after the GPS epoch, and
         // its geostationary satellites take the GEO orbit branch.
+        // `query_continuous_time` returns None for non-Keplerian systems.
         let (t_continuous, is_geo) = query_continuous_time(sat, t_j2000_s)?;
 
         let rec = self.select(sat, t_continuous)?;

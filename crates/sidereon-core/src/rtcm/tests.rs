@@ -850,6 +850,7 @@ fn message_enum_is_matched_exhaustively_without_wildcard() {
         Message::AntennaDescriptor(a) => a.message_number,
         Message::GpsEphemeris(_) => 1019,
         Message::GlonassEphemeris(_) => 1020,
+        Message::Ssr(s) => s.message_number,
         Message::Unsupported(u) => u.message_number,
     };
     assert_eq!(number, 1005);
