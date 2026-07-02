@@ -144,6 +144,7 @@ pub use frame::{
     Wgs84Geodetic,
 };
 pub use geoid::{
-    ellipsoidal_height_m, geoid_undulation, orthometric_height_m, GeoidError, GeoidGrid,
+    egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
+    geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, GeoidError, GeoidGrid,
 };
 pub use id::{GnssSatelliteId, GnssSystem, SatelliteIdError};
