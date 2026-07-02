@@ -462,6 +462,65 @@ fn teme_to_gcrs_compute_unchecked(
     }
 }
 
+/// Core GCRS->TEME transform. Returns ((px,py,pz), (vx,vy,vz)).
+///
+/// This is the rotational inverse of [`teme_to_gcrs_compute`]: it uses the
+/// transpose of the same orthogonal matrix and adds no new precession or
+/// nutation math.
+pub fn gcrs_to_teme_compute(
+    state: &TemeStateKm,
+    ts: &TimeScales,
+    skyfield_compat: bool,
+) -> Result<(Vec3, Vec3), FrameTransformError> {
+    validate_time_scales(ts)?;
+    validate_vec3("position_km", &state.position_km)?;
+    validate_vec3("velocity_km_s", &state.velocity_km_s)?;
+    let (position, velocity) = gcrs_to_teme_compute_unchecked(state, ts, skyfield_compat);
+    Ok((
+        validate_tuple3("teme_position_km", position)?,
+        validate_tuple3("teme_velocity_km_s", velocity)?,
+    ))
+}
+
+fn gcrs_to_teme_compute_unchecked(
+    state: &TemeStateKm,
+    ts: &TimeScales,
+    skyfield_compat: bool,
+) -> (Vec3, Vec3) {
+    let [x, y, z] = state.position_km;
+    let [vx, vy, vz] = state.velocity_km_s;
+    let t = inline_tr(&build_teme_to_gcrs_matrix(ts, skyfield_compat));
+
+    if skyfield_compat {
+        let r_au = [x / AU_KM, y / AU_KM, z / AU_KM];
+        let r_teme_au = mat3_vec3_mul_fma(&t, &r_au);
+        let r_teme = (
+            r_teme_au[0] * AU_KM,
+            r_teme_au[1] * AU_KM,
+            r_teme_au[2] * AU_KM,
+        );
+
+        let v_au_d = [
+            vx / AU_KM * SECONDS_PER_DAY,
+            vy / AU_KM * SECONDS_PER_DAY,
+            vz / AU_KM * SECONDS_PER_DAY,
+        ];
+        let v_teme_au_d = mat3_vec3_mul_fma(&t, &v_au_d);
+        let v_teme = (
+            v_teme_au_d[0] * AU_KM / SECONDS_PER_DAY,
+            v_teme_au_d[1] * AU_KM / SECONDS_PER_DAY,
+            v_teme_au_d[2] * AU_KM / SECONDS_PER_DAY,
+        );
+        (r_teme, v_teme)
+    } else {
+        let r_gcrs = [x, y, z];
+        let r_t = mat3_vec3_mul_unchecked(&t, &r_gcrs);
+        let v_gcrs = [vx, vy, vz];
+        let v_t = mat3_vec3_mul_unchecked(&t, &v_gcrs);
+        ((r_t[0], r_t[1], r_t[2]), (v_t[0], v_t[1], v_t[2]))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GCRS -> ITRS (Earth-fixed / ECEF)
 // ---------------------------------------------------------------------------
@@ -1321,6 +1380,39 @@ mod tests {
             [zero_back.0, zero_back.1, zero_back.2],
             [legacy_back.0, legacy_back.1, legacy_back.2],
         );
+    }
+
+    #[test]
+    fn gcrs_to_teme_inverts_teme_to_gcrs() {
+        let ts = TimeScales::from_utc(2020, 6, 24, 12, 34, 56.0).expect("valid UTC instant");
+        let teme = TemeStateKm {
+            position_km: [6524.834, 6862.875, 6448.296],
+            velocity_km_s: [4.901327, 5.533756, -1.976341],
+        };
+
+        for skyfield_compat in [false, true] {
+            let (gcrs_position, gcrs_velocity) =
+                teme_to_gcrs_compute(&teme, &ts, skyfield_compat).expect("valid transform");
+            let gcrs = TemeStateKm {
+                position_km: [gcrs_position.0, gcrs_position.1, gcrs_position.2],
+                velocity_km_s: [gcrs_velocity.0, gcrs_velocity.1, gcrs_velocity.2],
+            };
+            let (round_position, round_velocity) =
+                gcrs_to_teme_compute(&gcrs, &ts, skyfield_compat).expect("valid inverse");
+
+            let pos = [round_position.0, round_position.1, round_position.2];
+            let vel = [round_velocity.0, round_velocity.1, round_velocity.2];
+            for axis in 0..3 {
+                assert!(
+                    (pos[axis] - teme.position_km[axis]).abs() <= 1.0e-9,
+                    "position axis {axis} mode {skyfield_compat}"
+                );
+                assert!(
+                    (vel[axis] - teme.velocity_km_s[axis]).abs() <= 1.0e-12,
+                    "velocity axis {axis} mode {skyfield_compat}"
+                );
+            }
+        }
     }
 
     #[test]

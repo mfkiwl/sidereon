@@ -26,7 +26,9 @@
 //!   prints the same quantities as plain decimals, so the bridge re-quantizes
 //!   them onto the assumed-decimal grid via [`crate::astro::tle`].
 
-use crate::astro::sgp4::{self, ElementSet, Error as Sgp4Error, Satellite, Sgp4InputErrorKind};
+use crate::astro::sgp4::{
+    self, ElementSet, Error as Sgp4Error, JulianDate, Satellite, Sgp4InputErrorKind,
+};
 use crate::astro::tle;
 use crate::astro::xml;
 use crate::validate;
@@ -66,7 +68,7 @@ const FIELD_TAGS: &[&str] = &[
 /// UTC calendar epoch as carried by an OMM, split into the components a KVN/XML
 /// `EPOCH` (or JSON `EPOCH`) string spells out. Stored as integers so the epoch
 /// re-encodes losslessly and converts directly to the SGP4 epoch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OmmEpoch {
     pub year: i32,
     pub month: u32,
@@ -76,6 +78,11 @@ pub struct OmmEpoch {
     pub second: u32,
     /// Fractional second expressed in whole microseconds (0..=999_999).
     pub microsecond: u32,
+    /// Fractional remainder within `microsecond`, in whole femtoseconds
+    /// (0..=999_999_999). Ordinary catalog messages usually leave this at zero;
+    /// fitted OMMs use it to avoid losing sub-microsecond split-JD precision.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub femtosecond: u32,
 }
 
 /// Canonical, format-agnostic OMM container.
@@ -85,7 +92,7 @@ pub struct OmmEpoch {
 /// motion in revolutions/day, its derivatives in rev/day^2 and rev/day^3, B\*
 /// in inverse earth-radii) and are stored as directly parsed `f64`s, so every
 /// encoding decodes to the same value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Omm {
     // -- Header / metadata --
     pub ccsds_omm_vers: String,
@@ -126,6 +133,29 @@ pub struct Omm {
     pub mean_motion_dot: f64,
     /// Second derivative of mean motion, rev/day^3.
     pub mean_motion_ddot: f64,
+    /// Exact split SGP4 epoch for in-memory producers that already have the
+    /// split JD. CCSDS encodings do not carry this side channel; parsed catalog
+    /// messages leave it `None` and rebuild the split from `epoch`.
+    ///
+    /// Scope: this preserves the producer's exact `(whole, fraction)` split
+    /// *in memory only*. Through encode -> reparse the epoch travels as the
+    /// femtosecond-rounded calendar text and is rebuilt as a canonical
+    /// midnight-anchored split: the same instant to femtosecond precision (and
+    /// bit-identical when the producer's split was already midnight-anchored),
+    /// but not necessarily the same split representation, which SGP4's split
+    /// tsince subtraction is sensitive to at the last ULP.
+    #[serde(default, skip)]
+    pub exact_sgp4_epoch: Option<JulianDate>,
+    /// Whether TLE-derived GP fields (B\*, the second mean-motion derivative)
+    /// should be snapped to the legacy assumed-decimal TLE grid when bridging
+    /// into SGP4. Parsed catalog OMMs default to `true`: their GP values
+    /// originate in the TLE field format, so the historical compatibility path
+    /// reproduces the value a TLE consumer would see. Fitted OMMs set this
+    /// `false`: their elements were estimated directly and never lived on the
+    /// TLE grid, so snapping would discard converged precision for no
+    /// compatibility gain; `to_element_set` then passes them through losslessly.
+    #[serde(default = "default_quantize_tle_derived_fields", skip_serializing)]
+    pub quantize_tle_derived_fields: bool,
 }
 
 /// Failure modes of the OMM readers.
@@ -230,7 +260,8 @@ pub fn parse_kvn(text: &str) -> Result<Omm, OmmError> {
 /// Encode an [`Omm`] as a CCSDS OMM KVN message.
 ///
 /// Numeric values use their shortest round-tripping decimal form, so parsing the
-/// output reproduces the same `f64`s. The epoch is emitted to microseconds.
+/// output reproduces the same `f64`s. The epoch is emitted to microseconds,
+/// extended to femtoseconds only when a sub-microsecond remainder is present.
 pub fn encode_kvn(omm: &Omm) -> String {
     let mut out = String::new();
     let header = crate::astro::ndm::NdmHeader {
@@ -549,13 +580,14 @@ pub fn parse(text: &str) -> Result<Omm, OmmError> {
 
 /// Parse a single CCSDS `EPOCH` string field to the canonical [`OmmEpoch`].
 ///
-/// The accepted form is `YYYY-MM-DDThh:mm:ss[.ffffff][Z]`, interpreted under the
-/// UTC-like civil-second policy (the OMM default when no `TIME_SYSTEM` is
-/// declared, matching how a CelesTrak GP `EPOCH` is read). This is the single
-/// public entry point a thin binding (for example the Elixir constellation NIF)
-/// delegates to instead of hand-rolling the split; it wraps the same
-/// [`OmmEpoch`]/`NdmEpoch` parser the full OMM decode uses, so it produces
-/// byte-identical components.
+/// The accepted form is `YYYY-MM-DDThh:mm:ss[.f...][Z]` with up to 15
+/// fractional-second digits (whole microseconds plus a femtosecond remainder),
+/// interpreted under the UTC-like civil-second policy (the OMM default when no
+/// `TIME_SYSTEM` is declared, matching how a CelesTrak GP `EPOCH` is read).
+/// This is the single public entry point a thin binding (for example the
+/// Elixir constellation NIF) delegates to instead of hand-rolling the split;
+/// it wraps the same shared `NdmEpoch` parser the full OMM decode uses, so it
+/// produces byte-identical components.
 pub fn parse_epoch(text: &str) -> Result<OmmEpoch, OmmError> {
     OmmEpoch::parse(text, validate::CivilSecondPolicy::UtcLike)
 }
@@ -608,6 +640,8 @@ impl Omm {
             bstar: req_num(get("BSTAR"), "BSTAR")?,
             mean_motion_dot: req_num(get("MEAN_MOTION_DOT"), "MEAN_MOTION_DOT")?,
             mean_motion_ddot: req_num(get("MEAN_MOTION_DDOT"), "MEAN_MOTION_DDOT")?,
+            exact_sgp4_epoch: None,
+            quantize_tle_derived_fields: true,
         })
     }
 }
@@ -649,11 +683,23 @@ impl Omm {
     /// format.
     pub fn to_element_set(&self) -> Result<ElementSet, OmmError> {
         validate_omm_bridge(self)?;
+        let bstar = if self.quantize_tle_derived_fields {
+            tle::assumed_decimal_quantize(self.bstar)
+        } else {
+            self.bstar
+        };
+        let mean_motion_double_dot = if self.quantize_tle_derived_fields {
+            tle::assumed_decimal_quantize(self.mean_motion_ddot)
+        } else {
+            self.mean_motion_ddot
+        };
         Ok(ElementSet {
-            epoch: self.epoch.sgp4_julian_date(),
-            bstar: tle::assumed_decimal_quantize(self.bstar),
+            epoch: self
+                .exact_sgp4_epoch
+                .unwrap_or_else(|| self.epoch.sgp4_julian_date()),
+            bstar,
             mean_motion_dot: self.mean_motion_dot,
-            mean_motion_double_dot: tle::assumed_decimal_quantize(self.mean_motion_ddot),
+            mean_motion_double_dot,
             eccentricity: self.eccentricity,
             argument_of_perigee_deg: self.arg_of_pericenter_deg,
             inclination_deg: self.inclination_deg,
@@ -677,6 +723,18 @@ impl Satellite {
 }
 
 fn validate_omm_bridge(omm: &Omm) -> Result<(), OmmError> {
+    if omm.epoch.microsecond >= 1_000_000 {
+        return Err(OmmError::InvalidField {
+            field: "epoch.microsecond",
+            kind: OmmInputErrorKind::OutOfRange,
+        });
+    }
+    if omm.epoch.femtosecond >= 1_000_000_000 {
+        return Err(OmmError::InvalidField {
+            field: "epoch.femtosecond",
+            kind: OmmInputErrorKind::OutOfRange,
+        });
+    }
     validate::finite_positive(omm.mean_motion, "mean_motion").map_err(map_omm_field_error)?;
     validate::finite_in_range_exclusive_upper(omm.eccentricity, 0.0, 1.0, "eccentricity")
         .map_err(map_omm_field_error)?;
@@ -714,10 +772,11 @@ fn map_omm_bridge_to_sgp4(error: OmmError) -> Sgp4Error {
 // ── Epoch ────────────────────────────────────────────────────────────
 
 impl OmmEpoch {
-    /// Parse a CCSDS `EPOCH` value (`YYYY-MM-DDThh:mm:ss[.ffffff][Z]`, UTC).
+    /// Parse a CCSDS `EPOCH` value (`YYYY-MM-DDThh:mm:ss[.f...][Z]`, UTC) by
+    /// delegating to the shared NDM epoch parser.
     fn parse(text: &str, second_policy: validate::CivilSecondPolicy) -> Result<OmmEpoch, OmmError> {
         let e = crate::astro::ndm::NdmEpoch::parse(text, second_policy)
-            .map_err(|err| map_omm_epoch_field_error(err, text))?;
+            .map_err(|err| map_omm_epoch_field_error(err, text.trim()))?;
         Ok(OmmEpoch {
             year: e.year,
             month: e.month,
@@ -726,6 +785,7 @@ impl OmmEpoch {
             minute: e.minute,
             second: e.second,
             microsecond: e.microsecond,
+            femtosecond: e.femtosecond,
         })
     }
 
@@ -738,17 +798,72 @@ impl OmmEpoch {
             self.day as i32,
             self.hour as i32,
             self.minute as i32,
-            self.second as f64 + self.microsecond as f64 / 1_000_000.0,
+            self.second as f64
+                + self.microsecond as f64 / 1_000_000.0
+                + self.femtosecond as f64 / 1_000_000_000_000_000.0,
         )
     }
 
-    /// Format as a CCSDS `EPOCH` string with microsecond precision.
-    fn to_iso8601(&self) -> String {
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second, self.microsecond
-        )
+    pub(crate) fn from_sgp4_julian_date(epoch: JulianDate) -> Self {
+        let (mut jd_midnight, mut day_fraction) = if (epoch.0.fract().abs() - 0.5).abs() < 1.0e-9 {
+            (epoch.0, epoch.1)
+        } else if epoch.1 >= 0.5 {
+            (epoch.0 + 0.5, epoch.1 - 0.5)
+        } else {
+            (epoch.0 - 0.5, epoch.1 + 0.5)
+        };
+        let day_carry = day_fraction.floor();
+        jd_midnight += day_carry;
+        day_fraction -= day_carry;
+        let (year, month, day, hour, minute, second) =
+            crate::astro::time::civil::civil_from_split_julian_date(jd_midnight, day_fraction);
+        let whole_second = second.floor();
+        let subsecond = second - whole_second;
+        let mut femtoseconds = (subsecond * FEMTOSECONDS_PER_SECOND as f64).round() as i128;
+        let mut second = whole_second as u32;
+        if femtoseconds == FEMTOSECONDS_PER_SECOND {
+            second += 1;
+            femtoseconds = 0;
+        }
+        OmmEpoch {
+            year: year as i32,
+            month: month as u32,
+            day: day as u32,
+            hour: hour as u32,
+            minute: minute as u32,
+            second,
+            microsecond: (femtoseconds / FEMTOSECONDS_PER_MICROSECOND) as u32,
+            femtosecond: (femtoseconds % FEMTOSECONDS_PER_MICROSECOND) as u32,
+        }
     }
+
+    /// Format as a CCSDS `EPOCH` string via the shared NDM epoch encoder:
+    /// six fractional digits, extended to 15 only when a sub-microsecond
+    /// remainder is present.
+    fn to_iso8601(&self) -> String {
+        crate::astro::ndm::NdmEpoch {
+            year: self.year,
+            month: self.month,
+            day: self.day,
+            hour: self.hour,
+            minute: self.minute,
+            second: self.second,
+            microsecond: self.microsecond,
+            femtosecond: self.femtosecond,
+        }
+        .to_iso8601()
+    }
+}
+
+const FEMTOSECONDS_PER_SECOND: i128 = 1_000_000_000_000_000;
+const FEMTOSECONDS_PER_MICROSECOND: i128 = 1_000_000_000;
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn default_quantize_tle_derived_fields() -> bool {
+    true
 }
 
 // ── Numeric helpers ──────────────────────────────────────────────────
@@ -902,6 +1017,7 @@ mod tests {
                 minute: 32,
                 second: 52,
                 microsecond: 99296,
+                femtosecond: 0,
             }
         );
     }
@@ -983,6 +1099,7 @@ mod tests {
                 minute: 59,
                 second: 60,
                 microsecond: 0,
+                femtosecond: 0,
             }
         );
     }
@@ -1035,9 +1152,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_kvn_carries_rounded_fractional_epoch_seconds() {
+    fn parse_kvn_preserves_sub_microsecond_epoch_seconds() {
         let omm = parse_kvn(&kvn_with_field("EPOCH", "2026-06-17T04:32:52.9999995"))
-            .expect("fractional epoch carry");
+            .expect("fractional epoch");
         assert_eq!(
             omm.epoch,
             OmmEpoch {
@@ -1046,39 +1163,41 @@ mod tests {
                 day: 17,
                 hour: 4,
                 minute: 32,
-                second: 53,
-                microsecond: 0,
+                second: 52,
+                microsecond: 999_999,
+                femtosecond: 500_000_000,
             }
         );
         assert!(
-            encode_kvn(&omm).contains("EPOCH = 2026-06-17T04:32:53.000000"),
-            "carried epoch must encode with six fractional digits"
+            encode_kvn(&omm).contains("EPOCH = 2026-06-17T04:32:52.999999500000000"),
+            "sub-microsecond epoch must encode with high fractional precision"
         );
     }
 
     #[test]
-    fn parse_kvn_carries_continuous_time_fractional_epoch_across_day() {
+    fn parse_kvn_preserves_continuous_time_sub_microsecond_epoch_near_day() {
         let omm = parse_kvn(&kvn_with_fields(&[
             ("TIME_SYSTEM", "GPS"),
             ("EPOCH", "2026-06-17T23:59:59.9999995"),
         ]))
-        .expect("continuous-time fractional epoch carry");
+        .expect("continuous-time fractional epoch");
         assert_eq!(
             omm.epoch,
             OmmEpoch {
                 year: 2026,
                 month: 6,
-                day: 18,
-                hour: 0,
-                minute: 0,
-                second: 0,
-                microsecond: 0,
+                day: 17,
+                hour: 23,
+                minute: 59,
+                second: 59,
+                microsecond: 999_999,
+                femtosecond: 500_000_000,
             }
         );
     }
 
     #[test]
-    fn parse_kvn_carries_continuous_time_fractional_epoch_across_year() {
+    fn parse_kvn_preserves_continuous_time_sub_microsecond_epoch_near_year() {
         let ordinary = parse_kvn(&kvn_with_fields(&[
             ("TIME_SYSTEM", "GPS"),
             ("EPOCH", "2026-12-31T23:59:58.123456"),
@@ -1094,6 +1213,7 @@ mod tests {
                 minute: 59,
                 second: 58,
                 microsecond: 123_456,
+                femtosecond: 0,
             }
         );
         assert!(
@@ -1105,22 +1225,23 @@ mod tests {
             ("TIME_SYSTEM", "GPS"),
             ("EPOCH", "2026-12-31T23:59:59.9999995"),
         ]))
-        .expect("continuous-time fractional epoch carry across year");
+        .expect("continuous-time fractional epoch near year boundary");
         assert_eq!(
             carried.epoch,
             OmmEpoch {
-                year: 2027,
-                month: 1,
-                day: 1,
-                hour: 0,
-                minute: 0,
-                second: 0,
-                microsecond: 0,
+                year: 2026,
+                month: 12,
+                day: 31,
+                hour: 23,
+                minute: 59,
+                second: 59,
+                microsecond: 999_999,
+                femtosecond: 500_000_000,
             }
         );
         assert!(
-            encode_kvn(&carried).contains("EPOCH = 2027-01-01T00:00:00.000000"),
-            "carried epoch must encode with the next year"
+            encode_kvn(&carried).contains("EPOCH = 2026-12-31T23:59:59.999999500000000"),
+            "sub-microsecond year-end epoch must encode unchanged"
         );
     }
 
@@ -1129,6 +1250,36 @@ mod tests {
         let omm = parse_kvn(ISS_KVN).unwrap();
         let reparsed = parse_kvn(&encode_kvn(&omm)).unwrap();
         assert_eq!(omm, reparsed);
+    }
+
+    #[test]
+    fn kvn_re_encodes_catalog_epoch_byte_faithfully() {
+        // Parse -> encode must not balloon precision: a real microsecond-form
+        // catalog epoch re-encodes as the exact source text, and the 15-digit
+        // form appears only when sub-microsecond information is present.
+        let source_epoch = ISS_KVN
+            .lines()
+            .find_map(|line| match line.split_once('=') {
+                Some((key, value)) if key.trim() == "EPOCH" => Some(value.trim()),
+                _ => None,
+            })
+            .expect("fixture EPOCH");
+        let encoded = encode_kvn(&parse_kvn(ISS_KVN).unwrap());
+        assert!(
+            encoded.contains(&format!("EPOCH = {source_epoch}\n")),
+            "catalog epoch {source_epoch} must re-encode byte-faithfully"
+        );
+        assert_eq!(source_epoch.len(), "2026-06-17T04:32:52.099296".len());
+    }
+
+    #[test]
+    fn kvn_round_trips_femtosecond_epoch_through_struct() {
+        // IR-level parse(encode(ir)) == ir must include the femtosecond field.
+        let omm = parse_kvn(&kvn_with_field("EPOCH", "2026-06-17T04:32:52.9999995")).unwrap();
+        assert_eq!(omm.epoch.femtosecond, 500_000_000);
+        let reparsed = parse_kvn(&encode_kvn(&omm)).unwrap();
+        assert_eq!(omm, reparsed);
+        assert_eq!(reparsed.epoch.femtosecond, 500_000_000);
     }
 
     #[test]
@@ -1287,31 +1438,55 @@ mod tests {
     }
 
     #[test]
-    fn from_omm_uses_parser_rounded_year_end_epoch_directly() {
+    fn from_omm_preserves_sub_microsecond_year_end_epoch_directly() {
         for (epoch, expected_year) in [
-            ("2021-12-31T23:59:59.9999995", 2022),
-            ("2020-12-31T23:59:59.9999995", 2021),
+            ("2021-12-31T23:59:59.9999995", 2021),
+            ("2020-12-31T23:59:59.9999995", 2020),
         ] {
             let omm = parse_kvn(&kvn_with_field("EPOCH", epoch)).expect("year-end OMM epoch");
             assert_eq!(omm.epoch.year, expected_year);
-            assert_eq!(omm.epoch.month, 1);
-            assert_eq!(omm.epoch.day, 1);
-            assert_eq!(omm.epoch.hour, 0);
-            assert_eq!(omm.epoch.minute, 0);
-            assert_eq!(omm.epoch.second, 0);
-            assert_eq!(omm.epoch.microsecond, 0);
+            assert_eq!(omm.epoch.month, 12);
+            assert_eq!(omm.epoch.day, 31);
+            assert_eq!(omm.epoch.hour, 23);
+            assert_eq!(omm.epoch.minute, 59);
+            assert_eq!(omm.epoch.second, 59);
+            assert_eq!(omm.epoch.microsecond, 999_999);
+            assert_eq!(omm.epoch.femtosecond, 500_000_000);
 
-            let sat = Satellite::from_omm(&omm).expect("rounded year-end OMM must initialize");
+            let sat =
+                Satellite::from_omm(&omm).expect("sub-microsecond year-end OMM must initialize");
             let epoch_jd = sat.epoch_jd();
             let actual_jd = epoch_jd.0 + epoch_jd.1;
             let expected_jd =
-                crate::astro::time::scales::julian_day_number(expected_year, 1, 1) as f64 - 0.5;
+                crate::astro::time::scales::julian_day_number(expected_year, 12, 31) as f64 - 0.5
+                    + (86_399.999_999_5 / 86_400.0);
 
             assert!(
                 (actual_jd - expected_jd).abs() < 1.0e-9,
-                "{epoch} carried to JD {actual_jd}, expected {expected_jd}",
+                "{epoch} converted to JD {actual_jd}, expected {expected_jd}",
             );
         }
+    }
+
+    #[test]
+    fn from_sgp4_julian_date_normalizes_split_fraction_carry() {
+        let (jd_midnight, _) =
+            crate::astro::time::civil::split_julian_date(2026, 12, 31, 0, 0, 0.0);
+        let epoch = OmmEpoch::from_sgp4_julian_date(JulianDate(jd_midnight, 1.0));
+
+        assert_eq!(
+            epoch,
+            OmmEpoch {
+                year: 2027,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                microsecond: 0,
+                femtosecond: 0,
+            }
+        );
     }
 
     #[test]

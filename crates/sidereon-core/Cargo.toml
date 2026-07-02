@@ -36,6 +36,7 @@ roxmltree = "0.21"
 # fan independent per-satellite arcs across a rayon work-stealing pool. Each arc
 # is the same serial kernel, so results stay bit-identical to the serial path.
 rayon = "1"
+trust-region-least-squares = { path = "../trust-region-least-squares", version = "0.9" }
 
 [build-dependencies]
 cc = "1"
