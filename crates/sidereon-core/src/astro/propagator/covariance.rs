@@ -864,6 +864,7 @@ mod tests {
                     ..IntegratorOptions::default()
                 },
                 drag: None,
+                space_weather: None,
             };
             for output_frame in [CovarianceFrame::Inertial, CovarianceFrame::Rtn] {
                 let ephemeris = propagator
