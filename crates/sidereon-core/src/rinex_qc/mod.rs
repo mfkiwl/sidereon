@@ -102,7 +102,9 @@ pub enum Finding {
         observed: ObsEpochTime,
         observed_scale: TimeScale,
     },
-    /// TIME OF LAST OBS disagrees with the body.
+    /// TIME OF LAST OBS disagrees with the body epoch or with the file time
+    /// system declared by TIME OF FIRST OBS (RINEX 3.05: TIME OF FIRST OBS
+    /// defines the time system; TIME OF LAST OBS must agree with it).
     ObsTimeOfLastMismatch {
         at: FindingRef,
         declared: ObsEpochTime,
@@ -1796,23 +1798,16 @@ fn repair_obs_times(obs: &mut RinexObs, options: &RepairOptions, actions: &mut V
     let Some(last) = last_normal_epoch(obs).map(|epoch| epoch.epoch) else {
         return;
     };
+    // TIME OF FIRST OBS is the time-system authority (RINEX 3.05); a
+    // disagreeing TIME OF LAST OBS is rewritten to match it.
     if options.set_time_of_last_obs
         || obs
             .header
             .time_of_last_obs
             .is_some_and(|(declared, declared_scale)| {
-                !same_epoch_time(declared, last)
-                    || declared_scale
-                        != obs
-                            .header
-                            .time_of_first_obs
-                            .map_or(scale, |(_, scale)| scale)
+                !same_epoch_time(declared, last) || declared_scale != scale
             })
     {
-        let scale = obs
-            .header
-            .time_of_first_obs
-            .map_or_else(|| obs_body_time_scale(obs), |(_, scale)| scale);
         obs.header.time_of_last_obs = Some((last, scale));
         actions.push(RepairAction {
             id: "A4",
@@ -2039,10 +2034,12 @@ fn last_normal_epoch(obs: &RinexObs) -> Option<&ObsEpoch> {
     obs.epochs.iter().rev().find(|epoch| epoch.flag <= 1)
 }
 
+/// RINEX 3.05 Table A2: TIME OF FIRST OBS carries the file's time system, so
+/// it is authoritative; TIME OF LAST OBS must agree with it and is only
+/// consulted when TIME OF FIRST OBS is absent.
 fn obs_body_time_scale(obs: &RinexObs) -> TimeScale {
     match (obs.header.time_of_first_obs, obs.header.time_of_last_obs) {
-        (Some((_, first_scale)), Some((_, last_scale))) if first_scale != last_scale => last_scale,
-        (Some((_, scale)), _) | (_, Some((_, scale))) => scale,
+        (Some((_, scale)), _) | (None, Some((_, scale))) => scale,
         _ => TimeScale::Gpst,
     }
 }

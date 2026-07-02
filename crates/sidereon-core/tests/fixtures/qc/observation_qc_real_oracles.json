@@ -33541,6 +33541,7 @@
   "provenance": {
     "generated_for": "QC oracle bar, 2026-07-02",
     "generator": "crates/sidereon-core/fixtures-generators/generate_observation_qc_oracles.py",
-    "method": "Independent fixed-column extraction from raw RINEX OBS text; does not call sidereon parsers or QC code."
+    "method": "Independent fixed-column extraction from raw RINEX OBS text; does not call sidereon parsers or QC code.",
+    "python_version": "3.11.15"
   }
 }

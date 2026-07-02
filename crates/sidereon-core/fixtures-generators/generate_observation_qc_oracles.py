@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -318,6 +319,7 @@ def main() -> None:
             "generator": "crates/sidereon-core/fixtures-generators/generate_observation_qc_oracles.py",
             "method": "Independent fixed-column extraction from raw RINEX OBS text; does not call sidereon parsers or QC code.",
             "generated_for": "QC oracle bar, 2026-07-02",
+            "python_version": ".".join(str(part) for part in sys.version_info[:3]),
         },
         "fixtures": fixtures,
     }

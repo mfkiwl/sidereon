@@ -220,6 +220,9 @@ fn obs_lint_reports_time_interval_order_and_repair_fixes_them() {
 
 #[test]
 fn obs_lint_reports_time_scale_mismatch_and_repair_fixes_it() {
+    // RINEX 3.05: TIME OF FIRST OBS defines the file time system, so it is
+    // authoritative. A TIME OF LAST OBS declaring a different system is the
+    // finding (OBS-H08), and repair rewrites it to match TIME OF FIRST OBS.
     let headers = [
         header_line(
             "  2020    01    01    00    00    0.0000000     UTC",
@@ -238,7 +241,7 @@ fn obs_lint_reports_time_scale_mismatch_and_repair_fixes_it() {
     let obs = RinexObs::parse(&obs_text(&headers, &body)).expect("parse OBS");
 
     let report = lint_obs(&obs);
-    assert_finding_counts(&report, &[("OBS-H07", 1)]);
+    assert_finding_counts(&report, &[("OBS-H08", 1)]);
 
     let repair = repair_obs(&obs, &RepairOptions::default());
     assert_finding_counts(&repair.remaining, &[]);
@@ -248,7 +251,15 @@ fn obs_lint_reports_time_scale_mismatch_and_repair_fixes_it() {
             .header
             .time_of_first_obs
             .map(|(_, scale)| scale),
-        Some(TimeScale::Gpst)
+        Some(TimeScale::Utc)
+    );
+    assert_eq!(
+        repair
+            .repaired
+            .header
+            .time_of_last_obs
+            .map(|(_, scale)| scale),
+        Some(TimeScale::Utc)
     );
 }
 
