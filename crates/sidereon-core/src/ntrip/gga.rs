@@ -1,4 +1,5 @@
-use crate::{Error, Result};
+use crate::nmea::{self, Gga, GgaQuality, NmeaTalker, NmeaTime};
+use crate::{Error, Result, Wgs84Geodetic};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GgaPosition {
@@ -25,15 +26,25 @@ impl Default for GgaPosition {
 
 pub fn format_gga(position: &GgaPosition, utc_seconds_of_day: f64) -> Result<Vec<u8>> {
     validate(position, utc_seconds_of_day)?;
-    let time = format_time(utc_seconds_of_day);
-    let (lat, ns) = format_coord(position.lat_deg, 2, 'N', 'S');
-    let (lon, ew) = format_coord(position.lon_deg, 3, 'E', 'W');
-    let body = format!(
-        "GPGGA,{time},{lat},{ns},{lon},{ew},{},{:02},{:.1},{:.3},M,,M,,",
-        position.fix_quality, position.num_satellites, position.hdop, position.height_m
-    );
-    let checksum = body.bytes().fold(0u8, |acc, b| acc ^ b);
-    Ok(format!("${body}*{checksum:02X}\r\n").into_bytes())
+    let geodetic = Wgs84Geodetic::new(
+        position.lat_deg.to_radians(),
+        position.lon_deg.to_radians(),
+        position.height_m,
+    )
+    .map_err(|err| Error::InvalidInput(err.to_string()))?;
+    let mut gga = Gga::vrs_position(
+        geodetic,
+        format_time(utc_seconds_of_day)?,
+        quality(position.fix_quality),
+        position.num_satellites,
+        position.hdop,
+        7,
+    )
+    .map_err(|err| Error::InvalidInput(err.to_string()))?;
+    gga.geoid_separation_m = None;
+    nmea::write_gga(NmeaTalker::System(crate::GnssSystem::Gps), &gga)
+        .map(|sentence| sentence.into_bytes())
+        .map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
 fn validate(position: &GgaPosition, utc_seconds_of_day: f64) -> Result<()> {
@@ -62,30 +73,22 @@ fn validate(position: &GgaPosition, utc_seconds_of_day: f64) -> Result<()> {
     Ok(())
 }
 
-fn format_time(seconds: f64) -> String {
-    let centis = (seconds * 100.0).floor() as u32;
-    let whole = centis / 100;
-    let cs = centis % 100;
-    let h = whole / 3600;
-    let m = (whole % 3600) / 60;
-    let s = whole % 60;
-    format!("{h:02}{m:02}{s:02}.{cs:02}")
+fn format_time(seconds: f64) -> Result<NmeaTime> {
+    NmeaTime::from_seconds_of_day_floor_centis(seconds)
+        .map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
-fn format_coord(value: f64, degree_width: usize, pos: char, neg: char) -> (String, char) {
-    let hemi = if value.is_sign_negative() { neg } else { pos };
-    let abs = value.abs();
-    let mut deg = abs.floor() as u32;
-    let minutes = (abs - f64::from(deg)) * 60.0;
-    let mut minute_units = (minutes * 10_000_000.0 + 0.5).floor() as u64;
-    if minute_units >= 600_000_000 {
-        deg += 1;
-        minute_units -= 600_000_000;
+fn quality(value: u8) -> GgaQuality {
+    match value {
+        0 => GgaQuality::Invalid,
+        1 => GgaQuality::GpsSps,
+        2 => GgaQuality::Differential,
+        3 => GgaQuality::Pps,
+        4 => GgaQuality::RtkFixed,
+        5 => GgaQuality::RtkFloat,
+        6 => GgaQuality::Estimated,
+        7 => GgaQuality::Manual,
+        8 => GgaQuality::Simulator,
+        other => GgaQuality::Other(other),
     }
-    let whole_min = minute_units / 10_000_000;
-    let frac = minute_units % 10_000_000;
-    (
-        format!("{deg:0degree_width$}{whole_min:02}.{frac:07}"),
-        hemi,
-    )
 }

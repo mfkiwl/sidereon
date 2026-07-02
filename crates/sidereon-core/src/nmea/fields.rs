@@ -1,5 +1,7 @@
+use crate::frequencies::CarrierBand;
 use crate::validate::{self, FieldError};
-use crate::{GnssSystem, Wgs84Geodetic};
+use crate::{GnssSatelliteId, GnssSystem, Wgs84Geodetic};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NmeaTime {
@@ -76,6 +78,25 @@ impl NmeaTime {
 
     pub fn key(self) -> (u8, u8, u8, u32) {
         (self.hour, self.minute, self.second, self.nanos)
+    }
+
+    pub fn from_seconds_of_day_floor_centis(seconds: f64) -> Result<Self, crate::nmea::NmeaError> {
+        if !seconds.is_finite() || !(0.0..86_400.0).contains(&seconds) {
+            return Err(crate::nmea::NmeaError::InvalidInput {
+                field: "time",
+                reason: "must be finite and in [0, 86400)",
+            });
+        }
+        let whole = seconds.floor() as u32;
+        let fractional = (seconds - f64::from(whole)).clamp(0.0, 1.0);
+        let centis = (Duration::from_secs_f64(fractional).as_nanos() / 10_000_000).min(99) as u32;
+        Ok(Self {
+            hour: (whole / 3600) as u8,
+            minute: ((whole % 3600) / 60) as u8,
+            second: (whole % 60) as u8,
+            nanos: centis * 10_000_000,
+            decimals: 2,
+        })
     }
 }
 
@@ -248,6 +269,71 @@ pub struct NmeaDate {
     pub day: u8,
 }
 
+impl NmeaDate {
+    pub fn parse_rmc(token: &str) -> Result<Self, FieldError> {
+        let token = token.trim();
+        if token.len() != 6 || !token.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(FieldError::IntParse {
+                field: "nmea date",
+                value: token.to_string(),
+            });
+        }
+        let day = parse_u8(&token[0..2], "nmea date day")?;
+        let month = parse_u8(&token[2..4], "nmea date month")?;
+        let yy = parse_u8(&token[4..6], "nmea date year")?;
+        let year = if yy >= 80 {
+            1900 + u16::from(yy)
+        } else {
+            2000 + u16::from(yy)
+        };
+        Self::new(year, month, day)
+    }
+
+    pub fn new(year: u16, month: u8, day: u8) -> Result<Self, FieldError> {
+        let max_day = crate::astro::time::civil::days_in_month(i64::from(year), i64::from(month));
+        if max_day == 0 || day == 0 || i64::from(day) > max_day {
+            return Err(FieldError::InvalidCivilDate {
+                field: "nmea date",
+                year: i64::from(year),
+                month: i64::from(month),
+                day: i64::from(day),
+            });
+        }
+        Ok(Self { year, month, day })
+    }
+
+    pub fn next_day(self) -> Self {
+        let max_day =
+            crate::astro::time::civil::days_in_month(i64::from(self.year), i64::from(self.month))
+                as u8;
+        if self.day < max_day {
+            Self {
+                day: self.day + 1,
+                ..self
+            }
+        } else if self.month < 12 {
+            Self {
+                month: self.month + 1,
+                day: 1,
+                ..self
+            }
+        } else {
+            Self {
+                year: self.year + 1,
+                month: 1,
+                day: 1,
+            }
+        }
+    }
+}
+
+fn parse_u8(token: &str, field: &'static str) -> Result<u8, FieldError> {
+    token.parse::<u8>().map_err(|_| FieldError::IntParse {
+        field,
+        value: token.to_string(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NmeaTalker {
     System(GnssSystem),
@@ -284,6 +370,13 @@ impl NmeaTalker {
                 field: "talker",
                 reason: "must be ASCII",
             }),
+        }
+    }
+
+    pub fn system(self) -> Option<GnssSystem> {
+        match self {
+            Self::System(system) => Some(system),
+            Self::Combined | Self::Other(_) => None,
         }
     }
 }
@@ -358,6 +451,12 @@ impl Gga {
         hdop: f64,
         coordinate_decimals: u8,
     ) -> Result<Self, crate::nmea::NmeaError> {
+        if !hdop.is_finite() || hdop < 0.0 {
+            return Err(crate::nmea::NmeaError::InvalidInput {
+                field: "hdop",
+                reason: "must be finite and non-negative",
+            });
+        }
         Ok(Self {
             time: Some(time),
             latitude: Some(NmeaCoordinate::from_degrees(
@@ -379,4 +478,211 @@ impl Gga {
             differential_station_id: None,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NmeaSatNumber {
+    pub raw: u16,
+    pub resolved: Option<GnssSatelliteId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NmeaSignalId {
+    pub system: Option<GnssSystem>,
+    pub id: u8,
+}
+
+impl NmeaSignalId {
+    pub fn carrier_band(&self) -> Option<CarrierBand> {
+        let system = self.system?;
+        match system {
+            GnssSystem::Gps | GnssSystem::Sbas => match self.id {
+                1..=3 => Some(CarrierBand::L1),
+                4..=6 => Some(CarrierBand::L2),
+                7 | 8 => Some(CarrierBand::L5),
+                _ => None,
+            },
+            GnssSystem::Glonass => match self.id {
+                1 | 2 => Some(CarrierBand::G1),
+                3 | 4 => Some(CarrierBand::G2),
+                _ => None,
+            },
+            GnssSystem::Galileo => match self.id {
+                1 => Some(CarrierBand::E5a),
+                2 => Some(CarrierBand::E5b),
+                3 => Some(CarrierBand::E5),
+                4 | 5 => Some(CarrierBand::E6),
+                6 | 7 => Some(CarrierBand::E1),
+                _ => None,
+            },
+            GnssSystem::BeiDou => match self.id {
+                1 | 2 => Some(CarrierBand::B1i),
+                3 | 4 => Some(CarrierBand::B1c),
+                5 => Some(CarrierBand::B2a),
+                6 => Some(CarrierBand::B2b),
+                7 => Some(CarrierBand::B2),
+                8 | 9 => Some(CarrierBand::B3i),
+                _ => None,
+            },
+            GnssSystem::Qzss => match self.id {
+                1..=4 => Some(CarrierBand::L1),
+                5 | 6 => Some(CarrierBand::L2),
+                7 | 8 => Some(CarrierBand::L5),
+                _ => None,
+            },
+            GnssSystem::Navic => match self.id {
+                1 | 3 => Some(CarrierBand::L5),
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RmcStatus {
+    Valid,
+    Warning,
+    Other(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsaSelectionMode {
+    Manual,
+    Automatic,
+    Other(char),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsaFixMode {
+    None,
+    TwoD,
+    ThreeD,
+    Other(u8),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rmc {
+    pub time: Option<NmeaTime>,
+    pub status: Option<RmcStatus>,
+    pub latitude: Option<NmeaCoordinate>,
+    pub longitude: Option<NmeaCoordinate>,
+    pub speed_over_ground_kn: Option<f64>,
+    pub course_over_ground_deg: Option<f64>,
+    pub date: Option<NmeaDate>,
+    pub magnetic_variation_deg: Option<f64>,
+    pub faa_mode: Option<char>,
+    pub navigational_status: Option<char>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gsa {
+    pub selection_mode: Option<GsaSelectionMode>,
+    pub fix_mode: Option<GsaFixMode>,
+    pub satellites: Vec<NmeaSatNumber>,
+    pub pdop: Option<f64>,
+    pub hdop: Option<f64>,
+    pub vdop: Option<f64>,
+    pub system_id: Option<u8>,
+    pub system: Option<GnssSystem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GsvSatellite {
+    pub sat_number: Option<NmeaSatNumber>,
+    pub elevation_deg: Option<i16>,
+    pub azimuth_deg: Option<u16>,
+    pub cn0_db_hz: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gsv {
+    pub total_messages: u8,
+    pub message_number: u8,
+    pub satellites_in_view: Option<u16>,
+    pub satellites: Vec<GsvSatellite>,
+    pub signal: Option<NmeaSignalId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gst {
+    pub time: Option<NmeaTime>,
+    pub rms_range_residual_m: Option<f64>,
+    pub semi_major_error_m: Option<f64>,
+    pub semi_minor_error_m: Option<f64>,
+    pub orientation_deg: Option<f64>,
+    pub latitude_sigma_m: Option<f64>,
+    pub longitude_sigma_m: Option<f64>,
+    pub altitude_sigma_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vtg {
+    pub course_true_deg: Option<f64>,
+    pub course_magnetic_deg: Option<f64>,
+    pub speed_kn: Option<f64>,
+    pub speed_kmh: Option<f64>,
+    pub faa_mode: Option<char>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gll {
+    pub latitude: Option<NmeaCoordinate>,
+    pub longitude: Option<NmeaCoordinate>,
+    pub time: Option<NmeaTime>,
+    pub status: Option<RmcStatus>,
+    pub faa_mode: Option<char>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Zda {
+    pub time: Option<NmeaTime>,
+    pub date: Option<NmeaDate>,
+    pub local_zone_hours: Option<i8>,
+    pub local_zone_minutes: Option<u8>,
+}
+
+pub(crate) fn resolve_sat_number(context: Option<GnssSystem>, raw: u16) -> Option<GnssSatelliteId> {
+    let candidate = match context {
+        Some(GnssSystem::Gps) => match raw {
+            1..=32 => Some((GnssSystem::Gps, raw)),
+            33..=64 => Some((GnssSystem::Sbas, raw - 13)),
+            _ => None,
+        },
+        Some(GnssSystem::Glonass) => match raw {
+            65..=99 => Some((GnssSystem::Glonass, raw - 64)),
+            1..=35 => Some((GnssSystem::Glonass, raw)),
+            _ => None,
+        },
+        Some(GnssSystem::Galileo) => match raw {
+            1..=36 => Some((GnssSystem::Galileo, raw)),
+            _ => None,
+        },
+        Some(GnssSystem::BeiDou) => match raw {
+            1..=64 => Some((GnssSystem::BeiDou, raw)),
+            _ => None,
+        },
+        Some(GnssSystem::Qzss) => match raw {
+            1..=10 => Some((GnssSystem::Qzss, raw)),
+            193..=202 => Some((GnssSystem::Qzss, raw - 192)),
+            _ => None,
+        },
+        Some(GnssSystem::Navic) => match raw {
+            1..=15 => Some((GnssSystem::Navic, raw)),
+            _ => None,
+        },
+        Some(GnssSystem::Sbas) => match raw {
+            33..=64 => Some((GnssSystem::Sbas, raw - 13)),
+            120..=158 => Some((GnssSystem::Sbas, raw - 100)),
+            _ => None,
+        },
+        None => match raw {
+            1..=32 => Some((GnssSystem::Gps, raw)),
+            33..=64 => Some((GnssSystem::Sbas, raw - 13)),
+            65..=99 => Some((GnssSystem::Glonass, raw - 64)),
+            193..=202 => Some((GnssSystem::Qzss, raw - 192)),
+            _ => None,
+        },
+    }?;
+    let prn = u8::try_from(candidate.1).ok()?;
+    GnssSatelliteId::new(candidate.0, prn).ok()
 }

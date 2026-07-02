@@ -104,6 +104,12 @@ impl NtripConfig {
 }
 
 fn validate_config(config: &NtripConfig) -> Result<()> {
+    if config.host.bytes().any(|b| b == b'\r' || b == b'\n') {
+        return Err(Error::InvalidInput(
+            "NTRIP host must not contain CR or LF".into(),
+        ));
+    }
+
     if config
         .mountpoint
         .bytes()

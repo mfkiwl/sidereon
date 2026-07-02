@@ -45,9 +45,14 @@ pub struct NtripClientMachine {
     headers: Vec<(String, String)>,
     header_bytes: usize,
     status_version: Option<NtripVersion>,
+    http_status: Option<u16>,
+    http_reason: String,
     chunked: bool,
+    pending_icy_blank_line: bool,
+    sourcetable_chunked: bool,
     chunk_decoder: ChunkedDecoder,
     sourcetable_text: String,
+    sourcetable_carry: Vec<u8>,
     sourcetable_records_started: bool,
     last_gga_s: Option<f64>,
 }
@@ -61,9 +66,14 @@ impl NtripClientMachine {
             headers: Vec::new(),
             header_bytes: 0,
             status_version: None,
+            http_status: None,
+            http_reason: String::new(),
             chunked: false,
+            pending_icy_blank_line: false,
+            sourcetable_chunked: false,
             chunk_decoder: ChunkedDecoder::new(),
             sourcetable_text: String::new(),
+            sourcetable_carry: Vec::new(),
             sourcetable_records_started: false,
             last_gga_s: None,
         }
@@ -119,12 +129,25 @@ impl NtripClientMachine {
         position: &GgaPosition,
         utc_seconds_of_day: f64,
     ) -> Option<Vec<u8>> {
+        self.try_gga_message(now_s, position, utc_seconds_of_day)
+            .ok()
+            .flatten()
+    }
+
+    pub fn try_gga_message(
+        &mut self,
+        now_s: f64,
+        position: &GgaPosition,
+        utc_seconds_of_day: f64,
+    ) -> Result<Option<Vec<u8>>> {
         if self.state != NtripState::Streaming {
-            return None;
+            return Ok(None);
         }
-        let interval = self.config.gga_interval_s?;
+        let Some(interval) = self.config.gga_interval_s else {
+            return Ok(None);
+        };
         if !now_s.is_finite() {
-            return None;
+            return Ok(None);
         }
         let due = match self.last_gga_s {
             None => true,
@@ -132,11 +155,11 @@ impl NtripClientMachine {
             Some(_) => false,
         };
         if !due {
-            return None;
+            return Ok(None);
         }
-        let bytes = format_gga(position, utc_seconds_of_day).ok()?;
+        let bytes = format_gga(position, utc_seconds_of_day)?;
         self.last_gga_s = Some(now_s);
-        Some(bytes)
+        Ok(Some(bytes))
     }
 
     pub fn state(&self) -> NtripState {
@@ -170,7 +193,7 @@ impl NtripClientMachine {
                 self.state = NtripState::Streaming;
                 self.status_version = Some(NtripVersion::Rev1);
                 self.chunked = false;
-                self.consume_optional_blank_line();
+                self.pending_icy_blank_line = true;
                 events.push(NtripEvent::Connected(NtripHandshake {
                     version: NtripVersion::Rev1,
                     chunked: false,
@@ -208,9 +231,10 @@ impl NtripClientMachine {
             self.status_version = Some(version);
             self.headers.clear();
             self.header_bytes = 0;
+            self.http_status = Some(status);
+            self.http_reason = reason.to_string();
             self.state = NtripState::AwaitingHeaders;
-            self.headers.push((":status".into(), status.to_string()));
-            self.headers.push((":reason".into(), reason.to_string()));
+
             return true;
         }
 
@@ -228,37 +252,21 @@ impl NtripClientMachine {
             return false;
         };
         if line.is_empty() {
-            let status = self
-                .headers
-                .iter()
-                .find(|(name, _)| name == ":status")
-                .and_then(|(_, value)| value.parse::<u16>().ok())
-                .unwrap_or(0);
-            let reason = self
-                .headers
-                .iter()
-                .find(|(name, _)| name == ":reason")
-                .map(|(_, value)| value.as_str())
-                .unwrap_or("");
-            let real_headers: Vec<(String, String)> = self
-                .headers
-                .iter()
-                .filter(|(name, _)| !name.starts_with(':'))
-                .cloned()
-                .collect();
-            match classify_http_response(status, reason, &real_headers) {
+            let status = self.http_status.unwrap_or(0);
+            match classify_http_response(status, &self.http_reason, &self.headers) {
                 HttpClassification::Stream { chunked } => {
                     self.chunked = chunked;
                     self.state = NtripState::Streaming;
                     events.push(NtripEvent::Connected(NtripHandshake {
                         version: self.status_version.unwrap_or(NtripVersion::Rev2),
                         chunked,
-                        headers: real_headers,
+                        headers: self.headers.clone(),
                     }));
                     true
                 }
-                HttpClassification::Sourcetable => {
+                HttpClassification::Sourcetable { chunked } => {
                     self.state = NtripState::Sourcetable;
+                    self.sourcetable_chunked = chunked;
                     self.sourcetable_records_started = true;
                     true
                 }
@@ -281,6 +289,9 @@ impl NtripClientMachine {
     }
 
     fn drain_payload(&mut self, events: &mut Vec<NtripEvent>) {
+        if self.pending_icy_blank_line && !self.consume_pending_icy_blank_line() {
+            return;
+        }
         if self.carry.is_empty() {
             return;
         }
@@ -309,41 +320,120 @@ impl NtripClientMachine {
     }
 
     fn drain_sourcetable(&mut self, events: &mut Vec<NtripEvent>) -> bool {
-        while let Some(line) = self.take_line_or_reject(events) {
-            let text = String::from_utf8_lossy(&line).to_string();
-            let first = text.split(';').next().unwrap_or("").trim();
-
-            if !self.sourcetable_records_started {
-                if text.is_empty() {
-                    continue;
-                }
-                if matches!(first, "STR" | "CAS" | "NET" | "ENDSOURCETABLE") {
-                    self.sourcetable_records_started = true;
-                } else if text.contains(':') {
-                    continue;
-                } else {
-                    self.sourcetable_records_started = true;
+        if self.sourcetable_chunked {
+            if !self.carry.is_empty() {
+                let bytes: Vec<u8> = self.carry.drain(..).collect();
+                match self.chunk_decoder.push(&bytes) {
+                    Ok(decoded) => self.sourcetable_carry.extend_from_slice(&decoded),
+                    Err(err) => {
+                        self.state = NtripState::Closed;
+                        events.push(NtripEvent::StreamCorrupted {
+                            detail: err.to_string(),
+                        });
+                        return true;
+                    }
                 }
             }
-
-            self.sourcetable_text.push_str(&text);
-            self.sourcetable_text.push_str("\r\n");
-            if self.sourcetable_text.len() > MAX_SOURCETABLE {
-                self.reject_current_prefix(events);
+            if self.drain_sourcetable_lines(events) {
                 return true;
             }
-            if first == "ENDSOURCETABLE" {
-                match parse_sourcetable(&self.sourcetable_text) {
-                    Ok(table) => events.push(NtripEvent::Sourcetable(table)),
-                    Err(err) => events.push(NtripEvent::StreamCorrupted {
-                        detail: err.to_string(),
-                    }),
+            if self.chunk_decoder.finished() {
+                if !self.sourcetable_carry.is_empty() {
+                    let line: Vec<u8> = self.sourcetable_carry.drain(..).collect();
+                    if self.push_sourcetable_line(&line, events) {
+                        return true;
+                    }
                 }
-                self.state = NtripState::Closed;
+                self.finish_sourcetable(events);
+                return true;
+            }
+            false
+        } else {
+            self.drain_sourcetable_lines(events)
+        }
+    }
+
+    pub fn finish(&mut self) -> Vec<NtripEvent> {
+        let mut events = Vec::new();
+        if self.state == NtripState::Sourcetable {
+            if self.sourcetable_chunked {
+                if !self.sourcetable_carry.is_empty() {
+                    let line: Vec<u8> = self.sourcetable_carry.drain(..).collect();
+                    self.push_sourcetable_line(&line, &mut events);
+                }
+            } else if !self.carry.is_empty() {
+                let line: Vec<u8> = self.carry.drain(..).collect();
+                self.push_sourcetable_line(&line, &mut events);
+            }
+            self.finish_sourcetable(&mut events);
+        }
+        events
+    }
+
+    fn drain_sourcetable_lines(&mut self, events: &mut Vec<NtripEvent>) -> bool {
+        loop {
+            let line = if self.sourcetable_chunked {
+                take_line_from(&mut self.sourcetable_carry)
+            } else {
+                take_line_from(&mut self.carry)
+            };
+            let Some(line) = line else {
+                let len = if self.sourcetable_chunked {
+                    self.sourcetable_carry.len()
+                } else {
+                    self.carry.len()
+                };
+                if len > MAX_LINE {
+                    self.reject_current_prefix(events);
+                    return true;
+                }
+                return false;
+            };
+
+            if self.push_sourcetable_line(&line, events) {
                 return true;
             }
         }
+    }
+
+    fn push_sourcetable_line(&mut self, line: &[u8], events: &mut Vec<NtripEvent>) -> bool {
+        let text = String::from_utf8_lossy(line).to_string();
+        let first = text.split(';').next().unwrap_or("").trim();
+
+        if !self.sourcetable_records_started {
+            if text.is_empty() {
+                return false;
+            }
+            if is_sourcetable_record_start(first) {
+                self.sourcetable_records_started = true;
+            } else if text.contains(':') {
+                return false;
+            } else {
+                self.sourcetable_records_started = true;
+            }
+        }
+
+        self.sourcetable_text.push_str(&text);
+        self.sourcetable_text.push_str("\r\n");
+        if self.sourcetable_text.len() > MAX_SOURCETABLE {
+            self.reject_current_prefix(events);
+            return true;
+        }
+        if first.eq_ignore_ascii_case("ENDSOURCETABLE") {
+            self.finish_sourcetable(events);
+            return true;
+        }
         false
+    }
+
+    fn finish_sourcetable(&mut self, events: &mut Vec<NtripEvent>) {
+        match parse_sourcetable(&self.sourcetable_text) {
+            Ok(table) => events.push(NtripEvent::Sourcetable(table)),
+            Err(err) => events.push(NtripEvent::StreamCorrupted {
+                detail: err.to_string(),
+            }),
+        }
+        self.state = NtripState::Closed;
     }
 
     fn take_line_or_reject(&mut self, events: &mut Vec<NtripEvent>) -> Option<Vec<u8>> {
@@ -364,12 +454,27 @@ impl NtripClientMachine {
         }
     }
 
-    fn consume_optional_blank_line(&mut self) {
-        if self.carry.starts_with(b"\r\n") {
-            self.carry.drain(..2);
-        } else if self.carry.starts_with(b"\n") {
-            self.carry.drain(..1);
+    fn consume_pending_icy_blank_line(&mut self) -> bool {
+        if self.carry.is_empty() {
+            return false;
         }
+        if self.carry[0] == b'\n' {
+            self.carry.drain(..1);
+            self.pending_icy_blank_line = false;
+            return true;
+        }
+        if self.carry[0] == b'\r' {
+            if self.carry.len() == 1 {
+                return false;
+            }
+            if self.carry[1] == b'\n' {
+                self.carry.drain(..2);
+            }
+            self.pending_icy_blank_line = false;
+            return true;
+        }
+        self.pending_icy_blank_line = false;
+        true
     }
 
     fn reject_current_prefix(&mut self, events: &mut Vec<NtripEvent>) {
@@ -415,6 +520,29 @@ fn parse_http_status(text: &str) -> Option<(NtripVersion, u16, &str)> {
 fn split_header(line: &[u8]) -> Option<(String, String)> {
     let pos = line.iter().position(|&b| b == b':')?;
     let name = String::from_utf8_lossy(&line[..pos]).trim().to_string();
-    let value = String::from_utf8_lossy(&line[pos + 1..]).trim().to_string();
+    let value_bytes = if line.get(pos + 1) == Some(&b' ') {
+        &line[pos + 2..]
+    } else {
+        &line[pos + 1..]
+    };
+    let value = String::from_utf8_lossy(value_bytes).to_string();
     Some((name, value))
+}
+
+fn take_line_from(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let pos = buffer.iter().position(|&b| b == b'\n')?;
+    let mut line: Vec<u8> = buffer.drain(..=pos).collect();
+    if line.ends_with(b"\n") {
+        line.pop();
+    }
+    if line.ends_with(b"\r") {
+        line.pop();
+    }
+    Some(line)
+}
+
+fn is_sourcetable_record_start(first: &str) -> bool {
+    ["STR", "CAS", "NET", "ENDSOURCETABLE"]
+        .iter()
+        .any(|tag| first.eq_ignore_ascii_case(tag))
 }

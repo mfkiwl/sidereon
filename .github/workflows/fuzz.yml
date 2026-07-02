@@ -23,6 +23,12 @@ env:
     fuzz_signal
     fuzz_time
     ionex_parse
+    nmea_accumulate
+    nmea_parse
+    ntrip_chunk_decode
+    ntrip_response_parse
+    ntrip_sourcetable_parse
+    ntrip_sourcetable_round_trip
     omm_xml_parse
     omm_round_trip
     rinex_obs_parse

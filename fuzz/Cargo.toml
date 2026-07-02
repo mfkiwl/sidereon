@@ -265,5 +265,47 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ntrip_response_parse"
+path = "fuzz_targets/ntrip_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntrip_chunk_decode"
+path = "fuzz_targets/ntrip_chunk_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntrip_sourcetable_parse"
+path = "fuzz_targets/ntrip_sourcetable_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntrip_sourcetable_round_trip"
+path = "fuzz_targets/ntrip_sourcetable_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nmea_parse"
+path = "fuzz_targets/nmea_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nmea_accumulate"
+path = "fuzz_targets/nmea_accumulate.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
