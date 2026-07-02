@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::astro::time::j2000_seconds;
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::rinex::observations::{ObsEpochTime, RinexObs};
+use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
 
 /// Options controlling RINEX observation QC aggregation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,9 +34,31 @@ pub enum ObservationQcError {
     /// The supplied nominal interval was zero, negative, or non-finite.
     #[error("invalid observation QC interval: must be finite and positive")]
     InvalidInterval,
-    /// The supplied gap factor was zero, negative, or non-finite.
-    #[error("invalid observation QC gap factor: must be finite and positive")]
+    /// The supplied gap factor was not finite and greater than one.
+    #[error("invalid observation QC gap factor: must be finite and greater than one")]
     InvalidGapFactor,
+}
+
+/// Source of the interval used for gap detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalSource {
+    /// Caller override.
+    Override,
+    /// Header `INTERVAL`.
+    Header,
+    /// Modal positive epoch delta inferred from the body.
+    Inferred,
+    /// Not enough positive epoch deltas were available.
+    Unresolved,
+}
+
+/// Non-fatal QC note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationQcNote {
+    /// Adjacent observation epochs were duplicate or out of order.
+    NonMonotonicEpoch { epoch_index: usize },
+    /// No interval could be resolved.
+    IntervalUnresolved,
 }
 
 /// Aggregate QC report for one parsed RINEX observation file.
@@ -53,6 +75,10 @@ pub struct ObservationQcReport {
     pub power_failure_epochs: usize,
     /// Count of malformed records skipped by the RINEX observation parser.
     pub skipped_records: usize,
+    /// Interval used for gap detection.
+    pub interval_s: Option<f64>,
+    /// Where `interval_s` came from.
+    pub interval_source: IntervalSource,
     /// Estimated number of missing nominal epochs across all detected gaps.
     pub missing_epochs: usize,
     /// Gaps detected from adjacent observation epochs and the nominal interval.
@@ -63,6 +89,8 @@ pub struct ObservationQcReport {
     pub satellite_signals: Vec<SatelliteSignalQc>,
     /// Per-system, per-code observation completeness and SSI statistics.
     pub system_signals: Vec<SystemSignalQc>,
+    /// Non-fatal QC notes.
+    pub notes: Vec<ObservationQcNote>,
 }
 
 /// One detected gap between adjacent observation epochs.
@@ -102,7 +130,9 @@ pub struct SatelliteSignalQc {
     pub value_observations: usize,
     /// Signal-strength indicator statistics for non-blank values that carried
     /// an SSI digit.
-    pub ssi: Option<SsiStats>,
+    pub ssi: Option<SsiHistogram>,
+    /// Raw S-code statistics when this code is an `S*` observable.
+    pub snr: Option<SnrStats>,
 }
 
 /// Per-system, per-observation-code counts.
@@ -116,20 +146,31 @@ pub struct SystemSignalQc {
     pub value_observations: usize,
     /// Signal-strength indicator statistics for non-blank values that carried
     /// an SSI digit.
-    pub ssi: Option<SsiStats>,
+    pub ssi: Option<SsiHistogram>,
+    /// Raw S-code statistics when this code is an `S*` observable.
+    pub snr: Option<SnrStats>,
 }
 
-/// Summary statistics over RINEX signal-strength indicator digits.
+/// Histogram over RINEX SSI digits. Index 0 is blank/unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsiHistogram {
+    /// Counts indexed by SSI digit.
+    pub counts: [u64; 10],
+}
+
+/// Summary statistics over raw numeric `S*` signal-strength observations.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SsiStats {
-    /// Number of SSI digits included.
-    pub count: usize,
-    /// Minimum SSI digit.
-    pub min: u8,
-    /// Maximum SSI digit.
-    pub max: u8,
-    /// Arithmetic mean of SSI digits.
+pub struct SnrStats {
+    /// Number of samples.
+    pub n: usize,
+    /// Arithmetic mean.
     pub mean: f64,
+    /// Minimum sample.
+    pub min: f64,
+    /// Maximum sample.
+    pub max: f64,
+    /// Sample standard deviation, absent for one sample.
+    pub std: Option<f64>,
 }
 
 /// Build a QC report with default options.
@@ -192,17 +233,20 @@ pub fn observation_qc_with_options(
                 let sat_signal = satellite_signals
                     .entry((*satellite, code.clone()))
                     .or_default();
-                sat_signal.add(value.ssi);
+                sat_signal.add(code, value.value, value.ssi);
 
                 let sys_signal = system_signals
                     .entry((satellite.system, code.clone()))
                     .or_default();
-                sys_signal.add(value.ssi);
+                sys_signal.add(code, value.value, value.ssi);
             }
         }
     }
 
-    let data_gaps = detect_gaps(obs, options, &observation_epoch_times)?;
+    let mut notes = non_monotonic_notes(&observation_epoch_times);
+    let (interval_s, interval_source) =
+        resolve_interval(obs, options, &observation_epoch_times, &mut notes)?;
+    let data_gaps = detect_gaps(options, &observation_epoch_times, interval_s)?;
     let missing_epochs = data_gaps.iter().map(|gap| gap.missing_epochs).sum();
 
     Ok(ObservationQcReport {
@@ -211,6 +255,8 @@ pub fn observation_qc_with_options(
         event_records,
         power_failure_epochs,
         skipped_records: obs.skipped_records,
+        interval_s,
+        interval_source,
         missing_epochs,
         data_gaps,
         satellites: satellites
@@ -228,6 +274,7 @@ pub fn observation_qc_with_options(
                 code,
                 value_observations: acc.value_observations,
                 ssi: acc.ssi.finish(),
+                snr: acc.snr.finish(),
             })
             .collect(),
         system_signals: system_signals
@@ -237,13 +284,15 @@ pub fn observation_qc_with_options(
                 code,
                 value_observations: acc.value_observations,
                 ssi: acc.ssi.finish(),
+                snr: acc.snr.finish(),
             })
             .collect(),
+        notes,
     })
 }
 
 fn validate_options(options: ObservationQcOptions) -> Result<(), ObservationQcError> {
-    if !options.gap_factor.is_finite() || options.gap_factor <= 0.0 {
+    if !options.gap_factor.is_finite() || options.gap_factor <= 1.0 {
         return Err(ObservationQcError::InvalidGapFactor);
     }
 
@@ -262,26 +311,46 @@ fn validate_interval(interval_s: f64) -> Result<(), ObservationQcError> {
     }
 }
 
-fn detect_gaps(
+fn resolve_interval(
     obs: &RinexObs,
     options: ObservationQcOptions,
     observation_epoch_times: &[ObsEpochTime],
-) -> Result<Vec<ObservationDataGap>, ObservationQcError> {
-    let Some(interval_s) = options.interval_override_s.or(obs.header().interval_s) else {
-        return Ok(Vec::new());
+    notes: &mut Vec<ObservationQcNote>,
+) -> Result<(Option<f64>, IntervalSource), ObservationQcError> {
+    let Some(interval_s) = options.interval_override_s else {
+        if let Some(interval_s) = obs.header().interval_s {
+            validate_interval(interval_s)?;
+            return Ok((Some(interval_s), IntervalSource::Header));
+        }
+        if let Some(interval_s) = dominant_obs_interval_s(observation_epoch_times) {
+            return Ok((Some(interval_s), IntervalSource::Inferred));
+        }
+        notes.push(ObservationQcNote::IntervalUnresolved);
+        return Ok((None, IntervalSource::Unresolved));
     };
     validate_interval(interval_s)?;
+    Ok((Some(interval_s), IntervalSource::Override))
+}
+
+fn detect_gaps(
+    options: ObservationQcOptions,
+    observation_epoch_times: &[ObsEpochTime],
+    interval_s: Option<f64>,
+) -> Result<Vec<ObservationDataGap>, ObservationQcError> {
+    let Some(interval_s) = interval_s else {
+        return Ok(Vec::new());
+    };
 
     let mut gaps = Vec::new();
     for window in observation_epoch_times.windows(2) {
         let start_epoch = window[0];
         let end_epoch = window[1];
-        let observed_delta_s = epoch_seconds(end_epoch) - epoch_seconds(start_epoch);
-        if observed_delta_s <= interval_s * options.gap_factor {
+        let observed_delta_s = obs_epoch_seconds(end_epoch) - obs_epoch_seconds(start_epoch);
+        if observed_delta_s <= 0.0 || observed_delta_s <= interval_s * options.gap_factor {
             continue;
         }
 
-        let missing_epochs = ((observed_delta_s / interval_s).round() as isize - 1).max(1) as usize;
+        let missing_epochs = ((observed_delta_s / interval_s).round() as isize - 1) as usize;
         gaps.push(ObservationDataGap {
             start_epoch,
             end_epoch,
@@ -294,15 +363,16 @@ fn detect_gaps(
     Ok(gaps)
 }
 
-fn epoch_seconds(epoch: ObsEpochTime) -> f64 {
-    j2000_seconds(
-        epoch.year,
-        epoch.month as i32,
-        epoch.day as i32,
-        epoch.hour as i32,
-        epoch.minute as i32,
-        epoch.second,
-    )
+fn non_monotonic_notes(observation_epoch_times: &[ObsEpochTime]) -> Vec<ObservationQcNote> {
+    let mut notes = Vec::new();
+    for (idx, window) in observation_epoch_times.windows(2).enumerate() {
+        if obs_epoch_seconds(window[1]) - obs_epoch_seconds(window[0]) <= 0.0 {
+            notes.push(ObservationQcNote::NonMonotonicEpoch {
+                epoch_index: idx + 1,
+            });
+        }
+    }
+    notes
 }
 
 #[derive(Debug, Default)]
@@ -315,43 +385,82 @@ struct SatelliteAccum {
 struct SignalAccum {
     value_observations: usize,
     ssi: SsiAccum,
+    snr: SnrAccum,
 }
 
 impl SignalAccum {
-    fn add(&mut self, ssi: Option<u8>) {
+    fn add(&mut self, code: &str, value: Option<f64>, ssi: Option<u8>) {
         self.value_observations += 1;
-        if let Some(ssi) = ssi {
-            self.ssi.add(ssi);
+        self.ssi.add(ssi);
+        if code.starts_with('S') {
+            if let Some(value) = value {
+                self.snr.add(value);
+            }
         }
     }
 }
 
 #[derive(Debug, Default)]
 struct SsiAccum {
-    count: usize,
-    min: Option<u8>,
-    max: Option<u8>,
-    sum: u64,
+    counts: [u64; 10],
 }
 
 impl SsiAccum {
-    fn add(&mut self, value: u8) {
-        self.count += 1;
-        self.min = Some(self.min.map_or(value, |current| current.min(value)));
-        self.max = Some(self.max.map_or(value, |current| current.max(value)));
-        self.sum += u64::from(value);
+    fn add(&mut self, value: Option<u8>) {
+        let idx = value.unwrap_or(0).min(9) as usize;
+        self.counts[idx] += 1;
     }
 
-    fn finish(self) -> Option<SsiStats> {
-        if self.count == 0 {
+    fn finish(self) -> Option<SsiHistogram> {
+        if self.counts.iter().all(|count| *count == 0) {
             return None;
         }
 
-        Some(SsiStats {
-            count: self.count,
-            min: self.min.expect("count > 0 sets SSI minimum"),
-            max: self.max.expect("count > 0 sets SSI maximum"),
-            mean: self.sum as f64 / self.count as f64,
+        Some(SsiHistogram {
+            counts: self.counts,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct SnrAccum {
+    samples: Vec<f64>,
+}
+
+impl SnrAccum {
+    fn add(&mut self, value: f64) {
+        self.samples.push(value);
+    }
+
+    fn finish(self) -> Option<SnrStats> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let n = self.samples.len();
+        let mean = self.samples.iter().sum::<f64>() / n as f64;
+        let min = self.samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = self
+            .samples
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let std = (n > 1).then(|| {
+            let sum_sq = self
+                .samples
+                .iter()
+                .map(|value| {
+                    let residual = *value - mean;
+                    residual * residual
+                })
+                .sum::<f64>();
+            (sum_sq / (n - 1) as f64).sqrt()
+        });
+        Some(SnrStats {
+            n,
+            mean,
+            min,
+            max,
+            std,
         })
     }
 }
@@ -360,7 +469,9 @@ impl SsiAccum {
 mod tests {
     use super::*;
     use crate::rinex::observations::{ObsEpoch, ObsHeader, ObsValue};
+    use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     #[test]
     fn observation_qc_counts_epochs_satellites_signals_and_ssi() {
@@ -439,13 +550,11 @@ mod tests {
         assert_eq!(g01_c1c.value_observations, 2);
         assert_eq!(
             g01_c1c.ssi,
-            Some(SsiStats {
-                count: 2,
-                min: 5,
-                max: 7,
-                mean: 6.0,
+            Some(SsiHistogram {
+                counts: [0, 0, 0, 0, 0, 1, 0, 1, 0, 0],
             })
         );
+        assert_eq!(g01_c1c.snr, None);
 
         let gps_c1c = report
             .system_signals
@@ -453,7 +562,28 @@ mod tests {
             .find(|signal| signal.system == GnssSystem::Gps && signal.code == "C1C")
             .expect("GPS C1C signal");
         assert_eq!(gps_c1c.value_observations, 3);
-        assert!((gps_c1c.ssi.expect("SSI").mean - (16.0 / 3.0)).abs() < 1.0e-12);
+        assert_eq!(
+            gps_c1c.ssi,
+            Some(SsiHistogram {
+                counts: [0, 0, 0, 0, 1, 1, 0, 1, 0, 0],
+            })
+        );
+
+        let gps_s1c = report
+            .system_signals
+            .iter()
+            .find(|signal| signal.system == GnssSystem::Gps && signal.code == "S1C")
+            .expect("GPS S1C signal");
+        assert_eq!(
+            gps_s1c.snr,
+            Some(SnrStats {
+                n: 1,
+                mean: 9.0,
+                min: 9.0,
+                max: 9.0,
+                std: None,
+            })
+        );
     }
 
     #[test]
@@ -484,6 +614,65 @@ mod tests {
     }
 
     #[test]
+    fn observation_qc_infers_interval_when_header_is_absent() {
+        let g01 = sat(1);
+        let mut obs = observation_file(vec![
+            epoch(
+                0,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(1.0), Some(5))])]),
+            ),
+            epoch(
+                0,
+                30.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(2.0), Some(6))])]),
+            ),
+            epoch(
+                2,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(3.0), Some(7))])]),
+            ),
+        ]);
+        obs.header.interval_s = None;
+
+        let report = observation_qc(&obs);
+
+        assert_eq!(report.interval_s, Some(30.0));
+        assert_eq!(report.interval_source, IntervalSource::Inferred);
+        assert_eq!(report.missing_epochs, 2);
+    }
+
+    #[test]
+    fn observation_qc_notes_non_monotonic_epochs_and_excludes_them_from_gaps() {
+        let g01 = sat(1);
+        let obs = observation_file(vec![
+            epoch(
+                1,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(1.0), Some(5))])]),
+            ),
+            epoch(
+                0,
+                30.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(2.0), Some(6))])]),
+            ),
+        ]);
+
+        let report = observation_qc(&obs);
+
+        assert_eq!(
+            report.notes,
+            vec![ObservationQcNote::NonMonotonicEpoch { epoch_index: 1 }]
+        );
+        assert!(report.data_gaps.is_empty());
+    }
+
+    #[test]
     fn observation_qc_rejects_invalid_options() {
         let obs = observation_file(Vec::new());
 
@@ -501,11 +690,71 @@ mod tests {
             &obs,
             ObservationQcOptions {
                 interval_override_s: None,
-                gap_factor: f64::NAN,
+                gap_factor: 1.0,
             },
         )
         .expect_err("invalid gap factor");
         assert_eq!(err, ObservationQcError::InvalidGapFactor);
+    }
+
+    #[test]
+    fn observation_qc_matches_independent_real_fixture_oracles() {
+        let doc = read_json_fixture("qc/observation_qc_real_oracles.json");
+        assert_eq!(
+            doc["provenance"]["generator"],
+            "crates/sidereon-core/fixtures-generators/generate_observation_qc_oracles.py"
+        );
+        for fixture in doc["fixtures"].as_array().expect("fixtures array") {
+            let rel = fixture["path"].as_str().expect("fixture path");
+            let text = std::fs::read_to_string(fixture_path(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let obs = RinexObs::parse(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+            let report = observation_qc(&obs);
+
+            assert_eq!(
+                report.total_epoch_records,
+                fixture["total_epoch_records"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.observation_epochs,
+                fixture["observation_epochs"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.event_records,
+                fixture["event_records"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.power_failure_epochs,
+                fixture["power_failure_epochs"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.skipped_records,
+                fixture["skipped_records"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_close(
+                report.interval_s.expect("oracle interval"),
+                fixture["interval_s"].as_f64().unwrap(),
+                rel,
+            );
+            assert_eq!(
+                report.missing_epochs,
+                fixture["missing_epochs"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_gaps(&report.data_gaps, &fixture["data_gaps"], rel);
+            assert_satellites(&report.satellites, &fixture["satellites"], rel);
+            assert_satellite_signals(
+                &report.satellite_signals,
+                &fixture["satellite_signals"],
+                rel,
+            );
+            assert_system_signals(&report.system_signals, &fixture["system_signals"], rel);
+        }
     }
 
     fn observation_file(epochs: Vec<ObsEpoch>) -> RinexObs {
@@ -518,12 +767,27 @@ mod tests {
                     GnssSystem::Gps,
                     vec!["C1C".to_string(), "L1C".to_string(), "S1C".to_string()],
                 )]),
+                program_run_by_date: None,
+                comments: Vec::new(),
+                marker_number: None,
+                marker_type: None,
+                observer: None,
+                agency: None,
+                receiver: None,
+                antenna: None,
                 interval_s: Some(30.0),
                 time_of_first_obs: None,
+                time_of_last_obs: None,
+                n_satellites: None,
+                prn_obs_counts: BTreeMap::new(),
                 phase_shifts: Vec::new(),
                 scale_factors: Vec::new(),
                 glonass_slots: BTreeMap::new(),
+                glonass_cod_phs_bis: None,
+                signal_strength_unit: None,
+                leap_seconds: None,
                 marker_name: None,
+                unretained_header_labels: Vec::new(),
             },
             epochs,
             skipped_records: 0,
@@ -546,6 +810,10 @@ mod tests {
                 second,
             },
             flag,
+            rcv_clock_offset_s: None,
+            epoch_picoseconds: None,
+            declared_record_count: sats.len(),
+            special_record_count: if flag > 1 { sats.len() } else { 0 },
             sats,
         }
     }
@@ -560,5 +828,201 @@ mod tests {
 
     fn sat(prn: u8) -> GnssSatelliteId {
         GnssSatelliteId::new(GnssSystem::Gps, prn).expect("valid GPS PRN")
+    }
+
+    fn fixture_path(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    fn read_json_fixture(rel: &str) -> Value {
+        let path = fixture_path(&format!("tests/fixtures/{rel}"));
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    }
+
+    fn assert_close(actual: f64, expected: f64, context: &str) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "{context}: actual {actual:?}, expected {expected:?}"
+        );
+    }
+
+    fn assert_gaps(actual: &[ObservationDataGap], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("gap array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_epoch(&actual.start_epoch, &expected["start_epoch"], context);
+            assert_epoch(&actual.end_epoch, &expected["end_epoch"], context);
+            assert_close(
+                actual.nominal_interval_s,
+                expected["nominal_interval_s"].as_f64().unwrap(),
+                context,
+            );
+            assert_close(
+                actual.observed_delta_s,
+                expected["observed_delta_s"].as_f64().unwrap(),
+                context,
+            );
+            assert_eq!(
+                actual.missing_epochs,
+                expected["missing_epochs"].as_u64().unwrap() as usize,
+                "{context}"
+            );
+        }
+    }
+
+    fn assert_epoch(actual: &ObsEpochTime, expected: &Value, context: &str) {
+        assert_eq!(
+            actual.year,
+            expected["year"].as_i64().unwrap() as i32,
+            "{context}"
+        );
+        assert_eq!(
+            actual.month,
+            expected["month"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_eq!(
+            actual.day,
+            expected["day"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_eq!(
+            actual.hour,
+            expected["hour"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_eq!(
+            actual.minute,
+            expected["minute"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_close(actual.second, expected["second"].as_f64().unwrap(), context);
+    }
+
+    fn assert_satellites(actual: &[SatelliteObservationQc], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("satellites array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        let actual = actual
+            .iter()
+            .map(|sat| {
+                (
+                    sat.satellite.to_string(),
+                    (sat.epochs_with_observations, sat.value_observations),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for expected in expected {
+            let satellite = expected["satellite"].as_str().unwrap();
+            let actual = actual
+                .get(satellite)
+                .unwrap_or_else(|| panic!("{context}: missing satellite {satellite}"));
+            assert_eq!(
+                actual.0,
+                expected["epochs_with_observations"].as_u64().unwrap() as usize,
+                "{context} {satellite}"
+            );
+            assert_eq!(
+                actual.1,
+                expected["value_observations"].as_u64().unwrap() as usize,
+                "{context} {satellite}"
+            );
+        }
+    }
+
+    fn assert_satellite_signals(actual: &[SatelliteSignalQc], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("satellite signals array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        let actual = actual
+            .iter()
+            .map(|signal| {
+                (
+                    (signal.satellite.to_string(), signal.code.as_str()),
+                    (signal.value_observations, signal.ssi, signal.snr),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for expected in expected {
+            let satellite = expected["satellite"].as_str().unwrap();
+            let code = expected["code"].as_str().unwrap();
+            let actual = actual
+                .get(&(satellite.to_string(), code))
+                .unwrap_or_else(|| panic!("{context}: missing {satellite} {code}"));
+            assert_eq!(
+                actual.0,
+                expected["value_observations"].as_u64().unwrap() as usize,
+                "{context} {satellite} {code}"
+            );
+            assert_ssi(actual.1, &expected["ssi"], context);
+            assert_snr(actual.2, &expected["snr"], context);
+        }
+    }
+
+    fn assert_system_signals(actual: &[SystemSignalQc], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("system signals array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        let actual = actual
+            .iter()
+            .map(|signal| {
+                (
+                    (signal.system.letter().to_string(), signal.code.as_str()),
+                    (signal.value_observations, signal.ssi, signal.snr),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for expected in expected {
+            let system = expected["system"].as_str().unwrap();
+            let code = expected["code"].as_str().unwrap();
+            let actual = actual
+                .get(&(system.to_string(), code))
+                .unwrap_or_else(|| panic!("{context}: missing {system} {code}"));
+            assert_eq!(
+                actual.0,
+                expected["value_observations"].as_u64().unwrap() as usize,
+                "{context} {system} {code}"
+            );
+            assert_ssi(actual.1, &expected["ssi"], context);
+            assert_snr(actual.2, &expected["snr"], context);
+        }
+    }
+
+    fn assert_ssi(actual: Option<SsiHistogram>, expected: &Value, context: &str) {
+        if expected.is_null() {
+            assert_eq!(actual, None, "{context}");
+            return;
+        }
+        let expected = expected
+            .as_array()
+            .expect("ssi array")
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.expect("ssi").counts.to_vec(), expected, "{context}");
+    }
+
+    fn assert_snr(actual: Option<SnrStats>, expected: &Value, context: &str) {
+        if expected.is_null() {
+            assert_eq!(actual, None, "{context}");
+            return;
+        }
+        let actual = actual.expect("snr");
+        assert_eq!(
+            actual.n,
+            expected["n"].as_u64().unwrap() as usize,
+            "{context}"
+        );
+        assert_close(actual.mean, expected["mean"].as_f64().unwrap(), context);
+        assert_close(actual.min, expected["min"].as_f64().unwrap(), context);
+        assert_close(actual.max, expected["max"].as_f64().unwrap(), context);
+        if expected["std"].is_null() {
+            assert_eq!(actual.std, None, "{context}");
+        } else {
+            assert_close(
+                actual.std.expect("std"),
+                expected["std"].as_f64().unwrap(),
+                context,
+            );
+        }
     }
 }

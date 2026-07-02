@@ -39,9 +39,9 @@ pub mod nav {
 pub mod observations {
     pub use crate::rinex_obs::{
         band_frequency_hz, carrier_phase_rows, observation_frequency_hz, observation_values,
-        pseudoranges, CarrierPhaseRow, ObsEpoch, ObsEpochTime, ObsHeader, ObsPhaseShift,
-        ObsScaleFactor, ObsValue, ObservationFilter, ObservationKind, ObservationValueRow,
-        RinexObs, SignalPolicy,
+        pseudoranges, AntennaInfo, CarrierPhaseRow, ObsEpoch, ObsEpochTime, ObsHeader,
+        ObsLeapSeconds, ObsPhaseShift, ObsScaleFactor, ObsValue, ObservationFilter,
+        ObservationKind, ObservationValueRow, PgmRunByDate, ReceiverInfo, RinexObs, SignalPolicy,
     };
 
     /// Role-oriented alias for a parsed RINEX observation file.
@@ -52,8 +52,9 @@ pub mod observations {
 pub mod qc {
     pub use crate::rinex_qc::{
         lint_nav_text, lint_obs, lint_obs_text, repair_nav, repair_nav_text, repair_obs,
-        repair_obs_text, repair_obs_to_crinex_string, Finding, FindingRef, LintReport, NavRepair,
-        ObsRepair, RepairAction, RepairOptions, Severity,
+        repair_obs_text, repair_obs_to_crinex_string, AppliedEdit, Finding, FindingRef,
+        HeaderEditError, LintReport, NavRepair, ObsHeaderEdit, ObsRepair, RepairAction,
+        RepairOptions, Severity,
     };
 }
 

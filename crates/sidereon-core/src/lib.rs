@@ -124,6 +124,10 @@ pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric he
 pub mod geometry;
 pub mod ils; // integer least squares ambiguity-resolution kernels
 pub mod observation_qc; // RINEX observation completeness and signal rollups
+pub mod qc_obs {
+    //! RINEX observation quality-control rollups.
+    pub use crate::observation_qc::*;
+}
 pub mod orbit;
 pub mod positioning;
 pub mod prelude;

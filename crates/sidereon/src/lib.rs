@@ -178,8 +178,8 @@ pub use sidereon_core::quality::spp_robust_fde_driver;
 pub use sidereon_core::{
     antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
     constellation, data, dgnss, ephemeris, frequencies, geometry, ils, navigation, nmea,
-    observables, orbit, positioning, ppp_corrections, quality, rinex, rtcm, rtk, sbas, signal, ssr,
-    staleness, terrain, tides, velocity,
+    observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas,
+    signal, ssr, staleness, terrain, tides, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
@@ -322,8 +322,8 @@ pub mod least_squares {
 /// RINEX observation/navigation lint and mechanical repair types.
 pub mod rinex_qc {
     pub use sidereon_core::rinex::qc::{
-        Finding, FindingRef, LintReport, NavRepair, ObsRepair, RepairAction, RepairOptions,
-        Severity,
+        AppliedEdit, Finding, FindingRef, HeaderEditError, LintReport, NavRepair, ObsHeaderEdit,
+        ObsRepair, RepairAction, RepairOptions, Severity,
     };
 }
 

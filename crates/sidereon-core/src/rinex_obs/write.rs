@@ -51,8 +51,52 @@ impl RinexObs {
             ),
             "RINEX VERSION / TYPE",
         );
+        if let Some(pgm) = &h.program_run_by_date {
+            push_header_line(
+                out,
+                &format!("{:<20}{:<20}{:<20}", pgm.program, pgm.run_by, pgm.date),
+                "PGM / RUN BY / DATE",
+            );
+        }
+        for comment in &h.comments {
+            push_header_line(out, comment, "COMMENT");
+        }
         if let Some(name) = &h.marker_name {
             push_header_line(out, &format!("{name:<60}"), "MARKER NAME");
+        }
+        if let Some(number) = &h.marker_number {
+            push_header_line(out, number, "MARKER NUMBER");
+        }
+        if let Some(marker_type) = &h.marker_type {
+            push_header_line(out, marker_type, "MARKER TYPE");
+        }
+        if h.observer.is_some() || h.agency.is_some() {
+            push_header_line(
+                out,
+                &format!(
+                    "{:<20}{:<40}",
+                    h.observer.as_deref().unwrap_or(""),
+                    h.agency.as_deref().unwrap_or("")
+                ),
+                "OBSERVER / AGENCY",
+            );
+        }
+        if let Some(receiver) = &h.receiver {
+            push_header_line(
+                out,
+                &format!(
+                    "{:<20}{:<20}{:<20}",
+                    receiver.number, receiver.receiver_type, receiver.version
+                ),
+                "REC # / TYPE / VERS",
+            );
+        }
+        if let Some(antenna) = &h.antenna {
+            push_header_line(
+                out,
+                &format!("{:<20}{:<20}", antenna.number, antenna.antenna_type),
+                "ANT # / TYPE",
+            );
         }
         if let Some(pos) = h.approx_position_m {
             push_header_line(out, &format_vec3(pos), "APPROX POSITION XYZ");
@@ -63,12 +107,19 @@ impl RinexObs {
         for (system, codes) in &h.obs_codes {
             write_obs_types(out, *system, codes);
         }
+        if let Some(unit) = &h.signal_strength_unit {
+            push_header_line(out, unit, "SIGNAL STRENGTH UNIT");
+        }
         if let Some(interval) = h.interval_s {
             push_header_line(out, &format!("{interval:10.3}"), "INTERVAL");
         }
         if let Some((epoch, scale)) = h.time_of_first_obs {
             let label = crate::rinex_common::time_scale_rinex_label(scale);
             push_header_line(out, &format_first_obs(epoch, label), "TIME OF FIRST OBS");
+        }
+        if let Some((epoch, scale)) = h.time_of_last_obs {
+            let label = crate::rinex_common::time_scale_rinex_label(scale);
+            push_header_line(out, &format_first_obs(epoch, label), "TIME OF LAST OBS");
         }
         for shift in &h.phase_shifts {
             write_phase_shift(out, shift);
@@ -78,6 +129,18 @@ impl RinexObs {
         }
         if !h.glonass_slots.is_empty() {
             write_glonass_slots(out, &h.glonass_slots);
+        }
+        if let Some(entries) = &h.glonass_cod_phs_bis {
+            write_glonass_cod_phs_bis(out, entries);
+        }
+        if let Some(leap) = h.leap_seconds {
+            write_leap_seconds(out, leap);
+        }
+        if let Some(count) = h.n_satellites {
+            push_header_line(out, &format!("{count:6}"), "# OF SATELLITES");
+        }
+        for (sat, counts) in &h.prn_obs_counts {
+            write_prn_obs_counts(out, *sat, counts);
         }
         push_header_line(out, "", "END OF HEADER");
     }
@@ -93,9 +156,17 @@ impl RinexObs {
         // Event records (flag > 1) keep only their flag and epoch in the IR, so
         // no special records follow; flag 0/1 carry the satellite observations.
         let count = if epoch.flag > 1 { 0 } else { epoch.sats.len() };
+        let picoseconds = epoch
+            .epoch_picoseconds
+            .map(|value| format!(" {value:05}"))
+            .unwrap_or_default();
+        let clock = epoch
+            .rcv_clock_offset_s
+            .map(|value| format!("{value:15.12}"))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "> {:04} {:02} {:02} {:02} {:02}{:11.7}  {}{:3}",
+            "> {:04} {:02} {:02} {:02} {:02}{:11.7}{picoseconds}  {}{:3}{clock}",
             t.year, t.month, t.day, t.hour, t.minute, t.second, epoch.flag, count
         );
         if epoch.flag > 1 {
@@ -250,6 +321,45 @@ fn write_glonass_slots(out: &mut String, slots: &std::collections::BTreeMap<u8, 
         }
         push_header_line(out, content.trim_end(), "GLONASS SLOT / FRQ #");
     }
+}
+
+fn write_glonass_cod_phs_bis(out: &mut String, entries: &[(String, f64)]) {
+    let mut content = String::new();
+    for (code, value) in entries {
+        let _ = write!(content, " {code:>3} {value:8.3}");
+    }
+    push_header_line(out, content.trim_start(), "GLONASS COD/PHS/BIS");
+}
+
+fn write_leap_seconds(out: &mut String, leap: super::ObsLeapSeconds) {
+    let mut content = format!("{:6}", leap.current);
+    if let Some(value) = leap.delta_future {
+        let _ = write!(content, "{value:6}");
+    }
+    if let Some(value) = leap.week {
+        let _ = write!(content, "{value:6}");
+    }
+    if let Some(value) = leap.day {
+        let _ = write!(content, "{value:6}");
+    }
+    push_header_line(out, &content, "LEAP SECONDS");
+}
+
+fn write_prn_obs_counts(
+    out: &mut String,
+    sat: crate::id::GnssSatelliteId,
+    counts: &[Option<usize>],
+) {
+    let mut content = format!("{sat:<3}");
+    for count in counts {
+        match count {
+            Some(value) => {
+                let _ = write!(content, "{value:6}");
+            }
+            None => content.push_str("      "),
+        }
+    }
+    push_header_line(out, &content, "PRN / # OF OBS");
 }
 
 /// Append one 16-column observation field: the `F14.3` value (or blanks) re-scaled

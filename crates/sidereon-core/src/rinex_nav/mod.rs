@@ -842,6 +842,18 @@ impl core::fmt::Display for NavParseError {
 
 impl std::error::Error for NavParseError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedNavBlock {
+    pub satellite: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavParse {
+    pub records: Vec<BroadcastRecord>,
+    pub skipped: Vec<SkippedNavBlock>,
+}
+
 /// Parse a RINEX 3.x or 4.xx navigation file into the supported GPS, QZSS,
 /// Galileo, and BeiDou Keplerian records.
 ///
@@ -857,6 +869,22 @@ pub fn parse_nav(text: &str) -> Result<Vec<BroadcastRecord>, NavParseError> {
     } else {
         parse_nav_v3(lines, version)
     }
+}
+
+/// Parse supported NAV records while dropping malformed supported body blocks.
+///
+/// Header failures remain fatal because no record boundaries are trustworthy
+/// before the file type and version are known. Unsupported constellations and
+/// unsupported version-4 messages follow the strict parser's existing skip policy.
+pub fn parse_nav_lenient(text: &str) -> Result<NavParse, NavParseError> {
+    let mut lines = text.lines();
+    let version = verify_and_skip_header(&mut lines)?;
+    let (records, skipped) = if version.major >= 4 {
+        parse_nav_v4_lenient(lines, version)
+    } else {
+        parse_nav_v3_lenient(lines, version)
+    };
+    Ok(NavParse { records, skipped })
 }
 
 /// Version-3 body: a record starts at a line whose first three columns are a
@@ -889,6 +917,42 @@ where
         }
     }
     Ok(records)
+}
+
+fn parse_nav_v3_lenient<'a, I>(
+    lines: I,
+    version: RinexVersion,
+) -> (Vec<BroadcastRecord>, Vec<SkippedNavBlock>)
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in lines {
+        if is_record_start(line) {
+            blocks.push(vec![line]);
+        } else if let Some(last) = blocks.last_mut() {
+            last.push(line);
+        }
+    }
+
+    let mut records = Vec::new();
+    let mut skipped = Vec::new();
+    for block in &blocks {
+        let letter = block[0].as_bytes()[0] as char;
+        match GnssSystem::from_letter(letter) {
+            Some(GnssSystem::Gps) | Some(GnssSystem::Galileo) | Some(GnssSystem::BeiDou) => {
+                match parse_keplerian_block(block, None, version) {
+                    Ok(record) => records.push(record),
+                    Err(error) => skipped.push(SkippedNavBlock {
+                        satellite: nav_block_satellite(block),
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            _ => {}
+        }
+    }
+    (records, skipped)
 }
 
 /// Version-4 body: each record is introduced by a `> EPH|STO|EOP|ION SVNN MSG`
@@ -944,6 +1008,58 @@ where
         }
     }
     Ok(records)
+}
+
+fn parse_nav_v4_lenient<'a, I>(
+    lines: I,
+    version: RinexVersion,
+) -> (Vec<BroadcastRecord>, Vec<SkippedNavBlock>)
+where
+    I: Iterator<Item = &'a str>,
+{
+    let frames = v4_frames(lines);
+    let mut records = Vec::new();
+    let mut skipped = Vec::new();
+    for (marker, body) in &frames {
+        let Some((frame_type, sv, msg_token)) = parse_v4_marker(marker) else {
+            continue;
+        };
+        if frame_type != "EPH" {
+            continue;
+        }
+        let letter = sv.as_bytes().first().copied().map_or(' ', char::from);
+        let Some(system) = GnssSystem::from_letter(letter) else {
+            continue;
+        };
+        let supported = matches!(
+            system,
+            GnssSystem::Gps | GnssSystem::Qzss | GnssSystem::Galileo | GnssSystem::BeiDou
+        );
+        if !supported {
+            continue;
+        }
+        if let Some(message) = nav_message_from_v4_token(msg_token, system) {
+            let parsed = validate_v4_ephemeris_marker(sv, message, body)
+                .and_then(|()| parse_keplerian_block(body, Some(message), version));
+            match parsed {
+                Ok(record) => records.push(record),
+                Err(error) => skipped.push(SkippedNavBlock {
+                    satellite: sv.to_string(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+    }
+    (records, skipped)
+}
+
+fn nav_block_satellite(block: &[&str]) -> String {
+    block
+        .first()
+        .and_then(|line| line.get(0..3))
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn v4_frames<'a, I>(lines: I) -> Vec<(&'a str, Vec<&'a str>)>

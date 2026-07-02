@@ -9,11 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::astro::time::model::TimeScale;
 use crate::crinex;
 use crate::id::{GnssSatelliteId, GnssSystem};
+use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
 use crate::rinex_nav::{
-    parse_iono_corrections, parse_leap_seconds, parse_nav, BroadcastRecord, IonoCorrections,
-    NavMessage, NavParseError,
+    parse_iono_corrections, parse_leap_seconds, parse_nav, parse_nav_lenient, BroadcastRecord,
+    IonoCorrections, NavMessage, NavParseError,
 };
-use crate::rinex_obs::{ObsEpoch, ObsEpochTime, ObsHeader, RinexObs};
+use crate::rinex_obs::{
+    AntennaInfo, ObsEpoch, ObsEpochTime, ObsHeader, PgmRunByDate, ReceiverInfo, RinexObs,
+};
 use crate::Result;
 
 const EARTH_FIXED_RADIUS_MIN_M: f64 = 6_300_000.0;
@@ -95,13 +98,37 @@ pub enum Finding {
     ObsTimeOfFirstMismatch {
         at: FindingRef,
         declared: ObsEpochTime,
+        declared_scale: TimeScale,
         observed: ObsEpochTime,
+        observed_scale: TimeScale,
+    },
+    /// TIME OF LAST OBS disagrees with the body.
+    ObsTimeOfLastMismatch {
+        at: FindingRef,
+        declared: ObsEpochTime,
+        declared_scale: TimeScale,
+        observed: ObsEpochTime,
+        observed_scale: TimeScale,
     },
     /// INTERVAL disagrees with the dominant epoch spacing.
     ObsIntervalMismatch {
         at: FindingRef,
         declared_s: f64,
         observed_s: f64,
+    },
+    /// # OF SATELLITES disagrees with the body.
+    ObsSatelliteCountMismatch {
+        at: FindingRef,
+        declared: usize,
+        observed: usize,
+    },
+    /// PRN / # OF OBS disagrees with body tallies.
+    ObsPrnObsCountMismatch {
+        at: FindingRef,
+        satellite: GnssSatelliteId,
+        code: String,
+        declared: Option<usize>,
+        observed: usize,
     },
     /// GLONASS observations need a valid slot/frequency table.
     ObsGlonassSlotIssue {
@@ -121,6 +148,14 @@ pub enum Finding {
         system: GnssSystem,
         code: Option<String>,
     },
+    /// MARKER TYPE is not a RINEX Table 8 keyword.
+    ObsMarkerTypeIssue { at: FindingRef, marker_type: String },
+    /// Identity/header field exceeds width or has non-printable ASCII.
+    ObsIdentityFieldIssue {
+        at: FindingRef,
+        label: &'static str,
+        value: String,
+    },
     /// Approximate position is implausible for a fixed marker.
     ObsImplausibleApproxPosition { at: FindingRef, radius_m: f64 },
     /// Antenna height/east/north offset is implausible.
@@ -139,6 +174,16 @@ pub enum Finding {
     ObsDuplicateEpoch { at: FindingRef, epoch: ObsEpochTime },
     /// The parser skipped satellite records it could not represent.
     ObsSkippedRecords { at: FindingRef, count: usize },
+    /// Epoch record count disagreed with retained satellite records.
+    ObsEpochSatCountMismatch {
+        at: FindingRef,
+        declared: usize,
+        retained: usize,
+    },
+    /// A retained event epoch had special records that are not retained.
+    ObsEventSpecialRecords { at: FindingRef, count: usize },
+    /// Header record is outside the retained OBS product.
+    ObsUnretainedHeader { at: FindingRef, label: String },
     /// A pseudorange value is outside the configured plausibility window.
     ObsPseudorangeOutOfRange {
         at: FindingRef,
@@ -167,6 +212,12 @@ pub enum Finding {
     NavLeapSecondsAbsent { at: FindingRef },
     /// NAV ionospheric correction records are malformed.
     NavIonoMalformed { at: FindingRef, message: String },
+    /// NAV record block was dropped by lenient parsing.
+    NavDroppedBlock {
+        at: FindingRef,
+        satellite: String,
+        message: String,
+    },
     /// Duplicate NAV records share an identity.
     NavDuplicateRecord {
         at: FindingRef,
@@ -188,6 +239,12 @@ pub enum Finding {
         system: GnssSystem,
         count: usize,
     },
+    /// NAV records outside the retained/writable scope are present.
+    NavOutOfScopeRecords {
+        at: FindingRef,
+        class: String,
+        count: usize,
+    },
 }
 
 impl Finding {
@@ -201,50 +258,67 @@ impl Finding {
             Self::ObsInvalidObsCode { .. } => "OBS-H05",
             Self::ObsDuplicateObsCode { .. } => "OBS-H06",
             Self::ObsTimeOfFirstMismatch { .. } => "OBS-H07",
+            Self::ObsTimeOfLastMismatch { .. } => "OBS-H08",
             Self::ObsIntervalMismatch { .. } => "OBS-H09",
+            Self::ObsSatelliteCountMismatch { .. } => "OBS-H10",
+            Self::ObsPrnObsCountMismatch { .. } => "OBS-H11",
             Self::ObsGlonassSlotIssue { .. } => "OBS-H12",
             Self::ObsPhaseShiftUndeclaredCode { .. } => "OBS-H13",
             Self::ObsScaleFactorIssue { .. } => "OBS-H14",
+            Self::ObsMarkerTypeIssue { .. } => "OBS-H15",
+            Self::ObsIdentityFieldIssue { .. } => "OBS-H16",
             Self::ObsImplausibleApproxPosition { .. } => "OBS-H17",
             Self::ObsImplausibleAntennaDelta { .. } => "OBS-H18",
+            Self::ObsUnretainedHeader { .. } => "OBS-H90",
             Self::ObsEpochOrder { .. } => "OBS-B01",
             Self::ObsDuplicateEpoch { .. } => "OBS-B02",
+            Self::ObsEpochSatCountMismatch { .. } => "OBS-B03",
             Self::ObsSkippedRecords { .. } => "OBS-B04",
             Self::ObsPseudorangeOutOfRange { .. } => "OBS-B05",
             Self::ObsLossOfLockOutOfRange { .. } => "OBS-B06",
             Self::ObsEventEpoch { .. } => "OBS-B07",
             Self::ObsEmptySatelliteRecord { .. } => "OBS-B08",
             Self::ObsEpochGap { .. } => "OBS-B09",
+            Self::ObsEventSpecialRecords { .. } => "OBS-B11",
             Self::NavFatalParse { .. } => "NAV-H01",
             Self::NavLeapSecondsAbsent { .. } => "NAV-H02",
             Self::NavIonoMalformed { .. } => "NAV-H03",
+            Self::NavDroppedBlock { .. } => "NAV-B01",
             Self::NavDuplicateRecord { .. } => "NAV-B02",
             Self::NavUnsortedRecords { .. } => "NAV-B03",
             Self::NavImplausibleRecord { .. } => "NAV-B04",
             Self::NavUnhealthyRecords { .. } => "NAV-B05",
+            Self::NavOutOfScopeRecords { .. } => "NAV-B06",
         }
     }
 
     /// Rule severity.
     pub const fn severity(&self) -> Severity {
         match self {
-            Self::ObsFatalParse { .. } | Self::NavFatalParse { .. } => Severity::Fatal,
+            Self::ObsFatalParse { .. }
+            | Self::ObsMissingObsTypes { .. }
+            | Self::NavFatalParse { .. } => Severity::Fatal,
             Self::ObsUnpublishedVersion { .. }
             | Self::ObsSkippedRecords { .. }
             | Self::ObsPseudorangeOutOfRange { .. }
             | Self::ObsLossOfLockOutOfRange { .. }
             | Self::ObsIntervalMismatch { .. }
             | Self::ObsPhaseShiftUndeclaredCode { .. }
+            | Self::ObsMarkerTypeIssue { .. }
+            | Self::ObsIdentityFieldIssue { .. }
             | Self::ObsImplausibleApproxPosition { .. }
             | Self::ObsImplausibleAntennaDelta { .. }
+            | Self::ObsEventSpecialRecords { .. }
             | Self::NavIonoMalformed { .. }
             | Self::NavImplausibleRecord { .. } => Severity::Warning,
             Self::ObsEventEpoch { .. }
             | Self::ObsEmptySatelliteRecord { .. }
             | Self::ObsEpochGap { .. }
+            | Self::ObsUnretainedHeader { .. }
             | Self::NavLeapSecondsAbsent { .. }
             | Self::NavUnsortedRecords { .. }
-            | Self::NavUnhealthyRecords { .. } => Severity::Info,
+            | Self::NavUnhealthyRecords { .. }
+            | Self::NavOutOfScopeRecords { .. } => Severity::Info,
             Self::NavDuplicateRecord { same_payload, .. } => {
                 if *same_payload {
                     Severity::Warning
@@ -266,27 +340,37 @@ impl Finding {
             Self::ObsInvalidObsCode { .. } => "RINEX 3.05 Tables 13-20",
             Self::ObsDuplicateObsCode { .. } => "RINEX 3.05 section 5.2",
             Self::ObsTimeOfFirstMismatch { .. } => "RINEX 3.05 Table A2",
+            Self::ObsTimeOfLastMismatch { .. } => "RINEX 3.05 Table A2, TIME OF LAST OBS",
             Self::ObsIntervalMismatch { .. } => "RINEX 3.05 Table A2",
+            Self::ObsSatelliteCountMismatch { .. } => "RINEX 3.05 Table A2, # OF SATELLITES",
+            Self::ObsPrnObsCountMismatch { .. } => "RINEX 3.05 Table A2, PRN / # OF OBS",
             Self::ObsGlonassSlotIssue { .. } => "RINEX 3.05 Table A2",
             Self::ObsPhaseShiftUndeclaredCode { .. } => "RINEX 3.05 Table A2",
             Self::ObsScaleFactorIssue { .. } => "RINEX 3.05 Table A2",
+            Self::ObsMarkerTypeIssue { .. } => "RINEX 3.05 Table 8",
+            Self::ObsIdentityFieldIssue { .. } => "RINEX 3.05 Table A2 identity fields",
             Self::ObsImplausibleApproxPosition { .. } => "RINEX 3.05 Table A2",
             Self::ObsImplausibleAntennaDelta { .. } => "RINEX 3.05 Table A2",
+            Self::ObsUnretainedHeader { .. } => "RINEX 3.05 section 6.6",
             Self::ObsEpochOrder { .. } => "RINEX 3.05 Table A3",
             Self::ObsDuplicateEpoch { .. } => "RINEX 3.05 Table A3",
+            Self::ObsEpochSatCountMismatch { .. } => "RINEX 3.05 Table A3, NUM SAT",
             Self::ObsSkippedRecords { .. } => "parser diagnostic",
-            Self::ObsPseudorangeOutOfRange { .. } => "sidereon RINEX QC policy",
+            Self::ObsPseudorangeOutOfRange { .. } => "RINEX QC policy",
             Self::ObsLossOfLockOutOfRange { .. } => "RINEX 3.05 Table A3 note 1",
             Self::ObsEventEpoch { .. } => "RINEX 3.05 Table A3",
-            Self::ObsEmptySatelliteRecord { .. } => "sidereon RINEX QC policy",
-            Self::ObsEpochGap { .. } => "sidereon RINEX QC policy",
+            Self::ObsEmptySatelliteRecord { .. } => "RINEX QC policy",
+            Self::ObsEpochGap { .. } => "RINEX QC policy",
+            Self::ObsEventSpecialRecords { .. } => "RINEX 3.05/4.02 Table A3",
             Self::NavFatalParse { .. } => "RINEX 3.05 Table A5 / RINEX 4.02 Table A7",
             Self::NavLeapSecondsAbsent { .. } => "RINEX 3.05 Table A5",
             Self::NavIonoMalformed { .. } => "RINEX 3.05 Table A5",
+            Self::NavDroppedBlock { .. } => "RINEX 3.05/4.02 navigation record layout",
             Self::NavDuplicateRecord { .. } => "RINEX 3.05 section 6.12",
-            Self::NavUnsortedRecords { .. } => "sidereon RINEX QC policy",
-            Self::NavImplausibleRecord { .. } => "sidereon RINEX QC policy",
+            Self::NavUnsortedRecords { .. } => "RINEX QC policy",
+            Self::NavImplausibleRecord { .. } => "RINEX QC policy",
             Self::NavUnhealthyRecords { .. } => "RINEX 3.05 broadcast record layout",
+            Self::NavOutOfScopeRecords { .. } => "RINEX QC parse-scope disclosure",
         }
     }
 
@@ -300,27 +384,37 @@ impl Finding {
             | Self::ObsInvalidObsCode { at, .. }
             | Self::ObsDuplicateObsCode { at, .. }
             | Self::ObsTimeOfFirstMismatch { at, .. }
+            | Self::ObsTimeOfLastMismatch { at, .. }
             | Self::ObsIntervalMismatch { at, .. }
+            | Self::ObsSatelliteCountMismatch { at, .. }
+            | Self::ObsPrnObsCountMismatch { at, .. }
             | Self::ObsGlonassSlotIssue { at, .. }
             | Self::ObsPhaseShiftUndeclaredCode { at, .. }
             | Self::ObsScaleFactorIssue { at, .. }
+            | Self::ObsMarkerTypeIssue { at, .. }
+            | Self::ObsIdentityFieldIssue { at, .. }
             | Self::ObsImplausibleApproxPosition { at, .. }
             | Self::ObsImplausibleAntennaDelta { at, .. }
+            | Self::ObsUnretainedHeader { at, .. }
             | Self::ObsEpochOrder { at, .. }
             | Self::ObsDuplicateEpoch { at, .. }
+            | Self::ObsEpochSatCountMismatch { at, .. }
             | Self::ObsSkippedRecords { at, .. }
             | Self::ObsPseudorangeOutOfRange { at, .. }
             | Self::ObsLossOfLockOutOfRange { at, .. }
             | Self::ObsEventEpoch { at, .. }
             | Self::ObsEmptySatelliteRecord { at }
             | Self::ObsEpochGap { at, .. }
+            | Self::ObsEventSpecialRecords { at, .. }
             | Self::NavFatalParse { at, .. }
             | Self::NavLeapSecondsAbsent { at }
             | Self::NavIonoMalformed { at, .. }
+            | Self::NavDroppedBlock { at, .. }
             | Self::NavDuplicateRecord { at, .. }
             | Self::NavUnsortedRecords { at }
             | Self::NavImplausibleRecord { at, .. }
-            | Self::NavUnhealthyRecords { at, .. } => at,
+            | Self::NavUnhealthyRecords { at, .. }
+            | Self::NavOutOfScopeRecords { at, .. } => at,
         }
     }
 
@@ -329,9 +423,13 @@ impl Finding {
         matches!(
             self,
             Self::ObsTimeOfFirstMismatch { .. }
+                | Self::ObsTimeOfLastMismatch { .. }
                 | Self::ObsIntervalMismatch { .. }
+                | Self::ObsSatelliteCountMismatch { .. }
+                | Self::ObsPrnObsCountMismatch { .. }
                 | Self::ObsEpochOrder { .. }
                 | Self::ObsDuplicateEpoch { .. }
+                | Self::ObsEpochSatCountMismatch { .. }
                 | Self::ObsEmptySatelliteRecord { .. }
                 | Self::NavDuplicateRecord {
                     same_payload: true,
@@ -371,20 +469,32 @@ impl LintReport {
 /// Repair options for the first core slice.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepairOptions {
+    /// Caller-supplied PGM/RUN BY/DATE stamp for A8.
+    pub file_stamp: Option<PgmRunByDate>,
     /// Set `INTERVAL` to the dominant normal-epoch spacing.
     pub set_interval: bool,
+    /// Set `TIME OF LAST OBS` when absent or wrong.
+    pub set_time_of_last_obs: bool,
+    /// Recompute `# OF SATELLITES` and `PRN / # OF OBS`.
+    pub set_obs_counts: bool,
     /// Drop satellite rows whose observation fields are all blank.
     pub drop_empty_records: bool,
     /// Sort NAV records by satellite and toc.
     pub sort_records: bool,
+    /// Allow text repair to drop records outside the retained product scope.
+    pub drop_unsupported: bool,
 }
 
 impl Default for RepairOptions {
     fn default() -> Self {
         Self {
+            file_stamp: None,
             set_interval: false,
+            set_time_of_last_obs: false,
+            set_obs_counts: false,
             drop_empty_records: false,
             sort_records: true,
+            drop_unsupported: false,
         }
     }
 }
@@ -426,6 +536,308 @@ pub struct NavRepair {
     pub remaining: LintReport,
 }
 
+/// Validated observation-header edit builder.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObsHeaderEdit {
+    marker_name: Option<String>,
+    marker_number: Option<Option<String>>,
+    marker_type: Option<String>,
+    observer: Option<String>,
+    agency: Option<String>,
+    receiver: Option<ReceiverInfo>,
+    antenna: Option<AntennaInfo>,
+    antenna_height_m: Option<f64>,
+    antenna_eccentricity_en_m: Option<(f64, f64)>,
+    approx_position_m: Option<[f64; 3]>,
+}
+
+/// One field changed by [`ObsHeaderEdit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedEdit {
+    /// Field label.
+    pub field: &'static str,
+    /// Previous value.
+    pub old_value: Option<String>,
+    /// New value.
+    pub new_value: Option<String>,
+    /// Warning text for accepted suspicious values.
+    pub warning: Option<String>,
+}
+
+/// Header edit validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderEditError {
+    /// A staged field failed validation.
+    InvalidField {
+        /// Field label.
+        field: &'static str,
+        /// Validation reason.
+        reason: &'static str,
+    },
+}
+
+impl core::fmt::Display for HeaderEditError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidField { field, reason } => {
+                write!(f, "invalid RINEX OBS header field {field}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HeaderEditError {}
+
+impl ObsHeaderEdit {
+    /// Create an empty edit builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stage marker name.
+    pub fn marker_name(mut self, v: &str) -> Self {
+        self.marker_name = Some(v.to_string());
+        self
+    }
+
+    /// Stage marker number.
+    pub fn marker_number(mut self, v: &str) -> Self {
+        self.marker_number = Some(Some(v.to_string()));
+        self
+    }
+
+    /// Stage marker-number removal.
+    pub fn clear_marker_number(mut self) -> Self {
+        self.marker_number = Some(None);
+        self
+    }
+
+    /// Stage marker type.
+    pub fn marker_type(mut self, v: &str) -> Self {
+        self.marker_type = Some(v.to_string());
+        self
+    }
+
+    /// Stage observer.
+    pub fn observer(mut self, v: &str) -> Self {
+        self.observer = Some(v.to_string());
+        self
+    }
+
+    /// Stage agency.
+    pub fn agency(mut self, v: &str) -> Self {
+        self.agency = Some(v.to_string());
+        self
+    }
+
+    /// Stage receiver fields.
+    pub fn receiver(mut self, number: &str, receiver_type: &str, version: &str) -> Self {
+        self.receiver = Some(ReceiverInfo {
+            number: number.to_string(),
+            receiver_type: receiver_type.to_string(),
+            version: version.to_string(),
+        });
+        self
+    }
+
+    /// Stage antenna fields.
+    pub fn antenna(mut self, number: &str, antenna_type: &str) -> Self {
+        self.antenna = Some(AntennaInfo {
+            number: number.to_string(),
+            antenna_type: antenna_type.to_string(),
+        });
+        self
+    }
+
+    /// Stage antenna height.
+    pub fn antenna_height_m(mut self, v: f64) -> Self {
+        self.antenna_height_m = Some(v);
+        self
+    }
+
+    /// Stage antenna east/north eccentricities.
+    pub fn antenna_eccentricity_en_m(mut self, east: f64, north: f64) -> Self {
+        self.antenna_eccentricity_en_m = Some((east, north));
+        self
+    }
+
+    /// Stage approximate position.
+    pub fn approx_position_m(mut self, xyz: [f64; 3]) -> Self {
+        self.approx_position_m = Some(xyz);
+        self
+    }
+
+    /// Validate and apply all staged changes atomically.
+    pub fn apply(
+        self,
+        header: &mut ObsHeader,
+    ) -> std::result::Result<Vec<AppliedEdit>, HeaderEditError> {
+        self.validate()?;
+        let original = header.clone();
+        let mut edited = header.clone();
+        let mut applied = Vec::new();
+
+        if let Some(value) = self.marker_name {
+            push_edit(
+                &mut applied,
+                "MARKER NAME",
+                edited.marker_name.clone(),
+                Some(value.clone()),
+                None,
+            );
+            edited.marker_name = Some(value);
+        }
+        if let Some(value) = self.marker_number {
+            push_edit(
+                &mut applied,
+                "MARKER NUMBER",
+                edited.marker_number.clone(),
+                value.clone(),
+                None,
+            );
+            edited.marker_number = value;
+        }
+        if let Some(value) = self.marker_type {
+            let warning = (!is_valid_marker_type(&value))
+                .then(|| "not a RINEX Table 8 marker type".to_string());
+            push_edit(
+                &mut applied,
+                "MARKER TYPE",
+                edited.marker_type.clone(),
+                Some(value.clone()),
+                warning,
+            );
+            edited.marker_type = Some(value);
+        }
+        if let Some(value) = self.observer {
+            push_edit(
+                &mut applied,
+                "OBSERVER",
+                edited.observer.clone(),
+                Some(value.clone()),
+                None,
+            );
+            edited.observer = Some(value);
+        }
+        if let Some(value) = self.agency {
+            push_edit(
+                &mut applied,
+                "AGENCY",
+                edited.agency.clone(),
+                Some(value.clone()),
+                None,
+            );
+            edited.agency = Some(value);
+        }
+        if let Some(value) = self.receiver {
+            push_edit(
+                &mut applied,
+                "REC # / TYPE / VERS",
+                edited.receiver.as_ref().map(format_receiver),
+                Some(format_receiver(&value)),
+                None,
+            );
+            edited.receiver = Some(value);
+        }
+        if let Some(value) = self.antenna {
+            push_edit(
+                &mut applied,
+                "ANT # / TYPE",
+                edited.antenna.as_ref().map(format_antenna),
+                Some(format_antenna(&value)),
+                None,
+            );
+            edited.antenna = Some(value);
+        }
+        if let Some(value) = self.approx_position_m {
+            push_edit(
+                &mut applied,
+                "APPROX POSITION XYZ",
+                edited.approx_position_m.map(|v| format!("{v:?}")),
+                Some(format!("{value:?}")),
+                None,
+            );
+            edited.approx_position_m = Some(value);
+        }
+        if self.antenna_height_m.is_some() || self.antenna_eccentricity_en_m.is_some() {
+            let mut delta = edited.antenna_delta_hen_m.unwrap_or([0.0; 3]);
+            if let Some(height) = self.antenna_height_m {
+                delta[0] = height;
+            }
+            if let Some((east, north)) = self.antenna_eccentricity_en_m {
+                delta[1] = east;
+                delta[2] = north;
+            }
+            push_edit(
+                &mut applied,
+                "ANTENNA: DELTA H/E/N",
+                edited.antenna_delta_hen_m.map(|v| format!("{v:?}")),
+                Some(format!("{delta:?}")),
+                None,
+            );
+            edited.antenna_delta_hen_m = Some(delta);
+        }
+
+        if edited == original {
+            return Ok(Vec::new());
+        }
+        *header = edited;
+        Ok(applied)
+    }
+
+    fn validate(&self) -> std::result::Result<(), HeaderEditError> {
+        if let Some(value) = &self.marker_name {
+            validate_text_field("MARKER NAME", value, 60, false)?;
+        }
+        if let Some(Some(value)) = &self.marker_number {
+            validate_text_field("MARKER NUMBER", value, 20, true)?;
+        }
+        if let Some(value) = &self.marker_type {
+            validate_text_field("MARKER TYPE", value, 20, false)?;
+        }
+        if let Some(value) = &self.observer {
+            validate_text_field("OBSERVER", value, 20, false)?;
+        }
+        if let Some(value) = &self.agency {
+            validate_text_field("AGENCY", value, 40, false)?;
+        }
+        if let Some(value) = &self.receiver {
+            validate_text_field("REC #", &value.number, 20, true)?;
+            validate_text_field("REC TYPE", &value.receiver_type, 20, false)?;
+            validate_text_field("REC VERS", &value.version, 20, true)?;
+        }
+        if let Some(value) = &self.antenna {
+            validate_text_field("ANT #", &value.number, 20, true)?;
+            validate_text_field("ANT TYPE", &value.antenna_type, 20, false)?;
+        }
+        if let Some(value) = self.antenna_height_m {
+            validate_antenna_delta("ANTENNA HEIGHT", value)?;
+        }
+        if let Some((east, north)) = self.antenna_eccentricity_en_m {
+            validate_antenna_delta("ANTENNA EAST", east)?;
+            validate_antenna_delta("ANTENNA NORTH", north)?;
+        }
+        if let Some(xyz) = self.approx_position_m {
+            if !xyz.iter().all(|value| value.is_finite()) {
+                return Err(HeaderEditError::InvalidField {
+                    field: "APPROX POSITION XYZ",
+                    reason: "must be finite",
+                });
+            }
+            let radius = (xyz[0] * xyz[0] + xyz[1] * xyz[1] + xyz[2] * xyz[2]).sqrt();
+            if radius != 0.0
+                && !(EARTH_FIXED_RADIUS_MIN_M..=EARTH_FIXED_RADIUS_MAX_M).contains(&radius)
+            {
+                return Err(HeaderEditError::InvalidField {
+                    field: "APPROX POSITION XYZ",
+                    reason: "radius outside earth-fixed range",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Lint an already parsed observation product.
 pub fn lint_obs(obs: &RinexObs) -> LintReport {
     LintReport {
@@ -454,24 +866,55 @@ pub fn lint_obs_text(text: &str) -> LintReport {
             decoded_from_crinex,
         },
         Err(error) => LintReport {
-            findings: vec![Finding::ObsFatalParse {
-                at: FindingRef::default(),
-                message: error.to_string(),
-            }],
+            findings: vec![classify_obs_parse_error(&error.to_string())],
             decoded_from_crinex,
         },
+    }
+}
+
+fn classify_obs_parse_error(message: &str) -> Finding {
+    if message.contains("no SYS / # / OBS TYPES") {
+        Finding::ObsMissingObsTypes {
+            at: FindingRef::field("SYS / # / OBS TYPES"),
+        }
+    } else {
+        Finding::ObsFatalParse {
+            at: FindingRef::default(),
+            message: message.to_string(),
+        }
     }
 }
 
 /// Lint navigation text with the existing NAV parser and header readers.
 pub fn lint_nav_text(text: &str) -> LintReport {
     let mut findings = Vec::new();
-    match parse_nav(text) {
-        Ok(records) => findings.extend(nav_findings(&records)),
-        Err(error) => findings.push(Finding::NavFatalParse {
+    match parse_nav_lenient(text) {
+        Ok(parsed) => {
+            findings.extend(nav_findings(&parsed.records));
+            for skipped in parsed.skipped {
+                findings.push(Finding::NavDroppedBlock {
+                    at: FindingRef {
+                        satellite: Some(skipped.satellite.clone()),
+                        ..FindingRef::default()
+                    },
+                    satellite: skipped.satellite,
+                    message: skipped.message,
+                });
+            }
+        }
+        Err(error) => {
+            findings.push(Finding::NavFatalParse {
+                at: FindingRef::default(),
+                message: error.to_string(),
+            });
+        }
+    }
+    for (class, count) in nav_scope_tallies(text) {
+        findings.push(Finding::NavOutOfScopeRecords {
             at: FindingRef::default(),
-            message: error.to_string(),
-        }),
+            class,
+            count,
+        });
     }
     if matches!(parse_leap_seconds(text), Ok(None)) {
         findings.push(Finding::NavLeapSecondsAbsent {
@@ -495,7 +938,10 @@ pub fn repair_obs(obs: &RinexObs, options: &RepairOptions) -> ObsRepair {
     let mut repaired = obs.clone();
     let mut actions = Vec::new();
     repair_obs_order_and_duplicates(&mut repaired, &mut actions);
-    repair_obs_time_of_first(&mut repaired, &mut actions);
+    repair_obs_times(&mut repaired, options, &mut actions);
+    repair_obs_counts(&mut repaired, options, &mut actions);
+    repair_obs_file_stamp(&mut repaired, options, &mut actions);
+    repair_obs_unsupported_records(&mut repaired, options, &mut actions);
     if options.set_interval {
         repair_obs_interval(&mut repaired, &mut actions);
     }
@@ -515,6 +961,21 @@ pub fn repair_obs(obs: &RinexObs, options: &RepairOptions) -> ObsRepair {
 pub fn repair_obs_text(text: &str, options: &RepairOptions) -> Result<ObsRepair> {
     let (decoded_from_crinex, text) = decode_if_crinex(text)?;
     let obs = RinexObs::parse(&text)?;
+    if !options.drop_unsupported && !obs.header.unretained_header_labels.is_empty() {
+        return Err(crate::Error::InvalidInput(
+            "RINEX OBS text repair would drop unretained header records".to_string(),
+        ));
+    }
+    if !options.drop_unsupported
+        && obs
+            .epochs
+            .iter()
+            .any(|epoch| epoch.flag > 1 && epoch.special_record_count > 0)
+    {
+        return Err(crate::Error::InvalidInput(
+            "RINEX OBS text repair would drop event special records".to_string(),
+        ));
+    }
     let mut repaired = repair_obs(&obs, options);
     repaired.decoded_from_crinex = decoded_from_crinex;
     repaired.remaining.decoded_from_crinex = decoded_from_crinex;
@@ -552,8 +1013,22 @@ pub fn repair_nav_text(
     text: &str,
     options: &RepairOptions,
 ) -> std::result::Result<NavRepair, NavParseError> {
+    let scope_tallies = nav_scope_tallies(text);
+    if !scope_tallies.is_empty() && !options.drop_unsupported {
+        return Err(NavParseError::UnsupportedHeader(format!(
+            "RINEX NAV text repair would drop out-of-scope records: {scope_tallies:?}"
+        )));
+    }
     let records = parse_nav(text)?;
     let mut repair = repair_nav(&records, options);
+    if !scope_tallies.is_empty() {
+        for (class, count) in scope_tallies {
+            repair.actions.push(RepairAction {
+                id: "NAV-B06",
+                message: format!("dropped {count} out-of-scope NAV records in {class}"),
+            });
+        }
+    }
     repair.iono = parse_iono_corrections(text).ok();
     repair.leap_seconds = parse_leap_seconds(text).ok().flatten();
     Ok(repair)
@@ -563,7 +1038,7 @@ fn decode_if_crinex(text: &str) -> Result<(bool, String)> {
     let is_crinex = text
         .lines()
         .next()
-        .is_some_and(|line| line.get(60..80).unwrap_or("").contains("CRINEX VERS"));
+        .is_some_and(|line| line.get(60..).unwrap_or("").contains("CRINEX VERS"));
     if is_crinex {
         Ok((true, crinex::decode(text)?))
     } else {
@@ -591,10 +1066,45 @@ fn lint_obs_header(header: &ObsHeader, findings: &mut Vec<Finding>) {
             label: "MARKER NAME",
         });
     }
+    if header.program_run_by_date.is_none() {
+        findings.push(Finding::ObsMissingHeader {
+            at: FindingRef::field("PGM / RUN BY / DATE"),
+            label: "PGM / RUN BY / DATE",
+        });
+    }
+    if header.observer.is_none() || header.agency.is_none() {
+        findings.push(Finding::ObsMissingHeader {
+            at: FindingRef::field("OBSERVER / AGENCY"),
+            label: "OBSERVER / AGENCY",
+        });
+    }
+    if header.receiver.is_none() {
+        findings.push(Finding::ObsMissingHeader {
+            at: FindingRef::field("REC # / TYPE / VERS"),
+            label: "REC # / TYPE / VERS",
+        });
+    }
+    if header.antenna.is_none() {
+        findings.push(Finding::ObsMissingHeader {
+            at: FindingRef::field("ANT # / TYPE"),
+            label: "ANT # / TYPE",
+        });
+    }
     if header.antenna_delta_hen_m.is_none() {
         findings.push(Finding::ObsMissingHeader {
             at: FindingRef::field("ANTENNA: DELTA H/E/N"),
             label: "ANTENNA: DELTA H/E/N",
+        });
+    }
+    if header.approx_position_m.is_none()
+        && header
+            .marker_type
+            .as_deref()
+            .is_none_or(is_earth_fixed_marker_type)
+    {
+        findings.push(Finding::ObsMissingHeader {
+            at: FindingRef::field("APPROX POSITION XYZ"),
+            label: "APPROX POSITION XYZ",
         });
     }
     if header.time_of_first_obs.is_none() {
@@ -626,6 +1136,33 @@ fn lint_obs_header(header: &ObsHeader, findings: &mut Vec<Finding>) {
                 });
             }
         }
+    }
+    if let Some(marker_type) = &header.marker_type {
+        if !is_valid_marker_type(marker_type) {
+            findings.push(Finding::ObsMarkerTypeIssue {
+                at: FindingRef::field("MARKER TYPE"),
+                marker_type: marker_type.clone(),
+            });
+        }
+    }
+    lint_identity_field(findings, "MARKER NAME", header.marker_name.as_deref(), 60);
+    lint_identity_field(
+        findings,
+        "MARKER NUMBER",
+        header.marker_number.as_deref(),
+        20,
+    );
+    lint_identity_field(findings, "MARKER TYPE", header.marker_type.as_deref(), 20);
+    lint_identity_field(findings, "OBSERVER", header.observer.as_deref(), 20);
+    lint_identity_field(findings, "AGENCY", header.agency.as_deref(), 40);
+    if let Some(receiver) = &header.receiver {
+        lint_identity_field(findings, "REC #", Some(&receiver.number), 20);
+        lint_identity_field(findings, "REC TYPE", Some(&receiver.receiver_type), 20);
+        lint_identity_field(findings, "REC VERS", Some(&receiver.version), 20);
+    }
+    if let Some(antenna) = &header.antenna {
+        lint_identity_field(findings, "ANT #", Some(&antenna.number), 20);
+        lint_identity_field(findings, "ANT TYPE", Some(&antenna.antenna_type), 20);
     }
     for shift in &header.phase_shifts {
         if !header
@@ -683,6 +1220,12 @@ fn lint_obs_header(header: &ObsHeader, findings: &mut Vec<Finding>) {
             }
         }
     }
+    for label in &header.unretained_header_labels {
+        findings.push(Finding::ObsUnretainedHeader {
+            at: FindingRef::field("header"),
+            label: label.clone(),
+        });
+    }
 }
 
 fn lint_obs_body(obs: &RinexObs, findings: &mut Vec<Finding>) {
@@ -693,20 +1236,39 @@ fn lint_obs_body(obs: &RinexObs, findings: &mut Vec<Finding>) {
         });
     }
     if let Some(first) = first_normal_epoch(obs) {
-        if let Some((declared, _)) = obs.header.time_of_first_obs {
-            if !same_epoch_time(declared, first.epoch) {
+        if let Some((declared, declared_scale)) = obs.header.time_of_first_obs {
+            let observed_scale = obs_body_time_scale(obs);
+            if !same_epoch_time(declared, first.epoch) || declared_scale != observed_scale {
                 findings.push(Finding::ObsTimeOfFirstMismatch {
                     at: FindingRef::field("TIME OF FIRST OBS"),
                     declared,
+                    declared_scale,
                     observed: first.epoch,
+                    observed_scale,
                 });
             }
         }
     }
+    if let Some(last) = last_normal_epoch(obs) {
+        if let Some((declared, declared_scale)) = obs.header.time_of_last_obs {
+            let observed_scale = obs_body_time_scale(obs);
+            if !same_epoch_time(declared, last.epoch) || declared_scale != observed_scale {
+                findings.push(Finding::ObsTimeOfLastMismatch {
+                    at: FindingRef::field("TIME OF LAST OBS"),
+                    declared,
+                    declared_scale,
+                    observed: last.epoch,
+                    observed_scale,
+                });
+            }
+        }
+    }
+    lint_obs_counts(obs, findings);
     lint_obs_epoch_order(obs, findings);
-    if let (Some(declared), Some(observed)) =
-        (obs.header.interval_s, dominant_interval_s(&obs.epochs))
-    {
+    if let (Some(declared), Some(observed)) = (
+        obs.header.interval_s,
+        dominant_interval_for_epochs(&obs.epochs),
+    ) {
         if (declared - observed).abs() > 1.0e-6 {
             findings.push(Finding::ObsIntervalMismatch {
                 at: FindingRef::field("INTERVAL"),
@@ -715,7 +1277,7 @@ fn lint_obs_body(obs: &RinexObs, findings: &mut Vec<Finding>) {
             });
         }
         lint_obs_gaps(obs, observed, findings);
-    } else if let Some(observed) = dominant_interval_s(&obs.epochs) {
+    } else if let Some(observed) = dominant_interval_for_epochs(&obs.epochs) {
         lint_obs_gaps(obs, observed, findings);
     }
     lint_obs_glonass_slots(obs, findings);
@@ -746,10 +1308,66 @@ fn lint_obs_epoch_order(obs: &RinexObs, findings: &mut Vec<Finding>) {
     }
 }
 
+fn lint_obs_counts(obs: &RinexObs, findings: &mut Vec<Finding>) {
+    let body_counts = body_obs_counts(obs);
+    let distinct_sats = body_counts.keys().copied().collect::<BTreeSet<_>>();
+    if let Some(declared) = obs.header.n_satellites {
+        let observed = distinct_sats.len();
+        if declared != 0 && declared != observed {
+            findings.push(Finding::ObsSatelliteCountMismatch {
+                at: FindingRef::field("# OF SATELLITES"),
+                declared,
+                observed,
+            });
+        }
+    }
+    for (&sat, declared_counts) in &obs.header.prn_obs_counts {
+        let Some(codes) = obs.header.obs_codes.get(&sat.system) else {
+            continue;
+        };
+        let observed_counts = body_counts.get(&sat);
+        for (idx, declared) in declared_counts.iter().enumerate() {
+            let code = codes.get(idx).cloned().unwrap_or_default();
+            let observed = observed_counts
+                .and_then(|counts| counts.get(idx).copied())
+                .unwrap_or(0);
+            if declared.unwrap_or(0) != observed {
+                findings.push(Finding::ObsPrnObsCountMismatch {
+                    at: FindingRef {
+                        satellite: Some(sat.to_string()),
+                        field: Some("PRN / # OF OBS"),
+                        ..FindingRef::default()
+                    },
+                    satellite: sat,
+                    code,
+                    declared: *declared,
+                    observed,
+                });
+            }
+        }
+    }
+}
+
 fn lint_obs_glonass_slots(obs: &RinexObs, findings: &mut Vec<Finding>) {
     let has_glonass_codes = obs.header.obs_codes.contains_key(&GnssSystem::Glonass);
     if !has_glonass_codes {
         return;
+    }
+    let mut reported_missing = BTreeSet::new();
+    for (&prn, &channel) in &obs.header.glonass_slots {
+        if !crate::rinex_nav::valid_glonass_frequency_channel(i32::from(channel)) {
+            if let Ok(satellite) = GnssSatelliteId::new(GnssSystem::Glonass, prn) {
+                findings.push(Finding::ObsGlonassSlotIssue {
+                    at: FindingRef {
+                        satellite: Some(satellite.to_string()),
+                        field: Some("GLONASS SLOT / FRQ #"),
+                        ..FindingRef::default()
+                    },
+                    satellite,
+                    issue: "invalid channel",
+                });
+            }
+        }
     }
     for epoch in &obs.epochs {
         for sat in epoch
@@ -757,7 +1375,7 @@ fn lint_obs_glonass_slots(obs: &RinexObs, findings: &mut Vec<Finding>) {
             .keys()
             .filter(|sat| sat.system == GnssSystem::Glonass)
         {
-            if !obs.header.glonass_slots.contains_key(&sat.prn) {
+            if !obs.header.glonass_slots.contains_key(&sat.prn) && reported_missing.insert(*sat) {
                 findings.push(Finding::ObsGlonassSlotIssue {
                     at: FindingRef {
                         satellite: Some(sat.to_string()),
@@ -779,7 +1397,20 @@ fn lint_obs_values(obs: &RinexObs, findings: &mut Vec<Finding>) {
                 at: FindingRef::epoch(epoch_index),
                 flag: epoch.flag,
             });
+            if epoch.special_record_count > 0 {
+                findings.push(Finding::ObsEventSpecialRecords {
+                    at: FindingRef::epoch(epoch_index),
+                    count: epoch.special_record_count,
+                });
+            }
             continue;
+        }
+        if epoch.declared_record_count != epoch.sats.len() {
+            findings.push(Finding::ObsEpochSatCountMismatch {
+                at: FindingRef::epoch(epoch_index),
+                declared: epoch.declared_record_count,
+                retained: epoch.sats.len(),
+            });
         }
         for (&sat, values) in &epoch.sats {
             let all_blank = values.iter().all(|value| value.value.is_none());
@@ -795,7 +1426,7 @@ fn lint_obs_values(obs: &RinexObs, findings: &mut Vec<Finding>) {
                     .map_or("", String::as_str);
                 if code.starts_with('C') {
                     if let Some(v) = value.value {
-                        if !(15_000_000.0..=50_000_000.0).contains(&v) || !v.is_finite() {
+                        if !(15_000_000.0..=50_000_000.0).contains(&v) {
                             findings.push(Finding::ObsPseudorangeOutOfRange {
                                 at: FindingRef::sat(epoch_index, sat),
                                 code: code.to_string(),
@@ -822,7 +1453,7 @@ fn lint_obs_gaps(obs: &RinexObs, interval_s: f64, findings: &mut Vec<Finding>) {
     let mut previous: Option<ObsEpochTime> = None;
     for (idx, epoch) in obs.epochs.iter().enumerate().filter(|(_, e)| e.flag <= 1) {
         if let Some(prev) = previous {
-            let gap = epoch_seconds(epoch.epoch) - epoch_seconds(prev);
+            let gap = obs_epoch_seconds(epoch.epoch) - obs_epoch_seconds(prev);
             if gap > interval_s * 1.5 {
                 findings.push(Finding::ObsEpochGap {
                     at: FindingRef::epoch(idx),
@@ -835,12 +1466,211 @@ fn lint_obs_gaps(obs: &RinexObs, interval_s: f64, findings: &mut Vec<Finding>) {
     }
 }
 
+fn body_obs_counts(obs: &RinexObs) -> BTreeMap<GnssSatelliteId, Vec<usize>> {
+    let mut counts: BTreeMap<GnssSatelliteId, Vec<usize>> = BTreeMap::new();
+    for epoch in obs.epochs.iter().filter(|epoch| epoch.flag <= 1) {
+        for (&sat, values) in &epoch.sats {
+            let Some(codes) = obs.header.obs_codes.get(&sat.system) else {
+                continue;
+            };
+            let entry = counts.entry(sat).or_insert_with(|| vec![0; codes.len()]);
+            if entry.len() < codes.len() {
+                entry.resize(codes.len(), 0);
+            }
+            for (idx, value) in values.iter().enumerate() {
+                if value.value.is_some() {
+                    if let Some(count) = entry.get_mut(idx) {
+                        *count += 1;
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn is_earth_fixed_marker_type(marker_type: &str) -> bool {
+    matches!(
+        marker_type.trim(),
+        "" | "GEODETIC" | "NON_GEODETIC" | "FIXED_BUOY"
+    )
+}
+
+fn is_valid_marker_type(marker_type: &str) -> bool {
+    matches!(
+        marker_type.trim(),
+        "GEODETIC"
+            | "NON_GEODETIC"
+            | "NON_PHYSICAL"
+            | "SPACEBORNE"
+            | "AIRBORNE"
+            | "WATER_CRAFT"
+            | "GROUND_CRAFT"
+            | "FIXED_BUOY"
+            | "FLOATING_BUOY"
+            | "FLOATING_ICE"
+            | "GLACIER"
+            | "BALLOON"
+            | "ANIMAL"
+            | "HUMAN"
+    )
+}
+
+fn lint_identity_field(
+    findings: &mut Vec<Finding>,
+    label: &'static str,
+    value: Option<&str>,
+    max_width: usize,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.len() > max_width || !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        findings.push(Finding::ObsIdentityFieldIssue {
+            at: FindingRef::field(label),
+            label,
+            value: value.to_string(),
+        });
+    }
+}
+
+fn validate_text_field(
+    field: &'static str,
+    value: &str,
+    max_width: usize,
+    allow_empty: bool,
+) -> std::result::Result<(), HeaderEditError> {
+    let trimmed = value.trim();
+    if !allow_empty && trimmed.is_empty() {
+        return Err(HeaderEditError::InvalidField {
+            field,
+            reason: "must not be empty",
+        });
+    }
+    if trimmed.len() > max_width {
+        return Err(HeaderEditError::InvalidField {
+            field,
+            reason: "too wide for RINEX field",
+        });
+    }
+    if !trimmed.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return Err(HeaderEditError::InvalidField {
+            field,
+            reason: "must be printable ASCII",
+        });
+    }
+    Ok(())
+}
+
+fn validate_antenna_delta(
+    field: &'static str,
+    value: f64,
+) -> std::result::Result<(), HeaderEditError> {
+    if !value.is_finite() {
+        return Err(HeaderEditError::InvalidField {
+            field,
+            reason: "must be finite",
+        });
+    }
+    if value.abs() > 100.0 {
+        return Err(HeaderEditError::InvalidField {
+            field,
+            reason: "magnitude exceeds 100 m",
+        });
+    }
+    Ok(())
+}
+
+fn push_edit(
+    applied: &mut Vec<AppliedEdit>,
+    field: &'static str,
+    old_value: Option<String>,
+    new_value: Option<String>,
+    warning: Option<String>,
+) {
+    if old_value != new_value || warning.is_some() {
+        applied.push(AppliedEdit {
+            field,
+            old_value,
+            new_value,
+            warning,
+        });
+    }
+}
+
+fn format_receiver(value: &ReceiverInfo) -> String {
+    format!("{}/{}/{}", value.number, value.receiver_type, value.version)
+}
+
+fn format_antenna(value: &AntennaInfo) -> String {
+    format!("{}/{}", value.number, value.antenna_type)
+}
+
 fn nav_findings(records: &[BroadcastRecord]) -> Vec<Finding> {
     let mut findings = Vec::new();
     lint_nav_duplicates(records, &mut findings);
     lint_nav_order(records, &mut findings);
     lint_nav_plausibility(records, &mut findings);
     findings
+}
+
+fn nav_scope_tallies(text: &str) -> BTreeMap<String, usize> {
+    let mut body = false;
+    let mut version_major = 3_u8;
+    let mut tallies = BTreeMap::new();
+    for line in text.lines() {
+        if line.contains("RINEX VERSION / TYPE")
+            && line.get(0..9).unwrap_or("").trim().starts_with('4')
+        {
+            version_major = 4;
+        }
+        if !body {
+            if line.contains("END OF HEADER") {
+                body = true;
+            }
+            continue;
+        }
+        if version_major >= 4 {
+            if let Some(rest) = line.strip_prefix('>') {
+                let fields: Vec<_> = rest.split_whitespace().collect();
+                if fields.len() < 3 {
+                    continue;
+                }
+                let frame = fields[0];
+                let sv = fields[1];
+                let msg = fields[2];
+                let system = sv.chars().next();
+                let class = if frame != "EPH" {
+                    Some(format!("v4 {frame} frame"))
+                } else if !matches!(system, Some('G' | 'E' | 'C')) {
+                    Some(format!(
+                        "unsupported constellation {}",
+                        system.unwrap_or('?')
+                    ))
+                } else if !matches!(msg, "LNAV" | "INAV" | "FNAV" | "D1" | "D2") {
+                    Some(format!("unsupported message {msg}"))
+                } else {
+                    None
+                };
+                if let Some(class) = class {
+                    *tallies.entry(class).or_default() += 1;
+                }
+            }
+        } else if is_nav_record_start_text(line) {
+            let system = line.as_bytes()[0] as char;
+            if !matches!(system, 'G' | 'E' | 'C') {
+                *tallies
+                    .entry(format!("unsupported constellation {system}"))
+                    .or_default() += 1;
+            }
+        }
+    }
+    tallies
+}
+
+fn is_nav_record_start_text(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit()
 }
 
 fn lint_nav_duplicates(records: &[BroadcastRecord], findings: &mut Vec<Finding>) {
@@ -909,15 +1739,21 @@ fn repair_obs_order_and_duplicates(obs: &mut RinexObs, actions: &mut Vec<RepairA
     let before = obs.epochs.clone();
     obs.epochs.sort_by_key(|epoch| epoch_key(epoch.epoch));
     let mut merged: Vec<ObsEpoch> = Vec::new();
-    let mut discarded = 0_usize;
+    let mut discarded = Vec::new();
     for epoch in obs.epochs.drain(..) {
         if let Some(last) = merged.last_mut() {
             if same_epoch_time(last.epoch, epoch.epoch) {
                 for (sat, values) in epoch.sats {
-                    if last.sats.insert(sat, values).is_some() {
-                        discarded += 1;
+                    match last.sats.entry(sat) {
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert(values);
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            discarded.push(sat);
+                        }
                     }
                 }
+                last.declared_record_count = last.sats.len();
                 continue;
             }
         }
@@ -925,25 +1761,31 @@ fn repair_obs_order_and_duplicates(obs: &mut RinexObs, actions: &mut Vec<RepairA
     }
     obs.epochs = merged;
     if obs.epochs != before {
+        let discarded = discarded
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         actions.push(RepairAction {
             id: "A3",
-            message: format!("sorted epochs and merged duplicate epochs, discarded {discarded} duplicate satellite rows"),
+            message: format!(
+                "sorted epochs and merged duplicate epochs, discarded duplicate satellite rows [{discarded}]"
+            ),
         });
     }
 }
 
-fn repair_obs_time_of_first(obs: &mut RinexObs, actions: &mut Vec<RepairAction>) {
+fn repair_obs_times(obs: &mut RinexObs, options: &RepairOptions, actions: &mut Vec<RepairAction>) {
     let Some(first) = first_normal_epoch(obs).map(|epoch| epoch.epoch) else {
         return;
     };
-    let scale = obs
-        .header
-        .time_of_first_obs
-        .map_or(TimeScale::Gpst, |(_, scale)| scale);
+    let scale = obs_body_time_scale(obs);
     if obs
         .header
         .time_of_first_obs
-        .is_none_or(|(declared, _)| !same_epoch_time(declared, first))
+        .is_none_or(|(declared, declared_scale)| {
+            !same_epoch_time(declared, first) || declared_scale != scale
+        })
     {
         obs.header.time_of_first_obs = Some((first, scale));
         actions.push(RepairAction {
@@ -951,10 +1793,102 @@ fn repair_obs_time_of_first(obs: &mut RinexObs, actions: &mut Vec<RepairAction>)
             message: "recomputed TIME OF FIRST OBS".to_string(),
         });
     }
+    let Some(last) = last_normal_epoch(obs).map(|epoch| epoch.epoch) else {
+        return;
+    };
+    if options.set_time_of_last_obs
+        || obs
+            .header
+            .time_of_last_obs
+            .is_some_and(|(declared, declared_scale)| {
+                !same_epoch_time(declared, last)
+                    || declared_scale
+                        != obs
+                            .header
+                            .time_of_first_obs
+                            .map_or(scale, |(_, scale)| scale)
+            })
+    {
+        let scale = obs
+            .header
+            .time_of_first_obs
+            .map_or_else(|| obs_body_time_scale(obs), |(_, scale)| scale);
+        obs.header.time_of_last_obs = Some((last, scale));
+        actions.push(RepairAction {
+            id: "A4",
+            message: "recomputed TIME OF LAST OBS".to_string(),
+        });
+    }
+}
+
+fn repair_obs_counts(obs: &mut RinexObs, options: &RepairOptions, actions: &mut Vec<RepairAction>) {
+    if !options.set_obs_counts
+        && obs.header.n_satellites.is_none()
+        && obs.header.prn_obs_counts.is_empty()
+    {
+        return;
+    }
+    let counts = body_obs_counts(obs);
+    obs.header.n_satellites = Some(counts.len());
+    obs.header.prn_obs_counts = counts
+        .into_iter()
+        .map(|(sat, values)| (sat, values.into_iter().map(Some).collect()))
+        .collect();
+    actions.push(RepairAction {
+        id: "A5",
+        message: "recomputed observation count headers".to_string(),
+    });
+}
+
+fn repair_obs_file_stamp(
+    obs: &mut RinexObs,
+    options: &RepairOptions,
+    actions: &mut Vec<RepairAction>,
+) {
+    if let Some(stamp) = &options.file_stamp {
+        if obs.header.program_run_by_date.as_ref() != Some(stamp) {
+            obs.header.program_run_by_date = Some(stamp.clone());
+            actions.push(RepairAction {
+                id: "A8",
+                message: "set PGM / RUN BY / DATE".to_string(),
+            });
+        }
+    }
+}
+
+fn repair_obs_unsupported_records(
+    obs: &mut RinexObs,
+    options: &RepairOptions,
+    actions: &mut Vec<RepairAction>,
+) {
+    if !options.drop_unsupported {
+        return;
+    }
+    let mut dropped = 0_usize;
+    for epoch in &mut obs.epochs {
+        if epoch.flag > 1 && epoch.special_record_count > 0 {
+            dropped += epoch.special_record_count;
+            epoch.special_record_count = 0;
+            epoch.declared_record_count = 0;
+        }
+    }
+    if dropped > 0 {
+        actions.push(RepairAction {
+            id: "OBS-B11",
+            message: format!("dropped {dropped} event special records"),
+        });
+    }
+    let labels = std::mem::take(&mut obs.header.unretained_header_labels);
+    if !labels.is_empty() {
+        actions.push(RepairAction {
+            id: "OBS-H90",
+            message: format!("dropped {} unretained header records", labels.len()),
+        });
+    }
 }
 
 fn repair_obs_interval(obs: &mut RinexObs, actions: &mut Vec<RepairAction>) {
-    let Some(interval) = dominant_interval_s(&obs.epochs) else {
+    let Some(interval) = dominant_interval_for_epochs(&obs.epochs) else {
         return;
     };
     if obs
@@ -977,7 +1911,11 @@ fn repair_obs_empty_records(obs: &mut RinexObs, actions: &mut Vec<RepairAction>)
         epoch
             .sats
             .retain(|_, values| values.iter().any(|value| value.value.is_some()));
-        dropped += before - epoch.sats.len();
+        let removed = before - epoch.sats.len();
+        if removed > 0 {
+            epoch.declared_record_count = epoch.sats.len();
+        }
+        dropped += removed;
     }
     if dropped > 0 {
         actions.push(RepairAction {
@@ -988,20 +1926,17 @@ fn repair_obs_empty_records(obs: &mut RinexObs, actions: &mut Vec<RepairAction>)
 }
 
 fn repair_nav_duplicates(records: &mut Vec<BroadcastRecord>, actions: &mut Vec<RepairAction>) {
-    let mut seen: BTreeMap<String, BroadcastRecord> = BTreeMap::new();
+    let mut seen: BTreeMap<String, Vec<BroadcastRecord>> = BTreeMap::new();
     let mut out = Vec::with_capacity(records.len());
     let mut dropped = 0_usize;
     for record in records.drain(..) {
         let key = nav_identity(&record);
-        match seen.get(&key) {
-            Some(existing) if *existing == record => {
-                dropped += 1;
-            }
-            Some(_) => out.push(record),
-            None => {
-                seen.insert(key, record);
-                out.push(record);
-            }
+        let family = seen.entry(key).or_default();
+        if family.contains(&record) {
+            dropped += 1;
+        } else {
+            family.push(record);
+            out.push(record);
         }
     }
     *records = out;
@@ -1043,56 +1978,82 @@ fn is_valid_obs_code(system: GnssSystem, code: &str, version: f64) -> bool {
     if chars.next().is_some() || !"CLDSX".contains(kind) || !band.is_ascii_digit() {
         return false;
     }
-    let attrs = match system {
-        GnssSystem::Gps => "CWPYMLXIQS",
-        GnssSystem::Glonass => "CPXAB",
-        GnssSystem::Galileo => "ABCXZIQ",
-        GnssSystem::BeiDou => {
-            if version >= 4.0 {
-                "DPXAINQ"
-            } else {
-                "IQXDPAN"
-            }
-        }
-        GnssSystem::Qzss => "CSLXZ",
-        GnssSystem::Navic => "ABCX",
-        GnssSystem::Sbas => "CIX",
-    };
-    attrs.contains(attr)
+    obs_code_band_attr_allowed(system, band, attr, version)
+}
+
+fn obs_code_band_attr_allowed(system: GnssSystem, band: char, attr: char, _version: f64) -> bool {
+    match system {
+        // RINEX 3.05 Tables 14-20 plus RINEX 4.02 additions used by the
+        // committed fixtures. Band checks are explicit so GPS C9C is rejected.
+        GnssSystem::Gps => match band {
+            '1' => "CWPYMSLXN".contains(attr),
+            '2' => "CWPYMSLDXN".contains(attr),
+            '5' => "IQX".contains(attr),
+            _ => false,
+        },
+        GnssSystem::Glonass => match band {
+            '1' | '2' => "CP".contains(attr),
+            '3' => "IQX".contains(attr),
+            '4' | '6' => "ABX".contains(attr),
+            _ => false,
+        },
+        GnssSystem::Galileo => match band {
+            '1' => "ABCXZ".contains(attr),
+            '5' | '7' | '8' => "IQX".contains(attr),
+            '6' => "ABCXZ".contains(attr),
+            _ => false,
+        },
+        GnssSystem::BeiDou => match band {
+            '1' => "DPXAN".contains(attr),
+            '2' => "IQX".contains(attr),
+            '5' => "DPX".contains(attr),
+            '6' => "IQX".contains(attr),
+            '7' => "IQXDPZ".contains(attr),
+            '8' => "DPX".contains(attr),
+            _ => false,
+        },
+        GnssSystem::Qzss => match band {
+            '1' => "CSLXZ".contains(attr),
+            '2' => "SLX".contains(attr),
+            '5' => "IQX".contains(attr),
+            '6' => "SLXEZ".contains(attr),
+            _ => false,
+        },
+        GnssSystem::Navic => match band {
+            '5' | '9' => "ABCX".contains(attr),
+            _ => false,
+        },
+        GnssSystem::Sbas => match band {
+            '1' => "C".contains(attr),
+            '5' => "IQX".contains(attr),
+            _ => false,
+        },
+    }
 }
 
 fn first_normal_epoch(obs: &RinexObs) -> Option<&ObsEpoch> {
     obs.epochs.iter().find(|epoch| epoch.flag <= 1)
 }
 
-fn dominant_interval_s(epochs: &[ObsEpoch]) -> Option<f64> {
+fn last_normal_epoch(obs: &RinexObs) -> Option<&ObsEpoch> {
+    obs.epochs.iter().rev().find(|epoch| epoch.flag <= 1)
+}
+
+fn obs_body_time_scale(obs: &RinexObs) -> TimeScale {
+    match (obs.header.time_of_first_obs, obs.header.time_of_last_obs) {
+        (Some((_, first_scale)), Some((_, last_scale))) if first_scale != last_scale => last_scale,
+        (Some((_, scale)), _) | (_, Some((_, scale))) => scale,
+        _ => TimeScale::Gpst,
+    }
+}
+
+fn dominant_interval_for_epochs(epochs: &[ObsEpoch]) -> Option<f64> {
     let normal: Vec<_> = epochs
         .iter()
         .filter(|epoch| epoch.flag <= 1)
         .map(|epoch| epoch.epoch)
         .collect();
-    if normal.len() < 2 {
-        return None;
-    }
-    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
-    for pair in normal.windows(2) {
-        let delta_ms = ((epoch_seconds(pair[1]) - epoch_seconds(pair[0])) * 1000.0).round() as i64;
-        if delta_ms > 0 {
-            *counts.entry(delta_ms).or_default() += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(delta_ms, count)| (*count, -(*delta_ms)))
-        .map(|(delta_ms, _)| delta_ms as f64 / 1000.0)
-}
-
-fn epoch_seconds(epoch: ObsEpochTime) -> f64 {
-    let days = civil_days(epoch.year, epoch.month, epoch.day);
-    days as f64 * 86_400.0
-        + f64::from(epoch.hour) * 3600.0
-        + f64::from(epoch.minute) * 60.0
-        + epoch.second
+    dominant_obs_interval_s(&normal)
 }
 
 fn epoch_key(epoch: ObsEpochTime) -> (i32, u8, u8, u8, u8, i64) {
@@ -1108,16 +2069,6 @@ fn epoch_key(epoch: ObsEpochTime) -> (i32, u8, u8, u8, u8, i64) {
 
 fn same_epoch_time(a: ObsEpochTime, b: ObsEpochTime) -> bool {
     epoch_key(a) == epoch_key(b)
-}
-
-fn civil_days(year: i32, month: u8, day: u8) -> i64 {
-    let y = i64::from(year) - i64::from(month <= 2);
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = i64::from(month) + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 fn nav_identity(record: &BroadcastRecord) -> String {

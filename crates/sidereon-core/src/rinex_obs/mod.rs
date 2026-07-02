@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 use crate::astro::time::model::TimeScale;
 
-use crate::format::columns::raw_field as field;
+use crate::format::columns::{raw_field as field, raw_field_from};
 use crate::format::{Diagnostics, RecordRef, Skip, SkipReason};
 use crate::frequencies::{
     rinex_band_frequency_hz, rinex_observation_frequency_hz, rinex_observation_wavelength_m,
@@ -114,6 +114,50 @@ pub struct ObsScaleFactor {
     pub codes: Vec<String>,
 }
 
+/// One `PGM / RUN BY / DATE` header record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgmRunByDate {
+    /// Program name, trimmed from A20.
+    pub program: String,
+    /// Run-by agency/user, trimmed from A20.
+    pub run_by: String,
+    /// Date string, trimmed from A20.
+    pub date: String,
+}
+
+/// One `REC # / TYPE / VERS` header record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiverInfo {
+    /// Receiver serial number, trimmed from A20.
+    pub number: String,
+    /// Receiver type, trimmed from A20.
+    pub receiver_type: String,
+    /// Receiver firmware/version, trimmed from A20.
+    pub version: String,
+}
+
+/// One `ANT # / TYPE` header record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntennaInfo {
+    /// Antenna serial number, trimmed from A20.
+    pub number: String,
+    /// Antenna type, trimmed from A20.
+    pub antenna_type: String,
+}
+
+/// `LEAP SECONDS` header record retained from an observation file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObsLeapSeconds {
+    /// Current leap-second count.
+    pub current: i64,
+    /// Future/past delta field, if present.
+    pub delta_future: Option<i64>,
+    /// GPS week field, if present.
+    pub week: Option<i64>,
+    /// Day field, if present.
+    pub day: Option<i64>,
+}
+
 /// One epoch record: the civil time, the event flag, and the per-satellite
 /// observation values (aligned to that system's `SYS / # / OBS TYPES` order).
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +166,14 @@ pub struct ObsEpoch {
     pub epoch: ObsEpochTime,
     /// Epoch flag: 0 = OK, 1 = power failure, >1 = an event record (skipped).
     pub flag: u8,
+    /// Optional receiver clock offset from the epoch line, seconds.
+    pub rcv_clock_offset_s: Option<f64>,
+    /// Optional RINEX 4 epoch picosecond extension.
+    pub epoch_picoseconds: Option<u32>,
+    /// Satellite/special-record count declared on the epoch line.
+    pub declared_record_count: usize,
+    /// Number of special records declared by an event epoch.
+    pub special_record_count: usize,
     /// Satellite → observation values, ascending satellite id. The value vector
     /// is index-aligned to [`ObsHeader::obs_codes`] for that satellite's system.
     pub sats: BTreeMap<GnssSatelliteId, Vec<ObsValue>>,
@@ -141,18 +193,48 @@ pub struct ObsHeader {
     pub antenna_delta_hen_m: Option<[f64; 3]>,
     /// Per-constellation observation-code list, in declared order.
     pub obs_codes: BTreeMap<GnssSystem, Vec<String>>,
+    /// Program/run-by/date header record.
+    pub program_run_by_date: Option<PgmRunByDate>,
+    /// Header comments retained in file order.
+    pub comments: Vec<String>,
+    /// Marker number, if present.
+    pub marker_number: Option<String>,
+    /// Marker type, if present.
+    pub marker_type: Option<String>,
+    /// Observer name, if present.
+    pub observer: Option<String>,
+    /// Agency name, if present.
+    pub agency: Option<String>,
+    /// Receiver information, if present.
+    pub receiver: Option<ReceiverInfo>,
+    /// Antenna information, if present.
+    pub antenna: Option<AntennaInfo>,
     /// Nominal epoch spacing in seconds (`INTERVAL`), if present.
     pub interval_s: Option<f64>,
     /// First observation epoch and its time system (`TIME OF FIRST OBS`).
     pub time_of_first_obs: Option<(ObsEpochTime, TimeScale)>,
+    /// Last observation epoch and its time system (`TIME OF LAST OBS`).
+    pub time_of_last_obs: Option<(ObsEpochTime, TimeScale)>,
+    /// Declared distinct-satellite count.
+    pub n_satellites: Option<usize>,
+    /// Declared per-satellite, per-code observation counts.
+    pub prn_obs_counts: BTreeMap<GnssSatelliteId, Vec<Option<usize>>>,
     /// Carrier phase-shift records (`SYS / PHASE SHIFT`), in header order.
     pub phase_shifts: Vec<ObsPhaseShift>,
     /// Observation scale-factor records (`SYS / SCALE FACTOR`), in header order.
     pub scale_factors: Vec<ObsScaleFactor>,
     /// GLONASS slot → frequency channel map (`GLONASS SLOT / FRQ #`), if present.
     pub glonass_slots: BTreeMap<u8, i8>,
+    /// GLONASS code-phase bias/alignment record.
+    pub glonass_cod_phs_bis: Option<Vec<(String, f64)>>,
+    /// Signal-strength unit, e.g. `DBHZ`.
+    pub signal_strength_unit: Option<String>,
+    /// Observation-header leap-second record.
+    pub leap_seconds: Option<ObsLeapSeconds>,
     /// Marker (station) name, if present.
     pub marker_name: Option<String>,
+    /// Header labels retained only as drop-on-rewrite disclosure.
+    pub unretained_header_labels: Vec<String>,
 }
 
 /// A parsed RINEX 3 observation product.
@@ -570,12 +652,27 @@ struct Parser {
     obs_codes: BTreeMap<GnssSystem, Vec<String>>,
     interval_s: Option<f64>,
     time_of_first_obs: Option<(ObsEpochTime, TimeScale)>,
+    time_of_last_obs: Option<(ObsEpochTime, TimeScale)>,
+    program_run_by_date: Option<PgmRunByDate>,
+    comments: Vec<String>,
+    marker_number: Option<String>,
+    marker_type: Option<String>,
+    observer: Option<String>,
+    agency: Option<String>,
+    receiver: Option<ReceiverInfo>,
+    antenna: Option<AntennaInfo>,
+    n_satellites: Option<usize>,
+    prn_obs_counts: BTreeMap<GnssSatelliteId, Vec<Option<usize>>>,
     phase_shifts: Vec<ObsPhaseShift>,
     scale_factors: Vec<ObsScaleFactor>,
     scale_factor_continuation: Option<ScaleFactorContinuation>,
     glonass_slots: BTreeMap<u8, i8>,
     glonass_slots_remaining: Option<usize>,
+    glonass_cod_phs_bis: Option<Vec<(String, f64)>>,
+    signal_strength_unit: Option<String>,
+    leap_seconds: Option<ObsLeapSeconds>,
     marker_name: Option<String>,
+    unretained_header_labels: Vec<String>,
     epochs: Vec<ObsEpoch>,
     /// The constellation whose `SYS / # / OBS TYPES` list is currently being
     /// filled (for continuation lines).
@@ -604,12 +701,27 @@ impl Parser {
             obs_codes: BTreeMap::new(),
             interval_s: None,
             time_of_first_obs: None,
+            time_of_last_obs: None,
+            program_run_by_date: None,
+            comments: Vec::new(),
+            marker_number: None,
+            marker_type: None,
+            observer: None,
+            agency: None,
+            receiver: None,
+            antenna: None,
+            n_satellites: None,
+            prn_obs_counts: BTreeMap::new(),
             phase_shifts: Vec::new(),
             scale_factors: Vec::new(),
             scale_factor_continuation: None,
             glonass_slots: BTreeMap::new(),
             glonass_slots_remaining: None,
+            glonass_cod_phs_bis: None,
+            signal_strength_unit: None,
+            leap_seconds: None,
             marker_name: None,
+            unretained_header_labels: Vec::new(),
             epochs: Vec::new(),
             current_obs_sys: None,
             obs_codes_remaining: 0,
@@ -630,24 +742,63 @@ impl Parser {
         let mut saw_end = false;
         for raw in lines.by_ref() {
             let line = raw.trim_end_matches(['\r', '\n']);
-            let label = field(line, 60, 80).trim();
+            let label = raw_field_from(line, 60).trim();
             match label {
                 "RINEX VERSION / TYPE" => self.parse_version(line)?,
+                "PGM / RUN BY / DATE" => self.parse_pgm_run_by_date(line),
+                "COMMENT" => self.comments.push(field(line, 0, 60).trim().to_string()),
                 "APPROX POSITION XYZ" => self.parse_approx_position(line)?,
                 "ANTENNA: DELTA H/E/N" => self.parse_antenna_delta(line)?,
                 "SYS / # / OBS TYPES" => self.parse_obs_types(line)?,
                 "SYS / SCALE FACTOR" => self.parse_scale_factor(line)?,
                 "SYS / PHASE SHIFT" => self.parse_phase_shift(line)?,
                 "TIME OF FIRST OBS" => self.parse_time_of_first_obs(line)?,
+                "TIME OF LAST OBS" => self.parse_time_of_last_obs(line)?,
                 "INTERVAL" => {
                     self.interval_s = Some(strict_f64_field(line, 0, 10, "interval_s")?);
                 }
                 "GLONASS SLOT / FRQ #" => self.parse_glonass_slots(line)?,
+                "GLONASS COD/PHS/BIS" => self.parse_glonass_cod_phs_bis(line)?,
+                "SIGNAL STRENGTH UNIT" => {
+                    let unit = field(line, 0, 20).trim();
+                    if !unit.is_empty() {
+                        self.signal_strength_unit = Some(unit.to_string());
+                    }
+                }
+                "LEAP SECONDS" => self.parse_leap_seconds(line)?,
+                "# OF SATELLITES" => {
+                    self.n_satellites =
+                        Some(strict_int_field::<usize>(line, 0, 6, "n_satellites")?);
+                }
+                "PRN / # OF OBS" => self.parse_prn_obs_counts(line)?,
                 "MARKER NAME" => {
                     let name = field(line, 0, 60).trim();
                     if !name.is_empty() {
                         self.marker_name = Some(name.to_string());
                     }
+                }
+                "MARKER NUMBER" => {
+                    self.marker_number = optional_trimmed(line, 0, 20);
+                }
+                "MARKER TYPE" => {
+                    self.marker_type = optional_trimmed(line, 0, 20);
+                }
+                "OBSERVER / AGENCY" => {
+                    self.observer = optional_trimmed(line, 0, 20);
+                    self.agency = optional_trimmed(line, 20, 60);
+                }
+                "REC # / TYPE / VERS" => {
+                    self.receiver = Some(ReceiverInfo {
+                        number: field(line, 0, 20).trim().to_string(),
+                        receiver_type: field(line, 20, 40).trim().to_string(),
+                        version: field(line, 40, 60).trim().to_string(),
+                    });
+                }
+                "ANT # / TYPE" => {
+                    self.antenna = Some(AntennaInfo {
+                        number: field(line, 0, 20).trim().to_string(),
+                        antenna_type: field(line, 20, 40).trim().to_string(),
+                    });
                 }
                 "END OF HEADER" => {
                     self.ensure_obs_type_count_complete(line)?;
@@ -655,8 +806,13 @@ impl Parser {
                     saw_end = true;
                     break;
                 }
-                // Every other header record is tolerated and skipped.
-                _ => {}
+                // Every other header record is tolerated and surfaced to QC so
+                // callers know a rewrite will not carry it.
+                _ => {
+                    if !label.is_empty() {
+                        self.unretained_header_labels.push(label.to_string());
+                    }
+                }
             }
         }
         if !saw_end {
@@ -712,6 +868,14 @@ impl Parser {
             ],
         )?);
         Ok(())
+    }
+
+    fn parse_pgm_run_by_date(&mut self, line: &str) {
+        self.program_run_by_date = Some(PgmRunByDate {
+            program: field(line, 0, 20).trim().to_string(),
+            run_by: field(line, 20, 40).trim().to_string(),
+            date: field(line, 40, 60).trim().to_string(),
+        });
     }
 
     fn parse_obs_types(&mut self, line: &str) -> Result<()> {
@@ -887,24 +1051,54 @@ impl Parser {
     }
 
     fn parse_time_of_first_obs(&mut self, line: &str) -> Result<()> {
+        self.time_of_first_obs = Some(self.parse_time_header(line, "time_of_first_obs")?);
+        Ok(())
+    }
+
+    fn parse_time_of_last_obs(&mut self, line: &str) -> Result<()> {
+        self.time_of_last_obs = Some(self.parse_time_header(line, "time_of_last_obs")?);
+        Ok(())
+    }
+
+    fn parse_time_header(
+        &self,
+        line: &str,
+        prefix: &'static str,
+    ) -> Result<(ObsEpochTime, TimeScale)> {
         let body = field(line, 0, 43);
         let scale_label = field(line, 48, 51).trim();
         let scale = time_scale_from_label(scale_label, line)?;
+        let year = match prefix {
+            "time_of_last_obs" => "time_of_last_obs.year",
+            _ => "time_of_first_obs.year",
+        };
+        let month = match prefix {
+            "time_of_last_obs" => "time_of_last_obs.month",
+            _ => "time_of_first_obs.month",
+        };
+        let day = match prefix {
+            "time_of_last_obs" => "time_of_last_obs.day",
+            _ => "time_of_first_obs.day",
+        };
+        let hour = match prefix {
+            "time_of_last_obs" => "time_of_last_obs.hour",
+            _ => "time_of_first_obs.hour",
+        };
+        let minute = match prefix {
+            "time_of_last_obs" => "time_of_last_obs.minute",
+            _ => "time_of_first_obs.minute",
+        };
+        let second = match prefix {
+            "time_of_last_obs" => "time_of_last_obs.second",
+            _ => "time_of_first_obs.second",
+        };
         let epoch = parse_epoch_time_tokens(
             body,
             line,
-            [
-                "time_of_first_obs.year",
-                "time_of_first_obs.month",
-                "time_of_first_obs.day",
-                "time_of_first_obs.hour",
-                "time_of_first_obs.minute",
-                "time_of_first_obs.second",
-            ],
+            [year, month, day, hour, minute, second],
             civil_second_policy_for_time_scale(scale),
         )?;
-        self.time_of_first_obs = Some((epoch, scale));
-        Ok(())
+        Ok((epoch, scale))
     }
 
     fn parse_glonass_slots(&mut self, line: &str) -> Result<()> {
@@ -959,6 +1153,59 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_glonass_cod_phs_bis(&mut self, line: &str) -> Result<()> {
+        let tokens: Vec<&str> = field(line, 0, 60).split_whitespace().collect();
+        let mut entries = Vec::new();
+        for pair in tokens.chunks(2) {
+            if pair.len() != 2 {
+                return Err(Error::Parse(format!(
+                    "RINEX OBS GLONASS COD/PHS/BIS has an odd token count in {line:?}"
+                )));
+            }
+            entries.push((
+                pair[0].to_string(),
+                strict_f64_token(pair[1], "glonass_code_phase_bias", line)?,
+            ));
+        }
+        self.glonass_cod_phs_bis = Some(entries);
+        Ok(())
+    }
+
+    fn parse_leap_seconds(&mut self, line: &str) -> Result<()> {
+        let current = strict_int_field::<i64>(line, 0, 6, "leap_seconds.current")?;
+        self.leap_seconds = Some(ObsLeapSeconds {
+            current,
+            delta_future: optional_i64_field(line, 6, 12, "leap_seconds.delta_future")?,
+            week: optional_i64_field(line, 12, 18, "leap_seconds.week")?,
+            day: optional_i64_field(line, 18, 24, "leap_seconds.day")?,
+        });
+        Ok(())
+    }
+
+    fn parse_prn_obs_counts(&mut self, line: &str) -> Result<()> {
+        let token = field(line, 0, 3).trim();
+        if token.is_empty() {
+            return Ok(());
+        }
+        let Some(sat) = parse_sv_token(token) else {
+            self.push_unrepresentable_satellite_skip(token);
+            return Ok(());
+        };
+        let count = self.obs_codes.get(&sat.system).map_or(0, Vec::len);
+        let mut values = Vec::with_capacity(count);
+        for idx in 0..count {
+            let start = 3 + idx * 6;
+            let raw = field(line, start, start + 6).trim();
+            if raw.is_empty() {
+                values.push(None);
+            } else {
+                values.push(Some(strict_int_token::<usize>(raw, "prn_obs_count", line)?));
+            }
+        }
+        self.prn_obs_counts.insert(sat, values);
+        Ok(())
+    }
+
     fn parse_body<'a, I: Iterator<Item = &'a str>>(
         &mut self,
         lines: &mut std::iter::Peekable<I>,
@@ -975,7 +1222,7 @@ impl Parser {
             let time_scale = self
                 .time_of_first_obs
                 .map_or(TimeScale::Gpst, |(_, scale)| scale);
-            let (epoch_time, flag, numsat) =
+            let (epoch_time, flag, numsat, rcv_clock_offset_s, epoch_picoseconds) =
                 parse_epoch_line(line, civil_second_policy_for_time_scale(time_scale))?;
 
             if flag > 1 {
@@ -990,6 +1237,10 @@ impl Parser {
                 self.epochs.push(ObsEpoch {
                     epoch: epoch_time,
                     flag,
+                    rcv_clock_offset_s,
+                    epoch_picoseconds,
+                    declared_record_count: numsat,
+                    special_record_count: numsat,
                     sats: BTreeMap::new(),
                 });
                 continue;
@@ -1033,6 +1284,10 @@ impl Parser {
             self.epochs.push(ObsEpoch {
                 epoch: epoch_time,
                 flag,
+                rcv_clock_offset_s,
+                epoch_picoseconds,
+                declared_record_count: numsat,
+                special_record_count: 0,
                 sats,
             });
         }
@@ -1146,12 +1401,27 @@ impl Parser {
             approx_position_m: self.approx_position_m,
             antenna_delta_hen_m: self.antenna_delta_hen_m,
             obs_codes: self.obs_codes,
+            program_run_by_date: self.program_run_by_date,
+            comments: self.comments,
+            marker_number: self.marker_number,
+            marker_type: self.marker_type,
+            observer: self.observer,
+            agency: self.agency,
+            receiver: self.receiver,
+            antenna: self.antenna,
             interval_s: self.interval_s,
             time_of_first_obs: self.time_of_first_obs,
+            time_of_last_obs: self.time_of_last_obs,
+            n_satellites: self.n_satellites,
+            prn_obs_counts: self.prn_obs_counts,
             phase_shifts: self.phase_shifts,
             scale_factors: self.scale_factors,
             glonass_slots: self.glonass_slots,
+            glonass_cod_phs_bis: self.glonass_cod_phs_bis,
+            signal_strength_unit: self.signal_strength_unit,
+            leap_seconds: self.leap_seconds,
             marker_name: self.marker_name,
+            unretained_header_labels: self.unretained_header_labels,
         };
         Ok(RinexObs {
             header,
@@ -1174,15 +1444,23 @@ impl Parser {
 
 /// Parse a RINEX-3 epoch line `> YYYY MM DD HH MM SS.sssssss  F NN [clock]`,
 /// returning the civil time, event flag, and satellite count.
+type ParsedEpochLine = (ObsEpochTime, u8, usize, Option<f64>, Option<u32>);
+
 fn parse_epoch_line(
     line: &str,
     second_policy: validate::CivilSecondPolicy,
-) -> Result<(ObsEpochTime, u8, usize)> {
-    // The date occupies a fixed width after the leading '>'; the flag is at
-    // column 31 and the satellite count at columns 32..35.
-    let date_body = field(line, 1, 29);
+) -> Result<ParsedEpochLine> {
+    let body = line
+        .strip_prefix('>')
+        .ok_or_else(|| Error::Parse(format!("RINEX OBS epoch line lacks '>': {line:?}")))?;
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    if tokens.len() < 8 {
+        return Err(Error::Parse(format!(
+            "RINEX OBS epoch line has too few fields in {line:?}"
+        )));
+    }
     let epoch = parse_epoch_time_tokens(
-        date_body,
+        &tokens[..6].join(" "),
         line,
         [
             "epoch.year",
@@ -1194,9 +1472,28 @@ fn parse_epoch_line(
         ],
         second_policy,
     )?;
-    let flag = strict_int_field::<u8>(line, 31, 32, "epoch.flag")?;
-    let numsat = strict_int_field::<usize>(line, 32, 35, "epoch.satellite_count")?;
-    Ok((epoch, flag, numsat))
+
+    let mut index = 6;
+    let epoch_picoseconds = if tokens
+        .get(index)
+        .is_some_and(|token| token.len() == 5 && token.bytes().all(|b| b.is_ascii_digit()))
+        && tokens.len() >= 9
+    {
+        let value = strict_int_token::<u32>(tokens[index], "epoch.picoseconds", line)?;
+        index += 1;
+        Some(value)
+    } else {
+        None
+    };
+    let flag = strict_int_token::<u8>(tokens[index], "epoch.flag", line)?;
+    index += 1;
+    let numsat = strict_int_token::<usize>(tokens[index], "epoch.satellite_count", line)?;
+    index += 1;
+    let rcv_clock_offset_s = tokens
+        .get(index)
+        .map(|token| strict_f64_token(token, "epoch.rcv_clock_offset_s", line))
+        .transpose()?;
+    Ok((epoch, flag, numsat, rcv_clock_offset_s, epoch_picoseconds))
 }
 
 /// Map a RINEX time-system label onto the core [`TimeScale`]. A blank label
@@ -1281,6 +1578,25 @@ fn strict_vec3_tokens(body: &str, line: &str, fields: [&'static str; 3]) -> Resu
 
 fn strict_f64_field(line: &str, start: usize, end: usize, field_name: &'static str) -> Result<f64> {
     strict_f64_token(field(line, start, end), field_name, line)
+}
+
+fn optional_i64_field(
+    line: &str,
+    start: usize,
+    end: usize,
+    field_name: &'static str,
+) -> Result<Option<i64>> {
+    let token = field(line, start, end).trim();
+    if token.is_empty() {
+        Ok(None)
+    } else {
+        strict_int_token::<i64>(token, field_name, line).map(Some)
+    }
+}
+
+fn optional_trimmed(line: &str, start: usize, end: usize) -> Option<String> {
+    let value = field(line, start, end).trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn strict_int_field<T>(line: &str, start: usize, end: usize, field_name: &'static str) -> Result<T>
