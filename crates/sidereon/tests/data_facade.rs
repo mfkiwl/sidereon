@@ -1,4 +1,7 @@
-use sidereon::data::{mgex_nav, ops_ultra_sp3, station_obs_url, AnalysisCenter, ProductDate};
+use sidereon::data::{
+    dted_cache_relpath, hgt_to_dted, mgex_nav, ops_ultra_sp3, parse_skadi_tile_id,
+    skadi_archive_url, station_obs_url, terrain_tile_index, AnalysisCenter, ProductDate,
+};
 
 #[test]
 fn facade_reexports_data_catalog_derivation() {
@@ -33,4 +36,25 @@ fn facade_reexports_expanded_data_catalog_derivation() {
         station_obs_url("WTZR00DEU", date, "30S").expect("url"),
         "https://igs.bkg.bund.de/root_ftp/IGS/obs/2020/177/WTZR00DEU_R_20201770000_01D_30S_MO.crx.gz"
     );
+}
+
+#[test]
+fn facade_reexports_terrain_data_derivation_and_conversion() {
+    assert_eq!(
+        terrain_tile_index(36.75, -106.25).expect("tile index"),
+        (36, -107)
+    );
+    assert_eq!(
+        parse_skadi_tile_id("N36W107").expect("parse tile id"),
+        (36, -107)
+    );
+    assert_eq!(
+        skadi_archive_url(36, -107).expect("skadi URL"),
+        "https://s3.amazonaws.com/elevation-tiles-prod/skadi/N36/N36W107.hgt.gz"
+    );
+    assert_eq!(
+        dted_cache_relpath(36, -107).expect("DTED cache path"),
+        "n30_w110/n36_w107_1arc_v3.dt2"
+    );
+    assert!(hgt_to_dted(36, -107, &[]).is_err());
 }

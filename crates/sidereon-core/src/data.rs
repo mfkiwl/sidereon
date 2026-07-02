@@ -1,8 +1,9 @@
-//! GNSS product filename and archive URL catalog.
+//! Data product filename, cache path, and archive URL catalog.
 //!
 //! This module is sans-IO: it performs no network access, reads no files, and
-//! writes no cache entries. It only turns cataloged center/product/date inputs
-//! into canonical archive filenames and URLs.
+//! writes no cache entries. It only turns cataloged product inputs into
+//! canonical archive filenames, URLs, cache relative paths, and deterministic
+//! converted bytes for pure terrain ingestion.
 
 use core::fmt;
 use core::str::FromStr;
@@ -11,6 +12,7 @@ use crate::astro::time::civil::{civil_from_julian_day_number, day_of_year_int, d
 use crate::astro::time::gnss::{week_epoch_julian_day_number, week_from_calendar};
 use crate::astro::time::model::TimeScale;
 use crate::astro::time::scales::julian_day_number;
+use crate::terrain;
 
 /// Analysis-center code supported by the data-product catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -174,6 +176,15 @@ pub enum ArchiveCompression {
 }
 
 impl ArchiveCompression {
+    /// Catalog text for the compression format.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::None => "none",
+        }
+    }
+
     const fn suffix(self) -> &'static str {
         match self {
             Self::Gzip => ".gz",
@@ -261,6 +272,19 @@ pub struct CenterCatalogEntry {
     pub products: &'static [CenterProductConvention],
     /// Valid issue times for sub-daily products.
     pub issues: &'static [&'static str],
+}
+
+/// Static catalog entry for one terrain source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerrainSourceEntry {
+    /// Archive URI scheme.
+    pub protocol: ArchiveProtocol,
+    /// Archive host.
+    pub host: &'static str,
+    /// Archive compression.
+    pub compression: ArchiveCompression,
+    /// Archive root URL without trailing slash.
+    pub root_url: &'static str,
 }
 
 /// Product pair that is intentionally not offered because no open mirror exists.
@@ -554,11 +578,19 @@ const CATALOG: [CenterCatalogEntry; 11] = [
     },
 ];
 
-const ALLOWED_HOSTS: [&str; 4] = [
+const SKADI_SOURCE: TerrainSourceEntry = TerrainSourceEntry {
+    protocol: ArchiveProtocol::Https,
+    host: "s3.amazonaws.com",
+    compression: ArchiveCompression::Gzip,
+    root_url: "https://s3.amazonaws.com/elevation-tiles-prod",
+};
+
+const ALLOWED_HOSTS: [&str; 5] = [
     "ftp.aiub.unibe.ch",
     "navigation-office.esa.int",
     "isdc-data.gfz.de",
     "igs.bkg.bund.de",
+    "s3.amazonaws.com",
 ];
 
 const NO_OPEN_MIRRORS: [NoOpenMirrorProduct; 7] = [
@@ -664,6 +696,22 @@ pub enum DataCatalogError {
     NoAvailableUltraIssue,
     /// Station identifier is not a 9-character upper-case alphanumeric token.
     InvalidStation(String),
+    /// Terrain lookup coordinate is non-finite or outside the reader range.
+    InvalidCoordinate {
+        /// Latitude as `f64::to_bits()`.
+        lat_deg_bits: u64,
+        /// Longitude as `f64::to_bits()`.
+        lon_deg_bits: u64,
+    },
+    /// Terrain tile index is outside the valid one-degree cell range.
+    InvalidTileIndex {
+        /// Latitude index.
+        lat_index: i32,
+        /// Longitude index.
+        lon_index: i32,
+    },
+    /// Skadi tile identifier is malformed.
+    InvalidTileId(String),
 }
 
 impl fmt::Display for DataCatalogError {
@@ -708,11 +756,83 @@ impl fmt::Display for DataCatalogError {
                 write!(f, "no available ultra-rapid issue at or before target")
             }
             Self::InvalidStation(station) => write!(f, "invalid station code {station:?}"),
+            Self::InvalidCoordinate {
+                lat_deg_bits,
+                lon_deg_bits,
+            } => write!(
+                f,
+                "invalid terrain coordinate lat={} lon={}",
+                f64::from_bits(*lat_deg_bits),
+                f64::from_bits(*lon_deg_bits)
+            ),
+            Self::InvalidTileIndex {
+                lat_index,
+                lon_index,
+            } => write!(
+                f,
+                "invalid terrain tile index lat={lat_index} lon={lon_index}"
+            ),
+            Self::InvalidTileId(id) => write!(f, "invalid skadi tile id {id:?}"),
         }
     }
 }
 
 impl std::error::Error for DataCatalogError {}
+
+/// Error returned by SRTM HGT to DTED conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HgtConversionError {
+    /// The decompressed HGT payload is not the SRTM1 byte length.
+    BadLength {
+        /// Expected byte length.
+        expected: usize,
+        /// Actual byte length.
+        got: usize,
+    },
+    /// Terrain tile index is outside the valid one-degree cell range.
+    InvalidTileIndex {
+        /// Latitude index.
+        lat_index: i32,
+        /// Longitude index.
+        lon_index: i32,
+    },
+}
+
+impl fmt::Display for HgtConversionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadLength { expected, got } => {
+                write!(
+                    f,
+                    "invalid SRTM1 HGT length: expected {expected}, got {got}"
+                )
+            }
+            Self::InvalidTileIndex {
+                lat_index,
+                lon_index,
+            } => write!(
+                f,
+                "invalid terrain tile index lat={lat_index} lon={lon_index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HgtConversionError {}
+
+const MIN_TERRAIN_LAT_INDEX: i32 = -90;
+const MAX_TERRAIN_LAT_INDEX: i32 = 89;
+const MIN_TERRAIN_LON_INDEX: i32 = -180;
+const MAX_TERRAIN_LON_INDEX: i32 = 179;
+const MIN_TERRAIN_LAT_DEG: f64 = -90.0;
+const MAX_TERRAIN_LAT_DEG: f64 = 90.0;
+const MIN_TERRAIN_LON_DEG: f64 = -180.0;
+const MAX_TERRAIN_LON_DEG: f64 = 180.0;
+const SRTM1_POSTINGS_PER_AXIS: usize = 3601;
+const SRTM1_HGT_LEN: usize = SRTM1_POSTINGS_PER_AXIS * SRTM1_POSTINGS_PER_AXIS * 2;
+const DTED_SRTM1_DATA_BLOCK_LEN: usize = 12 + 2 * SRTM1_POSTINGS_PER_AXIS;
+const DTED_SRTM1_LEN: usize =
+    terrain::DATA_OFFSET + SRTM1_POSTINGS_PER_AXIS * DTED_SRTM1_DATA_BLOCK_LEN;
 
 /// Civil UTC date used by product archive names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1001,6 +1121,178 @@ pub const fn product_types() -> &'static [ProductTypeConvention] {
 #[must_use]
 pub const fn allowed_hosts() -> &'static [&'static str] {
     &ALLOWED_HOSTS
+}
+
+/// Catalog entry for the Skadi SRTM terrain source.
+#[must_use]
+pub const fn skadi_source_entry() -> TerrainSourceEntry {
+    SKADI_SOURCE
+}
+
+/// Build the Skadi SRTM tile id, for example `N36W107`.
+pub fn skadi_tile_id(lat_index: i32, lon_index: i32) -> Result<String, DataCatalogError> {
+    validate_terrain_tile_index(lat_index, lon_index)?;
+    let lat_hemi = if lat_index >= 0 { 'N' } else { 'S' };
+    let lon_hemi = if lon_index >= 0 { 'E' } else { 'W' };
+    Ok(format!(
+        "{lat_hemi}{:02}{lon_hemi}{:03}",
+        lat_index.abs(),
+        lon_index.abs()
+    ))
+}
+
+/// Build the Skadi latitude band directory, for example `N36`.
+pub fn skadi_band(lat_index: i32) -> Result<String, DataCatalogError> {
+    validate_terrain_lat_index(lat_index)?;
+    let lat_hemi = if lat_index >= 0 { 'N' } else { 'S' };
+    Ok(format!("{lat_hemi}{:02}", lat_index.abs()))
+}
+
+/// Build the Skadi SRTM archive URL for a tile.
+pub fn skadi_archive_url(lat_index: i32, lon_index: i32) -> Result<String, DataCatalogError> {
+    let band = skadi_band(lat_index)?;
+    let tile_id = skadi_tile_id(lat_index, lon_index)?;
+    Ok(format!(
+        "{}/skadi/{}/{}.hgt{}",
+        SKADI_SOURCE.root_url,
+        band,
+        tile_id,
+        SKADI_SOURCE.compression.suffix()
+    ))
+}
+
+/// Build the DTED tile filename read by the terrain module.
+pub fn dted_tile_filename(lat_index: i32, lon_index: i32) -> Result<String, DataCatalogError> {
+    validate_terrain_tile_index(lat_index, lon_index)?;
+    Ok(format!(
+        "{}_{}{}",
+        terrain::format_lat(lat_index),
+        terrain::format_lon(lon_index),
+        terrain::DTED_SUFFIX
+    ))
+}
+
+/// Build the DTED ten-degree cache block directory read by the terrain module.
+pub fn dted_block_dir(lat_index: i32, lon_index: i32) -> Result<String, DataCatalogError> {
+    validate_terrain_tile_index(lat_index, lon_index)?;
+    Ok(terrain::terrain_block_dir(lat_index, lon_index))
+}
+
+/// Build the DTED cache relative path read by the terrain module.
+pub fn dted_cache_relpath(lat_index: i32, lon_index: i32) -> Result<String, DataCatalogError> {
+    Ok(format!(
+        "{}/{}",
+        dted_block_dir(lat_index, lon_index)?,
+        dted_tile_filename(lat_index, lon_index)?
+    ))
+}
+
+/// Parse a Skadi SRTM tile id into `(lat_index, lon_index)`.
+pub fn parse_skadi_tile_id(id: &str) -> Result<(i32, i32), DataCatalogError> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 7
+        || !matches!(bytes[0], b'N' | b'S')
+        || !matches!(bytes[3], b'E' | b'W')
+        || !bytes[1..3].iter().all(u8::is_ascii_digit)
+        || !bytes[4..7].iter().all(u8::is_ascii_digit)
+    {
+        return Err(DataCatalogError::InvalidTileId(id.to_string()));
+    }
+
+    let lat_abs = id[1..3]
+        .parse::<i32>()
+        .map_err(|_| DataCatalogError::InvalidTileId(id.to_string()))?;
+    let lon_abs = id[4..7]
+        .parse::<i32>()
+        .map_err(|_| DataCatalogError::InvalidTileId(id.to_string()))?;
+    if (bytes[0] == b'S' && lat_abs == 0) || (bytes[3] == b'W' && lon_abs == 0) {
+        return Err(DataCatalogError::InvalidTileId(id.to_string()));
+    }
+
+    let lat_index = if bytes[0] == b'N' { lat_abs } else { -lat_abs };
+    let lon_index = if bytes[3] == b'E' { lon_abs } else { -lon_abs };
+    validate_terrain_tile_index(lat_index, lon_index)?;
+    Ok((lat_index, lon_index))
+}
+
+/// Derive the terrain tile index covering a latitude/longitude coordinate.
+pub fn terrain_tile_index(lat_deg: f64, lon_deg: f64) -> Result<(i32, i32), DataCatalogError> {
+    if !lat_deg.is_finite()
+        || !lon_deg.is_finite()
+        || !(MIN_TERRAIN_LAT_DEG..=MAX_TERRAIN_LAT_DEG).contains(&lat_deg)
+        || !(MIN_TERRAIN_LON_DEG..=MAX_TERRAIN_LON_DEG).contains(&lon_deg)
+    {
+        return Err(DataCatalogError::InvalidCoordinate {
+            lat_deg_bits: lat_deg.to_bits(),
+            lon_deg_bits: lon_deg.to_bits(),
+        });
+    }
+
+    let (mut lat_index, mut lon_index) = terrain::terrain_grid(lon_deg, lat_deg);
+    if lat_index == MAX_TERRAIN_LAT_DEG as i32 {
+        lat_index = MAX_TERRAIN_LAT_INDEX;
+    }
+    if lon_index == MAX_TERRAIN_LON_DEG as i32 {
+        lon_index = MAX_TERRAIN_LON_INDEX;
+    }
+    validate_terrain_tile_index(lat_index, lon_index)?;
+    Ok((lat_index, lon_index))
+}
+
+/// Convert decompressed SRTM1 HGT bytes into deterministic DTED `.dt2` bytes.
+///
+/// The HGT payload must be 3601 by 3601 big-endian `i16` samples in row-major
+/// order. HGT rows run north to south; DTED data records are longitude columns
+/// with postings south to north, so output posting `(i, j)` reads source sample
+/// `hgt[r = 3600 - i][c = j]`. SRTM void samples (`-32768`) are written as sea
+/// level (`0`) so the existing terrain reader returns `0` for those postings.
+pub fn hgt_to_dted(
+    lat_index: i32,
+    lon_index: i32,
+    hgt: &[u8],
+) -> Result<Vec<u8>, HgtConversionError> {
+    validate_hgt_tile_index(lat_index, lon_index)?;
+    if hgt.len() != SRTM1_HGT_LEN {
+        return Err(HgtConversionError::BadLength {
+            expected: SRTM1_HGT_LEN,
+            got: hgt.len(),
+        });
+    }
+
+    let mut out = vec![b' '; DTED_SRTM1_LEN];
+    out[0..4].copy_from_slice(b"UHL1");
+    out[4..12].copy_from_slice(dted_coord_field(lon_index, true).as_bytes());
+    out[12..20].copy_from_slice(dted_coord_field(lat_index, false).as_bytes());
+    out[47..51].copy_from_slice(b"3601");
+    out[51..55].copy_from_slice(b"3601");
+
+    for lon_posting in 0..SRTM1_POSTINGS_PER_AXIS {
+        let block_start = terrain::DATA_OFFSET + lon_posting * DTED_SRTM1_DATA_BLOCK_LEN;
+        let checksum_start = block_start + DTED_SRTM1_DATA_BLOCK_LEN - 4;
+        out[block_start] = terrain::DATA_SENTINEL;
+
+        let count = (lon_posting as u32).to_be_bytes();
+        out[block_start + 1..block_start + 4].copy_from_slice(&count[1..4]);
+        out[block_start + 4..block_start + 6].copy_from_slice(&(lon_posting as u16).to_be_bytes());
+        out[block_start + 6..block_start + 8].copy_from_slice(&0u16.to_be_bytes());
+
+        for lat_posting in 0..SRTM1_POSTINGS_PER_AXIS {
+            let hgt_row = SRTM1_POSTINGS_PER_AXIS - 1 - lat_posting;
+            let hgt_sample_start = 2 * (hgt_row * SRTM1_POSTINGS_PER_AXIS + lon_posting);
+            let sample = i16::from_be_bytes([hgt[hgt_sample_start], hgt[hgt_sample_start + 1]]);
+            let encoded = encode_dted_signed_magnitude(sample).to_be_bytes();
+            let dted_sample_start = block_start + 8 + 2 * lat_posting;
+            out[dted_sample_start..dted_sample_start + 2].copy_from_slice(&encoded);
+        }
+
+        let checksum = out[block_start..checksum_start]
+            .iter()
+            .fold(0i32, |acc, byte| acc + i32::from(*byte));
+        out[checksum_start..checksum_start + 4].copy_from_slice(&checksum.to_be_bytes());
+    }
+
+    debug_assert_eq!(out.len(), 25_981_042);
+    Ok(out)
 }
 
 /// Product pairs intentionally withheld because no open mirror is known.
@@ -1328,6 +1620,63 @@ pub fn station_obs_url(
 #[must_use]
 pub const fn station_obs_protocol() -> ArchiveProtocol {
     ArchiveProtocol::Https
+}
+
+fn validate_terrain_lat_index(lat_index: i32) -> Result<(), DataCatalogError> {
+    if (MIN_TERRAIN_LAT_INDEX..=MAX_TERRAIN_LAT_INDEX).contains(&lat_index) {
+        Ok(())
+    } else {
+        Err(DataCatalogError::InvalidTileIndex {
+            lat_index,
+            lon_index: 0,
+        })
+    }
+}
+
+fn validate_terrain_tile_index(lat_index: i32, lon_index: i32) -> Result<(), DataCatalogError> {
+    if (MIN_TERRAIN_LAT_INDEX..=MAX_TERRAIN_LAT_INDEX).contains(&lat_index)
+        && (MIN_TERRAIN_LON_INDEX..=MAX_TERRAIN_LON_INDEX).contains(&lon_index)
+    {
+        Ok(())
+    } else {
+        Err(DataCatalogError::InvalidTileIndex {
+            lat_index,
+            lon_index,
+        })
+    }
+}
+
+fn validate_hgt_tile_index(lat_index: i32, lon_index: i32) -> Result<(), HgtConversionError> {
+    if (MIN_TERRAIN_LAT_INDEX..=MAX_TERRAIN_LAT_INDEX).contains(&lat_index)
+        && (MIN_TERRAIN_LON_INDEX..=MAX_TERRAIN_LON_INDEX).contains(&lon_index)
+    {
+        Ok(())
+    } else {
+        Err(HgtConversionError::InvalidTileIndex {
+            lat_index,
+            lon_index,
+        })
+    }
+}
+
+fn dted_coord_field(index: i32, is_longitude: bool) -> String {
+    let hemi = match (is_longitude, index >= 0) {
+        (true, true) => 'E',
+        (true, false) => 'W',
+        (false, true) => 'N',
+        (false, false) => 'S',
+    };
+    format!("{:03}0000{hemi}", index.abs())
+}
+
+fn encode_dted_signed_magnitude(sample: i16) -> u16 {
+    if sample == i16::MIN {
+        0
+    } else if sample >= 0 {
+        sample as u16
+    } else {
+        0x8000 | (-i32::from(sample) as u16)
+    }
 }
 
 fn product_type_convention(product_type: ProductType) -> &'static ProductTypeConvention {

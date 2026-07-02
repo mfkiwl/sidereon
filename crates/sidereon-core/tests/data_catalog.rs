@@ -1,9 +1,11 @@
 use sidereon_core::data::{
-    archive_url, canonical_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk,
-    mgex_ionex, mgex_nav, mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3,
-    predicted_ionex, product_convention, rapid_ionex, station_obs, station_obs_filename,
-    station_obs_protocol, station_obs_url, AnalysisCenter, ArchiveProtocol, DataCatalogError,
-    ProductDate, ProductDateTime, ProductType, UltraIssue,
+    allowed_hosts, archive_url, canonical_filename, dted_block_dir, dted_cache_relpath,
+    dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk, mgex_ionex, mgex_nav,
+    mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3, parse_skadi_tile_id,
+    predicted_ionex, product_convention, rapid_ionex, skadi_archive_url, skadi_band,
+    skadi_source_entry, skadi_tile_id, station_obs, station_obs_filename, station_obs_protocol,
+    station_obs_url, terrain_tile_index, AnalysisCenter, ArchiveCompression, ArchiveProtocol,
+    DataCatalogError, ProductDate, ProductDateTime, ProductType, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
@@ -228,4 +230,110 @@ fn pure_issue_and_ionex_candidate_selection_matches_bindings() {
     let candidates =
         gim_date_candidates(AnalysisCenter::CodPrd1, date(2026, 6, 14), 1).expect("candidates");
     assert_eq!(candidates, vec![date(2026, 6, 14), date(2026, 6, 13)]);
+}
+
+#[test]
+fn skadi_source_entry_and_host_allowlist_are_cataloged() {
+    let source = skadi_source_entry();
+    assert_eq!(source.protocol, ArchiveProtocol::Https);
+    assert_eq!(source.host, "s3.amazonaws.com");
+    assert_eq!(source.compression, ArchiveCompression::Gzip);
+    assert_eq!(source.compression.as_str(), "gzip");
+    assert_eq!(
+        source.root_url,
+        "https://s3.amazonaws.com/elevation-tiles-prod"
+    );
+    assert!(allowed_hosts().contains(&"s3.amazonaws.com"));
+}
+
+#[test]
+fn skadi_tile_and_dted_derivation_match_known_tile_ids() {
+    assert_eq!(skadi_tile_id(36, -107).expect("tile id"), "N36W107");
+    assert_eq!(skadi_band(36).expect("band"), "N36");
+    assert_eq!(
+        skadi_archive_url(36, -107).expect("url"),
+        "https://s3.amazonaws.com/elevation-tiles-prod/skadi/N36/N36W107.hgt.gz"
+    );
+    assert_eq!(
+        dted_tile_filename(36, -107).expect("filename"),
+        "n36_w107_1arc_v3.dt2"
+    );
+    assert_eq!(dted_block_dir(36, -107).expect("block"), "n30_w110");
+    assert_eq!(
+        dted_cache_relpath(36, -107).expect("relative path"),
+        "n30_w110/n36_w107_1arc_v3.dt2"
+    );
+
+    assert_eq!(skadi_tile_id(-1, 10).expect("tile id"), "S01E010");
+    assert_eq!(skadi_band(-1).expect("band"), "S01");
+    assert_eq!(dted_block_dir(-1, 10).expect("block"), "s10_e010");
+    assert_eq!(
+        skadi_archive_url(-1, 10).expect("url"),
+        "https://s3.amazonaws.com/elevation-tiles-prod/skadi/S01/S01E010.hgt.gz"
+    );
+
+    assert_eq!(dted_block_dir(32, -117).expect("block"), "n30_w120");
+    assert_eq!(dted_block_dir(43, -112).expect("block"), "n40_w120");
+    assert_eq!(dted_block_dir(20, -103).expect("block"), "n20_w110");
+}
+
+#[test]
+fn parse_skadi_tile_id_validates_format_and_range() {
+    assert_eq!(
+        parse_skadi_tile_id("N36W107").expect("parsed tile"),
+        (36, -107)
+    );
+    assert_eq!(
+        parse_skadi_tile_id("S01E010").expect("parsed tile"),
+        (-1, 10)
+    );
+    assert_eq!(
+        parse_skadi_tile_id("N90E000"),
+        Err(DataCatalogError::InvalidTileIndex {
+            lat_index: 90,
+            lon_index: 0
+        })
+    );
+    assert_eq!(
+        parse_skadi_tile_id("S00E010"),
+        Err(DataCatalogError::InvalidTileId("S00E010".to_string()))
+    );
+    assert_eq!(
+        parse_skadi_tile_id("n36w107"),
+        Err(DataCatalogError::InvalidTileId("n36w107".to_string()))
+    );
+}
+
+#[test]
+fn terrain_tile_index_matches_reader_grid_and_clamps_upper_edges() {
+    assert_eq!(
+        terrain_tile_index(36.75, -106.25).expect("tile index"),
+        (36, -107)
+    );
+    assert_eq!(
+        terrain_tile_index(-0.25, 10.9).expect("tile index"),
+        (-1, 10)
+    );
+    assert_eq!(
+        terrain_tile_index(90.0, 180.0).expect("upper edge tile index"),
+        (89, 179)
+    );
+    assert_eq!(
+        terrain_tile_index(-90.0, -180.0).expect("lower edge tile index"),
+        (-90, -180)
+    );
+    assert_eq!(
+        terrain_tile_index(f64::NAN, -106.5),
+        Err(DataCatalogError::InvalidCoordinate {
+            lat_deg_bits: f64::NAN.to_bits(),
+            lon_deg_bits: (-106.5f64).to_bits()
+        })
+    );
+    assert_eq!(
+        skadi_tile_id(90, 0),
+        Err(DataCatalogError::InvalidTileIndex {
+            lat_index: 90,
+            lon_index: 0
+        })
+    );
 }
