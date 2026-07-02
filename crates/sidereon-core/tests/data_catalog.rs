@@ -278,6 +278,55 @@ fn skadi_tile_and_dted_derivation_match_known_tile_ids() {
 }
 
 #[test]
+fn southern_and_western_hemisphere_tiles_floor_to_sw_corner() {
+    // A fractional coordinate names the tile at its floored (south-west) integer
+    // corner, and the ten-degree DTED block floors to its own south-west corner.
+    // The rule is identical in every hemisphere; the negative quadrants are the
+    // load-bearing cases, where the corner is the floor, not a truncation toward
+    // zero (for example latitude -32.83 belongs to tile S33, never S32).
+
+    // Southern latitude, western longitude.
+    assert_eq!(
+        terrain_tile_index(-32.83, -117.12).expect("index"),
+        (-33, -118)
+    );
+    assert_eq!(skadi_tile_id(-33, -118).expect("tile id"), "S33W118");
+    assert_eq!(skadi_band(-33).expect("band"), "S33");
+    assert_eq!(
+        skadi_archive_url(-33, -118).expect("url"),
+        "https://s3.amazonaws.com/elevation-tiles-prod/skadi/S33/S33W118.hgt.gz"
+    );
+    assert_eq!(
+        dted_tile_filename(-33, -118).expect("filename"),
+        "s33_w118_1arc_v3.dt2"
+    );
+    assert_eq!(dted_block_dir(-33, -118).expect("block"), "s40_w120");
+    assert_eq!(
+        dted_cache_relpath(-33, -118).expect("relpath"),
+        "s40_w120/s33_w118_1arc_v3.dt2"
+    );
+
+    // Southern latitude, eastern longitude.
+    assert_eq!(terrain_tile_index(-33.92, 18.42).expect("index"), (-34, 18));
+    assert_eq!(skadi_tile_id(-34, 18).expect("tile id"), "S34E018");
+    assert_eq!(dted_block_dir(-34, 18).expect("block"), "s40_e010");
+    assert_eq!(
+        dted_cache_relpath(-34, 18).expect("relpath"),
+        "s40_e010/s34_e018_1arc_v3.dt2"
+    );
+
+    // Just south and west of the origin: the floored corner is -1, not 0.
+    assert_eq!(terrain_tile_index(-0.5, -0.5).expect("index"), (-1, -1));
+    assert_eq!(skadi_tile_id(-1, -1).expect("tile id"), "S01W001");
+    assert_eq!(dted_block_dir(-1, -1).expect("block"), "s10_w010");
+
+    // Northern and eastern control: the same flooring rule, no sign flip.
+    assert_eq!(terrain_tile_index(45.5, 10.5).expect("index"), (45, 10));
+    assert_eq!(skadi_tile_id(45, 10).expect("tile id"), "N45E010");
+    assert_eq!(dted_block_dir(45, 10).expect("block"), "n40_e010");
+}
+
+#[test]
 fn parse_skadi_tile_id_validates_format_and_range() {
     assert_eq!(
         parse_skadi_tile_id("N36W107").expect("parsed tile"),
