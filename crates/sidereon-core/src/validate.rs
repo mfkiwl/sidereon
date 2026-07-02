@@ -114,6 +114,21 @@ pub(crate) struct ValidCivilMicrosecond {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidCivilFemtosecond {
+    pub(crate) year: i64,
+    pub(crate) month: u32,
+    pub(crate) day: u32,
+    pub(crate) hour: u32,
+    pub(crate) minute: u32,
+    pub(crate) second: u32,
+    /// Fractional second expressed in whole microseconds.
+    pub(crate) microsecond: u32,
+    /// Sub-microsecond remainder of the fractional second, in whole
+    /// femtoseconds (0..1_000_000_000).
+    pub(crate) femtosecond: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CivilSecondPolicy {
     /// UTC-like labels, including GLONASS UTC, permit a `:60` leap-second label.
     UtcLike,
@@ -133,6 +148,11 @@ struct CivilMinute {
 
 const CIVIL_YEAR_MIN: i64 = 0;
 const CIVIL_YEAR_MAX: i64 = 9999;
+
+const MICROSECOND_FRACTION_DIGITS: usize = 6;
+const FEMTOSECOND_FRACTION_DIGITS: usize = 15;
+const FEMTOSECONDS_PER_SECOND: i128 = 1_000_000_000_000_000;
+const FEMTOSECONDS_PER_MICROSECOND: i128 = 1_000_000_000;
 
 impl CivilSecondPolicy {
     const fn allows_leap_second_label(self) -> bool {
@@ -683,7 +703,8 @@ pub(crate) fn civil_datetime_with_decimal_second_policy(
         return Err(FieldError::Missing { field: FIELD });
     }
 
-    let (whole_second, microsecond) = decimal_second_to_microseconds(second, FIELD)?;
+    let (whole_second, microsecond) =
+        decimal_second_to_subseconds(second, FIELD, MICROSECOND_FRACTION_DIGITS)?;
     civil_datetime_with_whole_microsecond_policy(
         CivilMinute {
             year,
@@ -693,7 +714,43 @@ pub(crate) fn civil_datetime_with_decimal_second_policy(
             minute,
         },
         whole_second,
-        microsecond,
+        microsecond as i64,
+        second_policy,
+    )
+}
+
+/// Femtosecond-precision variant of
+/// [`civil_datetime_with_decimal_second_policy`]: the decimal second keeps up
+/// to 15 fractional digits (rounding on the 16th) split into whole
+/// microseconds plus a femtosecond remainder, so sub-microsecond digits are
+/// preserved instead of rounded into the microsecond count.
+pub(crate) fn civil_datetime_with_femtosecond_policy(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: &str,
+    second_policy: CivilSecondPolicy,
+) -> Result<ValidCivilFemtosecond, FieldError> {
+    const FIELD: &str = "civil datetime";
+    let second = second.trim();
+    if second.is_empty() {
+        return Err(FieldError::Missing { field: FIELD });
+    }
+
+    let (whole_second, femtosecond) =
+        decimal_second_to_subseconds(second, FIELD, FEMTOSECOND_FRACTION_DIGITS)?;
+    civil_datetime_with_whole_femtosecond_policy(
+        CivilMinute {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+        },
+        whole_second,
+        femtosecond,
         second_policy,
     )
 }
@@ -729,16 +786,39 @@ pub(crate) fn civil_datetime_with_fractional_second_policy(
 fn civil_datetime_with_whole_microsecond_policy(
     minute_parts: CivilMinute,
     whole_second: i64,
-    mut microsecond: i64,
+    microsecond: i64,
     second_policy: CivilSecondPolicy,
 ) -> Result<ValidCivilMicrosecond, FieldError> {
+    let civil = civil_datetime_with_whole_femtosecond_policy(
+        minute_parts,
+        whole_second,
+        i128::from(microsecond) * FEMTOSECONDS_PER_MICROSECOND,
+        second_policy,
+    )?;
+    Ok(ValidCivilMicrosecond {
+        year: civil.year,
+        month: civil.month,
+        day: civil.day,
+        hour: civil.hour,
+        minute: civil.minute,
+        second: civil.second,
+        microsecond: civil.microsecond,
+    })
+}
+
+fn civil_datetime_with_whole_femtosecond_policy(
+    minute_parts: CivilMinute,
+    whole_second: i64,
+    mut femtosecond: i128,
+    second_policy: CivilSecondPolicy,
+) -> Result<ValidCivilFemtosecond, FieldError> {
     const FIELD: &str = "civil datetime";
-    if !(0..=1_000_000).contains(&microsecond) {
+    if !(0..=FEMTOSECONDS_PER_SECOND).contains(&femtosecond) {
         return Err(FieldError::InvalidCivilTime {
             field: FIELD,
             hour: minute_parts.hour,
             minute: minute_parts.minute,
-            second: whole_second as f64 + microsecond as f64 / 1_000_000.0,
+            second: whole_second as f64 + femtosecond as f64 / FEMTOSECONDS_PER_SECOND as f64,
         });
     }
 
@@ -753,11 +833,13 @@ fn civil_datetime_with_whole_microsecond_policy(
     )?;
 
     let mut rounded_second = whole_second;
-    let rounded_from_subsecond = microsecond == 1_000_000;
+    let rounded_from_subsecond = femtosecond == FEMTOSECONDS_PER_SECOND;
     if rounded_from_subsecond {
         rounded_second += 1;
-        microsecond = 0;
+        femtosecond = 0;
     }
+    let microsecond = (femtosecond / FEMTOSECONDS_PER_MICROSECOND) as u32;
+    let femtosecond = (femtosecond % FEMTOSECONDS_PER_MICROSECOND) as u32;
 
     let leap_second_label_allowed = second_policy.allows_leap_second_label()
         && is_positive_utc_leap_second_label(
@@ -768,14 +850,15 @@ fn civil_datetime_with_whole_microsecond_policy(
             minute_parts.minute,
         );
     if rounded_second <= 59 || (rounded_second == 60 && leap_second_label_allowed) {
-        return Ok(ValidCivilMicrosecond {
+        return Ok(ValidCivilFemtosecond {
             year: civil.year,
             month: civil.month,
             day: civil.day,
             hour: civil.hour,
             minute: civil.minute,
             second: rounded_second as u32,
-            microsecond: microsecond as u32,
+            microsecond,
+            femtosecond,
         });
     }
 
@@ -784,14 +867,15 @@ fn civil_datetime_with_whole_microsecond_policy(
     {
         let (year, month, day, hour, minute) =
             carry_to_next_minute(civil.year, civil.month, civil.day, civil.hour, civil.minute)?;
-        return Ok(ValidCivilMicrosecond {
+        return Ok(ValidCivilFemtosecond {
             year,
             month,
             day,
             hour,
             minute,
             second: 0,
-            microsecond: microsecond as u32,
+            microsecond,
+            femtosecond,
         });
     }
 
@@ -799,7 +883,10 @@ fn civil_datetime_with_whole_microsecond_policy(
         field: FIELD,
         hour: minute_parts.hour,
         minute: minute_parts.minute,
-        second: rounded_second as f64 + microsecond as f64 / 1_000_000.0,
+        second: rounded_second as f64
+            + (i128::from(microsecond) * FEMTOSECONDS_PER_MICROSECOND + i128::from(femtosecond))
+                as f64
+                / FEMTOSECONDS_PER_SECOND as f64,
     })
 }
 
@@ -822,10 +909,15 @@ fn is_positive_utc_leap_second_label(
     crate::astro::time::scales::is_positive_leap_second_label(year, month, day, hour, minute)
 }
 
-fn decimal_second_to_microseconds(
+/// Split a decimal-second string into its whole second and its fractional
+/// part scaled to `fraction_digits` digits, rounding half-up on the digit
+/// after the kept width. A `-0` whole second yields a negative fraction so
+/// downstream range checks reject the value.
+fn decimal_second_to_subseconds(
     second: &str,
     field: &'static str,
-) -> Result<(i64, i64), FieldError> {
+    fraction_digits: usize,
+) -> Result<(i64, i128), FieldError> {
     let (whole, fraction) = second
         .split_once('.')
         .map_or((second, None), |(whole, fraction)| (whole, Some(fraction)));
@@ -852,21 +944,25 @@ fn decimal_second_to_microseconds(
         });
     }
 
-    let mut microsecond = 0i64;
-    for i in 0..6 {
-        microsecond *= 10;
-        microsecond += fraction
+    let mut subsecond = 0i128;
+    for i in 0..fraction_digits {
+        subsecond *= 10;
+        subsecond += fraction
             .as_bytes()
             .get(i)
-            .map_or(0, |b| i64::from(b - b'0'));
+            .map_or(0, |b| i128::from(b - b'0'));
     }
-    if fraction.as_bytes().get(6).is_some_and(|b| b - b'0' >= 5) {
-        microsecond += 1;
+    if fraction
+        .as_bytes()
+        .get(fraction_digits)
+        .is_some_and(|b| b - b'0' >= 5)
+    {
+        subsecond += 1;
     }
     if negative_zero_whole {
-        microsecond = -microsecond.max(1);
+        subsecond = -subsecond.max(1);
     }
-    Ok((whole, microsecond))
+    Ok((whole, subsecond))
 }
 
 fn carry_to_next_minute(

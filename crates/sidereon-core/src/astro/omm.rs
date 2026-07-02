@@ -136,12 +136,24 @@ pub struct Omm {
     /// Exact split SGP4 epoch for in-memory producers that already have the
     /// split JD. CCSDS encodings do not carry this side channel; parsed catalog
     /// messages leave it `None` and rebuild the split from `epoch`.
+    ///
+    /// Scope: this preserves the producer's exact `(whole, fraction)` split
+    /// *in memory only*. Through encode -> reparse the epoch travels as the
+    /// femtosecond-rounded calendar text and is rebuilt as a canonical
+    /// midnight-anchored split: the same instant to femtosecond precision (and
+    /// bit-identical when the producer's split was already midnight-anchored),
+    /// but not necessarily the same split representation, which SGP4's split
+    /// tsince subtraction is sensitive to at the last ULP.
     #[serde(default, skip)]
     pub exact_sgp4_epoch: Option<JulianDate>,
-    /// Whether TLE-derived GP fields should be snapped to the legacy
-    /// assumed-decimal TLE grid when bridging into SGP4. Parsed catalog OMMs use
-    /// the historical compatibility path; fitted OMMs set this false so their
-    /// in-memory full-precision elements are lossless through `to_element_set`.
+    /// Whether TLE-derived GP fields (B\*, the second mean-motion derivative)
+    /// should be snapped to the legacy assumed-decimal TLE grid when bridging
+    /// into SGP4. Parsed catalog OMMs default to `true`: their GP values
+    /// originate in the TLE field format, so the historical compatibility path
+    /// reproduces the value a TLE consumer would see. Fitted OMMs set this
+    /// `false`: their elements were estimated directly and never lived on the
+    /// TLE grid, so snapping would discard converged precision for no
+    /// compatibility gain; `to_element_set` then passes them through losslessly.
     #[serde(default = "default_quantize_tle_derived_fields", skip_serializing)]
     pub quantize_tle_derived_fields: bool,
 }
@@ -248,7 +260,8 @@ pub fn parse_kvn(text: &str) -> Result<Omm, OmmError> {
 /// Encode an [`Omm`] as a CCSDS OMM KVN message.
 ///
 /// Numeric values use their shortest round-tripping decimal form, so parsing the
-/// output reproduces the same `f64`s. The epoch is emitted to microseconds.
+/// output reproduces the same `f64`s. The epoch is emitted to microseconds,
+/// extended to femtoseconds only when a sub-microsecond remainder is present.
 pub fn encode_kvn(omm: &Omm) -> String {
     let mut out = String::new();
     let header = crate::astro::ndm::NdmHeader {
@@ -567,13 +580,14 @@ pub fn parse(text: &str) -> Result<Omm, OmmError> {
 
 /// Parse a single CCSDS `EPOCH` string field to the canonical [`OmmEpoch`].
 ///
-/// The accepted form is `YYYY-MM-DDThh:mm:ss[.ffffff][Z]`, interpreted under the
-/// UTC-like civil-second policy (the OMM default when no `TIME_SYSTEM` is
-/// declared, matching how a CelesTrak GP `EPOCH` is read). This is the single
-/// public entry point a thin binding (for example the Elixir constellation NIF)
-/// delegates to instead of hand-rolling the split; it wraps the same
-/// [`OmmEpoch`]/`NdmEpoch` parser the full OMM decode uses, so it produces
-/// byte-identical components.
+/// The accepted form is `YYYY-MM-DDThh:mm:ss[.f...][Z]` with up to 15
+/// fractional-second digits (whole microseconds plus a femtosecond remainder),
+/// interpreted under the UTC-like civil-second policy (the OMM default when no
+/// `TIME_SYSTEM` is declared, matching how a CelesTrak GP `EPOCH` is read).
+/// This is the single public entry point a thin binding (for example the
+/// Elixir constellation NIF) delegates to instead of hand-rolling the split;
+/// it wraps the same shared `NdmEpoch` parser the full OMM decode uses, so it
+/// produces byte-identical components.
 pub fn parse_epoch(text: &str) -> Result<OmmEpoch, OmmError> {
     OmmEpoch::parse(text, validate::CivilSecondPolicy::UtcLike)
 }
@@ -758,9 +772,21 @@ fn map_omm_bridge_to_sgp4(error: OmmError) -> Sgp4Error {
 // ── Epoch ────────────────────────────────────────────────────────────
 
 impl OmmEpoch {
-    /// Parse a CCSDS `EPOCH` value (`YYYY-MM-DDThh:mm:ss[.ffffff][Z]`, UTC).
+    /// Parse a CCSDS `EPOCH` value (`YYYY-MM-DDThh:mm:ss[.f...][Z]`, UTC) by
+    /// delegating to the shared NDM epoch parser.
     fn parse(text: &str, second_policy: validate::CivilSecondPolicy) -> Result<OmmEpoch, OmmError> {
-        parse_omm_epoch(text, second_policy)
+        let e = crate::astro::ndm::NdmEpoch::parse(text, second_policy)
+            .map_err(|err| map_omm_epoch_field_error(err, text.trim()))?;
+        Ok(OmmEpoch {
+            year: e.year,
+            month: e.month,
+            day: e.day,
+            hour: e.hour,
+            minute: e.minute,
+            second: e.second,
+            microsecond: e.microsecond,
+            femtosecond: e.femtosecond,
+        })
     }
 
     /// Convert directly to the SGP4 split Julian date from the full OMM
@@ -811,17 +837,21 @@ impl OmmEpoch {
         }
     }
 
-    /// Format as a CCSDS `EPOCH` string with microsecond precision.
+    /// Format as a CCSDS `EPOCH` string via the shared NDM epoch encoder:
+    /// six fractional digits, extended to 15 only when a sub-microsecond
+    /// remainder is present.
     fn to_iso8601(&self) -> String {
-        let fractional = if self.femtosecond == 0 {
-            format!("{:06}", self.microsecond)
-        } else {
-            format!("{:06}{:09}", self.microsecond, self.femtosecond)
-        };
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second, fractional
-        )
+        crate::astro::ndm::NdmEpoch {
+            year: self.year,
+            month: self.month,
+            day: self.day,
+            hour: self.hour,
+            minute: self.minute,
+            second: self.second,
+            microsecond: self.microsecond,
+            femtosecond: self.femtosecond,
+        }
+        .to_iso8601()
     }
 }
 
@@ -834,162 +864,6 @@ fn is_zero_u32(value: &u32) -> bool {
 
 fn default_quantize_tle_derived_fields() -> bool {
     true
-}
-
-fn parse_omm_epoch(
-    text: &str,
-    second_policy: validate::CivilSecondPolicy,
-) -> Result<OmmEpoch, OmmError> {
-    let raw = text.trim();
-    let text = raw.strip_suffix('Z').unwrap_or(raw);
-    let (date, time) = text
-        .split_once('T')
-        .ok_or_else(|| OmmError::Epoch(format!("invalid epoch {raw:?}")))?;
-
-    let mut date_parts = date.split('-');
-    let year: i32 = epoch_int(date_parts.next(), raw)?;
-    let month: u32 = epoch_int(date_parts.next(), raw)?;
-    let day: u32 = epoch_int(date_parts.next(), raw)?;
-    if date_parts.next().is_some() {
-        return Err(OmmError::Epoch(format!("invalid epoch {raw:?}")));
-    }
-
-    let mut time_parts = time.split(':');
-    let hour: u32 = epoch_int(time_parts.next(), raw)?;
-    let minute: u32 = epoch_int(time_parts.next(), raw)?;
-    let second_text = time_parts
-        .next()
-        .ok_or_else(|| OmmError::Epoch(format!("invalid seconds in {raw:?}")))?;
-    if time_parts.next().is_some() {
-        return Err(OmmError::Epoch(format!("invalid seconds in {raw:?}")));
-    }
-
-    let (mut whole_second, mut femtoseconds) = decimal_second_to_femtoseconds(second_text, raw)?;
-    let carried_from_fraction = femtoseconds == FEMTOSECONDS_PER_SECOND;
-    if carried_from_fraction {
-        whole_second += 1;
-        femtoseconds = 0;
-    }
-
-    let second_value = whole_second as f64 + femtoseconds as f64 / FEMTOSECONDS_PER_SECOND as f64;
-    match validate::civil_datetime_with_second_policy(
-        i64::from(year),
-        i64::from(month),
-        i64::from(day),
-        i64::from(hour),
-        i64::from(minute),
-        second_value,
-        second_policy,
-    ) {
-        Ok(civil) => Ok(OmmEpoch {
-            year: civil.year as i32,
-            month: civil.month,
-            day: civil.day,
-            hour: civil.hour,
-            minute: civil.minute,
-            second: whole_second as u32,
-            microsecond: (femtoseconds / FEMTOSECONDS_PER_MICROSECOND) as u32,
-            femtosecond: (femtoseconds % FEMTOSECONDS_PER_MICROSECOND) as u32,
-        }),
-        Err(validate::FieldError::InvalidCivilTime { .. })
-            if carried_from_fraction && (whole_second == 60 || whole_second == 61) =>
-        {
-            let (year, month, day, hour, minute) =
-                carry_to_next_minute(i64::from(year), month, day, hour, minute, raw)?;
-            Ok(OmmEpoch {
-                year: year as i32,
-                month,
-                day,
-                hour,
-                minute,
-                second: 0,
-                microsecond: 0,
-                femtosecond: 0,
-            })
-        }
-        Err(err) => Err(map_omm_epoch_field_error(err, raw)),
-    }
-}
-
-fn epoch_int<T>(value: Option<&str>, raw: &str) -> Result<T, OmmError>
-where
-    T: std::str::FromStr,
-{
-    let value = value.ok_or_else(|| OmmError::Epoch(format!("invalid epoch {raw:?}")))?;
-    validate::strict_int(value, "epoch").map_err(|err| map_omm_epoch_field_error(err, raw))
-}
-
-fn decimal_second_to_femtoseconds(second: &str, raw: &str) -> Result<(i64, i128), OmmError> {
-    let (whole, fraction) = second
-        .split_once('.')
-        .map_or((second, None), |(whole, fraction)| (whole, Some(fraction)));
-    if whole.is_empty() {
-        return Err(OmmError::Epoch(format!("invalid seconds in {raw:?}")));
-    }
-    let negative_zero_whole = whole.starts_with('-');
-    let whole = whole
-        .parse::<i64>()
-        .map_err(|_| OmmError::Epoch(format!("invalid seconds in {raw:?}")))?;
-    if negative_zero_whole && whole == 0 {
-        return Err(OmmError::Epoch(format!("invalid seconds in {raw:?}")));
-    }
-
-    let Some(fraction) = fraction else {
-        return Ok((whole, 0));
-    };
-    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(OmmError::Epoch(format!("invalid seconds in {raw:?}")));
-    }
-
-    let mut femtoseconds = 0i128;
-    for i in 0..15 {
-        femtoseconds *= 10;
-        femtoseconds += fraction
-            .as_bytes()
-            .get(i)
-            .map_or(0, |b| i128::from(b - b'0'));
-    }
-    if fraction.as_bytes().get(15).is_some_and(|b| b - b'0' >= 5) {
-        femtoseconds += 1;
-    }
-    Ok((whole, femtoseconds))
-}
-
-fn carry_to_next_minute(
-    mut year: i64,
-    mut month: u32,
-    mut day: u32,
-    mut hour: u32,
-    mut minute: u32,
-    raw: &str,
-) -> Result<(i64, u32, u32, u32, u32), OmmError> {
-    minute += 1;
-    if minute < 60 {
-        return Ok((year, month, day, hour, minute));
-    }
-    minute = 0;
-    hour += 1;
-    if hour < 24 {
-        return Ok((year, month, day, hour, minute));
-    }
-    hour = 0;
-    day += 1;
-    if i64::from(day) <= crate::astro::time::civil::days_in_month(year, i64::from(month)) {
-        return Ok((year, month, day, hour, minute));
-    }
-    day = 1;
-    month += 1;
-    if month <= 12 {
-        return Ok((year, month, day, hour, minute));
-    }
-    month = 1;
-    year = year
-        .checked_add(1)
-        .ok_or_else(|| OmmError::Epoch(format!("invalid epoch {raw:?}")))?;
-    if year > 9999 {
-        return Err(OmmError::Epoch(format!("invalid epoch {raw:?}")));
-    }
-    Ok((year, month, day, hour, minute))
 }
 
 // ── Numeric helpers ──────────────────────────────────────────────────
@@ -1376,6 +1250,36 @@ mod tests {
         let omm = parse_kvn(ISS_KVN).unwrap();
         let reparsed = parse_kvn(&encode_kvn(&omm)).unwrap();
         assert_eq!(omm, reparsed);
+    }
+
+    #[test]
+    fn kvn_re_encodes_catalog_epoch_byte_faithfully() {
+        // Parse -> encode must not balloon precision: a real microsecond-form
+        // catalog epoch re-encodes as the exact source text, and the 15-digit
+        // form appears only when sub-microsecond information is present.
+        let source_epoch = ISS_KVN
+            .lines()
+            .find_map(|line| match line.split_once('=') {
+                Some((key, value)) if key.trim() == "EPOCH" => Some(value.trim()),
+                _ => None,
+            })
+            .expect("fixture EPOCH");
+        let encoded = encode_kvn(&parse_kvn(ISS_KVN).unwrap());
+        assert!(
+            encoded.contains(&format!("EPOCH = {source_epoch}\n")),
+            "catalog epoch {source_epoch} must re-encode byte-faithfully"
+        );
+        assert_eq!(source_epoch.len(), "2026-06-17T04:32:52.099296".len());
+    }
+
+    #[test]
+    fn kvn_round_trips_femtosecond_epoch_through_struct() {
+        // IR-level parse(encode(ir)) == ir must include the femtosecond field.
+        let omm = parse_kvn(&kvn_with_field("EPOCH", "2026-06-17T04:32:52.9999995")).unwrap();
+        assert_eq!(omm.epoch.femtosecond, 500_000_000);
+        let reparsed = parse_kvn(&encode_kvn(&omm)).unwrap();
+        assert_eq!(omm, reparsed);
+        assert_eq!(reparsed.epoch.femtosecond, 500_000_000);
     }
 
     #[test]

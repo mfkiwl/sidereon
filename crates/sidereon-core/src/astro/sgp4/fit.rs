@@ -44,6 +44,14 @@ const BSTAR_SCALE: f64 = 1.0e-4;
 const ECC_MAX: f64 = 0.999;
 const PENALTY_KM: f64 = 1.0e6;
 const SEED_REFINE_PASSES: usize = 2;
+/// Observability floor for the fitted B\* Jacobian column, as a fraction of
+/// the largest column norm. This is a diagnostic threshold feeding
+/// [`FitStatistics::bstar_observable`], not a solver parameter: it never
+/// changes the fit, only whether the recovered B\* is reported as trustworthy.
+/// 1.0e-5 is calibrated on the regression arcs: at that column-norm ratio and
+/// above, B\* recovery is demonstrably reliable (the high-drag decay arc
+/// recovers B\* to within 1e-6 of truth), while arcs whose ratio falls below
+/// it (the short GEO arc) carry no usable drag signal.
 const BSTAR_OBSERVABLE_REL: f64 = 1.0e-5;
 const MU_WGS72_KM3_S2: f64 = 398_600.8;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -156,6 +164,20 @@ pub struct FitStatistics {
 }
 
 /// Fitted SGP4 elements plus compatibility encodings.
+///
+/// Cross-format epoch fidelity: `elements.epoch` is the exact split JD the
+/// fit solved at. `omm` carries it twice: as femtosecond-precision `EPOCH`
+/// calendar text, and through the in-memory `exact_sgp4_epoch` side channel
+/// (with `quantize_tle_derived_fields` disabled), so
+/// `Satellite::from_omm(&fit.omm)` is bit-identical to
+/// `Satellite::from_elements(&fit.elements)`. Encoding the OMM to text and
+/// reparsing rebuilds the epoch from the calendar form: the same instant to
+/// femtosecond precision, bit-identical when the sample epochs were
+/// midnight-anchored splits (see [`crate::astro::omm::Omm::exact_sgp4_epoch`]).
+/// The TLE lines are coarser by format: the TLE epoch field holds 8
+/// fractional day-of-year digits, a grid of about 0.86 ms, so `line1`/`line2`
+/// reproduce the fit epoch only to that resolution (reflected in
+/// `stats.tle_rms_position_km`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TleFit {
     pub elements: ElementSet,
@@ -1555,6 +1577,88 @@ mod tests {
             fit.elements.bstar,
             truth.bstar
         );
+    }
+
+    #[test]
+    fn fitted_omm_epoch_survives_text_round_trip() {
+        let truth = tle::parse(ISS_L1, ISS_L2)
+            .unwrap()
+            .elements
+            .to_element_set()
+            .unwrap();
+        let metadata = metadata_from_tle(ISS_L1, ISS_L2);
+
+        // Midnight-anchored split (what calendar/TLE producers emit): the
+        // femtosecond epoch text carries the full split JD, so a text round
+        // trip rebuilds it bit-identically and propagation matches exactly.
+        let omm = omm_from_fit(&truth, &metadata).expect("fitted OMM");
+        let mut reparsed = parse_kvn(&encode_kvn(&omm)).expect("fitted OMM reparses");
+        assert_eq!(reparsed.epoch, omm.epoch);
+        assert_eq!(reparsed.exact_sgp4_epoch, None);
+        // The quantize flag is in-memory fit state, not carried by the text.
+        reparsed.quantize_tle_derived_fields = false;
+
+        let in_memory_elements = omm.to_element_set().expect("in-memory bridge");
+        let rebuilt = reparsed.to_element_set().expect("reparsed OMM bridges");
+        assert_element_sets_bit_identical(&rebuilt, &in_memory_elements);
+
+        let direct = Satellite::from_omm(&omm).expect("direct satellite");
+        let round_tripped = Satellite::from_omm(&reparsed).expect("round-tripped satellite");
+        for minutes in [0.0, 45.0, 720.0] {
+            let jd = add_seconds(truth.epoch, minutes * 60.0);
+            let a = direct.propagate_jd(jd).expect("direct propagates");
+            let b = round_tripped.propagate_jd(jd).expect("reparsed propagates");
+            assert_eq!(a.position, b.position, "position at {minutes} min");
+            assert_eq!(a.velocity, b.velocity, "velocity at {minutes} min");
+        }
+
+        // Non-canonical (noon-anchored) split: the side channel preserves the
+        // producer's representation in memory, while the text round trip
+        // renormalizes to the midnight-anchored split of the same instant.
+        let JulianDate(whole, fraction) = truth.epoch;
+        let shifted = if fraction >= 0.5 {
+            JulianDate(whole + 0.5, fraction - 0.5)
+        } else {
+            JulianDate(whole - 0.5, fraction + 0.5)
+        };
+        assert_eq!(shifted.0 + shifted.1, whole + fraction);
+        let mut shifted_elements = truth.clone();
+        shifted_elements.epoch = shifted;
+        let omm2 = omm_from_fit(&shifted_elements, &metadata).expect("shifted fitted OMM");
+        let in_memory = omm2.to_element_set().expect("in-memory bridge").epoch;
+        assert_eq!(in_memory.0.to_bits(), shifted.0.to_bits());
+        assert_eq!(in_memory.1.to_bits(), shifted.1.to_bits());
+
+        let mut reparsed2 = parse_kvn(&encode_kvn(&omm2)).expect("shifted OMM reparses");
+        reparsed2.quantize_tle_derived_fields = false;
+        let rebuilt2 = reparsed2.to_element_set().expect("shifted bridge").epoch;
+        assert_eq!(rebuilt2.0.to_bits(), whole.to_bits());
+        assert_eq!(rebuilt2.1.to_bits(), fraction.to_bits());
+        assert_eq!(rebuilt2.0 + rebuilt2.1, shifted.0 + shifted.1);
+
+        // Propagation error bound between the in-memory representation and
+        // the renormalized text round trip: the instant is exact, only the
+        // split representation differs, so any drift stays at the last-ULP
+        // tsince level (well under a micrometer).
+        let in_memory_sat = Satellite::from_omm(&omm2).expect("in-memory satellite");
+        let round_tripped2 = Satellite::from_omm(&reparsed2).expect("round-tripped satellite");
+        for minutes in [0.0, 45.0, 720.0] {
+            let jd = add_seconds(truth.epoch, minutes * 60.0);
+            let a = in_memory_sat
+                .propagate_jd(jd)
+                .expect("in-memory propagates");
+            let b = round_tripped2
+                .propagate_jd(jd)
+                .expect("reparsed propagates");
+            for axis in 0..3 {
+                assert!(
+                    (a.position[axis] - b.position[axis]).abs() <= 1.0e-9,
+                    "axis {axis} at {minutes} min: {} vs {}",
+                    a.position[axis],
+                    b.position[axis]
+                );
+            }
+        }
     }
 
     #[test]
