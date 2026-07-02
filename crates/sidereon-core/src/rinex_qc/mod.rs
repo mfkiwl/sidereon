@@ -6,13 +6,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::astro::time::civil::j2000_seconds;
 use crate::astro::time::model::TimeScale;
 use crate::crinex;
 use crate::id::{GnssSatelliteId, GnssSystem};
+use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
 use crate::rinex_nav::{
-    parse_iono_corrections, parse_leap_seconds, parse_nav, BroadcastRecord, IonoCorrections,
-    NavMessage, NavParseError,
+    parse_iono_corrections, parse_leap_seconds, parse_nav, parse_nav_lenient, BroadcastRecord,
+    IonoCorrections, NavMessage, NavParseError,
 };
 use crate::rinex_obs::{
     AntennaInfo, ObsEpoch, ObsEpochTime, ObsHeader, PgmRunByDate, ReceiverInfo, RinexObs,
@@ -98,13 +98,17 @@ pub enum Finding {
     ObsTimeOfFirstMismatch {
         at: FindingRef,
         declared: ObsEpochTime,
+        declared_scale: TimeScale,
         observed: ObsEpochTime,
+        observed_scale: TimeScale,
     },
     /// TIME OF LAST OBS disagrees with the body.
     ObsTimeOfLastMismatch {
         at: FindingRef,
         declared: ObsEpochTime,
+        declared_scale: TimeScale,
         observed: ObsEpochTime,
+        observed_scale: TimeScale,
     },
     /// INTERVAL disagrees with the dominant epoch spacing.
     ObsIntervalMismatch {
@@ -176,10 +180,6 @@ pub enum Finding {
         declared: usize,
         retained: usize,
     },
-    /// Lenient parse dropped a malformed optional header record.
-    ObsMalformedOptionalHeader { at: FindingRef, label: String },
-    /// Lenient parse dropped an epoch.
-    ObsDroppedEpoch { at: FindingRef, message: String },
     /// A retained event epoch had special records that are not retained.
     ObsEventSpecialRecords { at: FindingRef, count: usize },
     /// Header record is outside the retained OBS product.
@@ -269,7 +269,6 @@ impl Finding {
             Self::ObsIdentityFieldIssue { .. } => "OBS-H16",
             Self::ObsImplausibleApproxPosition { .. } => "OBS-H17",
             Self::ObsImplausibleAntennaDelta { .. } => "OBS-H18",
-            Self::ObsMalformedOptionalHeader { .. } => "OBS-H19",
             Self::ObsUnretainedHeader { .. } => "OBS-H90",
             Self::ObsEpochOrder { .. } => "OBS-B01",
             Self::ObsDuplicateEpoch { .. } => "OBS-B02",
@@ -280,7 +279,6 @@ impl Finding {
             Self::ObsEventEpoch { .. } => "OBS-B07",
             Self::ObsEmptySatelliteRecord { .. } => "OBS-B08",
             Self::ObsEpochGap { .. } => "OBS-B09",
-            Self::ObsDroppedEpoch { .. } => "OBS-B10",
             Self::ObsEventSpecialRecords { .. } => "OBS-B11",
             Self::NavFatalParse { .. } => "NAV-H01",
             Self::NavLeapSecondsAbsent { .. } => "NAV-H02",
@@ -310,8 +308,6 @@ impl Finding {
             | Self::ObsIdentityFieldIssue { .. }
             | Self::ObsImplausibleApproxPosition { .. }
             | Self::ObsImplausibleAntennaDelta { .. }
-            | Self::ObsMalformedOptionalHeader { .. }
-            | Self::ObsDroppedEpoch { .. }
             | Self::ObsEventSpecialRecords { .. }
             | Self::NavIonoMalformed { .. }
             | Self::NavImplausibleRecord { .. } => Severity::Warning,
@@ -355,7 +351,6 @@ impl Finding {
             Self::ObsIdentityFieldIssue { .. } => "RINEX 3.05 Table A2 identity fields",
             Self::ObsImplausibleApproxPosition { .. } => "RINEX 3.05 Table A2",
             Self::ObsImplausibleAntennaDelta { .. } => "RINEX 3.05 Table A2",
-            Self::ObsMalformedOptionalHeader { .. } => "parser diagnostic",
             Self::ObsUnretainedHeader { .. } => "RINEX 3.05 section 6.6",
             Self::ObsEpochOrder { .. } => "RINEX 3.05 Table A3",
             Self::ObsDuplicateEpoch { .. } => "RINEX 3.05 Table A3",
@@ -366,7 +361,6 @@ impl Finding {
             Self::ObsEventEpoch { .. } => "RINEX 3.05 Table A3",
             Self::ObsEmptySatelliteRecord { .. } => "RINEX QC policy",
             Self::ObsEpochGap { .. } => "RINEX QC policy",
-            Self::ObsDroppedEpoch { .. } => "parser diagnostic",
             Self::ObsEventSpecialRecords { .. } => "RINEX 3.05/4.02 Table A3",
             Self::NavFatalParse { .. } => "RINEX 3.05 Table A5 / RINEX 4.02 Table A7",
             Self::NavLeapSecondsAbsent { .. } => "RINEX 3.05 Table A5",
@@ -401,7 +395,6 @@ impl Finding {
             | Self::ObsIdentityFieldIssue { at, .. }
             | Self::ObsImplausibleApproxPosition { at, .. }
             | Self::ObsImplausibleAntennaDelta { at, .. }
-            | Self::ObsMalformedOptionalHeader { at, .. }
             | Self::ObsUnretainedHeader { at, .. }
             | Self::ObsEpochOrder { at, .. }
             | Self::ObsDuplicateEpoch { at, .. }
@@ -412,7 +405,6 @@ impl Finding {
             | Self::ObsEventEpoch { at, .. }
             | Self::ObsEmptySatelliteRecord { at }
             | Self::ObsEpochGap { at, .. }
-            | Self::ObsDroppedEpoch { at, .. }
             | Self::ObsEventSpecialRecords { at, .. }
             | Self::NavFatalParse { at, .. }
             | Self::NavLeapSecondsAbsent { at }
@@ -437,8 +429,6 @@ impl Finding {
                 | Self::ObsPrnObsCountMismatch { .. }
                 | Self::ObsEpochOrder { .. }
                 | Self::ObsDuplicateEpoch { .. }
-                | Self::ObsMalformedOptionalHeader { .. }
-                | Self::ObsDroppedEpoch { .. }
                 | Self::ObsEpochSatCountMismatch { .. }
                 | Self::ObsEmptySatelliteRecord { .. }
                 | Self::NavDuplicateRecord {
@@ -898,14 +888,21 @@ fn classify_obs_parse_error(message: &str) -> Finding {
 /// Lint navigation text with the existing NAV parser and header readers.
 pub fn lint_nav_text(text: &str) -> LintReport {
     let mut findings = Vec::new();
-    match parse_nav(text) {
-        Ok(records) => findings.extend(nav_findings(&records)),
+    match parse_nav_lenient(text) {
+        Ok(parsed) => {
+            findings.extend(nav_findings(&parsed.records));
+            for skipped in parsed.skipped {
+                findings.push(Finding::NavDroppedBlock {
+                    at: FindingRef {
+                        satellite: Some(skipped.satellite.clone()),
+                        ..FindingRef::default()
+                    },
+                    satellite: skipped.satellite,
+                    message: skipped.message,
+                });
+            }
+        }
         Err(error) => {
-            findings.push(Finding::NavDroppedBlock {
-                at: FindingRef::default(),
-                satellite: String::new(),
-                message: error.to_string(),
-            });
             findings.push(Finding::NavFatalParse {
                 at: FindingRef::default(),
                 message: error.to_string(),
@@ -1239,32 +1236,39 @@ fn lint_obs_body(obs: &RinexObs, findings: &mut Vec<Finding>) {
         });
     }
     if let Some(first) = first_normal_epoch(obs) {
-        if let Some((declared, _)) = obs.header.time_of_first_obs {
-            if !same_epoch_time(declared, first.epoch) {
+        if let Some((declared, declared_scale)) = obs.header.time_of_first_obs {
+            let observed_scale = obs_body_time_scale(obs);
+            if !same_epoch_time(declared, first.epoch) || declared_scale != observed_scale {
                 findings.push(Finding::ObsTimeOfFirstMismatch {
                     at: FindingRef::field("TIME OF FIRST OBS"),
                     declared,
+                    declared_scale,
                     observed: first.epoch,
+                    observed_scale,
                 });
             }
         }
     }
     if let Some(last) = last_normal_epoch(obs) {
-        if let Some((declared, _)) = obs.header.time_of_last_obs {
-            if !same_epoch_time(declared, last.epoch) {
+        if let Some((declared, declared_scale)) = obs.header.time_of_last_obs {
+            let observed_scale = obs_body_time_scale(obs);
+            if !same_epoch_time(declared, last.epoch) || declared_scale != observed_scale {
                 findings.push(Finding::ObsTimeOfLastMismatch {
                     at: FindingRef::field("TIME OF LAST OBS"),
                     declared,
+                    declared_scale,
                     observed: last.epoch,
+                    observed_scale,
                 });
             }
         }
     }
     lint_obs_counts(obs, findings);
     lint_obs_epoch_order(obs, findings);
-    if let (Some(declared), Some(observed)) =
-        (obs.header.interval_s, dominant_interval_s(&obs.epochs))
-    {
+    if let (Some(declared), Some(observed)) = (
+        obs.header.interval_s,
+        dominant_interval_for_epochs(&obs.epochs),
+    ) {
         if (declared - observed).abs() > 1.0e-6 {
             findings.push(Finding::ObsIntervalMismatch {
                 at: FindingRef::field("INTERVAL"),
@@ -1273,7 +1277,7 @@ fn lint_obs_body(obs: &RinexObs, findings: &mut Vec<Finding>) {
             });
         }
         lint_obs_gaps(obs, observed, findings);
-    } else if let Some(observed) = dominant_interval_s(&obs.epochs) {
+    } else if let Some(observed) = dominant_interval_for_epochs(&obs.epochs) {
         lint_obs_gaps(obs, observed, findings);
     }
     lint_obs_glonass_slots(obs, findings);
@@ -1422,7 +1426,7 @@ fn lint_obs_values(obs: &RinexObs, findings: &mut Vec<Finding>) {
                     .map_or("", String::as_str);
                 if code.starts_with('C') {
                     if let Some(v) = value.value {
-                        if !(15_000_000.0..=50_000_000.0).contains(&v) || !v.is_finite() {
+                        if !(15_000_000.0..=50_000_000.0).contains(&v) {
                             findings.push(Finding::ObsPseudorangeOutOfRange {
                                 at: FindingRef::sat(epoch_index, sat),
                                 code: code.to_string(),
@@ -1449,7 +1453,7 @@ fn lint_obs_gaps(obs: &RinexObs, interval_s: f64, findings: &mut Vec<Finding>) {
     let mut previous: Option<ObsEpochTime> = None;
     for (idx, epoch) in obs.epochs.iter().enumerate().filter(|(_, e)| e.flag <= 1) {
         if let Some(prev) = previous {
-            let gap = epoch_seconds(epoch.epoch) - epoch_seconds(prev);
+            let gap = obs_epoch_seconds(epoch.epoch) - obs_epoch_seconds(prev);
             if gap > interval_s * 1.5 {
                 findings.push(Finding::ObsEpochGap {
                     at: FindingRef::epoch(idx),
@@ -1775,14 +1779,13 @@ fn repair_obs_times(obs: &mut RinexObs, options: &RepairOptions, actions: &mut V
     let Some(first) = first_normal_epoch(obs).map(|epoch| epoch.epoch) else {
         return;
     };
-    let scale = obs
-        .header
-        .time_of_first_obs
-        .map_or(TimeScale::Gpst, |(_, scale)| scale);
+    let scale = obs_body_time_scale(obs);
     if obs
         .header
         .time_of_first_obs
-        .is_none_or(|(declared, _)| !same_epoch_time(declared, first))
+        .is_none_or(|(declared, declared_scale)| {
+            !same_epoch_time(declared, first) || declared_scale != scale
+        })
     {
         obs.header.time_of_first_obs = Some((first, scale));
         actions.push(RepairAction {
@@ -1797,13 +1800,19 @@ fn repair_obs_times(obs: &mut RinexObs, options: &RepairOptions, actions: &mut V
         || obs
             .header
             .time_of_last_obs
-            .is_some_and(|(declared, _)| !same_epoch_time(declared, last))
+            .is_some_and(|(declared, declared_scale)| {
+                !same_epoch_time(declared, last)
+                    || declared_scale
+                        != obs
+                            .header
+                            .time_of_first_obs
+                            .map_or(scale, |(_, scale)| scale)
+            })
     {
         let scale = obs
             .header
-            .time_of_last_obs
-            .or(obs.header.time_of_first_obs)
-            .map_or(TimeScale::Gpst, |(_, scale)| scale);
+            .time_of_first_obs
+            .map_or_else(|| obs_body_time_scale(obs), |(_, scale)| scale);
         obs.header.time_of_last_obs = Some((last, scale));
         actions.push(RepairAction {
             id: "A4",
@@ -1879,7 +1888,7 @@ fn repair_obs_unsupported_records(
 }
 
 fn repair_obs_interval(obs: &mut RinexObs, actions: &mut Vec<RepairAction>) {
-    let Some(interval) = dominant_interval_s(&obs.epochs) else {
+    let Some(interval) = dominant_interval_for_epochs(&obs.epochs) else {
         return;
     };
     if obs
@@ -1902,7 +1911,11 @@ fn repair_obs_empty_records(obs: &mut RinexObs, actions: &mut Vec<RepairAction>)
         epoch
             .sats
             .retain(|_, values| values.iter().any(|value| value.value.is_some()));
-        dropped += before - epoch.sats.len();
+        let removed = before - epoch.sats.len();
+        if removed > 0 {
+            epoch.declared_record_count = epoch.sats.len();
+        }
+        dropped += removed;
     }
     if dropped > 0 {
         actions.push(RepairAction {
@@ -2026,37 +2039,21 @@ fn last_normal_epoch(obs: &RinexObs) -> Option<&ObsEpoch> {
     obs.epochs.iter().rev().find(|epoch| epoch.flag <= 1)
 }
 
-fn dominant_interval_s(epochs: &[ObsEpoch]) -> Option<f64> {
+fn obs_body_time_scale(obs: &RinexObs) -> TimeScale {
+    match (obs.header.time_of_first_obs, obs.header.time_of_last_obs) {
+        (Some((_, first_scale)), Some((_, last_scale))) if first_scale != last_scale => last_scale,
+        (Some((_, scale)), _) | (_, Some((_, scale))) => scale,
+        _ => TimeScale::Gpst,
+    }
+}
+
+fn dominant_interval_for_epochs(epochs: &[ObsEpoch]) -> Option<f64> {
     let normal: Vec<_> = epochs
         .iter()
         .filter(|epoch| epoch.flag <= 1)
         .map(|epoch| epoch.epoch)
         .collect();
-    if normal.len() < 2 {
-        return None;
-    }
-    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
-    for pair in normal.windows(2) {
-        let delta_ms = ((epoch_seconds(pair[1]) - epoch_seconds(pair[0])) * 1000.0).round() as i64;
-        if delta_ms > 0 {
-            *counts.entry(delta_ms).or_default() += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(delta_ms, count)| (*count, -(*delta_ms)))
-        .map(|(delta_ms, _)| delta_ms as f64 / 1000.0)
-}
-
-fn epoch_seconds(epoch: ObsEpochTime) -> f64 {
-    j2000_seconds(
-        epoch.year,
-        i32::from(epoch.month),
-        i32::from(epoch.day),
-        i32::from(epoch.hour),
-        i32::from(epoch.minute),
-        epoch.second,
-    )
+    dominant_obs_interval_s(&normal)
 }
 
 fn epoch_key(epoch: ObsEpochTime) -> (i32, u8, u8, u8, u8, i64) {

@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::astro::time::j2000_seconds;
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::rinex::observations::{ObsEpochTime, RinexObs};
+use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
 
 /// Options controlling RINEX observation QC aggregation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -322,7 +322,7 @@ fn resolve_interval(
             validate_interval(interval_s)?;
             return Ok((Some(interval_s), IntervalSource::Header));
         }
-        if let Some(interval_s) = infer_interval_s(observation_epoch_times) {
+        if let Some(interval_s) = dominant_obs_interval_s(observation_epoch_times) {
             return Ok((Some(interval_s), IntervalSource::Inferred));
         }
         notes.push(ObservationQcNote::IntervalUnresolved);
@@ -345,7 +345,7 @@ fn detect_gaps(
     for window in observation_epoch_times.windows(2) {
         let start_epoch = window[0];
         let end_epoch = window[1];
-        let observed_delta_s = epoch_seconds(end_epoch) - epoch_seconds(start_epoch);
+        let observed_delta_s = obs_epoch_seconds(end_epoch) - obs_epoch_seconds(start_epoch);
         if observed_delta_s <= 0.0 || observed_delta_s <= interval_s * options.gap_factor {
             continue;
         }
@@ -363,42 +363,16 @@ fn detect_gaps(
     Ok(gaps)
 }
 
-fn infer_interval_s(observation_epoch_times: &[ObsEpochTime]) -> Option<f64> {
-    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
-    for window in observation_epoch_times.windows(2) {
-        let delta_ms =
-            ((epoch_seconds(window[1]) - epoch_seconds(window[0])) * 1000.0).round() as i64;
-        if delta_ms > 0 {
-            *counts.entry(delta_ms).or_default() += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(delta_ms, count)| (*count, -(*delta_ms)))
-        .map(|(delta_ms, _)| delta_ms as f64 / 1000.0)
-}
-
 fn non_monotonic_notes(observation_epoch_times: &[ObsEpochTime]) -> Vec<ObservationQcNote> {
     let mut notes = Vec::new();
     for (idx, window) in observation_epoch_times.windows(2).enumerate() {
-        if epoch_seconds(window[1]) - epoch_seconds(window[0]) <= 0.0 {
+        if obs_epoch_seconds(window[1]) - obs_epoch_seconds(window[0]) <= 0.0 {
             notes.push(ObservationQcNote::NonMonotonicEpoch {
                 epoch_index: idx + 1,
             });
         }
     }
     notes
-}
-
-fn epoch_seconds(epoch: ObsEpochTime) -> f64 {
-    j2000_seconds(
-        epoch.year,
-        epoch.month as i32,
-        epoch.day as i32,
-        epoch.hour as i32,
-        epoch.minute as i32,
-        epoch.second,
-    )
 }
 
 #[derive(Debug, Default)]
@@ -495,7 +469,9 @@ impl SnrAccum {
 mod tests {
     use super::*;
     use crate::rinex::observations::{ObsEpoch, ObsHeader, ObsValue};
+    use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     #[test]
     fn observation_qc_counts_epochs_satellites_signals_and_ssi() {
@@ -721,6 +697,66 @@ mod tests {
         assert_eq!(err, ObservationQcError::InvalidGapFactor);
     }
 
+    #[test]
+    fn observation_qc_matches_independent_real_fixture_oracles() {
+        let doc = read_json_fixture("qc/observation_qc_real_oracles.json");
+        assert_eq!(
+            doc["provenance"]["generator"],
+            "crates/sidereon-core/fixtures-generators/generate_observation_qc_oracles.py"
+        );
+        for fixture in doc["fixtures"].as_array().expect("fixtures array") {
+            let rel = fixture["path"].as_str().expect("fixture path");
+            let text = std::fs::read_to_string(fixture_path(rel))
+                .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            let obs = RinexObs::parse(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+            let report = observation_qc(&obs);
+
+            assert_eq!(
+                report.total_epoch_records,
+                fixture["total_epoch_records"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.observation_epochs,
+                fixture["observation_epochs"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.event_records,
+                fixture["event_records"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.power_failure_epochs,
+                fixture["power_failure_epochs"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_eq!(
+                report.skipped_records,
+                fixture["skipped_records"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_close(
+                report.interval_s.expect("oracle interval"),
+                fixture["interval_s"].as_f64().unwrap(),
+                rel,
+            );
+            assert_eq!(
+                report.missing_epochs,
+                fixture["missing_epochs"].as_u64().unwrap() as usize,
+                "{rel}"
+            );
+            assert_gaps(&report.data_gaps, &fixture["data_gaps"], rel);
+            assert_satellites(&report.satellites, &fixture["satellites"], rel);
+            assert_satellite_signals(
+                &report.satellite_signals,
+                &fixture["satellite_signals"],
+                rel,
+            );
+            assert_system_signals(&report.system_signals, &fixture["system_signals"], rel);
+        }
+    }
+
     fn observation_file(epochs: Vec<ObsEpoch>) -> RinexObs {
         RinexObs {
             header: ObsHeader {
@@ -792,5 +828,201 @@ mod tests {
 
     fn sat(prn: u8) -> GnssSatelliteId {
         GnssSatelliteId::new(GnssSystem::Gps, prn).expect("valid GPS PRN")
+    }
+
+    fn fixture_path(rel: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    fn read_json_fixture(rel: &str) -> Value {
+        let path = fixture_path(&format!("tests/fixtures/{rel}"));
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    }
+
+    fn assert_close(actual: f64, expected: f64, context: &str) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "{context}: actual {actual:?}, expected {expected:?}"
+        );
+    }
+
+    fn assert_gaps(actual: &[ObservationDataGap], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("gap array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_epoch(&actual.start_epoch, &expected["start_epoch"], context);
+            assert_epoch(&actual.end_epoch, &expected["end_epoch"], context);
+            assert_close(
+                actual.nominal_interval_s,
+                expected["nominal_interval_s"].as_f64().unwrap(),
+                context,
+            );
+            assert_close(
+                actual.observed_delta_s,
+                expected["observed_delta_s"].as_f64().unwrap(),
+                context,
+            );
+            assert_eq!(
+                actual.missing_epochs,
+                expected["missing_epochs"].as_u64().unwrap() as usize,
+                "{context}"
+            );
+        }
+    }
+
+    fn assert_epoch(actual: &ObsEpochTime, expected: &Value, context: &str) {
+        assert_eq!(
+            actual.year,
+            expected["year"].as_i64().unwrap() as i32,
+            "{context}"
+        );
+        assert_eq!(
+            actual.month,
+            expected["month"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_eq!(
+            actual.day,
+            expected["day"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_eq!(
+            actual.hour,
+            expected["hour"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_eq!(
+            actual.minute,
+            expected["minute"].as_u64().unwrap() as u8,
+            "{context}"
+        );
+        assert_close(actual.second, expected["second"].as_f64().unwrap(), context);
+    }
+
+    fn assert_satellites(actual: &[SatelliteObservationQc], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("satellites array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        let actual = actual
+            .iter()
+            .map(|sat| {
+                (
+                    sat.satellite.to_string(),
+                    (sat.epochs_with_observations, sat.value_observations),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for expected in expected {
+            let satellite = expected["satellite"].as_str().unwrap();
+            let actual = actual
+                .get(satellite)
+                .unwrap_or_else(|| panic!("{context}: missing satellite {satellite}"));
+            assert_eq!(
+                actual.0,
+                expected["epochs_with_observations"].as_u64().unwrap() as usize,
+                "{context} {satellite}"
+            );
+            assert_eq!(
+                actual.1,
+                expected["value_observations"].as_u64().unwrap() as usize,
+                "{context} {satellite}"
+            );
+        }
+    }
+
+    fn assert_satellite_signals(actual: &[SatelliteSignalQc], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("satellite signals array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        let actual = actual
+            .iter()
+            .map(|signal| {
+                (
+                    (signal.satellite.to_string(), signal.code.as_str()),
+                    (signal.value_observations, signal.ssi, signal.snr),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for expected in expected {
+            let satellite = expected["satellite"].as_str().unwrap();
+            let code = expected["code"].as_str().unwrap();
+            let actual = actual
+                .get(&(satellite.to_string(), code))
+                .unwrap_or_else(|| panic!("{context}: missing {satellite} {code}"));
+            assert_eq!(
+                actual.0,
+                expected["value_observations"].as_u64().unwrap() as usize,
+                "{context} {satellite} {code}"
+            );
+            assert_ssi(actual.1, &expected["ssi"], context);
+            assert_snr(actual.2, &expected["snr"], context);
+        }
+    }
+
+    fn assert_system_signals(actual: &[SystemSignalQc], expected: &Value, context: &str) {
+        let expected = expected.as_array().expect("system signals array");
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        let actual = actual
+            .iter()
+            .map(|signal| {
+                (
+                    (signal.system.letter().to_string(), signal.code.as_str()),
+                    (signal.value_observations, signal.ssi, signal.snr),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for expected in expected {
+            let system = expected["system"].as_str().unwrap();
+            let code = expected["code"].as_str().unwrap();
+            let actual = actual
+                .get(&(system.to_string(), code))
+                .unwrap_or_else(|| panic!("{context}: missing {system} {code}"));
+            assert_eq!(
+                actual.0,
+                expected["value_observations"].as_u64().unwrap() as usize,
+                "{context} {system} {code}"
+            );
+            assert_ssi(actual.1, &expected["ssi"], context);
+            assert_snr(actual.2, &expected["snr"], context);
+        }
+    }
+
+    fn assert_ssi(actual: Option<SsiHistogram>, expected: &Value, context: &str) {
+        if expected.is_null() {
+            assert_eq!(actual, None, "{context}");
+            return;
+        }
+        let expected = expected
+            .as_array()
+            .expect("ssi array")
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.expect("ssi").counts.to_vec(), expected, "{context}");
+    }
+
+    fn assert_snr(actual: Option<SnrStats>, expected: &Value, context: &str) {
+        if expected.is_null() {
+            assert_eq!(actual, None, "{context}");
+            return;
+        }
+        let actual = actual.expect("snr");
+        assert_eq!(
+            actual.n,
+            expected["n"].as_u64().unwrap() as usize,
+            "{context}"
+        );
+        assert_close(actual.mean, expected["mean"].as_f64().unwrap(), context);
+        assert_close(actual.min, expected["min"].as_f64().unwrap(), context);
+        assert_close(actual.max, expected["max"].as_f64().unwrap(), context);
+        if expected["std"].is_null() {
+            assert_eq!(actual.std, None, "{context}");
+        } else {
+            assert_close(
+                actual.std.expect("std"),
+                expected["std"].as_f64().unwrap(),
+                context,
+            );
+        }
     }
 }

@@ -1,0 +1,87 @@
+{
+  "provenance": {
+    "tool": "teqc",
+    "tool_version": "teqc  2019Feb25",
+    "tool_build": "OSX ker:10.11.6|Core i5|gcc 4.3 -m64|OSX ker:10.10+|=+",
+    "download_url": "https://www.unavco.org/software/data-processing/teqc/development/teqc_OSX_i5_gcc4.3d_64.zip",
+    "download_page": "https://www.unavco.org/software/data-processing/teqc/teqc.html",
+    "archive_sha256": "917bdf02f41d4607bf2965ebdedd0b9901be71d7e52e1b453bb68b2907a3cfb9",
+    "binary_sha256": "6ddcd637a98acf0d6c9e2f1009ef6fa23925b52a513e72c8cf30b5802945b863",
+    "command": "./teqc +qc algo0010_2015001_v1_trim.rnx",
+    "host": "Darwin arm64 with x86_64 translation",
+    "generated_for": "QC oracle bar, 2026-07-02"
+  },
+  "source_fixture": {
+    "path": "tests/fixtures/obs/algo0010_2015001_v1_trim.rnx",
+    "sha256": "f2eae58b37fa267b6f64549de8eb1504473057b46fba1d039b9d2f063b536f22",
+    "rinex_version": "2.11"
+  },
+  "output": {
+    "summary_file": "algo0010_2015001_v1_trim.15S",
+    "summary_sha256": "c8d6380b351c60e125d9be9c33d4fc8158220a82d6bfc5ad93dc32eeb76b3c2f"
+  },
+  "window": {
+    "start": "2015-01-01T00:00:00.000",
+    "end": "2015-01-01T00:00:30.000",
+    "length_s": 30.0,
+    "observation_interval_s": 30.0
+  },
+  "summary": {
+    "total_satellites_with_obs": 20,
+    "possible_observation_epochs": 2,
+    "epochs_with_observations": 2,
+    "epochs_repeated": 0,
+    "complete_observations": 39,
+    "deleted_observations": 0,
+    "observations_with_sv_duplication": 0,
+    "moving_average_mp12_m": 0.208985,
+    "moving_average_mp21_m": 0.138536,
+    "points_in_mp_moving_average": 50,
+    "mean_s1": 45.13,
+    "sd_s1": 6.92,
+    "n_s1": 39,
+    "mean_s2": 37.28,
+    "sd_s2": 12.10,
+    "n_s2": 39,
+    "receiver_clock_offsets": 0,
+    "total_receiver_clock_drift_ms": 0.0,
+    "rate_receiver_clock_drift_ms_per_hr": 0.0,
+    "report_gap_gt_min": 10.0,
+    "report_gap_lt_min": 90.0,
+    "epochs_with_msec_clock_slip": 0,
+    "other_msec_mp_events": 0,
+    "iod_slips": 0,
+    "iod_or_mp_slips": 0,
+    "gaps": []
+  },
+  "sum_line": {
+    "hours": 0.0167,
+    "dt_s": 30,
+    "have_observations": 39,
+    "mp1_m": 0.21,
+    "mp2_m": 0.14,
+    "observations_per_slip": 39
+  },
+  "satellite_completeness": [
+    {"satellite": "G08", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 0},
+    {"satellite": "G14", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 0},
+    {"satellite": "G03", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "R07", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "R09", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "R16", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G31", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G16", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 0},
+    {"satellite": "G20", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 0},
+    {"satellite": "R24", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G23", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 0},
+    {"satellite": "G29", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G32", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 0},
+    {"satellite": "R15", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "R17", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G25", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "R06", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G22", "reported": 1, "complete": 1, "L1": 1, "L2": 1, "P1": 1, "P2": 1, "C1": 1, "C2": 0},
+    {"satellite": "R05", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2},
+    {"satellite": "G01", "reported": 2, "complete": 2, "L1": 2, "L2": 2, "P1": 2, "P2": 2, "C1": 2, "C2": 2}
+  ]
+}

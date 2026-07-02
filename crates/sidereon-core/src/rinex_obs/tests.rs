@@ -1055,8 +1055,10 @@ fn to_rinex_string_round_trips_through_parse() {
 
     let serialized = obs.to_rinex_string();
     let reparsed = RinexObs::parse(&serialized).expect("re-parse serialized RINEX OBS");
+    let mut expected = obs;
+    expected.header.unretained_header_labels.clear();
     assert_eq!(
-        reparsed, obs,
+        reparsed, expected,
         "to_rinex_string must round-trip through parse"
     );
     // Deterministic output.

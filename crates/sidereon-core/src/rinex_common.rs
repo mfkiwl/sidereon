@@ -5,7 +5,11 @@
 //! duplicating it per reader, or borrowing it from an unrelated parser module)
 //! gives the family one canonical, format-faithful decode and serialize point.
 
+use std::collections::BTreeMap;
+
+use crate::astro::time::civil::j2000_seconds;
 use crate::astro::time::model::TimeScale;
+use crate::rinex_obs::ObsEpochTime;
 
 /// Map a RINEX header time-system label onto the core [`TimeScale`].
 ///
@@ -46,6 +50,32 @@ pub(crate) fn time_scale_rinex_label(scale: TimeScale) -> &'static str {
         // time system and keeps a serialized header parseable.
         TimeScale::Tt | TimeScale::Tdb | TimeScale::Glonasst => "GPS",
     }
+}
+
+pub(crate) fn obs_epoch_seconds(epoch: ObsEpochTime) -> f64 {
+    j2000_seconds(
+        epoch.year,
+        i32::from(epoch.month),
+        i32::from(epoch.day),
+        i32::from(epoch.hour),
+        i32::from(epoch.minute),
+        epoch.second,
+    )
+}
+
+pub(crate) fn dominant_obs_interval_s(times: &[ObsEpochTime]) -> Option<f64> {
+    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+    for pair in times.windows(2) {
+        let delta_ms =
+            ((obs_epoch_seconds(pair[1]) - obs_epoch_seconds(pair[0])) * 1000.0).round() as i64;
+        if delta_ms > 0 {
+            *counts.entry(delta_ms).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(delta_ms, count)| (*count, -(*delta_ms)))
+        .map(|(delta_ms, _)| delta_ms as f64 / 1000.0)
 }
 
 #[cfg(test)]

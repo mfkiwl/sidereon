@@ -142,9 +142,6 @@ impl RinexObs {
         for (sat, counts) in &h.prn_obs_counts {
             write_prn_obs_counts(out, *sat, counts);
         }
-        for label in &h.unretained_header_labels {
-            push_header_line(out, "", label);
-        }
         push_header_line(out, "", "END OF HEADER");
     }
 
