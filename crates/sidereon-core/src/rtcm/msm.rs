@@ -117,6 +117,17 @@ pub struct MsmSignal {
     pub fine_phase_range_rate: Option<i16>,
 }
 
+impl MsmSignal {
+    /// Minimum continuous-lock time encoded by this signal's lock indicator.
+    ///
+    /// The caller supplies the owning message kind because MSM4 carries DF402
+    /// while MSM7 carries DF407. Returns `None` for values outside the
+    /// indicator's defined range.
+    pub fn minimum_lock_time_ms(&self, kind: MsmKind) -> Option<u32> {
+        super::lli::minimum_lock_time_ms(kind, self.lock_time_indicator)
+    }
+}
+
 /// A decoded MSM4 or MSM7 observation message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MsmMessage {

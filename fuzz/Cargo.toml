@@ -307,5 +307,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rtcm_stream"
+path = "fuzz_targets/rtcm_stream.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

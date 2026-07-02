@@ -76,6 +76,7 @@ pub(crate) mod bits;
 pub(crate) mod crc;
 mod ephemeris;
 mod framing;
+mod lli;
 mod msm;
 mod ssr;
 mod station;
@@ -92,6 +93,10 @@ pub use ephemeris::{GlonassEphemeris, GpsEphemeris};
 pub use framing::{
     decode_frame, encode_frame, DecodedFrame, FrameScanner, FRAME_OVERHEAD, MAX_BODY_LEN, PREAMBLE,
 };
+pub use lli::{
+    derive_lli, minimum_lock_time_ms, msm_epoch_dt_ms, msm_signal_rinex_code, CellLli,
+    LockTimeTracker, PreviousLock, LLI_HALF_CYCLE, LLI_LOSS_OF_LOCK,
+};
 pub use msm::{MsmHeader, MsmKind, MsmMessage, MsmSatellite, MsmSignal};
 pub use ssr::{
     SsrClockRecord, SsrCodeBiasRecord, SsrHeader, SsrKind, SsrMessage, SsrOrbitRecord,
@@ -107,6 +112,44 @@ pub struct UnsupportedMessage {
     pub message_number: u16,
     /// The undecoded message body.
     pub body: Vec<u8>,
+}
+
+/// A decoded RTCM byte stream plus diagnostics for skipped frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtcmStream {
+    /// Every message decoded from a CRC-valid frame, in stream order.
+    pub messages: Vec<Message>,
+    /// Forgiving stream diagnostics for skipped bytes and skipped frames.
+    pub diagnostics: StreamDiagnostics,
+}
+
+/// Diagnostics collected while scanning an RTCM byte stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamDiagnostics {
+    /// Bytes skipped while resynchronizing on the next valid frame.
+    pub resync_bytes: usize,
+    /// CRC-valid frames whose body could not be decoded into the message IR.
+    pub skipped_frames: Vec<FrameSkip>,
+}
+
+/// One CRC-valid frame that could not be decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameSkip {
+    /// Byte offset of the frame preamble in the scanned buffer.
+    pub offset: usize,
+    /// RTCM message number when the body was long enough to carry one.
+    pub message_number: Option<u16>,
+    /// Why the body did not decode.
+    pub reason: FrameSkipReason,
+}
+
+/// Typed reason for a skipped CRC-valid frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameSkipReason {
+    /// The body ended before all required fields of its recognized type.
+    Truncated,
+    /// The body is internally inconsistent for its recognized type.
+    Malformed(String),
 }
 
 /// The canonical, format-agnostic RTCM 3 message IR.
@@ -208,9 +251,74 @@ impl Message {
 /// scan resynchronizes on the next preamble. This is the forgiving stream entry
 /// point for a noisy serial feed.
 pub fn decode_messages(bytes: &[u8]) -> Vec<Message> {
-    FrameScanner::new(bytes)
-        .filter_map(|frame| Message::decode(frame.body).ok())
-        .collect()
+    decode_stream(bytes).messages
+}
+
+/// Decode every CRC-valid frame while recording forgiving stream diagnostics.
+///
+/// Unknown message numbers decode to [`Message::Unsupported`] values and are
+/// not diagnostics. CRC-valid frames for recognized message types whose body
+/// cannot be decoded are skipped and recorded in [`RtcmStream::diagnostics`].
+pub fn decode_stream(bytes: &[u8]) -> RtcmStream {
+    let mut stream = RtcmStream {
+        messages: Vec::new(),
+        diagnostics: StreamDiagnostics::default(),
+    };
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        let Some(rel) = bytes[pos..].iter().position(|&b| b == PREAMBLE) else {
+            stream.diagnostics.resync_bytes += bytes.len() - pos;
+            break;
+        };
+        stream.diagnostics.resync_bytes += rel;
+        pos += rel;
+
+        if bytes.len() - pos < FRAME_OVERHEAD {
+            stream.diagnostics.resync_bytes += bytes.len() - pos;
+            break;
+        }
+
+        let body_len = ((usize::from(bytes[pos + 1] & 0x03)) << 8) | usize::from(bytes[pos + 2]);
+        let frame_len = 3 + body_len + 3;
+        if bytes.len() - pos < frame_len {
+            stream.diagnostics.resync_bytes += bytes.len() - pos;
+            break;
+        }
+
+        match decode_frame(&bytes[pos..pos + frame_len]) {
+            Ok(frame) => {
+                match Message::decode(frame.body) {
+                    Ok(message) => stream.messages.push(message),
+                    Err(error) => stream.diagnostics.skipped_frames.push(FrameSkip {
+                        offset: pos,
+                        message_number: message_number(frame.body).ok(),
+                        reason: classify_decode_error(error),
+                    }),
+                }
+                pos += frame.frame_len;
+            }
+            Err(_) => {
+                stream.diagnostics.resync_bytes += 1;
+                pos += 1;
+            }
+        }
+    }
+
+    stream
+}
+
+fn classify_decode_error(error: crate::error::Error) -> FrameSkipReason {
+    match error {
+        crate::error::Error::Parse(message)
+            if message.starts_with("RTCM body truncated:")
+                || message.starts_with("RTCM frame truncated:") =>
+        {
+            FrameSkipReason::Truncated
+        }
+        crate::error::Error::Parse(message) => FrameSkipReason::Malformed(message),
+        other => FrameSkipReason::Malformed(other.to_string()),
+    }
 }
 
 /// Owns an RTCM carry buffer for chunked stream decoding.

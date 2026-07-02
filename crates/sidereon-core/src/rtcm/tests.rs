@@ -511,6 +511,260 @@ fn msm_kind_maps_constellation_and_type() {
     }
 }
 
+fn lli_msm(
+    system: crate::id::GnssSystem,
+    kind: MsmKind,
+    epoch_time: u32,
+    satellite_id: u8,
+    signal_id: u8,
+    lock_time_indicator: u16,
+    half_cycle_ambiguity: bool,
+) -> MsmMessage {
+    let message_number = match (system, kind) {
+        (crate::id::GnssSystem::Gps, MsmKind::Msm4) => 1074,
+        (crate::id::GnssSystem::Gps, MsmKind::Msm7) => 1077,
+        (crate::id::GnssSystem::Glonass, MsmKind::Msm4) => 1084,
+        (crate::id::GnssSystem::Glonass, MsmKind::Msm7) => 1087,
+        (crate::id::GnssSystem::Galileo, MsmKind::Msm4) => 1094,
+        (crate::id::GnssSystem::Galileo, MsmKind::Msm7) => 1097,
+        (crate::id::GnssSystem::Sbas, MsmKind::Msm4) => 1104,
+        (crate::id::GnssSystem::Sbas, MsmKind::Msm7) => 1107,
+        (crate::id::GnssSystem::Qzss, MsmKind::Msm4) => 1114,
+        (crate::id::GnssSystem::Qzss, MsmKind::Msm7) => 1117,
+        (crate::id::GnssSystem::BeiDou, MsmKind::Msm4) => 1124,
+        (crate::id::GnssSystem::BeiDou, MsmKind::Msm7) => 1127,
+        (crate::id::GnssSystem::Navic, MsmKind::Msm4) => 1134,
+        (crate::id::GnssSystem::Navic, MsmKind::Msm7) => 1137,
+    };
+    let mut header = msm_header();
+    header.epoch_time = epoch_time;
+    MsmMessage {
+        message_number,
+        system,
+        kind,
+        header,
+        satellites: vec![MsmSatellite {
+            id: satellite_id,
+            rough_range_ms: 75,
+            rough_range_mod1: 512,
+            extended_info: (kind == MsmKind::Msm7).then_some(0),
+            rough_phase_range_rate_m_s: (kind == MsmKind::Msm7).then_some(0),
+        }],
+        signals: vec![MsmSignal {
+            satellite_id,
+            signal_id,
+            fine_pseudorange: 0,
+            fine_phase_range: 0,
+            lock_time_indicator,
+            half_cycle_ambiguity,
+            cnr: 40,
+            fine_phase_range_rate: (kind == MsmKind::Msm7).then_some(0),
+        }],
+    }
+}
+
+#[test]
+fn msm_lock_time_tables_and_signal_helpers_are_pinned() {
+    let df402 = [
+        0, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536, 131_072, 262_144,
+        524_288,
+    ];
+    for (indicator, expected) in df402.into_iter().enumerate() {
+        assert_eq!(
+            minimum_lock_time_ms(MsmKind::Msm4, indicator as u16),
+            Some(expected),
+            "DF402 {indicator}"
+        );
+    }
+    assert_eq!(minimum_lock_time_ms(MsmKind::Msm4, 16), None);
+    assert_eq!(minimum_lock_time_ms(MsmKind::Msm7, 1024), None);
+
+    let signal = MsmSignal {
+        satellite_id: 1,
+        signal_id: 2,
+        fine_pseudorange: 0,
+        fine_phase_range: 0,
+        lock_time_indicator: 6,
+        half_cycle_ambiguity: false,
+        cnr: 0,
+        fine_phase_range_rate: None,
+    };
+    assert_eq!(signal.minimum_lock_time_ms(MsmKind::Msm4), Some(1024));
+    assert_eq!(signal.minimum_lock_time_ms(MsmKind::Msm7), Some(6));
+}
+
+#[test]
+fn derive_lli_pins_loss_of_lock_truth_table() {
+    let prev_some = PreviousLock {
+        min_lock_time_ms: Some(512),
+        elapsed_ms: 400,
+    };
+    assert_eq!(derive_lli(None, Some(0), false), 0);
+    assert_eq!(derive_lli(None, None, true), LLI_HALF_CYCLE);
+    assert_eq!(
+        derive_lli(Some(prev_some), Some(256), false),
+        LLI_LOSS_OF_LOCK
+    );
+    assert_eq!(
+        derive_lli(
+            Some(PreviousLock {
+                min_lock_time_ms: Some(512),
+                elapsed_ms: 600,
+            }),
+            Some(512),
+            false
+        ),
+        LLI_LOSS_OF_LOCK
+    );
+    assert_eq!(derive_lli(Some(prev_some), Some(512), false), 0);
+    assert_eq!(
+        derive_lli(
+            Some(PreviousLock {
+                min_lock_time_ms: None,
+                elapsed_ms: 600,
+            }),
+            Some(512),
+            false
+        ),
+        LLI_LOSS_OF_LOCK
+    );
+    assert_eq!(
+        derive_lli(
+            Some(PreviousLock {
+                min_lock_time_ms: None,
+                elapsed_ms: 400,
+            }),
+            Some(512),
+            false
+        ),
+        0
+    );
+    assert_eq!(derive_lli(Some(prev_some), None, false), LLI_LOSS_OF_LOCK);
+    assert_eq!(
+        derive_lli(Some(prev_some), None, true),
+        LLI_LOSS_OF_LOCK | LLI_HALF_CYCLE
+    );
+}
+
+#[test]
+fn derive_lli_pins_same_bucket_and_half_cycle_cases() {
+    let previous = PreviousLock {
+        min_lock_time_ms: Some(512),
+        elapsed_ms: 400,
+    };
+    assert_eq!(derive_lli(Some(previous), Some(512), false), 0);
+    assert_eq!(
+        derive_lli(
+            Some(PreviousLock {
+                elapsed_ms: 512,
+                ..previous
+            }),
+            Some(512),
+            false
+        ),
+        0
+    );
+    assert_eq!(
+        derive_lli(
+            Some(PreviousLock {
+                elapsed_ms: 600,
+                ..previous
+            }),
+            Some(512),
+            false
+        ),
+        LLI_LOSS_OF_LOCK
+    );
+    assert_eq!(
+        derive_lli(
+            Some(PreviousLock {
+                min_lock_time_ms: Some(0),
+                elapsed_ms: 30,
+            }),
+            Some(0),
+            false
+        ),
+        LLI_LOSS_OF_LOCK
+    );
+    assert_eq!(
+        [
+            derive_lli(Some(previous), Some(512), false),
+            derive_lli(Some(previous), Some(512), true),
+            derive_lli(Some(previous), Some(512), false),
+        ],
+        [0, LLI_HALF_CYCLE, 0]
+    );
+}
+
+#[test]
+fn lock_time_tracker_handles_mixed_msm_rollovers_duplicates_and_reset() {
+    use crate::id::GnssSystem::*;
+
+    let mut tracker = LockTimeTracker::new();
+    let first = lli_msm(Gps, MsmKind::Msm4, 10_000, 3, 2, 6, false);
+    assert_eq!(tracker.observe(&first)[0].lli, 0);
+
+    let mixed_same_raw_decrease = lli_msm(Gps, MsmKind::Msm7, 11_000, 3, 2, 6, false);
+    assert_eq!(
+        tracker.observe(&mixed_same_raw_decrease)[0].lli,
+        LLI_LOSS_OF_LOCK,
+        "DF402 6 means 1024 ms, DF407 6 means 6 ms"
+    );
+
+    let duplicate = lli_msm(Gps, MsmKind::Msm7, 11_000, 3, 2, 700, false);
+    assert_eq!(tracker.observe(&duplicate)[0].lli, 0);
+    let after_duplicate = lli_msm(Gps, MsmKind::Msm7, 11_010, 3, 2, 20, false);
+    assert_eq!(
+        tracker.observe(&after_duplicate)[0].lli,
+        0,
+        "duplicate epoch must not replace the stored low lock time"
+    );
+
+    let week_wrap = msm_epoch_dt_ms(Gps, 604_799_000, 1_000);
+    assert_eq!(week_wrap, 2_000);
+
+    let glonass_prev = 6u32 << 27 | 86_399_000;
+    let glonass_now = 1_000;
+    assert_eq!(msm_epoch_dt_ms(Glonass, glonass_prev, glonass_now), 2_000);
+    let glonass_unknown_prev = 7u32 << 27 | 86_399_000;
+    assert_eq!(msm_epoch_dt_ms(Glonass, glonass_unknown_prev, 1_000), 2_000);
+
+    let galileo = lli_msm(Galileo, MsmKind::Msm4, 20_000, 3, 2, 1, false);
+    assert_eq!(
+        tracker.observe(&galileo)[0].lli,
+        0,
+        "same satellite/signal id in another constellation has separate state"
+    );
+
+    tracker.reset();
+    assert_eq!(tracker.observe(&mixed_same_raw_decrease)[0].lli, 0);
+}
+
+#[test]
+fn msm_signal_rinex_code_has_anchor_mappings() {
+    use crate::id::GnssSystem::*;
+    let cases = [
+        (Gps, 2, Some("1C")),
+        (Gps, 10, Some("2W")),
+        (Gps, 22, Some("5I")),
+        (Gps, 23, Some("5Q")),
+        (Gps, 24, Some("5X")),
+        (Galileo, 2, Some("1C")),
+        (Glonass, 2, Some("1C")),
+        (BeiDou, 2, Some("2I")),
+        (Sbas, 2, Some("1C")),
+        (Gps, 1, None),
+        (Gps, 33, None),
+    ];
+    for (system, signal, expected) in cases {
+        assert_eq!(
+            msm_signal_rinex_code(system, signal),
+            expected,
+            "{system:?} signal {signal}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unsupported messages and dispatch
 // ---------------------------------------------------------------------------
@@ -576,6 +830,61 @@ fn multiple_messages_in_one_stream() {
     stream.extend_from_slice(&eph.to_frame().unwrap());
 
     assert_eq!(decode_messages(&stream), vec![station, eph]);
+}
+
+#[test]
+fn decode_stream_surfaces_skipped_frames_without_dropping_unsupported_messages() {
+    let valid = Message::Msm(lli_msm(
+        crate::id::GnssSystem::Gps,
+        MsmKind::Msm7,
+        10_000,
+        3,
+        2,
+        64,
+        false,
+    ));
+    let valid_frame = valid.to_frame().unwrap();
+
+    let mut unsupported_body = BitWriter::new();
+    unsupported_body.push_u(1230, 12);
+    unsupported_body.push_u(0xABCD, 16);
+    let unsupported = Message::Unsupported(UnsupportedMessage {
+        message_number: 1230,
+        body: unsupported_body.into_bytes(),
+    });
+    let unsupported_frame = unsupported.to_frame().unwrap();
+
+    let mut truncated_body = BitWriter::new();
+    truncated_body.push_u(1005, 12);
+    let truncated_frame = encode_frame(&truncated_body.into_bytes()).unwrap();
+    let garbage = [0xAA, 0xD3, 0x00, 0x00, 0x12, 0x34, 0x56];
+
+    let mut stream_bytes = Vec::new();
+    stream_bytes.extend_from_slice(&valid_frame);
+    stream_bytes.extend_from_slice(&unsupported_frame);
+    stream_bytes.extend_from_slice(&garbage);
+    let truncated_offset = stream_bytes.len();
+    stream_bytes.extend_from_slice(&truncated_frame);
+    stream_bytes.extend_from_slice(&valid_frame);
+
+    let stream = decode_stream(&stream_bytes);
+    assert_eq!(
+        stream.messages,
+        vec![valid.clone(), unsupported.clone(), valid.clone()]
+    );
+    assert_eq!(decode_messages(&stream_bytes), stream.messages);
+    assert_eq!(stream.diagnostics.resync_bytes, garbage.len());
+    assert_eq!(
+        stream.diagnostics.skipped_frames,
+        vec![FrameSkip {
+            offset: truncated_offset,
+            message_number: Some(1005),
+            reason: FrameSkipReason::Truncated,
+        }]
+    );
+
+    let frames: Vec<_> = FrameScanner::new(&stream_bytes).collect();
+    assert_eq!(frames.len(), 4);
 }
 
 // ---------------------------------------------------------------------------
