@@ -15,7 +15,10 @@ use crate::astro::frames::transforms::{mat3_vec3_mul_unchecked, teme_to_gcrs_mat
 use crate::astro::math::mat3::Mat3;
 use crate::astro::math::vec3;
 use crate::astro::propagator::api::IntegratorOptions;
-use crate::astro::propagator::{ForceModelKind, IntegratorKind, StatePropagator};
+use crate::astro::propagator::{
+    CovarianceFrame, CovariancePropagationOptions, ForceModelKind, IntegratorKind,
+    LabeledCovariance6, ProcessNoise, StatePropagator,
+};
 use crate::astro::sgp4::{Error as Sgp4Error, JulianDate, MinutesSinceEpoch, Satellite};
 use crate::astro::state::CartesianState;
 use crate::astro::time::civil::{civil_from_split_julian_date, split_julian_date_add_seconds};
@@ -102,7 +105,7 @@ impl<'a> TcaTle<'a> {
 pub struct TcaTleWithCovariance<'a> {
     /// Borrowed two-line element set.
     pub tle: TcaTle<'a>,
-    /// State covariance at the satellite's TLE epoch.
+    /// Cartesian TEME state covariance at the satellite's TLE epoch.
     pub covariance0: Covariance6,
 }
 
@@ -220,6 +223,8 @@ pub struct TcaPropagatedCovarianceOptions {
     pub integrator: IntegratorKind,
     /// Step-size / tolerance controls for covariance transport.
     pub integrator_options: IntegratorOptions,
+    /// Additive RTN acceleration process noise used during covariance transport.
+    pub process_noise: ProcessNoise,
 }
 
 impl TcaPropagatedCovarianceOptions {
@@ -232,6 +237,7 @@ impl TcaPropagatedCovarianceOptions {
             force_model: ForceModelKind::two_body_j2(),
             integrator: IntegratorKind::Dp54,
             integrator_options: IntegratorOptions::default(),
+            process_noise: ProcessNoise::None,
         }
     }
 
@@ -248,6 +254,12 @@ impl TcaPropagatedCovarianceOptions {
         self
     }
 
+    /// Replace the additive covariance process-noise model.
+    pub fn with_process_noise(mut self, process_noise: ProcessNoise) -> Self {
+        self.process_noise = process_noise;
+        self
+    }
+
     fn for_initial_covariances(
         self,
         primary_covariance0: Covariance6,
@@ -261,6 +273,7 @@ impl TcaPropagatedCovarianceOptions {
             force_model: self.force_model,
             integrator: self.integrator,
             integrator_options: self.integrator_options,
+            process_noise: self.process_noise,
         }
     }
 }
@@ -272,9 +285,17 @@ pub struct TcaPropagatedCovariancePcOptions {
     pub hard_body_radius_km: f64,
     /// Collision-probability method from the conjunction Pc module.
     pub method: PcMethod,
-    /// Primary-object initial 6x6 state covariance at the primary TLE epoch.
+    /// Primary-object initial 6x6 Cartesian TEME state covariance at the primary TLE epoch.
+    ///
+    /// To use a CDM RTN covariance, convert from m-based CDM units with
+    /// [`crate::astro::covariance::covariance6_m_to_km`], then rotate with
+    /// [`crate::astro::covariance::rtn_to_eci_covariance6`] at the object's
+    /// TEME epoch state before passing it here.
     pub primary_covariance0: Covariance6,
-    /// Secondary-object initial 6x6 state covariance at the secondary TLE epoch.
+    /// Secondary-object initial 6x6 Cartesian TEME state covariance at the secondary TLE epoch.
+    ///
+    /// CDM RTN covariances follow the same conversion recipe as
+    /// [`Self::primary_covariance0`].
     pub secondary_covariance0: Covariance6,
     /// Numerical force model used only for covariance transport.
     pub force_model: ForceModelKind,
@@ -282,6 +303,8 @@ pub struct TcaPropagatedCovariancePcOptions {
     pub integrator: IntegratorKind,
     /// Step-size / tolerance controls for covariance transport.
     pub integrator_options: IntegratorOptions,
+    /// Additive RTN acceleration process noise used during covariance transport.
+    pub process_noise: ProcessNoise,
 }
 
 impl TcaPropagatedCovariancePcOptions {
@@ -301,6 +324,7 @@ impl TcaPropagatedCovariancePcOptions {
             force_model: ForceModelKind::two_body_j2(),
             integrator: IntegratorKind::Dp54,
             integrator_options: IntegratorOptions::default(),
+            process_noise: ProcessNoise::None,
         }
     }
 
@@ -314,6 +338,12 @@ impl TcaPropagatedCovariancePcOptions {
         self.force_model = force_model;
         self.integrator = integrator;
         self.integrator_options = integrator_options;
+        self
+    }
+
+    /// Replace the additive covariance process-noise model.
+    pub fn with_process_noise(mut self, process_noise: ProcessNoise) -> Self {
+        self.process_noise = process_noise;
         self
     }
 }
@@ -1292,12 +1322,23 @@ fn propagate_position_covariance_to_tca(
         options: options.integrator_options,
         drag: None,
     };
-    let (_, covariance_f) = propagator
-        .propagate_state_with_covariance(covariance0, span_seconds)
+    let ephemeris = propagator
+        .propagate_covariance(
+            LabeledCovariance6 {
+                covariance: covariance0,
+                frame: CovarianceFrame::Inertial,
+            },
+            &[span_seconds],
+            &CovariancePropagationOptions {
+                process_noise: options.process_noise,
+                output_frame: CovarianceFrame::Inertial,
+            },
+        )
         .map_err(|source| TcaError::CovariancePropagation {
             object,
             reason: source.to_string(),
         })?;
+    let covariance_f = ephemeris.nodes()[0].covariance;
 
     Ok(covariance_f.position_covariance_km2())
 }
@@ -1452,6 +1493,8 @@ fn covariance_error_reason(error: Covariance6Error) -> &'static str {
         Covariance6Error::NonFinite => "not finite",
         Covariance6Error::Asymmetric => "not symmetric",
         Covariance6Error::NotPositiveSemidefinite => "not positive semidefinite",
+        Covariance6Error::NotFactorizable => "not factorizable",
+        Covariance6Error::InvalidInterpolationParameter => "invalid interpolation parameter",
     }
 }
 
@@ -2489,6 +2532,119 @@ mod tests {
     }
 
     #[test]
+    fn tca_propagated_covariance_process_noise_changes_pc_and_matches_direct_path() {
+        let primary = Satellite::from_tle(ISS_L1, ISS_L2).expect("primary TLE parses");
+        let secondary =
+            Satellite::from_tle(ISS_FAST_L1, ISS_FAST_L2).expect("secondary TLE parses");
+        let start = primary.epoch_jd();
+        let end = add_seconds_to_julian_date(start, 12_000.0);
+        let tca_options = TcaFinderOptions {
+            coarse_step_seconds: 30.0,
+            time_tolerance_seconds: 1.0e-4,
+        };
+        let candidates = find_tca_candidates(&primary, &secondary, start, end, tca_options)
+            .expect("TCA search succeeds");
+        assert_eq!(candidates.len(), 1);
+
+        let candidate = candidates[0];
+        let primary_covariance0 =
+            Covariance6::from_diagonal([100.0, 144.0, 196.0, 1.0e-4, 1.5e-4, 2.0e-4]).unwrap();
+        let secondary_covariance0 =
+            Covariance6::from_diagonal([64.0, 81.0, 121.0, 8.0e-5, 9.0e-5, 1.0e-4]).unwrap();
+        let base_options = TcaPropagatedCovariancePcOptions::new(
+            0.020,
+            PcMethod::Alfano2005,
+            primary_covariance0,
+            secondary_covariance0,
+        )
+        .with_covariance_propagator(
+            ForceModelKind::two_body_j2(),
+            IntegratorKind::Rk4,
+            IntegratorOptions {
+                initial_step: 30.0,
+                ..IntegratorOptions::default()
+            },
+        );
+        let noisy_options = base_options.with_process_noise(ProcessNoise::RtnAccelerationPsd {
+            q_radial_km2_s3: 4.0e-10,
+            q_transverse_km2_s3: 5.0e-10,
+            q_normal_km2_s3: 6.0e-10,
+        });
+
+        let no_noise = tca_collision_probability_with_propagated_covariance(
+            &primary,
+            &secondary,
+            candidate,
+            base_options,
+        )
+        .expect("Q-free propagated covariance Pc");
+        let with_noise = tca_collision_probability_with_propagated_covariance(
+            &primary,
+            &secondary,
+            candidate,
+            noisy_options,
+        )
+        .expect("Q propagated covariance Pc");
+        let primary_no_noise = manual_position_covariance_at_tca(
+            &primary,
+            primary_covariance0,
+            candidate,
+            base_options,
+        );
+        let primary_with_noise = manual_position_covariance_at_tca(
+            &primary,
+            primary_covariance0,
+            candidate,
+            noisy_options,
+        );
+        let secondary_no_noise = manual_position_covariance_at_tca(
+            &secondary,
+            secondary_covariance0,
+            candidate,
+            base_options,
+        );
+        let secondary_with_noise = manual_position_covariance_at_tca(
+            &secondary,
+            secondary_covariance0,
+            candidate,
+            noisy_options,
+        );
+
+        assert!(trace3(&primary_with_noise) > trace3(&primary_no_noise));
+        assert!(trace3(&secondary_with_noise) > trace3(&secondary_no_noise));
+        assert_probability_diff_exceeds(
+            with_noise.collision_probability.pc,
+            no_noise.collision_probability.pc,
+            1.0e-18,
+        );
+
+        let pc_state =
+            tca_candidate_relative_state_for_pc(candidate).expect("candidate converts to GCRS");
+        let direct = collision_probability(
+            &ConjunctionState {
+                position_km: pc_state.relative_position_km,
+                velocity_km_s: pc_state.relative_velocity_km_s,
+                covariance_km2: primary_with_noise,
+            },
+            &ConjunctionState {
+                position_km: [0.0; 3],
+                velocity_km_s: [0.0; 3],
+                covariance_km2: secondary_with_noise,
+            },
+            noisy_options.hard_body_radius_km,
+            noisy_options.method,
+        )
+        .expect("direct Q propagated covariance Pc");
+
+        assert_eq!(with_noise.candidate, candidate);
+        assert_eq!(with_noise.collision_probability, direct);
+        assert_eq!(
+            with_noise.collision_probability.pc.to_bits(),
+            4_506_509_322_197_832_265
+        );
+    }
+
+    #[test]
     fn tle_catalog_screening_propagates_initial_covariances_to_pc() {
         let primary_satellite = Satellite::from_tle(ISS_L1, ISS_L2).expect("primary TLE parses");
         let start = primary_satellite.epoch_jd();
@@ -2598,6 +2754,10 @@ mod tests {
             diff > threshold,
             "probability diff {diff} did not exceed {threshold}: {actual} vs {expected}"
         );
+    }
+
+    fn trace3(matrix: &Mat3) -> f64 {
+        matrix[0][0] + matrix[1][1] + matrix[2][2]
     }
 
     fn assert_covariance_close(actual: &Mat6, expected: &Mat6, tolerance: f64) {
@@ -2756,10 +2916,20 @@ mod tests {
             options: options.integrator_options,
             drag: None,
         };
-        let (_, covariance_f) = propagator
-            .propagate_state_with_covariance(covariance0, span_seconds)
+        let ephemeris = propagator
+            .propagate_covariance(
+                LabeledCovariance6 {
+                    covariance: covariance0,
+                    frame: CovarianceFrame::Inertial,
+                },
+                &[span_seconds],
+                &CovariancePropagationOptions {
+                    process_noise: options.process_noise,
+                    output_frame: CovarianceFrame::Inertial,
+                },
+            )
             .expect("manual covariance propagation succeeds");
-        covariance_f.position_covariance_km2()
+        ephemeris.nodes()[0].covariance.position_covariance_km2()
     }
 
     fn pre_fix_position_covariance_at_tca(

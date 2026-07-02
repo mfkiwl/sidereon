@@ -20,6 +20,9 @@ use crate::astro::forces::{
 };
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
+use crate::astro::propagator::covariance::{
+    CovarianceFrame, CovariancePropagationOptions, LabeledCovariance6,
+};
 use crate::astro::propagator::dynamics::OrbitalDynamics;
 use crate::astro::propagator::result::PropagationResult;
 use crate::astro::state::CartesianState;
@@ -180,8 +183,8 @@ impl StatePropagator {
     /// Propagate the initial state and a 6x6 state covariance over a relative
     /// span in seconds.
     ///
-    /// The returned covariance is `P_f = Phi * P_0 * Phi^T`, where `Phi` is the
-    /// finite-difference STM produced by [`Self::state_transition_matrix_for_span`].
+    /// This is the single-segment, no-process-noise convenience wrapper over
+    /// [`Self::propagate_covariance`].
     pub fn propagate_state_with_covariance(
         &self,
         covariance0: Covariance6,
@@ -196,12 +199,16 @@ impl StatePropagator {
             return Ok((self.initial, covariance0));
         }
 
-        let final_state = self.propagate_to(t_end_tdb_seconds)?.final_state;
-        let stm = self.state_transition_matrix_to(t_end_tdb_seconds)?;
-        let covariance = covariance0
-            .propagate_with_stm(&stm)
-            .map_err(map_covariance6_error)?;
-        Ok((final_state, covariance))
+        let ephemeris = self.propagate_covariance(
+            LabeledCovariance6 {
+                covariance: covariance0,
+                frame: CovarianceFrame::Inertial,
+            },
+            &[t_end_tdb_seconds],
+            &CovariancePropagationOptions::default(),
+        )?;
+        let node = ephemeris.nodes()[0];
+        Ok((node.state, node.covariance))
     }
 
     /// Build the finite-difference state-transition matrix over a relative
@@ -258,10 +265,10 @@ impl StatePropagator {
             let minus = perturb_state(initial, column, -delta);
 
             let plus_final = self
-                .run(plus, t_end_tdb_seconds, &dynamics, &ctx)?
+                .run(plus, t_end_tdb_seconds, dynamics, ctx)?
                 .final_state;
             let minus_final = self
-                .run(minus, t_end_tdb_seconds, &dynamics, &ctx)?
+                .run(minus, t_end_tdb_seconds, dynamics, ctx)?
                 .final_state;
             let plus_vector = state_vector(&plus_final);
             let minus_vector = state_vector(&minus_final);
@@ -354,8 +361,10 @@ pub(super) fn map_covariance6_error(error: Covariance6Error) -> PropagationError
         Covariance6Error::NonFinite => "not finite",
         Covariance6Error::Asymmetric => "not symmetric",
         Covariance6Error::NotPositiveSemidefinite => "not positive semidefinite",
+        Covariance6Error::NotFactorizable => "not factorizable",
+        Covariance6Error::InvalidInterpolationParameter => "invalid interpolation parameter",
     };
-    PropagationError::InvalidInput(format!("covariance {reason}"))
+    PropagationError::NumericalFailure(format!("covariance {reason}"))
 }
 
 fn identity_stm() -> StateTransitionMatrix {

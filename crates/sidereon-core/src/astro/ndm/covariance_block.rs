@@ -98,6 +98,14 @@ fn map_covariance6_error(error: Covariance6Error) -> FieldError {
         Covariance6Error::NotPositiveSemidefinite => FieldError::NotPositive {
             field: "covariance",
         },
+        Covariance6Error::NotFactorizable | Covariance6Error::InvalidInterpolationParameter => {
+            FieldError::OutOfRange {
+                field: "covariance",
+                min: 0.0,
+                max: 0.0,
+                upper_inclusive: true,
+            }
+        }
     }
 }
 

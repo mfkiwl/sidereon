@@ -4,6 +4,20 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [0.10.1]
 
+### Added
+
+- Added core 6x6 orbit covariance transport with frame-labeled nodes,
+  RTN acceleration process noise, caller-supplied transport segments,
+  PSD-safe Log-Cholesky interpolation, covariance unit conversion helpers, and
+  TCA Pc integration for propagated covariances.
+
+### Changed
+
+- `Covariance6Error` now includes interpolation-specific
+  `NotFactorizable` and `InvalidInterpolationParameter` variants, and
+  propagated-covariance TCA option structs now carry `process_noise`.
+  Exhaustive matches and struct literals may need source updates.
+
 ### Fixed
 
 - DTED ten-degree block directories now follow the layout production stores

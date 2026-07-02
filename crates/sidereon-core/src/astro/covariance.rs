@@ -34,6 +34,8 @@ const SYMMETRY_EPS: f64 = 1.0e-12;
 const SYMMETRY_REL_EPS6: f64 = 1.0e-12;
 /// Eigenvalues below this relative bound are treated as negative for 6x6 PSD.
 const PSD6_EIGEN_REL_EPS: f64 = 1.0e-10;
+/// Relative eigenvalue floor used only before interpolation Cholesky factoring.
+const INTERPOLATION_EIGEN_REL_FLOOR: f64 = 1.0e-9;
 
 /// Row-major 6x6 covariance for state vector `[r_x, r_y, r_z, v_x, v_y, v_z]`.
 pub type Mat6 = [[f64; 6]; 6];
@@ -53,6 +55,10 @@ pub enum Covariance6Error {
     Asymmetric,
     /// The symmetric matrix was not positive semidefinite.
     NotPositiveSemidefinite,
+    /// A PSD interpolation endpoint could not be Cholesky-factorized.
+    NotFactorizable,
+    /// The interpolation parameter was non-finite or outside `[0, 1]`.
+    InvalidInterpolationParameter,
 }
 
 impl Covariance6 {
@@ -184,6 +190,60 @@ pub fn covariance6_km_to_m(covariance: &Covariance6) -> Result<Covariance6, Cova
 /// Convert an m-based 6x6 state covariance to km-based covariance units.
 pub fn covariance6_m_to_km(covariance: &Covariance6) -> Result<Covariance6, Covariance6Error> {
     scale_covariance6(covariance, 1.0e-6)
+}
+
+/// PSD-safe interpolation between two same-frame 6x6 covariances.
+///
+/// The interpolation follows the Log-Cholesky geodesic: strictly lower
+/// Cholesky entries are linearly blended, diagonal entries are blended in log
+/// space, and the covariance is reconstructed as `L * L^T`. Endpoints are
+/// returned bit-for-bit. Singular but non-zero validated endpoints are nudged
+/// through [`eigen_floor6`] before factorization; an all-zero endpoint is
+/// rejected because the logarithmic diagonal is undefined.
+#[allow(clippy::needless_range_loop)]
+pub fn interpolate_covariance_psd(
+    a: &Covariance6,
+    b: &Covariance6,
+    u: f64,
+) -> Result<Covariance6, Covariance6Error> {
+    if !u.is_finite() || !(0.0..=1.0).contains(&u) {
+        return Err(Covariance6Error::InvalidInterpolationParameter);
+    }
+    if u == 0.0 {
+        return Ok(*a);
+    }
+    if u == 1.0 {
+        return Ok(*b);
+    }
+    if is_all_zero6(a.as_matrix()) || is_all_zero6(b.as_matrix()) {
+        return Err(Covariance6Error::NotFactorizable);
+    }
+
+    let la = cholesky_lower_with_floor(a.as_matrix())?;
+    let lb = cholesky_lower_with_floor(b.as_matrix())?;
+    let mut l = [[0.0_f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            l[i][j] = if i == j {
+                (la[i][j].ln() * (1.0 - u) + lb[i][j].ln() * u).exp()
+            } else {
+                la[i][j] * (1.0 - u) + lb[i][j] * u
+            };
+        }
+    }
+
+    let mut interpolated = [[0.0_f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let mut value = 0.0_f64;
+            for k in 0..=j {
+                value += l[i][k] * l[j][k];
+            }
+            interpolated[i][j] = value;
+            interpolated[j][i] = value;
+        }
+    }
+    Covariance6::try_from_matrix(interpolated)
 }
 
 /// Reason an RTN->ECI transform could not be built from an orbit state.
@@ -365,6 +425,25 @@ fn positive_semidefinite6(m: &Mat6) -> bool {
     eigenvalues.iter().all(|&lambda| lambda >= floor)
 }
 
+/// Clamp small eigenvalues of a symmetric 6x6 matrix to a relative floor.
+///
+/// This is used only to make marginal PSD interpolation endpoints strictly
+/// factorizable. It is not a propagation repair path.
+pub(crate) fn eigen_floor6(matrix: &Mat6, rel_floor: f64) -> Mat6 {
+    let m = SMatrix::<f64, 6, 6>::from_fn(|i, j| matrix[i][j]);
+    let eig = m.symmetric_eigen();
+    let scale = covariance_scale6(matrix);
+    let floor = rel_floor.max(0.0) * scale;
+    let mut diagonal = SMatrix::<f64, 6, 6>::zeros();
+    for i in 0..6 {
+        diagonal[(i, i)] = eig.eigenvalues[i].max(floor);
+    }
+    let floored = eig.eigenvectors * diagonal * eig.eigenvectors.transpose();
+    let mut out = mat6_from_smatrix(&floored);
+    symmetrize6(&mut out);
+    out
+}
+
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn symmetrize6(m: &mut Mat6) {
     for i in 0..6 {
@@ -376,11 +455,38 @@ pub(crate) fn symmetrize6(m: &mut Mat6) {
     }
 }
 
+fn is_all_zero6(m: &Mat6) -> bool {
+    m.iter().flatten().all(|value| *value == 0.0)
+}
+
+fn mat6_from_smatrix(matrix: &SMatrix<f64, 6, 6>) -> Mat6 {
+    let mut out = [[0.0_f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..6 {
+            out[i][j] = matrix[(i, j)];
+        }
+    }
+    out
+}
+
+fn cholesky_lower(matrix: &Mat6) -> Option<Mat6> {
+    let m = SMatrix::<f64, 6, 6>::from_fn(|i, j| matrix[i][j]);
+    m.cholesky().map(|factor| mat6_from_smatrix(&factor.l()))
+}
+
+fn cholesky_lower_with_floor(matrix: &Mat6) -> Result<Mat6, Covariance6Error> {
+    if let Some(lower) = cholesky_lower(matrix) {
+        return Ok(lower);
+    }
+    let floored = eigen_floor6(matrix, INTERPOLATION_EIGEN_REL_FLOOR);
+    cholesky_lower(&floored).ok_or(Covariance6Error::NotFactorizable)
+}
+
 #[allow(clippy::needless_range_loop)]
-fn covariance_congruence6(
+pub(crate) fn covariance_congruence6_checked(
     covariance: &Covariance6,
     rotation: &Mat3,
-) -> Result<Covariance6, RtnFrameError> {
+) -> Result<Covariance6, Covariance6Error> {
     let matrix = covariance.as_matrix();
     let mut block_rotation = [[0.0_f64; 6]; 6];
     for i in 0..3 {
@@ -408,11 +514,26 @@ fn covariance_congruence6(
         }
     }
     symmetrize6(&mut transformed);
-    Covariance6::try_from_matrix(transformed).map_err(|error| match error {
+    Covariance6::try_from_matrix(transformed)
+}
+
+fn covariance_congruence6(
+    covariance: &Covariance6,
+    rotation: &Mat3,
+) -> Result<Covariance6, RtnFrameError> {
+    covariance_congruence6_checked(covariance, rotation).map_err(covariance_error_to_rtn_error)
+}
+
+fn covariance_error_to_rtn_error(error: Covariance6Error) -> RtnFrameError {
+    match error {
         Covariance6Error::NonFinite => invalid_input("covariance", "components must be finite"),
         Covariance6Error::Asymmetric => invalid_input("covariance", "not symmetric"),
-        Covariance6Error::NotPositiveSemidefinite => invalid_input("covariance", "not positive"),
-    })
+        Covariance6Error::NotPositiveSemidefinite
+        | Covariance6Error::NotFactorizable
+        | Covariance6Error::InvalidInterpolationParameter => {
+            invalid_input("covariance", "not positive")
+        }
+    }
 }
 
 fn scale_covariance6(
@@ -684,6 +805,9 @@ mod tests {
         let eci3 = rtn_to_eci(&cov_rtn, state.position_array(), state.velocity_array()).unwrap();
         let eci6 = rtn_to_eci_covariance6(&full, &state).unwrap();
 
+        // The 6x6 path symmetrizes by spec after congruence, while the legacy
+        // 3x3 helper preserves its frozen multiply asymmetry for binding
+        // parity. Pin the deviation explicitly instead of widening silently.
         for (i, row) in eci3.iter().enumerate() {
             for (j, expected) in row.iter().enumerate() {
                 assert!((eci6.as_matrix()[i][j] - expected).abs() <= 1.0e-14);
@@ -702,6 +826,113 @@ mod tests {
 
         let kilometers = covariance6_m_to_km(&meters).expect("m to km");
         assert_eq!(kilometers, covariance);
+    }
+
+    #[test]
+    fn covariance6_interpolation_rejects_invalid_parameters_and_zero_endpoint() {
+        let a = Covariance6::from_diagonal([1.0, 2.0, 3.0, 1.0e-6, 2.0e-6, 3.0e-6]).unwrap();
+        let b = Covariance6::from_diagonal([4.0, 5.0, 6.0, 4.0e-6, 5.0e-6, 6.0e-6]).unwrap();
+
+        assert_eq!(interpolate_covariance_psd(&a, &b, 0.0).unwrap(), a);
+        assert_eq!(interpolate_covariance_psd(&a, &b, 1.0).unwrap(), b);
+        for u in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                interpolate_covariance_psd(&a, &b, u),
+                Err(Covariance6Error::InvalidInterpolationParameter)
+            );
+        }
+
+        let zero = Covariance6::from_diagonal([0.0; 6]).unwrap();
+        assert_eq!(
+            interpolate_covariance_psd(&zero, &b, 0.5),
+            Err(Covariance6Error::NotFactorizable)
+        );
+    }
+
+    #[test]
+    fn covariance6_interpolation_floors_singular_endpoint() {
+        let singular = Covariance6::from_diagonal([1.0, 2.0, 3.0, 0.0, 5.0e-6, 6.0e-6]).unwrap();
+        let full_rank =
+            Covariance6::from_diagonal([1.5, 2.5, 3.5, 1.0e-6, 5.5e-6, 6.5e-6]).unwrap();
+
+        let interpolated = interpolate_covariance_psd(&singular, &full_rank, 0.5)
+            .expect("floored singular endpoint interpolates");
+
+        assert!(interpolated.is_symmetric());
+        assert!(interpolated.is_positive_semidefinite());
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn eigen_floor6_clamps_only_values_below_floor() {
+        let mut marginal = [[0.0_f64; 6]; 6];
+        for (idx, row) in marginal.iter_mut().enumerate() {
+            row[idx] = (idx + 1) as f64;
+        }
+        marginal[5][5] = -1.0e-15;
+
+        let floored = eigen_floor6(&marginal, 1.0e-9);
+        assert!(cholesky_lower(&floored).is_some());
+        assert!(Covariance6::try_from_matrix(floored).is_ok());
+
+        let healthy = Covariance6::from_diagonal([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let healthy_floored = eigen_floor6(healthy.as_matrix(), 1.0e-12);
+        for i in 0..6 {
+            for j in 0..6 {
+                assert!((healthy_floored[i][j] - healthy.as_matrix()[i][j]).abs() <= 1.0e-12);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn covariance6_cdm_lower_triangle_unit_bridge_is_pinned() {
+        let mut matrix = [[0.0_f64; 6]; 6];
+        let mut value = 1.0_f64;
+        for i in 0..6 {
+            for j in 0..=i {
+                matrix[i][j] = value;
+                matrix[j][i] = value;
+                value += 1.0;
+            }
+        }
+        for i in 0..6 {
+            matrix[i][i] += 30.0;
+        }
+        let covariance = Covariance6::try_from_matrix(matrix).unwrap();
+        let meters = covariance6_km_to_m(&covariance).unwrap();
+        let lower_triangle = [
+            meters.as_matrix()[0][0],
+            meters.as_matrix()[1][0],
+            meters.as_matrix()[1][1],
+            meters.as_matrix()[2][0],
+            meters.as_matrix()[2][1],
+            meters.as_matrix()[2][2],
+            meters.as_matrix()[3][0],
+            meters.as_matrix()[3][1],
+            meters.as_matrix()[3][2],
+            meters.as_matrix()[3][3],
+            meters.as_matrix()[4][0],
+            meters.as_matrix()[4][1],
+            meters.as_matrix()[4][2],
+            meters.as_matrix()[4][3],
+            meters.as_matrix()[4][4],
+            meters.as_matrix()[5][0],
+            meters.as_matrix()[5][1],
+            meters.as_matrix()[5][2],
+            meters.as_matrix()[5][3],
+            meters.as_matrix()[5][4],
+            meters.as_matrix()[5][5],
+        ];
+
+        assert_eq!(
+            lower_triangle,
+            [
+                31.0e6, 2.0e6, 33.0e6, 4.0e6, 5.0e6, 36.0e6, 7.0e6, 8.0e6, 9.0e6, 40.0e6, 11.0e6,
+                12.0e6, 13.0e6, 14.0e6, 45.0e6, 16.0e6, 17.0e6, 18.0e6, 19.0e6, 20.0e6, 51.0e6,
+            ]
+        );
+        assert_eq!(covariance6_m_to_km(&meters).unwrap(), covariance);
     }
 
     fn identity() -> Mat3 {
