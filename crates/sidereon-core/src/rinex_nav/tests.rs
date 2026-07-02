@@ -1809,6 +1809,10 @@ fn broadcast_store_rejects_unsupported_systems() {
     let rec = BroadcastRecord {
         satellite_id: sat,
         message: NavMessage::GpsLnav,
+        issue_of_data: BroadcastIssue {
+            issue: 0,
+            message: NavMessage::GpsLnav,
+        },
         week: 2111,
         toe: broadcast_time(sat.system, 2111, 0.0),
         toc: broadcast_time(sat.system, 2111, 0.0),
@@ -1897,6 +1901,10 @@ fn gps_fit_interval_bounds_record_validity() {
     let make = |system, fit_interval_s| BroadcastRecord {
         satellite_id: GnssSatelliteId::new(system, 1).expect("valid satellite id"),
         message: NavMessage::GpsLnav,
+        issue_of_data: BroadcastIssue {
+            issue: 0,
+            message: NavMessage::GpsLnav,
+        },
         week: 2111,
         toe: broadcast_time(system, 2111, 0.0),
         toc: broadcast_time(system, 2111, 0.0),
@@ -1986,6 +1994,10 @@ fn select_prefers_a_valid_farther_record_over_an_expired_nearer_one() {
     let rec = |toe_sow, fit_interval_s| BroadcastRecord {
         satellite_id: GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id"),
         message: NavMessage::GpsLnav,
+        issue_of_data: BroadcastIssue {
+            issue: 0,
+            message: NavMessage::GpsLnav,
+        },
         week: 2111,
         toe: broadcast_time(GnssSystem::Gps, 2111, toe_sow),
         toc: broadcast_time(GnssSystem::Gps, 2111, toe_sow),

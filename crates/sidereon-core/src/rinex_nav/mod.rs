@@ -101,6 +101,15 @@ pub enum NavMessage {
     BeidouD2,
 }
 
+/// Broadcast issue-of-data plus the navigation message identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BroadcastIssue {
+    /// The native issue value: IODE for GPS, IODnav for Galileo.
+    pub issue: u32,
+    /// The navigation message carrying the issue value.
+    pub message: NavMessage,
+}
+
 /// A broadcast group-delay term carried by a RINEX NAV record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastGroupDelayTerm {
@@ -287,6 +296,8 @@ pub struct BroadcastRecord {
     pub satellite_id: GnssSatelliteId,
     /// The navigation message the record carries.
     pub message: NavMessage,
+    /// Broadcast issue-of-data for issue-matched correction products.
+    pub issue_of_data: BroadcastIssue,
     /// Native broadcast week number (from the broadcast record).
     pub week: u32,
     /// Scale-tagged ephemeris reference time (`toe`).
@@ -430,6 +441,10 @@ impl BroadcastRecord {
         Ok(BroadcastRecord {
             satellite_id,
             message: NavMessage::GpsLnav,
+            issue_of_data: BroadcastIssue {
+                issue: decoded.iode as u32,
+                message: NavMessage::GpsLnav,
+            },
             week: full_week,
             toe,
             toc,
@@ -1301,6 +1316,10 @@ fn parse_keplerian_block(
             _ => NavMessage::GpsLnav,
         }
     };
+    let issue_of_data = BroadcastIssue {
+        issue: finite_integral_u32(g(o1[0], "issue of data")?, "issue of data", &sat)?,
+        message,
+    };
 
     let sv_accuracy_m = g(o6[0], "accuracy")?;
     let sv_health = g(o6[1], "health")?;
@@ -1330,6 +1349,7 @@ fn parse_keplerian_block(
     Ok(BroadcastRecord {
         satellite_id,
         message,
+        issue_of_data,
         week,
         toe,
         toc,

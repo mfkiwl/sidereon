@@ -173,7 +173,7 @@ use std::path::Path;
 pub use sidereon_core::{
     antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
     dgnss, ephemeris, frequencies, geometry, navigation, observables, orbit, positioning, quality,
-    rinex, rtcm, signal, velocity,
+    rinex, rtcm, signal, ssr, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
@@ -345,6 +345,8 @@ pub enum Error {
     RinexClock(RinexClockError),
     /// Bias-SINEX or CODE DCB parsing failed.
     Bias(BiasError),
+    /// SSR decode or correction-store ingest failed.
+    Ssr(sidereon_core::Error),
     /// [`decode_crinex`] or [`load_crinex`] failed to decode the CRINEX product.
     Crinex(sidereon_core::Error),
     /// A product file could not be read.
@@ -372,6 +374,7 @@ impl fmt::Display for Error {
             Error::RinexObs(e) => write!(f, "RINEX OBS parse failed: {e}"),
             Error::RinexClock(e) => write!(f, "RINEX clock parse failed: {e}"),
             Error::Bias(e) => write!(f, "bias product parse failed: {e}"),
+            Error::Ssr(e) => write!(f, "SSR ingest failed: {e}"),
             Error::Crinex(e) => write!(f, "CRINEX decode failed: {e}"),
             Error::Io(e) => write!(f, "product file read failed: {e}"),
             Error::Spp(e) => write!(f, "{e}"),
@@ -393,6 +396,7 @@ impl std::error::Error for Error {
             Error::RinexObs(e) => Some(e),
             Error::RinexClock(e) => Some(e),
             Error::Bias(e) => Some(e),
+            Error::Ssr(e) => Some(e),
             Error::Crinex(e) => Some(e),
             Error::Io(e) => Some(e),
             Error::Spp(e) => Some(e),
@@ -719,6 +723,20 @@ pub fn parse_rinex_nav(text: &str) -> Result<BroadcastEphemeris> {
 pub fn load_rinex_nav(path: impl AsRef<Path>) -> Result<BroadcastEphemeris> {
     let text = std::fs::read_to_string(path)?;
     parse_rinex_nav(&text)
+}
+
+/// Build an SSR correction store from framed RTCM bytes.
+pub fn ssr_store_from_rtcm(
+    bytes: &[u8],
+    week: sidereon_core::astro::time::GnssWeekTow,
+) -> Result<sidereon_core::ssr::SsrCorrectionStore> {
+    let mut store = sidereon_core::ssr::SsrCorrectionStore::new();
+    let mut assembler = sidereon_core::rtcm::SsrStreamAssembler::new();
+    for decoded in assembler.push(bytes) {
+        let message = decoded.map_err(Error::Ssr)?;
+        store.ingest(&message, week).map_err(Error::Ssr)?;
+    }
+    Ok(store)
 }
 
 /// Parse RINEX OBS text into a typed observation product.
@@ -1159,6 +1177,8 @@ mod tests {
     );
     const STATIONS_TLE: &str =
         include_str!("../../sidereon-core/tests/fixtures/celestrak/stations.tle");
+    const REAL_SSRA02IGS0_1060_FRAME_HEX: &str =
+        include_str!("../../sidereon-core/tests/fixtures/ssr/SSRA02IGS0_2026181234930_1060.hex");
 
     fn fixture_path(parts: &[&str]) -> PathBuf {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1187,6 +1207,20 @@ mod tests {
 
     fn norm3(v: [f64; 3]) -> f64 {
         (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        let compact: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        assert_eq!(compact.len() % 2, 0);
+        compact
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| {
+                let hi = (chunk[0] as char).to_digit(16).unwrap();
+                let lo = (chunk[1] as char).to_digit(16).unwrap();
+                ((hi << 4) | lo) as u8
+            })
+            .collect()
     }
 
     fn rtk_model() -> MeasModel {
@@ -1372,6 +1406,26 @@ mod tests {
         ]))
         .expect("load CRINEX");
         assert_eq!(loaded_decoded, decoded);
+    }
+
+    #[test]
+    fn ssr_store_from_rtcm_ingests_real_combined_orbit_clock_frame() {
+        let week = sidereon_core::astro::time::model::GnssWeekTow::new(
+            sidereon_core::astro::time::model::TimeScale::Gpst,
+            2425,
+            344_970.0,
+        )
+        .expect("valid week");
+        let store = ssr_store_from_rtcm(&hex_bytes(REAL_SSRA02IGS0_1060_FRAME_HEX), week)
+            .expect("ingest real SSR frame");
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 30).expect("valid satellite");
+        let orbit = store.orbit(sat).expect("G30 orbit correction");
+        let clock = store.clock(sat).expect("G30 clock correction");
+        assert_eq!(orbit.iode, 90);
+        assert!((orbit.radial_m + 0.0807).abs() < 1.0e-12);
+        assert!((orbit.along_m + 0.2484).abs() < 1.0e-12);
+        assert!((orbit.cross_m - 0.1396).abs() < 1.0e-12);
+        assert!((clock.c0_m - 0.0166).abs() < 1.0e-12);
     }
 
     #[test]

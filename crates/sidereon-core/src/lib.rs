@@ -98,6 +98,7 @@ pub mod rtk; // RTK double-difference construction
 pub mod signal; // GPS C/A code, coherent correlation, and acquisition
 mod sp3; // SP3-c / SP3-d parser + arbitrary-epoch interpolation
 mod spp; // single-point positioning (least-squares PVT)
+pub mod ssr; // SSR correction store and corrected broadcast ephemeris source
 pub mod staleness; // product-staleness graceful degradation for time-varying products
 mod tropo; // Saastamoinen zenith + Niell (NMF) mapping troposphere
 pub mod velocity; // receiver velocity / clock-drift least-squares solve

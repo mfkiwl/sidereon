@@ -77,6 +77,7 @@ mod crc;
 mod ephemeris;
 mod framing;
 mod msm;
+mod ssr;
 mod station;
 
 #[cfg(test)]
@@ -92,6 +93,10 @@ pub use framing::{
     decode_frame, encode_frame, DecodedFrame, FrameScanner, FRAME_OVERHEAD, MAX_BODY_LEN, PREAMBLE,
 };
 pub use msm::{MsmHeader, MsmKind, MsmMessage, MsmSatellite, MsmSignal};
+pub use ssr::{
+    SsrClockRecord, SsrCodeBiasRecord, SsrHeader, SsrKind, SsrMessage, SsrOrbitRecord,
+    SsrPhaseBiasRecord, SsrPhaseBiasSignal,
+};
 pub use station::StationCoordinates;
 
 /// A message whose number is recognized but whose body this codec does not
@@ -124,6 +129,8 @@ pub enum Message {
     GpsEphemeris(GpsEphemeris),
     /// A 1020 GLONASS broadcast ephemeris.
     GlonassEphemeris(GlonassEphemeris),
+    /// A supported RTCM SSR correction message.
+    Ssr(SsrMessage),
     /// A recognized-but-undecoded message, preserved verbatim.
     Unsupported(UnsupportedMessage),
 }
@@ -151,6 +158,7 @@ impl Message {
             1019 => Message::GpsEphemeris(GpsEphemeris::decode(body)?),
             1020 => Message::GlonassEphemeris(GlonassEphemeris::decode(body)?),
             n if msm::is_supported_msm(n) => Message::Msm(MsmMessage::decode(body)?),
+            n if ssr::is_supported_ssr(n) => Message::Ssr(SsrMessage::decode(body)?),
             _ => Message::Unsupported(UnsupportedMessage {
                 message_number: number,
                 body: body.to_vec(),
@@ -167,6 +175,7 @@ impl Message {
             Message::AntennaDescriptor(a) => a.encode(),
             Message::GpsEphemeris(e) => e.encode(),
             Message::GlonassEphemeris(e) => e.encode(),
+            Message::Ssr(s) => s.encode(),
             Message::Unsupported(u) => u.body.clone(),
         }
     }
@@ -179,6 +188,7 @@ impl Message {
             Message::AntennaDescriptor(a) => a.message_number,
             Message::GpsEphemeris(_) => 1019,
             Message::GlonassEphemeris(_) => 1020,
+            Message::Ssr(s) => s.message_number,
             Message::Unsupported(u) => u.message_number,
         }
     }
@@ -201,4 +211,62 @@ pub fn decode_messages(bytes: &[u8]) -> Vec<Message> {
     FrameScanner::new(bytes)
         .filter_map(|frame| Message::decode(frame.body).ok())
         .collect()
+}
+
+/// Owns an RTCM carry buffer for chunked stream decoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SsrStreamAssembler {
+    buf: Vec<u8>,
+}
+
+impl SsrStreamAssembler {
+    /// Build an empty assembler.
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append bytes and drain every complete CRC-valid frame.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<Result<Message>> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+
+        while pos < self.buf.len() {
+            let Some(rel) = self.buf[pos..].iter().position(|&b| b == PREAMBLE) else {
+                pos = self.buf.len();
+                break;
+            };
+            pos += rel;
+            if self.buf.len() - pos < FRAME_OVERHEAD {
+                break;
+            }
+
+            let body_len =
+                ((usize::from(self.buf[pos + 1] & 0x03)) << 8) | usize::from(self.buf[pos + 2]);
+            let frame_len = 3 + body_len + 3;
+            if self.buf.len() - pos < frame_len {
+                break;
+            }
+
+            match decode_frame(&self.buf[pos..pos + frame_len]) {
+                Ok(frame) => {
+                    out.push(Message::decode(frame.body));
+                    pos += frame.frame_len;
+                }
+                Err(_) => {
+                    pos += 1;
+                }
+            }
+        }
+
+        if pos > 0 {
+            self.buf.drain(..pos);
+        }
+        out
+    }
+
+    /// Number of bytes retained for the next chunk.
+    pub fn retained_len(&self) -> usize {
+        self.buf.len()
+    }
 }
