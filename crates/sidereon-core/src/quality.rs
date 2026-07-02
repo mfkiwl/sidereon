@@ -9,7 +9,9 @@ pub mod normality;
 
 use crate::astro::math::linear::{invert_symmetric_pd, normal_equations_weighted};
 use crate::constants::DEG_TO_RAD;
-use crate::spp::{solve, EphemerisSource, Observation, ReceiverSolution, SolveInputs, SppError};
+use crate::spp::{
+    solve, EphemerisSource, Observation, ReceiverSolution, RobustConfig, SolveInputs, SppError,
+};
 use crate::validate;
 
 /// Default zenith-floor term for pseudorange variance, meters.
@@ -665,6 +667,24 @@ pub fn fde_spp(
             .map_err(FdeSppError::Validation)?;
         Ok(solution)
     })
+}
+
+/// Run robust-reweighted SPP under the RAIM/FDE exclusion loop.
+///
+/// This is the robust-specific composition of [`RobustConfig`] and [`fde_spp`].
+/// It clones the inputs, installs `robust`, then delegates to [`fde_spp`], which
+/// delegates each candidate solve to [`solve`] and each exclusion step to
+/// [`fde`].
+pub fn spp_robust_fde_driver(
+    eph: &dyn EphemerisSource,
+    inputs: &SolveInputs,
+    with_geodetic: bool,
+    robust: RobustConfig,
+    options: &FdeSppOptions,
+) -> Result<FdeResult<ReceiverSolution>, FdeError<FdeSppError>> {
+    let mut robust_inputs = inputs.clone();
+    robust_inputs.robust = Some(robust);
+    fde_spp(eph, &robust_inputs, with_geodetic, options)
 }
 
 // --- generic range RAIM/FDE over a linearized measurement set -------------
@@ -1323,7 +1343,7 @@ mod tests {
 
     use crate::rinex_nav::BroadcastStore;
     use crate::rinex_obs::{pseudoranges, RinexObs, SignalPolicy};
-    use crate::spp::{Corrections, KlobucharCoeffs, SurfaceMet};
+    use crate::spp::{Corrections, KlobucharCoeffs, RobustConfig, SurfaceMet};
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1410,6 +1430,23 @@ mod tests {
         assert_eq!(left.metadata, right.metadata);
     }
 
+    fn fde_spp_options(inputs: &SolveInputs) -> FdeSppOptions {
+        FdeSppOptions {
+            fde: FdeOptions {
+                raim: RaimOptions::default(),
+                max_iterations: inputs.observations.len().saturating_sub(4),
+            },
+            validation: SolutionValidationOptions::default(),
+        }
+    }
+
+    fn position_delta_m(left: &ReceiverSolution, right: &ReceiverSolution) -> f64 {
+        ((left.position.x_m - right.position.x_m).powi(2)
+            + (left.position.y_m - right.position.y_m).powi(2)
+            + (left.position.z_m - right.position.z_m).powi(2))
+        .sqrt()
+    }
+
     /// The `fde_spp` driver must equal the hand-assembled solve + validate + FDE
     /// loop the bindings each spell out, bit-for-bit, on a real converging
     /// scenario with one injected outlier that the loop detects and excludes.
@@ -1439,13 +1476,7 @@ mod tests {
             .expect("outlier satellite is present in the observation set");
         outlier_obs.pseudorange_m += 1000.0;
 
-        let options = FdeSppOptions {
-            fde: FdeOptions {
-                raim: RaimOptions::default(),
-                max_iterations: inputs.observations.len().saturating_sub(4),
-            },
-            validation: SolutionValidationOptions::default(),
-        };
+        let options = fde_spp_options(&inputs);
 
         // Driver path.
         let driver = fde_spp(&store, &inputs, with_geodetic, &options)
@@ -1490,13 +1521,7 @@ mod tests {
     fn fde_spp_clean_set_takes_no_exclusion_and_matches_manual() {
         let store = esbc_broadcast_store();
         let inputs = esbc_first_epoch_inputs();
-        let options = FdeSppOptions {
-            fde: FdeOptions {
-                raim: RaimOptions::default(),
-                max_iterations: inputs.observations.len().saturating_sub(4),
-            },
-            validation: SolutionValidationOptions::default(),
-        };
+        let options = fde_spp_options(&inputs);
 
         let driver = fde_spp(&store, &inputs, false, &options).expect("driver solves clean set");
 
@@ -1516,6 +1541,63 @@ mod tests {
         assert_eq!(driver.iterations, reference.iterations);
         assert_eq!(driver.excluded, reference.excluded);
         assert_receiver_solution_bits_eq(&driver.solution, &reference.solution);
+    }
+
+    #[test]
+    fn spp_robust_fde_driver_clean_set_uses_robust_solve_without_exclusion() {
+        let store = esbc_broadcast_store();
+        let inputs = esbc_first_epoch_inputs();
+        let options = fde_spp_options(&inputs);
+
+        let driver =
+            spp_robust_fde_driver(&store, &inputs, false, RobustConfig::default(), &options)
+                .expect("robust FDE solves clean set");
+
+        assert_eq!(driver.iterations, 0);
+        assert!(driver.excluded.is_empty());
+        assert!(driver.solution.metadata.outer_iterations > 0);
+        assert!(driver.solution.metadata.final_robust_scale_m.is_some());
+        let surviving = raim_for_solution(&driver.solution, &options.fde.raim).expect("raim");
+        assert!(!surviving.fault_detected);
+    }
+
+    #[test]
+    fn spp_robust_fde_driver_excludes_fault_and_recovers_solution() {
+        let store = esbc_broadcast_store();
+        let clean_inputs = esbc_first_epoch_inputs();
+        let clean_options = fde_spp_options(&clean_inputs);
+        let robust = RobustConfig::default();
+        let clean = spp_robust_fde_driver(&store, &clean_inputs, false, robust, &clean_options)
+            .expect("clean robust FDE solve");
+        let outlier_sat = gps(15);
+        assert!(clean.solution.used_sats.contains(&outlier_sat));
+
+        let mut faulty_inputs = clean_inputs.clone();
+        let outlier_obs = faulty_inputs
+            .observations
+            .iter_mut()
+            .find(|obs| obs.satellite_id == outlier_sat)
+            .expect("outlier satellite is observed");
+        outlier_obs.pseudorange_m += 1000.0;
+        let faulty_options = fde_spp_options(&faulty_inputs);
+
+        let driver = spp_robust_fde_driver(&store, &faulty_inputs, false, robust, &faulty_options)
+            .expect("robust FDE resolves fault");
+
+        assert_eq!(driver.iterations, 1);
+        assert_eq!(driver.iterations, driver.excluded.len());
+        assert_eq!(driver.excluded, vec![outlier_sat.to_string()]);
+        assert!(driver.solution.metadata.outer_iterations > 0);
+        assert!(driver.solution.metadata.final_robust_scale_m.is_some());
+        let surviving = raim_for_solution(&driver.solution, &faulty_options.fde.raim)
+            .expect("surviving set RAIM");
+        assert!(!surviving.fault_detected);
+        let recovered_delta_m = position_delta_m(&driver.solution, &clean.solution);
+        assert!(
+            recovered_delta_m < 1.0,
+            "protected solution should stay close to the clean robust solution, got {recovered_delta_m} m with exclusions {:?}",
+            driver.excluded
+        );
     }
 
     #[derive(Debug, Clone)]
