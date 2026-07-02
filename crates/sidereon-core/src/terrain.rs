@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 
 use crate::Error;
 
-const UHL_SIZE: usize = 80;
-const DSI_SIZE: usize = 648;
-const ACC_SIZE: usize = 2700;
-const DATA_OFFSET: usize = UHL_SIZE + DSI_SIZE + ACC_SIZE;
-const DATA_SENTINEL: u8 = 0xAA;
-const DTED_SUFFIX: &str = concat!("_1arc_v3.d", "t", "2");
+pub(crate) const UHL_SIZE: usize = 80;
+pub(crate) const DSI_SIZE: usize = 648;
+pub(crate) const ACC_SIZE: usize = 2700;
+pub(crate) const DATA_OFFSET: usize = UHL_SIZE + DSI_SIZE + ACC_SIZE;
+pub(crate) const DATA_SENTINEL: u8 = 0xAA;
+pub(crate) const DTED_SUFFIX: &str = concat!("_1arc_v3.d", "t", "2");
 const MIN_LOOKUP_LATITUDE_DEG: f64 = -90.0;
 const MAX_LOOKUP_LATITUDE_DEG: f64 = 90.0;
 const MIN_LOOKUP_LONGITUDE_DEG: f64 = -180.0;
@@ -285,7 +285,7 @@ impl DtedTile {
     }
 }
 
-fn terrain_grid(longitude: f64, latitude: f64) -> (i32, i32) {
+pub(crate) fn terrain_grid(longitude: f64, latitude: f64) -> (i32, i32) {
     (latitude.floor() as i32, longitude.floor() as i32)
 }
 
@@ -306,7 +306,7 @@ fn terrain_grid_candidates(longitude: f64, latitude: f64) -> Vec<(i32, i32)> {
     out
 }
 
-fn format_lat(latitude_index: i32) -> String {
+pub(crate) fn format_lat(latitude_index: i32) -> String {
     if latitude_index >= 0 {
         format!("n{latitude_index:02}")
     } else {
@@ -314,7 +314,7 @@ fn format_lat(latitude_index: i32) -> String {
     }
 }
 
-fn format_lon(longitude_index: i32) -> String {
+pub(crate) fn format_lon(longitude_index: i32) -> String {
     if longitude_index >= 0 {
         format!("e{longitude_index:03}")
     } else {
@@ -322,7 +322,7 @@ fn format_lon(longitude_index: i32) -> String {
     }
 }
 
-fn terrain_block_dir(latitude_index: i32, longitude_index: i32) -> String {
+pub(crate) fn terrain_block_dir(latitude_index: i32, longitude_index: i32) -> String {
     format!(
         "{}_{}",
         format_lat(block_origin(latitude_index)),
@@ -330,7 +330,7 @@ fn terrain_block_dir(latitude_index: i32, longitude_index: i32) -> String {
     )
 }
 
-fn block_origin(index: i32) -> i32 {
+pub(crate) fn block_origin(index: i32) -> i32 {
     index.div_euclid(10) * 10
 }
 
