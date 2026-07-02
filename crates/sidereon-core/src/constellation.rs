@@ -1523,6 +1523,7 @@ mod tests {
                 minute: 0,
                 second: 0,
                 microsecond: 0,
+                femtosecond: 0,
             },
             mean_motion: 0.0,
             eccentricity: 0.0,
@@ -1538,6 +1539,8 @@ mod tests {
             bstar: 0.0,
             mean_motion_dot: 0.0,
             mean_motion_ddot: 0.0,
+            exact_sgp4_epoch: None,
+            quantize_tle_derived_fields: true,
         }
     }
 

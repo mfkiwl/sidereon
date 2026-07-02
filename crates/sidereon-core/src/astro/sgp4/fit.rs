@@ -25,14 +25,15 @@
 use std::cell::Cell;
 
 use thiserror::Error;
-use trust_region_least_squares::loss::Loss;
+pub use trust_region_least_squares::loss::Loss;
 use trust_region_least_squares::model::{solve_model, ResidualModel};
-use trust_region_least_squares::trf::{TrfError, TrfOptions, TrfResult, XScale};
+pub use trust_region_least_squares::trf::XScale;
+use trust_region_least_squares::trf::{TrfError, TrfOptions, TrfResult};
 
 use crate::astro::anomaly::true_to_mean;
 use crate::astro::elements::{rv2coe, ClassicalElements, OrbitType};
 use crate::astro::math::vec3;
-use crate::astro::omm::{Omm, OmmEpoch};
+use crate::astro::omm::Omm;
 use crate::astro::sgp4::{ElementSet, Error as Sgp4Error, JulianDate, OpsMode, Satellite};
 use crate::astro::time::civil::{civil_from_split_julian_date, day_of_year};
 use crate::astro::tle::{self, TleElements};
@@ -43,7 +44,7 @@ const BSTAR_SCALE: f64 = 1.0e-4;
 const ECC_MAX: f64 = 0.999;
 const PENALTY_KM: f64 = 1.0e6;
 const SEED_REFINE_PASSES: usize = 2;
-const BSTAR_OBSERVABLE_REL: f64 = 1.0e-8;
+const BSTAR_OBSERVABLE_REL: f64 = 1.0e-5;
 const MU_WGS72_KM3_S2: f64 = 398_600.8;
 const SECONDS_PER_DAY: f64 = 86_400.0;
 const TAU: f64 = std::f64::consts::TAU;
@@ -903,9 +904,6 @@ fn tle_elements_from_fit(
 }
 
 fn omm_from_fit(elements: &ElementSet, metadata: &TleMetadata) -> Result<Omm, TleFitError> {
-    let (year, month, day, hour, minute, second) = civil_from_jd(elements.epoch);
-    let whole_second = second.floor();
-    let microsecond = ((second - whole_second) * 1_000_000.0).floor() as u32;
     Ok(Omm {
         ccsds_omm_vers: "2.0".to_string(),
         creation_date: None,
@@ -916,15 +914,7 @@ fn omm_from_fit(elements: &ElementSet, metadata: &TleMetadata) -> Result<Omm, Tl
         ref_frame: Some("TEME".to_string()),
         time_system: Some("UTC".to_string()),
         mean_element_theory: Some("SGP4".to_string()),
-        epoch: OmmEpoch {
-            year: year as i32,
-            month: month as u32,
-            day: day as u32,
-            hour: hour as u32,
-            minute: minute as u32,
-            second: whole_second as u32,
-            microsecond,
-        },
+        epoch: crate::astro::omm::OmmEpoch::from_sgp4_julian_date(elements.epoch),
         mean_motion: elements.mean_motion_rev_per_day,
         eccentricity: elements.eccentricity,
         inclination_deg: elements.inclination_deg,
@@ -939,6 +929,8 @@ fn omm_from_fit(elements: &ElementSet, metadata: &TleMetadata) -> Result<Omm, Tl
         bstar: elements.bstar,
         mean_motion_dot: 0.0,
         mean_motion_ddot: 0.0,
+        exact_sgp4_epoch: Some(elements.epoch),
+        quantize_tle_derived_fields: false,
     })
 }
 
@@ -960,9 +952,13 @@ fn object_id_from_designator(designator: &str) -> Option<String> {
 }
 
 fn civil_from_jd(epoch: JulianDate) -> (i64, i64, i64, i64, i64, f64) {
-    let jd = epoch.0 + epoch.1;
-    let midnight = (jd + 0.5).floor() - 0.5;
-    let fraction = jd - midnight;
+    let (midnight, fraction) = if (epoch.0.fract().abs() - 0.5).abs() < 1.0e-9 {
+        (epoch.0, epoch.1)
+    } else if epoch.1 >= 0.5 {
+        (epoch.0 + 0.5, epoch.1 - 0.5)
+    } else {
+        (epoch.0 - 0.5, epoch.1 + 0.5)
+    };
     civil_from_split_julian_date(midnight, fraction)
 }
 
@@ -1131,13 +1127,23 @@ fn normalize_degrees(degrees: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astro::frames::transforms::{gcrs_to_teme_compute, TemeStateKm};
+    use crate::astro::omm::{encode_kvn, parse_kvn};
+    use crate::astro::propagator::{propagate_states, PropagationConfig, PropagationForceModel};
+    use crate::astro::time::civil::split_julian_date;
+    use crate::astro::time::scales::TimeScales;
     use crate::astro::tle;
+    use crate::constants::J2000_JD;
     use trust_region_least_squares::model::ResidualModel;
 
     const ISS_L1: &str = "1 25544U 98067A   26168.18949189  .00009113  00000+0  17172-3 0  9996";
     const ISS_L2: &str = "2 25544  51.6332 300.0813 0004737 195.1146 164.9702 15.49273435571752";
     const GEO_L1: &str = "1 28884U 05041A   26167.71607684 -.00000267  00000+0  00000+0 0  9995";
     const GEO_L2: &str = "2 28884   3.5359  77.2731 0014354 137.8081 105.3728  0.98943614 75438";
+    const DECAY_L1: &str = "1 28872U 05037B   05333.02012661  .25992681  00000-0  24476-3 0  1534";
+    const DECAY_L2: &str = "2 28872  96.4736 157.9986 0303955 244.0492 110.6523 16.46015938 10708";
+    const SSO_L1: &str = "1 28057U 03049A   06177.78615833  .00000060  00000-0  35970-4 0  1836";
+    const SSO_L2: &str = "2 28057  98.4283 247.6961 0000884  88.1964 271.9322 14.35478080140550";
 
     fn arc_from_tle(line1: &str, line2: &str, offsets_min: &[f64]) -> Vec<FitSample> {
         let satellite = Satellite::from_tle(line1, line2).expect("valid TLE");
@@ -1157,6 +1163,23 @@ mod tests {
             .collect()
     }
 
+    fn arc_from_elements(elements: &ElementSet, offsets_min: &[f64]) -> Vec<FitSample> {
+        let satellite = Satellite::from_elements(elements).expect("valid elements");
+        offsets_min
+            .iter()
+            .map(|&minutes| {
+                let prediction = satellite
+                    .propagate(super::super::MinutesSinceEpoch(minutes))
+                    .expect("propagates");
+                FitSample {
+                    epoch: add_seconds(elements.epoch, minutes * 60.0),
+                    position_teme_km: prediction.position,
+                    velocity_teme_km_s: Some(prediction.velocity),
+                }
+            })
+            .collect()
+    }
+
     fn metadata_from_tle(line1: &str, line2: &str) -> TleMetadata {
         let parsed = tle::parse(line1, line2).expect("parse").elements;
         TleMetadata {
@@ -1165,6 +1188,17 @@ mod tests {
             international_designator: parsed.international_designator,
             element_set_number: parsed.elset_number,
             rev_at_epoch: parsed.rev_number as i64,
+            object_name: String::new(),
+        }
+    }
+
+    fn metadata_for_catalog(catalog_number: u32) -> TleMetadata {
+        TleMetadata {
+            catalog_number,
+            classification: "U".to_string(),
+            international_designator: String::new(),
+            element_set_number: 999,
+            rev_at_epoch: 0,
             object_name: String::new(),
         }
     }
@@ -1180,6 +1214,188 @@ mod tests {
             ca.psi - cb.psi,
             wrap_to_pi(ca.lam - cb.lam),
         ]
+    }
+
+    fn assert_element_sets_bit_identical(a: &ElementSet, b: &ElementSet) {
+        assert_eq!(a.epoch.0.to_bits(), b.epoch.0.to_bits(), "epoch whole");
+        assert_eq!(a.epoch.1.to_bits(), b.epoch.1.to_bits(), "epoch frac");
+        assert_eq!(a.bstar.to_bits(), b.bstar.to_bits(), "bstar");
+        assert_eq!(
+            a.mean_motion_dot.to_bits(),
+            b.mean_motion_dot.to_bits(),
+            "mean motion dot"
+        );
+        assert_eq!(
+            a.mean_motion_double_dot.to_bits(),
+            b.mean_motion_double_dot.to_bits(),
+            "mean motion ddot"
+        );
+        assert_eq!(a.eccentricity.to_bits(), b.eccentricity.to_bits(), "ecc");
+        assert_eq!(
+            a.argument_of_perigee_deg.to_bits(),
+            b.argument_of_perigee_deg.to_bits(),
+            "argp"
+        );
+        assert_eq!(
+            a.inclination_deg.to_bits(),
+            b.inclination_deg.to_bits(),
+            "incl"
+        );
+        assert_eq!(
+            a.mean_anomaly_deg.to_bits(),
+            b.mean_anomaly_deg.to_bits(),
+            "mean anomaly"
+        );
+        assert_eq!(
+            a.mean_motion_rev_per_day.to_bits(),
+            b.mean_motion_rev_per_day.to_bits(),
+            "mean motion"
+        );
+        assert_eq!(
+            a.right_ascension_deg.to_bits(),
+            b.right_ascension_deg.to_bits(),
+            "raan"
+        );
+        assert_eq!(a.catalog_number, b.catalog_number, "catalog");
+    }
+
+    fn assert_satellites_bit_identical(a: &Satellite, b: &Satellite) {
+        let ea = a.epoch_jd();
+        let eb = b.epoch_jd();
+        assert_eq!(ea.0.to_bits(), eb.0.to_bits(), "sat epoch whole");
+        assert_eq!(ea.1.to_bits(), eb.1.to_bits(), "sat epoch fraction");
+        for minutes in [-120.0, 0.0, 120.0] {
+            let pa = a
+                .propagate(super::super::MinutesSinceEpoch(minutes))
+                .expect("left propagates");
+            let pb = b
+                .propagate(super::super::MinutesSinceEpoch(minutes))
+                .expect("right propagates");
+            for axis in 0..3 {
+                assert_eq!(
+                    pa.position[axis].to_bits(),
+                    pb.position[axis].to_bits(),
+                    "position axis {axis} at {minutes} min"
+                );
+                assert_eq!(
+                    pa.velocity[axis].to_bits(),
+                    pb.velocity[axis].to_bits(),
+                    "velocity axis {axis} at {minutes} min"
+                );
+            }
+        }
+    }
+
+    fn assert_fit_bit_identical(a: &TleFit, b: &TleFit) {
+        assert_element_sets_bit_identical(&a.elements, &b.elements);
+        assert_eq!(a.line1, b.line1);
+        assert_eq!(a.line2, b.line2);
+        assert_eq!(a.omm, b.omm);
+        assert_eq!(a.stats, b.stats);
+    }
+
+    fn rms_against_samples(samples: &[FitSample], satellite: &Satellite) -> f64 {
+        let mut sum = 0.0;
+        for sample in samples {
+            let prediction = satellite
+                .propagate_jd(sample.epoch)
+                .expect("sample propagates");
+            let mut r2 = 0.0;
+            for axis in 0..3 {
+                let residual = prediction.position[axis] - sample.position_teme_km[axis];
+                r2 += residual * residual;
+            }
+            sum += r2;
+        }
+        (sum / samples.len() as f64).sqrt()
+    }
+
+    fn seed_rms(samples: &[FitSample], config: &FitConfig) -> f64 {
+        let resolved = validate_and_resolve(samples, config).expect("valid fit input");
+        let (x0, _) = initial_guess(samples, config, &resolved).expect("seed");
+        let seed = chart_to_elements(
+            &x0,
+            resolved.epoch,
+            config.fit_bstar,
+            config.bstar_seed,
+            config.metadata.catalog_number,
+        )
+        .expect("seed elements");
+        let satellite =
+            Satellite::from_elements_with_opsmode(&seed, config.opsmode).expect("seed satellite");
+        rms_against_samples(samples, &satellite)
+    }
+
+    fn clean_position_rms(samples: &[FitSample], satellite: &Satellite) -> f64 {
+        rms_against_samples(samples, satellite)
+    }
+
+    fn fit_round_trip_case(
+        name: &str,
+        truth: &ElementSet,
+        samples: &[FitSample],
+        max_rms_km: f64,
+        max_chart_delta: f64,
+    ) {
+        let config = FitConfig {
+            epoch: FitEpoch::Jd(truth.epoch),
+            fit_bstar: false,
+            metadata: metadata_for_catalog(truth.catalog_number),
+            max_nfev: Some(120),
+            ..FitConfig::default()
+        };
+        let fit = fit_tle(samples, &config).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            fit.stats.rms_position_km <= max_rms_km,
+            "{name} rms {}",
+            fit.stats.rms_position_km
+        );
+        let delta = chart_delta(&fit.elements, truth);
+        for value in delta {
+            assert!(value.abs() <= max_chart_delta, "{name} chart delta {value}");
+        }
+    }
+
+    fn utc_time_scales_with_offset(offset_s: f64) -> TimeScales {
+        let hour = (offset_s / 3600.0).floor() as i32;
+        let rem = offset_s - hour as f64 * 3600.0;
+        let minute = (rem / 60.0).floor() as i32;
+        let second = rem - minute as f64 * 60.0;
+        TimeScales::from_utc(2026, 6, 17, hour, minute, second).expect("time scales")
+    }
+
+    fn numerical_teme_arc(offsets_s: &[f64], include_velocity: bool) -> Vec<FitSample> {
+        let start = TimeScales::from_utc(2026, 6, 17, 0, 0, 0.0).expect("start time");
+        let start_tdb_s = (start.jd_tdb - J2000_JD) * SECONDS_PER_DAY;
+        let config = PropagationConfig {
+            force_model: PropagationForceModel::TwoBodyJ2,
+            ..PropagationConfig::new(start_tdb_s, [7000.0, -1210.0, 1300.0], [1.2, 7.35, 0.92])
+        };
+        let epochs: Vec<f64> = offsets_s
+            .iter()
+            .map(|offset| start_tdb_s + offset)
+            .collect();
+        let states = propagate_states(&config, &epochs).expect("numerical propagation");
+        states
+            .iter()
+            .zip(offsets_s)
+            .map(|(state, &offset_s)| {
+                let ts = utc_time_scales_with_offset(offset_s);
+                let gcrs = TemeStateKm {
+                    position_km: state.position_array(),
+                    velocity_km_s: state.velocity_array(),
+                };
+                let (position, velocity) =
+                    gcrs_to_teme_compute(&gcrs, &ts, false).expect("GCRS to TEME");
+                let (jd_whole, fraction) = split_julian_date(2026, 6, 17, 0, 0, offset_s);
+                FitSample {
+                    epoch: JulianDate(jd_whole, fraction),
+                    position_teme_km: [position.0, position.1, position.2],
+                    velocity_teme_km_s: include_velocity
+                        .then_some([velocity.0, velocity.1, velocity.2]),
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -1279,6 +1495,19 @@ mod tests {
         assert_eq!(fit.elements.mean_motion_double_dot, 0.0);
         assert_eq!(fit.omm.mean_motion_dot, 0.0);
         assert_eq!(fit.omm.mean_motion_ddot, 0.0);
+
+        let omm_elements = fit.omm.to_element_set().expect("fitted OMM bridge");
+        assert_element_sets_bit_identical(&omm_elements, &fit.elements);
+        let from_omm = Satellite::from_omm(&fit.omm).expect("fitted OMM satellite");
+        let from_elements =
+            Satellite::from_elements(&fit.elements).expect("fitted element satellite");
+        assert_satellites_bit_identical(&from_omm, &from_elements);
+
+        let encoded_omm = encode_kvn(&fit.omm);
+        let reparsed_omm = parse_kvn(&encoded_omm).expect("encoded fitted OMM reparses");
+        let _ = reparsed_omm
+            .to_element_set()
+            .expect("encoded fitted OMM bridges");
     }
 
     #[test]
@@ -1299,6 +1528,319 @@ mod tests {
 
         let fit = fit_tle(&samples, &config).expect("fit converges");
         assert!(fit.stats.rms_position_km <= 1.0e-3);
+        assert!(!fit.stats.bstar_observable);
+    }
+
+    #[test]
+    fn high_drag_bstar_recovery_is_observable() {
+        let offsets: Vec<f64> = (0..=10).map(|i| i as f64 * 5.0).collect();
+        let samples = arc_from_tle(DECAY_L1, DECAY_L2, &offsets);
+        let truth = tle::parse(DECAY_L1, DECAY_L2)
+            .unwrap()
+            .elements
+            .to_element_set()
+            .unwrap();
+        let config = FitConfig {
+            epoch: FitEpoch::Jd(truth.epoch),
+            metadata: metadata_from_tle(DECAY_L1, DECAY_L2),
+            max_nfev: Some(120),
+            ..FitConfig::default()
+        };
+
+        let fit = fit_tle(&samples, &config).expect("high-drag fit converges");
+        assert!(fit.stats.bstar_observable);
+        assert!(
+            (fit.elements.bstar - truth.bstar).abs() <= 1.0e-6,
+            "bstar fit {} truth {}",
+            fit.elements.bstar,
+            truth.bstar
+        );
+    }
+
+    #[test]
+    fn molniya_and_sun_sync_round_trip_cases_converge() {
+        let molniya = ElementSet {
+            epoch: JulianDate(2_461_208.5, 0.317_123_456_789_012),
+            bstar: 0.0,
+            mean_motion_dot: 0.0,
+            mean_motion_double_dot: 0.0,
+            eccentricity: 0.742_8,
+            argument_of_perigee_deg: 270.5,
+            inclination_deg: 63.4,
+            mean_anomaly_deg: 15.8,
+            mean_motion_rev_per_day: 2.006_1,
+            right_ascension_deg: 90.16,
+            catalog_number: 28163,
+        };
+        let molniya_offsets: Vec<f64> = (-12..=12).map(|i| i as f64 * 120.0).collect();
+        let molniya_samples = arc_from_elements(&molniya, &molniya_offsets);
+        fit_round_trip_case("molniya", &molniya, &molniya_samples, 1.0e-3, 2.0e-6);
+
+        let sso_truth = tle::parse(SSO_L1, SSO_L2)
+            .unwrap()
+            .elements
+            .to_element_set()
+            .unwrap();
+        let sso_offsets: Vec<f64> = (-24..=24).map(|i| i as f64 * 10.0).collect();
+        let sso_samples = arc_from_tle(SSO_L1, SSO_L2, &sso_offsets);
+        fit_round_trip_case("sun-sync", &sso_truth, &sso_samples, 1.0e-3, 2.0e-6);
+    }
+
+    #[test]
+    fn raan_singular_geo_round_trip_converges() {
+        let truth = ElementSet {
+            epoch: JulianDate(2_461_208.5, 0.625_987_654_321_098),
+            bstar: 0.0,
+            mean_motion_dot: 0.0,
+            mean_motion_double_dot: 0.0,
+            eccentricity: 0.0012,
+            argument_of_perigee_deg: 137.8,
+            inclination_deg: 0.05,
+            mean_anomaly_deg: 105.4,
+            mean_motion_rev_per_day: 1.0027,
+            right_ascension_deg: 77.3,
+            catalog_number: 39000,
+        };
+        let offsets: Vec<f64> = (-12..=12).map(|i| i as f64 * 120.0).collect();
+        let samples = arc_from_elements(&truth, &offsets);
+        fit_round_trip_case("raan-singular geo", &truth, &samples, 1.0e-3, 2.0e-6);
+    }
+
+    #[test]
+    fn numerical_cross_source_oracle_improves_seed_position_only() {
+        let offsets_s: Vec<f64> = (0..=18).map(|i| i as f64 * 300.0).collect();
+        let samples = numerical_teme_arc(&offsets_s, false);
+        let config = FitConfig {
+            epoch: FitEpoch::Midpoint,
+            fit_bstar: false,
+            use_velocity: false,
+            metadata: metadata_for_catalog(60001),
+            max_nfev: Some(120),
+            ..FitConfig::default()
+        };
+
+        let seed = seed_rms(&samples, &config);
+        let fit = fit_tle(&samples, &config).expect("numerical position fit");
+        assert!(
+            fit.stats.rms_position_km < seed,
+            "fit rms {} seed rms {}",
+            fit.stats.rms_position_km,
+            seed
+        );
+        assert!(!fit.stats.bstar_observable);
+    }
+
+    #[test]
+    fn numerical_cross_source_oracle_improves_seed_with_velocity() {
+        let offsets_s: Vec<f64> = (0..=18).map(|i| i as f64 * 300.0).collect();
+        let samples = numerical_teme_arc(&offsets_s, true);
+        let config = FitConfig {
+            epoch: FitEpoch::Midpoint,
+            fit_bstar: false,
+            use_velocity: true,
+            metadata: metadata_for_catalog(60002),
+            max_nfev: Some(120),
+            ..FitConfig::default()
+        };
+
+        let seed = seed_rms(&samples, &config);
+        let fit = fit_tle(&samples, &config).expect("numerical position+velocity fit");
+        assert!(
+            fit.stats.rms_position_km < seed,
+            "fit rms {} seed rms {}",
+            fit.stats.rms_position_km,
+            seed
+        );
+        assert!(fit.stats.rms_velocity_km_s.is_some());
+        assert!(!fit.stats.bstar_observable);
+    }
+
+    #[test]
+    fn seed_refinement_improves_initial_guess() {
+        let samples = arc_from_tle(ISS_L1, ISS_L2, &[-30.0, -15.0, 0.0, 15.0, 30.0]);
+        let config = FitConfig {
+            epoch: FitEpoch::Sample(2),
+            metadata: metadata_from_tle(ISS_L1, ISS_L2),
+            ..FitConfig::default()
+        };
+        let resolved = validate_and_resolve(&samples, &config).expect("valid fit input");
+        let sample = samples[resolved.epoch_index];
+        let target = chart_from_state(sample.position_teme_km, sample.velocity_teme_km_s.unwrap())
+            .expect("target chart");
+        let raw = target.to_vec(config.fit_bstar, config.bstar_seed);
+        let raw_elements = chart_to_elements(
+            &raw,
+            resolved.epoch,
+            config.fit_bstar,
+            config.bstar_seed,
+            config.metadata.catalog_number,
+        )
+        .expect("raw seed");
+        let raw_satellite = Satellite::from_elements(&raw_elements).expect("raw seed satellite");
+        let raw_rms = rms_against_samples(&samples, &raw_satellite);
+
+        let (refined, passes) = refine_seed(
+            raw,
+            target,
+            resolved.epoch,
+            config.opsmode,
+            config.fit_bstar,
+            config.bstar_seed,
+            config.metadata.catalog_number,
+        );
+        let refined_elements = chart_to_elements(
+            &refined,
+            resolved.epoch,
+            config.fit_bstar,
+            config.bstar_seed,
+            config.metadata.catalog_number,
+        )
+        .expect("refined seed");
+        let refined_satellite =
+            Satellite::from_elements(&refined_elements).expect("refined seed satellite");
+        let refined_rms = rms_against_samples(&samples, &refined_satellite);
+
+        assert!(passes > 0);
+        assert!(
+            refined_rms < raw_rms,
+            "refined rms {refined_rms} raw rms {raw_rms}"
+        );
+    }
+
+    #[test]
+    fn seed_propagation_reports_typed_error() {
+        let elements = tle::parse(DECAY_L1, DECAY_L2)
+            .unwrap()
+            .elements
+            .to_element_set()
+            .unwrap();
+        let samples = [
+            FitSample {
+                epoch: elements.epoch,
+                position_teme_km: [7000.0, 0.0, 0.0],
+                velocity_teme_km_s: Some([0.0, 7.5, 0.0]),
+            },
+            FitSample {
+                epoch: add_seconds(elements.epoch, 1440.0 * 60.0),
+                position_teme_km: [7000.0, 0.0, 0.0],
+                velocity_teme_km_s: Some([0.0, 7.5, 0.0]),
+            },
+        ];
+        let err = validate_seed_propagates(&samples, &elements, OpsMode::Improved)
+            .expect_err("decayed seed must error");
+        assert!(matches!(
+            err,
+            TleFitError::SeedPropagation { epoch_index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn epoch_selection_modes_resolve_expected_epochs() {
+        let samples = arc_from_tle(ISS_L1, ISS_L2, &[-20.0, -10.0, 0.0, 10.0, 20.0]);
+        for (mode, expected_index) in [
+            (FitEpoch::First, 0),
+            (FitEpoch::Midpoint, 2),
+            (FitEpoch::Last, 4),
+            (FitEpoch::Sample(3), 3),
+        ] {
+            let config = FitConfig {
+                epoch: mode,
+                ..FitConfig::default()
+            };
+            let resolved = validate_and_resolve(&samples, &config).expect("resolve epoch");
+            assert_eq!(resolved.epoch_index, expected_index);
+            assert_eq!(resolved.epoch, samples[expected_index].epoch);
+        }
+
+        let explicit = add_seconds(samples[0].epoch, 15.0 * 60.0);
+        let config = FitConfig {
+            epoch: FitEpoch::Jd(explicit),
+            ..FitConfig::default()
+        };
+        let resolved = validate_and_resolve(&samples, &config).expect("resolve JD epoch");
+        assert_eq!(resolved.epoch, explicit);
+        assert_eq!(resolved.epoch_index, 1);
+
+        let outside = add_seconds(samples[0].epoch, -1.0);
+        let config = FitConfig {
+            epoch: FitEpoch::Jd(outside),
+            ..FitConfig::default()
+        };
+        assert!(matches!(
+            validate_and_resolve(&samples, &config),
+            Err(TleFitError::EpochOutsideArc)
+        ));
+    }
+
+    #[test]
+    fn sample_weights_reduce_outlier_leverage() {
+        let offsets: Vec<f64> = (-12..=12).map(|i| i as f64 * 5.0).collect();
+        let clean = arc_from_tle(ISS_L1, ISS_L2, &offsets);
+        let mut corrupted = clean.clone();
+        let outlier = corrupted.len() / 2;
+        corrupted[outlier].position_teme_km[0] += 8.0;
+        corrupted[outlier].position_teme_km[1] -= 5.0;
+
+        let base_config = FitConfig {
+            epoch: FitEpoch::Jd(clean[outlier].epoch),
+            metadata: metadata_from_tle(ISS_L1, ISS_L2),
+            max_nfev: Some(100),
+            ..FitConfig::default()
+        };
+        let unweighted = fit_tle(&corrupted, &base_config).expect("unweighted fit");
+        let unweighted_sat =
+            Satellite::from_elements(&unweighted.elements).expect("unweighted satellite");
+        let unweighted_clean_rms = clean_position_rms(&clean, &unweighted_sat);
+
+        let mut weights = vec![1.0; corrupted.len()];
+        weights[outlier] = 0.01;
+        let weighted_config = FitConfig {
+            weights: Some(weights),
+            ..base_config
+        };
+        let weighted = fit_tle(&corrupted, &weighted_config).expect("weighted fit");
+        let weighted_sat =
+            Satellite::from_elements(&weighted.elements).expect("weighted satellite");
+        let weighted_clean_rms = clean_position_rms(&clean, &weighted_sat);
+
+        assert!(
+            weighted_clean_rms < unweighted_clean_rms,
+            "weighted clean rms {weighted_clean_rms} unweighted {unweighted_clean_rms}"
+        );
+    }
+
+    #[test]
+    fn deterministic_fit_repeats_bit_identically() {
+        let samples = arc_from_tle(ISS_L1, ISS_L2, &[-30.0, -15.0, 0.0, 15.0, 30.0]);
+        let config = FitConfig {
+            epoch: FitEpoch::Sample(2),
+            metadata: metadata_from_tle(ISS_L1, ISS_L2),
+            max_nfev: Some(80),
+            ..FitConfig::default()
+        };
+
+        let a = fit_tle(&samples, &config).expect("first fit");
+        let b = fit_tle(&samples, &config).expect("second fit");
+        assert_fit_bit_identical(&a, &b);
+    }
+
+    #[test]
+    fn iss_ninety_minute_arc_marks_bstar_unobservable() {
+        let offsets: Vec<f64> = (-9..=9).map(|i| i as f64 * 5.0).collect();
+        let samples = arc_from_tle(ISS_L1, ISS_L2, &offsets);
+        let truth = tle::parse(ISS_L1, ISS_L2)
+            .unwrap()
+            .elements
+            .to_element_set()
+            .unwrap();
+        let config = FitConfig {
+            epoch: FitEpoch::Jd(truth.epoch),
+            metadata: metadata_from_tle(ISS_L1, ISS_L2),
+            max_nfev: Some(80),
+            ..FitConfig::default()
+        };
+
+        let fit = fit_tle(&samples, &config).expect("ISS short arc fit");
         assert!(!fit.stats.bstar_observable);
     }
 
