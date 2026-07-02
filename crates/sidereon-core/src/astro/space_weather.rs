@@ -165,14 +165,12 @@ impl SpaceWeatherTable {
             last_observed_j2000_s: self
                 .days
                 .iter()
-                .filter(|row| matches!(row.class, ObservationClass::Observed))
-                .next_back()
+                .rfind(|row| matches!(row.class, ObservationClass::Observed))
                 .map(|row| day_start_j2000_s(row.jdn())),
             last_daily_predicted_j2000_s: self
                 .days
                 .iter()
-                .filter(|row| matches!(row.class, ObservationClass::DailyPredicted))
-                .next_back()
+                .rfind(|row| matches!(row.class, ObservationClass::DailyPredicted))
                 .map(|row| day_start_j2000_s(row.jdn())),
             end_j2000_s: day_start_j2000_s(end_jdn),
         }
