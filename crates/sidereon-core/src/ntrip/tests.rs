@@ -66,6 +66,10 @@ fn request_validation_rejects_malformed_values() {
         password: "pass".into(),
     });
     assert!(cfg.request_bytes().is_err());
+
+    let mut cfg = config(NtripVersion::Rev2);
+    cfg.host = "caster.example.test\r\nX: y".into();
+    assert!(cfg.request_bytes().is_err());
 }
 
 #[test]
@@ -86,6 +90,38 @@ fn rev1_icy_stream_emits_payload_after_optional_blank_line() {
         ]
     );
     assert_eq!(machine.state(), NtripState::Streaming);
+}
+
+#[test]
+fn rev1_icy_optional_blank_line_can_be_split() {
+    let mut machine = NtripClientMachine::new(config(NtripVersion::Rev1));
+    machine.connection_request().unwrap();
+    let connected = machine.push(b"ICY 200 OK\r\n");
+    assert_eq!(
+        connected,
+        vec![NtripEvent::Connected(NtripHandshake {
+            version: NtripVersion::Rev1,
+            chunked: false,
+            headers: vec![],
+        })]
+    );
+    assert!(machine.push(b"\r").is_empty());
+    assert_eq!(
+        machine.push(b"\nDATA"),
+        vec![NtripEvent::Payload(b"DATA".to_vec())]
+    );
+
+    let mut byte_machine = NtripClientMachine::new(config(NtripVersion::Rev1));
+    byte_machine.connection_request().unwrap();
+    let mut payload = Vec::new();
+    for byte in b"ICY 200 OK\r\n\r\nDATA" {
+        for event in byte_machine.push(&[*byte]) {
+            if let NtripEvent::Payload(bytes) = event {
+                payload.extend(bytes);
+            }
+        }
+    }
+    assert_eq!(payload, b"DATA");
 }
 
 #[test]
@@ -173,6 +209,47 @@ fn rev1_sourcetable_response_parses_records_after_headers() {
 }
 
 #[test]
+fn rev2_chunked_sourcetable_is_decoded_before_parsing() {
+    let body = b"STR;MOUNT;ID;RTCM;1004;2;GPS;NET;USA;40.1;-105.2;1;0;gen;none;B;N;9600;misc\r\nENDSOURCETABLE\r\n";
+    let mut wire =
+        b"HTTP/1.1 200 OK\r\nContent-Type: gnss/sourcetable\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+    wire.extend_from_slice(format!("{:X}\r\n", body.len()).as_bytes());
+    wire.extend_from_slice(&body[..10]);
+
+    let mut machine = NtripClientMachine::new(config(NtripVersion::Rev2));
+    machine.connection_request().unwrap();
+    assert!(machine.push(&wire).is_empty());
+
+    let mut tail = body[10..].to_vec();
+    tail.extend_from_slice(b"\r\n0\r\n\r\n");
+    let events = machine.push(&tail);
+    let NtripEvent::Sourcetable(table) = &events[0] else {
+        panic!("expected sourcetable");
+    };
+    assert_eq!(table.records.len(), 1);
+    assert_eq!(table.streams().next().unwrap().mountpoint, "MOUNT");
+}
+
+#[test]
+fn sourcetable_finish_accepts_eof_and_case_insensitive_terminator() {
+    let mut machine = NtripClientMachine::new(config(NtripVersion::Rev1));
+    machine.connection_request().unwrap();
+    machine.push(b"SOURCETABLE 200 OK\r\nSTR;MP;ID;RTCM;;;;;;1.0;2.0;0;0;;;;N;9600;tail\r\n");
+    let events = machine.finish();
+    let NtripEvent::Sourcetable(table) = &events[0] else {
+        panic!("expected sourcetable");
+    };
+    assert_eq!(table.records.len(), 1);
+
+    let mut machine = NtripClientMachine::new(config(NtripVersion::Rev1));
+    machine.connection_request().unwrap();
+    let events = machine
+        .push(b"SOURCETABLE 200 OK\r\nSTR;MP;ID;RTCM;;;;;;;;;;;;;;;N;;tail\r\nendsourcetable\r\n");
+    assert!(matches!(events[0], NtripEvent::Sourcetable(_)));
+}
+
+#[test]
 fn bad_auth_status_digest_and_content_type_are_rejections() {
     let mut machine = NtripClientMachine::new(config(NtripVersion::Rev1));
     machine.connection_request().unwrap();
@@ -200,6 +277,15 @@ fn bad_auth_status_digest_and_content_type_are_rejections() {
     let mut machine = NtripClientMachine::new(config(NtripVersion::Rev2));
     machine.connection_request().unwrap();
     assert_eq!(
+        machine.push(
+            b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"caster\", Basic realm=\"caster\"\r\n\r\n"
+        ),
+        vec![NtripEvent::Rejected(NtripRejection::Unauthorized)]
+    );
+
+    let mut machine = NtripClientMachine::new(config(NtripVersion::Rev2));
+    machine.connection_request().unwrap();
+    assert_eq!(
         machine.push(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html>"),
         vec![NtripEvent::Rejected(
             NtripRejection::UnexpectedContentType {
@@ -220,6 +306,21 @@ fn sourcetable_round_trip_preserves_unknown_and_raw_fields() {
     assert_eq!(stream.carrier, Field::Raw("bad".into()));
     assert_eq!(stream.lat_deg, Field::Raw("badlat".into()));
     assert_eq!(stream.misc, "tail;more");
+
+    let table = Sourcetable {
+        records: vec![SourcetableRecord::Other(OtherRecord {
+            type_tag: " weird tag ".into(),
+            fields: vec!["a;b".into(), "c\\d".into()],
+        })],
+    };
+    assert_eq!(parse_sourcetable(&table.to_text()).unwrap(), table);
+
+    let nan =
+        parse_sourcetable("STR;MP;ID;RTCM;;2;GPS;NET;USA;NaN;inf;0;0;gen;none;N;N;9600;tail\r\n")
+            .unwrap();
+    let stream = nan.streams().next().unwrap();
+    assert_eq!(stream.lat_deg, Field::Raw("NaN".into()));
+    assert_eq!(stream.lon_deg, Field::Raw("inf".into()));
 }
 
 #[test]
@@ -233,7 +334,7 @@ fn gga_formatter_and_machine_pacing_are_deterministic() {
     let sentence = format_gga(&position, 3661.239).unwrap();
     assert_eq!(
         String::from_utf8(sentence).unwrap(),
-        "$GPGGA,010101.23,4000.0000000,N,10500.0000000,W,1,10,1.0,1600.000,M,,M,,*57\r\n"
+        "$GPGGA,010101.23,4000.0000000,N,10500.0000000,W,1,10,1.00,1600.0,M,,,,*2A\r\n"
     );
 
     let mut cfg = config(NtripVersion::Rev1);
@@ -245,4 +346,10 @@ fn gga_formatter_and_machine_pacing_are_deterministic() {
     assert!(machine.gga_message(14.0, &position, 2.0).is_none());
     assert!(machine.gga_message(15.0, &position, 3.0).is_some());
     assert!(machine.gga_message(14.0, &position, 4.0).is_none());
+
+    let bad_position = GgaPosition {
+        lat_deg: 91.0,
+        ..position
+    };
+    assert!(machine.try_gga_message(25.0, &bad_position, 5.0).is_err());
 }

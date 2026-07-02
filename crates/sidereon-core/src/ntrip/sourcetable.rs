@@ -99,19 +99,23 @@ pub fn parse_sourcetable(text: &str) -> Result<Sourcetable> {
         if line.is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split(';').collect();
+        let field_storage = split_fields(line);
+        let fields: Vec<&str> = field_storage.iter().map(String::as_str).collect();
         let tag = fields[0].trim();
         if tag.eq_ignore_ascii_case("ENDSOURCETABLE") {
             break;
         }
-        let record = match tag {
-            "STR" => SourcetableRecord::Str(parse_str(&fields)),
-            "CAS" => SourcetableRecord::Cas(parse_cas(&fields)),
-            "NET" => SourcetableRecord::Net(parse_net(&fields)),
-            _ => SourcetableRecord::Other(OtherRecord {
-                type_tag: tag.to_string(),
-                fields: fields.iter().skip(1).map(|s| (*s).to_string()).collect(),
-            }),
+        let record = if tag.eq_ignore_ascii_case("STR") {
+            SourcetableRecord::Str(parse_str(&fields))
+        } else if tag.eq_ignore_ascii_case("CAS") {
+            SourcetableRecord::Cas(parse_cas(&fields))
+        } else if tag.eq_ignore_ascii_case("NET") {
+            SourcetableRecord::Net(parse_net(&fields))
+        } else {
+            SourcetableRecord::Other(OtherRecord {
+                type_tag: unescape_text(fields[0]),
+                fields: fields.iter().skip(1).map(|s| unescape_text(s)).collect(),
+            })
         };
         records.push(record);
     }
@@ -144,8 +148,8 @@ impl SourcetableRecord {
             SourcetableRecord::Cas(record) => record.to_line(),
             SourcetableRecord::Net(record) => record.to_line(),
             SourcetableRecord::Other(record) => {
-                let mut fields = vec![record.type_tag.clone()];
-                fields.extend(record.fields.clone());
+                let mut fields = vec![escape_text(&record.type_tag)];
+                fields.extend(record.fields.iter().map(|field| escape_text(field)));
                 fields.join(";")
             }
         }
@@ -156,24 +160,24 @@ impl StrRecord {
     fn to_line(&self) -> String {
         [
             "STR".to_string(),
-            self.mountpoint.clone(),
-            self.identifier.clone(),
-            self.format.clone(),
-            self.format_details.clone(),
+            escape_text(&self.mountpoint),
+            escape_text(&self.identifier),
+            escape_text(&self.format),
+            escape_text(&self.format_details),
             field_to_string(&self.carrier),
-            self.nav_system.clone(),
-            self.network.clone(),
-            self.country.clone(),
+            escape_text(&self.nav_system),
+            escape_text(&self.network),
+            escape_text(&self.country),
             field_to_string(&self.lat_deg),
             field_to_string(&self.lon_deg),
             bool01_to_string(&self.nmea_required),
             bool01_to_string(&self.network_solution),
-            self.generator.clone(),
-            self.compression.clone(),
+            escape_text(&self.generator),
+            escape_text(&self.compression),
             auth_to_string(&self.authentication),
             boolyn_to_string(&self.fee),
             field_to_string(&self.bitrate),
-            self.misc.clone(),
+            escape_text(&self.misc),
         ]
         .join(";")
     }
@@ -183,17 +187,17 @@ impl CasRecord {
     fn to_line(&self) -> String {
         [
             "CAS".to_string(),
-            self.host.clone(),
+            escape_text(&self.host),
             field_to_string(&self.port),
-            self.identifier.clone(),
-            self.operator.clone(),
+            escape_text(&self.identifier),
+            escape_text(&self.operator),
             bool01_to_string(&self.nmea_required),
-            self.country.clone(),
+            escape_text(&self.country),
             field_to_string(&self.lat_deg),
             field_to_string(&self.lon_deg),
-            self.fallback_host.clone(),
+            escape_text(&self.fallback_host),
             field_to_string(&self.fallback_port),
-            self.misc.clone(),
+            escape_text(&self.misc),
         ]
         .join(";")
     }
@@ -203,14 +207,14 @@ impl NetRecord {
     fn to_line(&self) -> String {
         [
             "NET".to_string(),
-            self.identifier.clone(),
-            self.operator.clone(),
+            escape_text(&self.identifier),
+            escape_text(&self.operator),
             auth_to_string(&self.authentication),
             boolyn_to_string(&self.fee),
-            self.web_net.clone(),
-            self.web_str.clone(),
-            self.web_reg.clone(),
-            self.misc.clone(),
+            escape_text(&self.web_net),
+            escape_text(&self.web_str),
+            escape_text(&self.web_reg),
+            escape_text(&self.misc),
         ]
         .join(";")
     }
@@ -218,20 +222,20 @@ impl NetRecord {
 
 fn parse_str(fields: &[&str]) -> StrRecord {
     StrRecord {
-        mountpoint: get(fields, 1).to_string(),
-        identifier: get(fields, 2).to_string(),
-        format: get(fields, 3).to_string(),
-        format_details: get(fields, 4).to_string(),
+        mountpoint: unescape_text(get(fields, 1)),
+        identifier: unescape_text(get(fields, 2)),
+        format: unescape_text(get(fields, 3)),
+        format_details: unescape_text(get(fields, 4)),
         carrier: parse_field(get(fields, 5)),
-        nav_system: get(fields, 6).to_string(),
-        network: get(fields, 7).to_string(),
-        country: get(fields, 8).to_string(),
-        lat_deg: parse_field(get(fields, 9)),
-        lon_deg: parse_field(get(fields, 10)),
+        nav_system: unescape_text(get(fields, 6)),
+        network: unescape_text(get(fields, 7)),
+        country: unescape_text(get(fields, 8)),
+        lat_deg: parse_finite_f64_field(get(fields, 9)),
+        lon_deg: parse_finite_f64_field(get(fields, 10)),
         nmea_required: parse_bool01(get(fields, 11)),
         network_solution: parse_bool01(get(fields, 12)),
-        generator: get(fields, 13).to_string(),
-        compression: get(fields, 14).to_string(),
+        generator: unescape_text(get(fields, 13)),
+        compression: unescape_text(get(fields, 14)),
         authentication: parse_auth(get(fields, 15)),
         fee: parse_boolyn(get(fields, 16)),
         bitrate: parse_field(get(fields, 17)),
@@ -241,15 +245,15 @@ fn parse_str(fields: &[&str]) -> StrRecord {
 
 fn parse_cas(fields: &[&str]) -> CasRecord {
     CasRecord {
-        host: get(fields, 1).to_string(),
+        host: unescape_text(get(fields, 1)),
         port: parse_field(get(fields, 2)),
-        identifier: get(fields, 3).to_string(),
-        operator: get(fields, 4).to_string(),
+        identifier: unescape_text(get(fields, 3)),
+        operator: unescape_text(get(fields, 4)),
         nmea_required: parse_bool01(get(fields, 5)),
-        country: get(fields, 6).to_string(),
-        lat_deg: parse_field(get(fields, 7)),
-        lon_deg: parse_field(get(fields, 8)),
-        fallback_host: get(fields, 9).to_string(),
+        country: unescape_text(get(fields, 6)),
+        lat_deg: parse_finite_f64_field(get(fields, 7)),
+        lon_deg: parse_finite_f64_field(get(fields, 8)),
+        fallback_host: unescape_text(get(fields, 9)),
         fallback_port: parse_field(get(fields, 10)),
         misc: join_tail(fields, 11),
     }
@@ -257,13 +261,13 @@ fn parse_cas(fields: &[&str]) -> CasRecord {
 
 fn parse_net(fields: &[&str]) -> NetRecord {
     NetRecord {
-        identifier: get(fields, 1).to_string(),
-        operator: get(fields, 2).to_string(),
+        identifier: unescape_text(get(fields, 1)),
+        operator: unescape_text(get(fields, 2)),
         authentication: parse_auth(get(fields, 3)),
         fee: parse_boolyn(get(fields, 4)),
-        web_net: get(fields, 5).to_string(),
-        web_str: get(fields, 6).to_string(),
-        web_reg: get(fields, 7).to_string(),
+        web_net: unescape_text(get(fields, 5)),
+        web_str: unescape_text(get(fields, 6)),
+        web_reg: unescape_text(get(fields, 7)),
         misc: join_tail(fields, 8),
     }
 }
@@ -276,8 +280,29 @@ fn join_tail(fields: &[&str], index: usize) -> String {
     if index >= fields.len() {
         String::new()
     } else {
-        fields[index..].join(";")
+        unescape_text(&fields[index..].join(";"))
     }
+}
+
+fn split_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            field.push(ch);
+            if let Some(next) = chars.next() {
+                field.push(next);
+            }
+        } else if ch == ';' {
+            fields.push(field);
+            field = String::new();
+        } else {
+            field.push(ch);
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 fn parse_field<T>(value: &str) -> Field<T>
@@ -291,6 +316,17 @@ where
             .parse()
             .map(Field::Parsed)
             .unwrap_or_else(|_| Field::Raw(value.to_string()))
+    }
+}
+
+fn parse_finite_f64_field(value: &str) -> Field<f64> {
+    if value.is_empty() {
+        Field::Empty
+    } else {
+        match value.parse::<f64>() {
+            Ok(parsed) if parsed.is_finite() => Field::Parsed(parsed),
+            _ => Field::Raw(value.to_string()),
+        }
     }
 }
 
@@ -325,7 +361,7 @@ fn field_to_string<T: ToString>(field: &Field<T>) -> String {
     match field {
         Field::Parsed(value) => value.to_string(),
         Field::Empty => String::new(),
-        Field::Raw(value) => value.clone(),
+        Field::Raw(value) => escape_text(value),
     }
 }
 
@@ -352,6 +388,43 @@ fn auth_to_string(auth: &StrAuth) -> String {
         StrAuth::None => "N".into(),
         StrAuth::Basic => "B".into(),
         StrAuth::Digest => "D".into(),
-        StrAuth::Other(value) => value.clone(),
+        StrAuth::Other(value) => escape_text(value),
     }
+}
+
+fn escape_text(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            ';' => out.push_str("\\;"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn unescape_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some(';') => out.push(';'),
+                Some('r') => out.push('\r'),
+                Some('n') => out.push('\n'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }

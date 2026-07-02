@@ -12,7 +12,7 @@ pub enum NtripRejection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HttpClassification {
     Stream { chunked: bool },
-    Sourcetable,
+    Sourcetable { chunked: bool },
     Rejection(NtripRejection),
 }
 
@@ -42,7 +42,9 @@ pub fn classify_http_response(
         None | Some("gnss/data") => HttpClassification::Stream {
             chunked: transfer_is_chunked(headers),
         },
-        Some("gnss/sourcetable") => HttpClassification::Sourcetable,
+        Some("gnss/sourcetable") => HttpClassification::Sourcetable {
+            chunked: transfer_is_chunked(headers),
+        },
         Some(other) => HttpClassification::Rejection(NtripRejection::UnexpectedContentType {
             content_type: other.to_string(),
         }),
@@ -60,13 +62,18 @@ pub(crate) fn transfer_is_chunked(headers: &[(String, String)]) -> bool {
 fn digest_required(headers: &[(String, String)]) -> bool {
     let mut saw = false;
     for value in header_values(headers, "WWW-Authenticate") {
-        saw = true;
-        if !value
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("digest")
-        {
-            return false;
+        for challenge in value.split(',') {
+            let challenge = challenge.trim_start();
+            let Some(scheme) = challenge.split_whitespace().next() else {
+                continue;
+            };
+            if scheme.contains('=') {
+                continue;
+            }
+            saw = true;
+            if !scheme.eq_ignore_ascii_case("digest") {
+                return false;
+            }
         }
     }
     saw

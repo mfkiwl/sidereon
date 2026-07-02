@@ -9,8 +9,12 @@ mod write;
 
 pub use crate::format::{Diagnostics, Parsed, RecordRef, Skip, SkipReason, Warning, WarningKind};
 pub use crate::validate::FieldError;
-pub use epoch::{EpochSnapshot, NmeaAccumulator, NmeaChunkOutput};
-pub use fields::{Gga, GgaQuality, NmeaCoordinate, NmeaDate, NmeaTalker, NmeaTime};
+pub use epoch::{EpochSnapshot, GsaEntry, GsvGroup, NmeaAccumulator, NmeaChunkOutput};
+pub use fields::{
+    Gga, GgaQuality, Gll, Gsa, GsaFixMode, GsaSelectionMode, Gst, Gsv, GsvSatellite,
+    NmeaCoordinate, NmeaDate, NmeaSatNumber, NmeaSignalId, NmeaTalker, NmeaTime, Rmc, RmcStatus,
+    Vtg, Zda,
+};
 pub use sentence::{NmeaBody, NmeaSentence};
 pub use write::write_gga;
 
@@ -95,15 +99,11 @@ pub(crate) fn merge_diagnostics(target: &mut Diagnostics, mut source: Diagnostic
     target.warnings.append(&mut source.warnings);
 }
 
-pub(crate) fn push_error_skip(diagnostics: &mut Diagnostics, error: NmeaError) {
-    push_error_skip_at(diagnostics, error, RecordRef::default());
-}
-
 fn push_error_skip_at_line(diagnostics: &mut Diagnostics, error: NmeaError, line: usize) {
     push_error_skip_at(diagnostics, error, RecordRef::at_line(line));
 }
 
-fn push_error_skip_at(diagnostics: &mut Diagnostics, error: NmeaError, at: RecordRef) {
+pub(crate) fn push_error_skip_at(diagnostics: &mut Diagnostics, error: NmeaError, at: RecordRef) {
     let reason = match error {
         NmeaError::NotFramed {
             reason: "non-ASCII byte",
@@ -111,10 +111,16 @@ fn push_error_skip_at(diagnostics: &mut Diagnostics, error: NmeaError, at: Recor
         NmeaError::NotFramed {
             reason: "sentence over length cap",
         } => SkipReason::InconsistentRecord("sentence over length cap"),
+        NmeaError::NotFramed {
+            reason: "malformed checksum",
+        } => SkipReason::InconsistentRecord("malformed checksum"),
         NmeaError::NotFramed { .. } => {
             SkipReason::UnknownBlock("no NMEA start delimiter".to_string())
         }
         NmeaError::ChecksumMismatch { .. } => SkipReason::InconsistentRecord("checksum mismatch"),
+        NmeaError::UnsupportedType { ref address } if address == "encapsulated sentence" => {
+            SkipReason::UnsupportedRecordType("encapsulated sentence")
+        }
         NmeaError::UnsupportedType { .. } => {
             SkipReason::UnsupportedRecordType("unsupported sentence type")
         }
@@ -125,7 +131,7 @@ fn push_error_skip_at(diagnostics: &mut Diagnostics, error: NmeaError, at: Recor
     diagnostics.push_skip(Skip { at, reason });
 }
 
-fn set_diagnostic_lines(diagnostics: &mut Diagnostics, line: usize) {
+pub(crate) fn set_diagnostic_lines(diagnostics: &mut Diagnostics, line: usize) {
     for skip in &mut diagnostics.skips {
         if skip.at.line.is_none() {
             skip.at.line = Some(line);
