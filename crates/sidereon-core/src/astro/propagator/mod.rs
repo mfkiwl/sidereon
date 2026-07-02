@@ -1,5 +1,6 @@
 pub mod api;
 pub mod controller;
+pub mod covariance;
 pub mod decay;
 pub mod dense_output;
 pub mod driver;
@@ -9,6 +10,10 @@ pub mod result;
 
 pub use crate::astro::forces::DragParameters;
 pub use api::{IntegratorOptions, PropagationContext};
+pub use covariance::{
+    transport_covariance, CovarianceEphemeris, CovarianceFrame, CovarianceNode,
+    CovariancePropagationOptions, CovarianceSegment, LabeledCovariance6, ProcessNoise,
+};
 pub use decay::{estimate_decay, DecayConfig, DecayError, DecayEstimate};
 pub use driver::{propagate_states, PropagationConfig, PropagationForceModel};
 pub use dynamics::OrbitalDynamics;

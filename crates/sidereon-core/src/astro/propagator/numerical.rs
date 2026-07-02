@@ -229,22 +229,33 @@ impl StatePropagator {
         t_end_tdb_seconds: f64,
     ) -> Result<StateTransitionMatrix, PropagationError> {
         crate::validate::finite(t_end_tdb_seconds, "t_end_tdb_seconds").map_err(map_field_error)?;
-        if t_end_tdb_seconds == self.initial.epoch_tdb_seconds {
-            return Ok(identity_stm());
-        }
-
         let force = self.build_force();
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
         let ctx = PropagationContext::default();
+        self.state_transition_matrix_between(self.initial, t_end_tdb_seconds, &dynamics, &ctx)
+    }
+
+    pub(super) fn state_transition_matrix_between(
+        &self,
+        initial: CartesianState,
+        t_end_tdb_seconds: f64,
+        dynamics: &OrbitalDynamics,
+        ctx: &PropagationContext,
+    ) -> Result<StateTransitionMatrix, PropagationError> {
+        crate::validate::finite(t_end_tdb_seconds, "t_end_tdb_seconds").map_err(map_field_error)?;
+        if t_end_tdb_seconds == initial.epoch_tdb_seconds {
+            return Ok(identity_stm());
+        }
+
         let mut stm = [[0.0_f64; 6]; 6];
-        let initial_vector = state_vector(&self.initial);
+        let initial_vector = state_vector(&initial);
 
         for (column, &component) in initial_vector.iter().enumerate() {
             let delta = finite_difference_step(component);
-            let plus = perturb_state(self.initial, column, delta);
-            let minus = perturb_state(self.initial, column, -delta);
+            let plus = perturb_state(initial, column, delta);
+            let minus = perturb_state(initial, column, -delta);
 
             let plus_final = self
                 .run(plus, t_end_tdb_seconds, &dynamics, &ctx)?
@@ -300,7 +311,7 @@ impl StatePropagator {
 
     /// Dispatch to the selected integrator. Kept private so the public surface
     /// stays `propagate_to` / `ephemeris`.
-    fn run(
+    pub(super) fn run(
         &self,
         initial: CartesianState,
         t_end_tdb_seconds: f64,
@@ -321,7 +332,7 @@ impl StatePropagator {
         }
     }
 
-    fn build_force(&self) -> Box<dyn ForceModel> {
+    pub(super) fn build_force(&self) -> Box<dyn ForceModel> {
         let gravity = self.force_model.build();
         if let Some(drag) = self.drag {
             let mut composite = CompositeForceModel::new();
@@ -338,7 +349,7 @@ fn map_field_error(error: crate::validate::FieldError) -> PropagationError {
     PropagationError::InvalidInput(format!("{} {}", error.field(), error.reason()))
 }
 
-fn map_covariance6_error(error: Covariance6Error) -> PropagationError {
+pub(super) fn map_covariance6_error(error: Covariance6Error) -> PropagationError {
     let reason = match error {
         Covariance6Error::NonFinite => "not finite",
         Covariance6Error::Asymmetric => "not symmetric",

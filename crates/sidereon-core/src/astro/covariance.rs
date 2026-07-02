@@ -12,6 +12,7 @@
 
 use crate::astro::math::mat3::{self, Mat3};
 use crate::astro::math::vec3;
+use crate::astro::state::CartesianState;
 use crate::validate;
 use nalgebra::SMatrix;
 
@@ -144,6 +145,45 @@ impl Covariance6 {
 
         Self::try_from_matrix(propagated)
     }
+}
+
+/// Transform a 6x6 inertial state covariance to RTN at `state`.
+///
+/// This uses the kinematic covariance convention: the same instantaneous RTN
+/// rotation is applied to position and velocity rows, without rotating-frame
+/// velocity terms.
+pub fn eci_to_rtn_covariance6(
+    covariance: &Covariance6,
+    state: &CartesianState,
+) -> Result<Covariance6, RtnFrameError> {
+    let rot = rtn_to_eci_rotation(state.position_array(), state.velocity_array())?;
+    let rot_t = mat3::inline_tr(&rot);
+    covariance_congruence6(covariance, &rot_t)
+}
+
+/// Transform a 6x6 RTN state covariance to inertial axes at `state`.
+///
+/// This is the inverse of [`eci_to_rtn_covariance6`] under the same kinematic
+/// covariance convention.
+pub fn rtn_to_eci_covariance6(
+    covariance: &Covariance6,
+    state: &CartesianState,
+) -> Result<Covariance6, RtnFrameError> {
+    let rot = rtn_to_eci_rotation(state.position_array(), state.velocity_array())?;
+    covariance_congruence6(covariance, &rot)
+}
+
+/// Convert a km-based 6x6 state covariance to m-based covariance units.
+///
+/// Every entry scales by 1e6 because position and velocity components both
+/// scale by 1e3 and covariance is quadratic in the state.
+pub fn covariance6_km_to_m(covariance: &Covariance6) -> Result<Covariance6, Covariance6Error> {
+    scale_covariance6(covariance, 1.0e6)
+}
+
+/// Convert an m-based 6x6 state covariance to km-based covariance units.
+pub fn covariance6_m_to_km(covariance: &Covariance6) -> Result<Covariance6, Covariance6Error> {
+    scale_covariance6(covariance, 1.0e-6)
 }
 
 /// Reason an RTN->ECI transform could not be built from an orbit state.
@@ -292,7 +332,7 @@ pub fn positive_semidefinite(m: &Mat3) -> bool {
         && det123 >= -PSD_MINOR_EPS
 }
 
-fn finite6(m: &Mat6) -> bool {
+pub(crate) fn finite6(m: &Mat6) -> bool {
     m.iter().flatten().all(|value| value.is_finite())
 }
 
@@ -326,7 +366,7 @@ fn positive_semidefinite6(m: &Mat6) -> bool {
 }
 
 #[allow(clippy::needless_range_loop)]
-fn symmetrize6(m: &mut Mat6) {
+pub(crate) fn symmetrize6(m: &mut Mat6) {
     for i in 0..6 {
         for j in (i + 1)..6 {
             let value = 0.5 * (m[i][j] + m[j][i]);
@@ -334,6 +374,58 @@ fn symmetrize6(m: &mut Mat6) {
             m[j][i] = value;
         }
     }
+}
+
+#[allow(clippy::needless_range_loop)]
+fn covariance_congruence6(
+    covariance: &Covariance6,
+    rotation: &Mat3,
+) -> Result<Covariance6, RtnFrameError> {
+    let matrix = covariance.as_matrix();
+    let mut block_rotation = [[0.0_f64; 6]; 6];
+    for i in 0..3 {
+        for j in 0..3 {
+            block_rotation[i][j] = rotation[i][j];
+            block_rotation[i + 3][j + 3] = rotation[i][j];
+        }
+    }
+
+    let mut temp = [[0.0_f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..6 {
+            for k in 0..6 {
+                temp[i][j] += block_rotation[i][k] * matrix[k][j];
+            }
+        }
+    }
+
+    let mut transformed = [[0.0_f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..6 {
+            for k in 0..6 {
+                transformed[i][j] += temp[i][k] * block_rotation[j][k];
+            }
+        }
+    }
+    symmetrize6(&mut transformed);
+    Covariance6::try_from_matrix(transformed).map_err(|error| match error {
+        Covariance6Error::NonFinite => invalid_input("covariance", "components must be finite"),
+        Covariance6Error::Asymmetric => invalid_input("covariance", "not symmetric"),
+        Covariance6Error::NotPositiveSemidefinite => invalid_input("covariance", "not positive"),
+    })
+}
+
+fn scale_covariance6(
+    covariance: &Covariance6,
+    scale: f64,
+) -> Result<Covariance6, Covariance6Error> {
+    let mut scaled = *covariance.as_matrix();
+    for row in &mut scaled {
+        for value in row {
+            *value *= scale;
+        }
+    }
+    Covariance6::try_from_matrix(scaled)
 }
 
 #[cfg(test)]
@@ -545,6 +637,71 @@ mod tests {
             Covariance6::try_from_matrix(small_indefinite),
             Err(Covariance6Error::NotPositiveSemidefinite)
         );
+    }
+
+    #[test]
+    fn covariance6_rtn_round_trip_recovers_input() {
+        let state = CartesianState::new(100.0, [7000.0, 100.0, 20.0], [-0.1, 7.5, 0.3]);
+        let covariance = Covariance6::try_from_matrix([
+            [4.0, 0.2, 0.1, 1.0e-5, 2.0e-5, 3.0e-5],
+            [0.2, 9.0, 0.3, 4.0e-5, 5.0e-5, 6.0e-5],
+            [0.1, 0.3, 16.0, 7.0e-5, 8.0e-5, 9.0e-5],
+            [1.0e-5, 4.0e-5, 7.0e-5, 1.0e-4, 1.0e-5, 2.0e-5],
+            [2.0e-5, 5.0e-5, 8.0e-5, 1.0e-5, 2.0e-4, 3.0e-5],
+            [3.0e-5, 6.0e-5, 9.0e-5, 2.0e-5, 3.0e-5, 3.0e-4],
+        ])
+        .expect("SPD covariance");
+
+        let rtn = eci_to_rtn_covariance6(&covariance, &state).expect("ECI to RTN");
+        let eci = rtn_to_eci_covariance6(&rtn, &state).expect("RTN to ECI");
+
+        for i in 0..6 {
+            for j in 0..6 {
+                let expected = covariance.as_matrix()[i][j];
+                let actual = eci.as_matrix()[i][j];
+                let tolerance = 1.0e-12 * expected.abs().max(1.0);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "entry [{i}][{j}] expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn covariance6_position_block_matches_existing_rtn_to_eci() {
+        let state = CartesianState::new(0.0, [7000.123, 1234.5, -250.7], [1.2, 7.4, 0.3]);
+        let cov_rtn = [[4.0, 0.5, 0.1], [0.5, 9.0, 0.2], [0.1, 0.2, 16.0]];
+        let full = Covariance6::from_diagonal([4.0, 9.0, 16.0, 1.0, 1.0, 1.0]).unwrap();
+        let mut matrix = *full.as_matrix();
+        for i in 0..3 {
+            for j in 0..3 {
+                matrix[i][j] = cov_rtn[i][j];
+            }
+        }
+        let full = Covariance6::try_from_matrix(matrix).unwrap();
+
+        let eci3 = rtn_to_eci(&cov_rtn, state.position_array(), state.velocity_array()).unwrap();
+        let eci6 = rtn_to_eci_covariance6(&full, &state).unwrap();
+
+        for (i, row) in eci3.iter().enumerate() {
+            for (j, expected) in row.iter().enumerate() {
+                assert!((eci6.as_matrix()[i][j] - expected).abs() <= 1.0e-14);
+            }
+        }
+    }
+
+    #[test]
+    fn covariance6_unit_scaling_round_trips() {
+        let covariance =
+            Covariance6::from_diagonal([1.0, 2.0, 3.0, 1.0e-6, 2.0e-6, 3.0e-6]).unwrap();
+
+        let meters = covariance6_km_to_m(&covariance).expect("km to m");
+        assert_eq!(meters.as_matrix()[0][0].to_bits(), 1.0e6_f64.to_bits());
+        assert_eq!(meters.as_matrix()[3][3].to_bits(), 1.0_f64.to_bits());
+
+        let kilometers = covariance6_m_to_km(&meters).expect("m to km");
+        assert_eq!(kilometers, covariance);
     }
 
     fn identity() -> Mat3 {
