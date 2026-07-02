@@ -15,6 +15,8 @@ pub use crate::broadcast::{
     satellite_position_ecef, satellite_state, ClockOffset, ClockPolynomial, ConstellationConstants,
     EccentricAnomaly, KeplerianElements, OrbitState, SatelliteState,
 };
+pub use crate::observables::{ObservableEphemerisSource, ObservablesError};
+use crate::observables::{ObservableState, ObservablesInputErrorKind};
 pub use crate::rinex_nav::{
     is_beidou_geo, BroadcastGroupDelayTerm, BroadcastGroupDelays, BroadcastIssue, BroadcastRecord,
     GlonassRecord, IonoCorrections, KlobucharAlphaBeta, LnavRecordError, NavMessage,
@@ -26,7 +28,7 @@ pub use crate::sp3::{
     Sp3TimeSystem, Sp3Version,
 };
 pub use crate::spp::EphemerisSource;
-use crate::GnssSystem;
+use crate::{validate, GnssSatelliteId, GnssSystem};
 
 /// Broadcast navigation ephemeris store selected by satellite and query epoch.
 ///
@@ -40,6 +42,96 @@ pub type BroadcastEphemeris = crate::rinex_nav::BroadcastStore;
 /// making the implementation type fight Rust naming conventions.
 #[allow(clippy::upper_case_acronyms)]
 pub type SP3 = Sp3;
+
+/// Status for one source-agnostic ephemeris sample row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemerisSampleStatus {
+    /// The source returned a usable ECEF position for this satellite and epoch.
+    Valid,
+    /// The source had no data, or the query fell outside a valid fit interval.
+    Gap,
+}
+
+/// One satellite and epoch in a regular ephemeris sample grid.
+///
+/// For [`EphemerisSampleStatus::Valid`], `position_ecef_m` is `Some` and
+/// `clock_s` carries the source clock when available. For
+/// [`EphemerisSampleStatus::Gap`], both value fields are `None`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EphemerisSampleRow {
+    /// The sampled satellite.
+    pub sat: GnssSatelliteId,
+    /// Query epoch, seconds since J2000 in the source time scale.
+    pub epoch_j2000_s: f64,
+    /// Whether this row carries data or a gap marker.
+    pub status: EphemerisSampleStatus,
+    /// Satellite ECEF position, meters, when `status` is `Valid`.
+    pub position_ecef_m: Option<[f64; 3]>,
+    /// Satellite clock offset, seconds, when supplied by the source.
+    pub clock_s: Option<f64>,
+}
+
+impl EphemerisSampleRow {
+    /// Build a valid ephemeris sample row.
+    pub const fn valid(
+        sat: GnssSatelliteId,
+        epoch_j2000_s: f64,
+        position_ecef_m: [f64; 3],
+        clock_s: Option<f64>,
+    ) -> Self {
+        Self {
+            sat,
+            epoch_j2000_s,
+            status: EphemerisSampleStatus::Valid,
+            position_ecef_m: Some(position_ecef_m),
+            clock_s,
+        }
+    }
+
+    /// Build a gap ephemeris sample row.
+    pub const fn gap(sat: GnssSatelliteId, epoch_j2000_s: f64) -> Self {
+        Self {
+            sat,
+            epoch_j2000_s,
+            status: EphemerisSampleStatus::Gap,
+            position_ecef_m: None,
+            clock_s: None,
+        }
+    }
+
+    /// Whether this row is a gap marker.
+    pub const fn is_gap(&self) -> bool {
+        matches!(self.status, EphemerisSampleStatus::Gap)
+    }
+}
+
+/// Sample an ephemeris source on a regular inclusive time grid.
+///
+/// Rows are returned in satellite-major order: for each satellite in
+/// `satellites`, the function emits `start_j2000_s`, `start_j2000_s + step_s`,
+/// and so on up to `stop_j2000_s`, with a final row snapped to `stop_j2000_s`
+/// when the step does not land exactly on the end. If `start_j2000_s >
+/// stop_j2000_s`, the returned grid is empty.
+///
+/// Missing satellite data and out-of-fit-interval epochs are represented as
+/// [`EphemerisSampleStatus::Gap`] rows, not as errors. Invalid inputs and invalid
+/// source states remain errors.
+pub fn sample(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    start_j2000_s: f64,
+    stop_j2000_s: f64,
+    step_s: f64,
+) -> core::result::Result<Vec<EphemerisSampleRow>, ObservablesError> {
+    let epochs = sample_epochs(start_j2000_s, stop_j2000_s, step_s)?;
+    let mut rows = Vec::with_capacity(satellites.len().saturating_mul(epochs.len()));
+    for &sat in satellites {
+        for &epoch_j2000_s in &epochs {
+            rows.push(sample_one(source, sat, epoch_j2000_s)?);
+        }
+    }
+    Ok(rows)
+}
 
 /// Select a broadcast TGD/BGD value from a parsed delay set.
 ///
@@ -74,6 +166,94 @@ pub const fn broadcast_message_group_delay_s(
 /// evaluator.
 pub fn broadcast_record_group_delay_s(record: &BroadcastRecord) -> f64 {
     record.broadcast_clock_group_delay_s()
+}
+
+fn sample_epochs(
+    start_j2000_s: f64,
+    stop_j2000_s: f64,
+    step_s: f64,
+) -> core::result::Result<Vec<f64>, ObservablesError> {
+    validate::finite(start_j2000_s, "start_j2000_s").map_err(map_sample_input_error)?;
+    validate::finite(stop_j2000_s, "stop_j2000_s").map_err(map_sample_input_error)?;
+    validate::finite_positive(step_s, "step_s").map_err(map_sample_input_error)?;
+
+    if start_j2000_s > stop_j2000_s {
+        return Ok(Vec::new());
+    }
+
+    let mut epochs = Vec::new();
+    let mut step_index = 0usize;
+    loop {
+        let epoch = start_j2000_s + step_s * step_index as f64;
+        if epoch > stop_j2000_s {
+            break;
+        }
+        if epochs.last().is_some_and(|last| epoch <= *last) {
+            return Err(sample_input_error(
+                "step_s",
+                ObservablesInputErrorKind::OutOfRange,
+            ));
+        }
+        epochs.push(epoch);
+        step_index = step_index
+            .checked_add(1)
+            .ok_or_else(|| sample_input_error("step_s", ObservablesInputErrorKind::OutOfRange))?;
+    }
+
+    if let Some(&last) = epochs.last() {
+        if last < stop_j2000_s {
+            epochs.push(stop_j2000_s);
+        }
+    }
+
+    Ok(epochs)
+}
+
+fn sample_one(
+    source: &dyn ObservableEphemerisSource,
+    sat: GnssSatelliteId,
+    epoch_j2000_s: f64,
+) -> core::result::Result<EphemerisSampleRow, ObservablesError> {
+    match source.observable_state_at_j2000_s(sat, epoch_j2000_s) {
+        Ok(state) => sample_row_from_state(sat, epoch_j2000_s, state),
+        Err(error) if is_gap_error(&error) => Ok(EphemerisSampleRow::gap(sat, epoch_j2000_s)),
+        Err(error) => Err(error),
+    }
+}
+
+fn sample_row_from_state(
+    sat: GnssSatelliteId,
+    epoch_j2000_s: f64,
+    state: ObservableState,
+) -> core::result::Result<EphemerisSampleRow, ObservablesError> {
+    validate::finite_vec3(state.position_ecef_m, "observable state position_ecef_m")
+        .map_err(map_sample_input_error)?;
+    if let Some(clock_s) = state.clock_s {
+        validate::finite(clock_s, "observable state clock_s").map_err(map_sample_input_error)?;
+    }
+    Ok(EphemerisSampleRow::valid(
+        sat,
+        epoch_j2000_s,
+        state.position_ecef_m,
+        state.clock_s,
+    ))
+}
+
+fn is_gap_error(error: &ObservablesError) -> bool {
+    matches!(
+        error,
+        ObservablesError::NoEphemeris
+            | ObservablesError::Ephemeris(crate::Error::EpochOutOfRange)
+            | ObservablesError::Ephemeris(crate::Error::UnknownSatellite(_))
+    )
+}
+
+fn map_sample_input_error(error: validate::FieldError) -> ObservablesError {
+    sample_input_error(error.field(), ObservablesInputErrorKind::from(&error))
+}
+
+fn sample_input_error(field: &'static str, kind: ObservablesInputErrorKind) -> ObservablesError {
+    ObservablesError::InvalidInput { field, kind }
 }
 
 #[cfg(test)]
