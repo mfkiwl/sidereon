@@ -316,6 +316,18 @@ impl GeoidGrid {
         self.undulation_deg(lat_rad.to_degrees(), lon_rad.to_degrees())
     }
 
+    /// Batch bilinear undulation lookup for geodetic positions in radians.
+    ///
+    /// Each input tuple is `(lat_rad, lon_rad)`, with latitude positive north and
+    /// longitude positive east. Output element `i` is exactly the scalar
+    /// [`undulation_rad`](Self::undulation_rad) result for input element `i`.
+    pub fn undulations_rad(&self, points_rad: &[(f64, f64)]) -> Vec<f64> {
+        points_rad
+            .iter()
+            .map(|&(lat_rad, lon_rad)| self.undulation_rad(lat_rad, lon_rad))
+            .collect()
+    }
+
     /// Bilinearly interpolated undulation `N` (metres) at a geodetic position in
     /// degrees (latitude positive north, longitude positive east).
     pub fn undulation_deg(&self, lat_deg: f64, lon_deg: f64) -> f64 {
@@ -332,6 +344,66 @@ impl GeoidGrid {
         let bottom = v00 + (v01 - v00) * tx;
         let top = v10 + (v11 - v10) * tx;
         bottom + (top - bottom) * ty
+    }
+
+    /// Batch bilinear undulation lookup for geodetic positions in degrees.
+    ///
+    /// Each input tuple is `(lat_deg, lon_deg)`, with latitude positive north and
+    /// longitude positive east. Output element `i` is exactly the scalar
+    /// [`undulation_deg`](Self::undulation_deg) result for input element `i`.
+    pub fn undulations_deg(&self, points_deg: &[(f64, f64)]) -> Vec<f64> {
+        points_deg
+            .iter()
+            .map(|&(lat_deg, lon_deg)| self.undulation_deg(lat_deg, lon_deg))
+            .collect()
+    }
+
+    /// Orthometric height `H = h - N` (metres above mean sea level) from an
+    /// ellipsoidal height and a geodetic position in radians, using this grid's
+    /// undulation.
+    pub fn orthometric_height_rad(
+        &self,
+        ellipsoidal_height_m: f64,
+        lat_rad: f64,
+        lon_rad: f64,
+    ) -> f64 {
+        ellipsoidal_height_m - self.undulation_rad(lat_rad, lon_rad)
+    }
+
+    /// Ellipsoidal height `h = H + N` (metres above the WGS84 ellipsoid) from an
+    /// orthometric height and a geodetic position in radians, using this grid's
+    /// undulation.
+    pub fn ellipsoidal_height_rad(
+        &self,
+        orthometric_height_m: f64,
+        lat_rad: f64,
+        lon_rad: f64,
+    ) -> f64 {
+        orthometric_height_m + self.undulation_rad(lat_rad, lon_rad)
+    }
+
+    /// Orthometric height `H = h - N` (metres above mean sea level) from an
+    /// ellipsoidal height and a geodetic position in degrees, using this grid's
+    /// undulation.
+    pub fn orthometric_height_deg(
+        &self,
+        ellipsoidal_height_m: f64,
+        lat_deg: f64,
+        lon_deg: f64,
+    ) -> f64 {
+        ellipsoidal_height_m - self.undulation_deg(lat_deg, lon_deg)
+    }
+
+    /// Ellipsoidal height `h = H + N` (metres above the WGS84 ellipsoid) from an
+    /// orthometric height and a geodetic position in degrees, using this grid's
+    /// undulation.
+    pub fn ellipsoidal_height_deg(
+        &self,
+        orthometric_height_m: f64,
+        lat_deg: f64,
+        lon_deg: f64,
+    ) -> f64 {
+        orthometric_height_m + self.undulation_deg(lat_deg, lon_deg)
     }
 
     fn lat_max_deg(&self) -> f64 {
@@ -410,6 +482,23 @@ fn normalize_longitude_deg(lon_deg: f64) -> f64 {
 /// [`GeoidGrid::undulation_rad`].
 pub fn geoid_undulation(lat_rad: f64, lon_rad: f64) -> f64 {
     builtin_grid().undulation_rad(lat_rad, lon_rad)
+}
+
+/// Batch geoid undulation lookup against the COARSE built-in global grid.
+///
+/// Each input tuple is `(lat_rad, lon_rad)`, with latitude positive north and
+/// longitude positive east. Output element `i` is exactly the scalar
+/// [`geoid_undulation`] result for input element `i`.
+pub fn geoid_undulations_rad(points_rad: &[(f64, f64)]) -> Vec<f64> {
+    builtin_grid().undulations_rad(points_rad)
+}
+
+/// Batch geoid undulation lookup against the COARSE built-in global grid.
+///
+/// Each input tuple is `(lat_deg, lon_deg)`, with latitude positive north and
+/// longitude positive east.
+pub fn geoid_undulations_deg(points_deg: &[(f64, f64)]) -> Vec<f64> {
+    builtin_grid().undulations_deg(points_deg)
 }
 
 /// Orthometric height `H = h - N` (metres above mean sea level) from an
@@ -530,6 +619,25 @@ pub fn egm96_undulation(lat_rad: f64, lon_rad: f64) -> f64 {
     egm96_grid().undulation_rad(lat_rad, lon_rad)
 }
 
+/// Batch geoid undulation lookup against the embedded GENUINE EGM96 1-degree
+/// global grid.
+///
+/// Each input tuple is `(lat_rad, lon_rad)`, with latitude positive north and
+/// longitude positive east. Output element `i` is exactly the scalar
+/// [`egm96_undulation`] result for input element `i`.
+pub fn egm96_undulations_rad(points_rad: &[(f64, f64)]) -> Vec<f64> {
+    egm96_grid().undulations_rad(points_rad)
+}
+
+/// Batch geoid undulation lookup against the embedded GENUINE EGM96 1-degree
+/// global grid.
+///
+/// Each input tuple is `(lat_deg, lon_deg)`, with latitude positive north and
+/// longitude positive east.
+pub fn egm96_undulations_deg(points_deg: &[(f64, f64)]) -> Vec<f64> {
+    egm96_grid().undulations_deg(points_deg)
+}
+
 /// The coarse 30-degree built-in global geoid, built once on first use.
 fn builtin_grid() -> &'static GeoidGrid {
     static GRID: OnceLock<GeoidGrid> = OnceLock::new();
@@ -577,6 +685,148 @@ const BUILTIN_VALUES_M: [f64; BUILTIN_N_LAT * BUILTIN_N_LON] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    struct ProjGeoidFixture {
+        lat_deg: f64,
+        lon_deg: f64,
+        undulation_m: f64,
+    }
+
+    // PROJ oracle provenance for the 15-arcminute EGM96 fixture below:
+    //
+    // Tool: PROJ 9.8.1 (`cct`, Rel. 9.8.1, April 10th, 2026).
+    // Grid: `us_nga_egm96_15.tif`, fetched with
+    // `projsync --target-dir /tmp/sidereon-proj-egm96 --file us_nga_egm96_15.tif`.
+    // Grid SHA-256:
+    // db493027562c9b004d7220fa881f5603adada4e1c5029b933fa7de4547b0e78d.
+    // Command:
+    // `PROJ_DATA=/tmp/sidereon-proj-egm96 cct -d 12 +proj=pipeline +step +inv
+    //  +proj=vgridshift +grids=us_nga_egm96_15.tif +multiplier=1`.
+    //
+    // `cct` returns orthometric height for an ellipsoidal-height input. With
+    // input height 0, the geoid undulation is `-output_z`.
+    const PROJ_EGM96_FIXTURES: &[ProjGeoidFixture] = &[
+        ProjGeoidFixture {
+            lat_deg: 0.000000,
+            lon_deg: 0.000000,
+            undulation_m: 17.161579132080,
+        },
+        ProjGeoidFixture {
+            lat_deg: 0.000000,
+            lon_deg: 80.000000,
+            undulation_m: -102.687904357910,
+        },
+        ProjGeoidFixture {
+            lat_deg: 60.000000,
+            lon_deg: -30.000000,
+            undulation_m: 63.799266815186,
+        },
+        ProjGeoidFixture {
+            lat_deg: 45.625000,
+            lon_deg: 12.375000,
+            undulation_m: 44.181870460510,
+        },
+        ProjGeoidFixture {
+            lat_deg: 0.125000,
+            lon_deg: 179.875000,
+            undulation_m: 21.099070549011,
+        },
+        ProjGeoidFixture {
+            lat_deg: 0.125000,
+            lon_deg: -179.875000,
+            undulation_m: 20.864660263062,
+        },
+        ProjGeoidFixture {
+            lat_deg: -10.500000,
+            lon_deg: 179.990000,
+            undulation_m: 38.607539978027,
+        },
+        ProjGeoidFixture {
+            lat_deg: -10.500000,
+            lon_deg: -179.990000,
+            undulation_m: 38.540365447998,
+        },
+        ProjGeoidFixture {
+            lat_deg: 89.875000,
+            lon_deg: 45.000000,
+            undulation_m: 13.639517307281,
+        },
+        ProjGeoidFixture {
+            lat_deg: -89.875000,
+            lon_deg: 123.625000,
+            undulation_m: -29.676423549652,
+        },
+        ProjGeoidFixture {
+            lat_deg: 37.774900,
+            lon_deg: -122.419400,
+            undulation_m: -32.242452185586,
+        },
+    ];
+
+    // Real EGM96 15-arcminute node values, rounded to the centimetre grid the
+    // NGA `WW15MGH.DAC` format stores. The sparse test grid writes only these
+    // nodes into an otherwise-zero DAC-sized byte buffer; each oracle point
+    // above falls in a cell whose four corners are present here. This avoids
+    // committing the full 2 MB grid while still checking node registration,
+    // antimeridian wrap, pole-row handling, and bilinear cell selection against
+    // PROJ-derived values. The largest measured PROJ-vs-DAC-centimetre
+    // difference in these fixtures is 0.0032 m.
+    const SPARSE_EGM96_DAC_NODES_CM: &[(f64, f64, i16)] = &[
+        (-90.00, 123.50, -2953),
+        (-90.00, 123.75, -2953),
+        (-89.75, 123.50, -2982),
+        (-89.75, 123.75, -2982),
+        (-10.50, 179.75, 3919),
+        (-10.50, 180.00, 3858),
+        (-10.50, 180.25, 3751),
+        (-10.25, 179.75, 3733),
+        (-10.25, 180.00, 3697),
+        (-10.25, 180.25, 3611),
+        (0.00, 0.00, 1716),
+        (0.00, 0.25, 1708),
+        (0.00, 80.00, -10269),
+        (0.00, 80.25, -10255),
+        (0.00, 179.75, 2138),
+        (0.00, 180.00, 2115),
+        (0.00, 180.25, 2095),
+        (0.25, 0.00, 1719),
+        (0.25, 0.25, 1711),
+        (0.25, 80.00, -10286),
+        (0.25, 80.25, -10276),
+        (0.25, 179.75, 2109),
+        (0.25, 180.00, 2078),
+        (0.25, 180.25, 2058),
+        (37.75, 237.50, -3237),
+        (37.75, 237.75, -3204),
+        (38.00, 237.50, -3211),
+        (38.00, 237.75, -3200),
+        (45.50, 12.25, 4398),
+        (45.50, 12.50, 4355),
+        (45.75, 12.25, 4498),
+        (45.75, 12.50, 4421),
+        (60.00, 330.00, 6380),
+        (60.00, 330.25, 6400),
+        (60.25, 330.00, 6365),
+        (60.25, 330.25, 6388),
+        (89.75, 45.00, 1367),
+        (89.75, 45.25, 1367),
+        (90.00, 45.00, 1361),
+        (90.00, 45.25, 1361),
+    ];
+
+    fn sparse_egm96_dac_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; super::EGM96_DAC_N_LAT * super::EGM96_DAC_N_LON * 2];
+        for &(lat_deg, lon_east_deg, cm) in SPARSE_EGM96_DAC_NODES_CM {
+            let record = ((90.0 - lat_deg) / 0.25).round() as usize;
+            let col = (lon_east_deg.rem_euclid(360.0) / 0.25).round() as usize;
+            assert!(record < super::EGM96_DAC_N_LAT);
+            assert!(col < super::EGM96_DAC_N_LON);
+            let off = (record * super::EGM96_DAC_N_LON + col) * 2;
+            bytes[off..off + 2].copy_from_slice(&cm.to_be_bytes());
+        }
+        bytes
+    }
 
     #[test]
     fn builtin_returns_exact_node_values() {
@@ -661,6 +911,36 @@ mod tests {
         assert_ne!(
             egm96_orthometric_height_m(h, lat, lon),
             orthometric_height_m(h, lat, lon)
+        );
+    }
+
+    #[test]
+    fn batch_undulation_entries_match_scalar_lookup() {
+        let points_deg = [(0.0, 0.0), (45.625, 12.375), (0.125, -179.875)];
+        let got_deg = egm96_undulations_deg(&points_deg);
+        let expected_deg: Vec<f64> = points_deg
+            .iter()
+            .map(|&(lat, lon)| egm96_grid().undulation_deg(lat, lon))
+            .collect();
+        assert_eq!(got_deg, expected_deg);
+
+        let points_rad: Vec<(f64, f64)> = points_deg
+            .iter()
+            .map(|&(lat, lon)| (lat.to_radians(), lon.to_radians()))
+            .collect();
+        let got_rad = egm96_undulations_rad(&points_rad);
+        let expected_rad: Vec<f64> = points_rad
+            .iter()
+            .map(|&(lat, lon)| egm96_undulation(lat, lon))
+            .collect();
+        assert_eq!(got_rad, expected_rad);
+
+        assert_eq!(
+            geoid_undulations_deg(&points_deg),
+            points_deg
+                .iter()
+                .map(|&(lat, lon)| geoid_undulation(lat.to_radians(), lon.to_radians()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -815,5 +1095,46 @@ mod tests {
             GeoidGrid::from_egm96_dac(&bytes[..bytes.len() - 2]),
             Err(GeoidError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn egm96_dac_sparse_fixture_matches_proj_oracle() {
+        let bytes = sparse_egm96_dac_bytes();
+        let grid = GeoidGrid::from_egm96_dac(&bytes).expect("parse sparse EGM96 DAC fixture");
+        for fixture in PROJ_EGM96_FIXTURES {
+            let got = grid.undulation_deg(fixture.lat_deg, fixture.lon_deg);
+            assert!(
+                (got - fixture.undulation_m).abs() <= 0.005,
+                "PROJ EGM96 fixture ({}, {}): got {got}, want {}",
+                fixture.lat_deg,
+                fixture.lon_deg,
+                fixture.undulation_m
+            );
+        }
+    }
+
+    #[test]
+    fn geoid_grid_height_conversions_pin_sign_convention() {
+        let bytes = sparse_egm96_dac_bytes();
+        let grid = GeoidGrid::from_egm96_dac(&bytes).expect("parse sparse EGM96 DAC fixture");
+        for fixture in PROJ_EGM96_FIXTURES {
+            let n = grid.undulation_deg(fixture.lat_deg, fixture.lon_deg);
+            let h = 250.0;
+            let orthometric = grid.orthometric_height_deg(h, fixture.lat_deg, fixture.lon_deg);
+            assert_eq!(orthometric, h - n);
+            assert_eq!(
+                grid.ellipsoidal_height_deg(orthometric, fixture.lat_deg, fixture.lon_deg),
+                orthometric + n
+            );
+
+            let lat_rad = fixture.lat_deg.to_radians();
+            let lon_rad = fixture.lon_deg.to_radians();
+            assert!((grid.orthometric_height_rad(h, lat_rad, lon_rad) - (h - n)).abs() <= 1.0e-12);
+            assert!(
+                (grid.ellipsoidal_height_rad(orthometric, lat_rad, lon_rad) - (orthometric + n))
+                    .abs()
+                    <= 1.0e-12
+            );
+        }
     }
 }
