@@ -107,6 +107,104 @@ fn consts_for(system: &str) -> ConstellationConstants {
     }
 }
 
+fn legacy_satellite_position_ecef_reference(
+    elements: &KeplerianElements,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+    is_geo: bool,
+) -> OrbitState {
+    let sqrt_a = elements.sqrt_a;
+    let e = elements.e;
+    let gm = consts.gm_m3_s2;
+    let omega_e = consts.omega_e_rad_s;
+
+    let a = sqrt_a * sqrt_a;
+    let n0 = (gm / (a * a * a)).sqrt();
+    let n = n0 + elements.delta_n;
+
+    let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
+
+    let mk = elements.m0 + n * tk;
+    let kepler = eccentric_anomaly_unchecked(mk, e);
+    let ecc_anom = kepler.value;
+    let sin_e = ecc_anom.sin();
+    let cos_e = ecc_anom.cos();
+
+    let e2 = e * e;
+    let nu = ((1.0 - e2).sqrt() * sin_e).atan2(cos_e - e);
+    let phi = nu + elements.omega;
+
+    let two_phi = 2.0 * phi;
+    let s2 = two_phi.sin();
+    let c2 = two_phi.cos();
+    let du = elements.cus * s2 + elements.cuc * c2;
+    let dr = elements.crs * s2 + elements.crc * c2;
+    let di = elements.cis * s2 + elements.cic * c2;
+
+    let u = phi + du;
+    let r = a * (1.0 - e * cos_e) + dr;
+    let i = elements.i0 + di + elements.idot * tk;
+
+    let xp = r * u.cos();
+    let yp = r * u.sin();
+
+    let omega_k = if is_geo {
+        elements.omega0 + elements.omega_dot * tk - omega_e * elements.toe_sow
+    } else {
+        elements.omega0 + (elements.omega_dot - omega_e) * tk - omega_e * elements.toe_sow
+    };
+
+    let sin_o = omega_k.sin();
+    let cos_o = omega_k.cos();
+    let sin_i = i.sin();
+    let cos_i = i.cos();
+    let xg = xp * cos_o - yp * cos_i * sin_o;
+    let yg = xp * sin_o + yp * cos_i * cos_o;
+    let zg = yp * sin_i;
+
+    let (x, y, z) = if is_geo {
+        let deg5 = 5.0_f64.to_radians();
+        let cos_phi = deg5.cos();
+        let sin_phi = -deg5.sin();
+        let z_ang = omega_e * tk;
+        let cos_z = z_ang.cos();
+        let sin_z = z_ang.sin();
+        let yr = yg * cos_phi + zg * sin_phi;
+        let zr = -yg * sin_phi + zg * cos_phi;
+        (xg * cos_z + yr * sin_z, -xg * sin_z + yr * cos_z, zr)
+    } else {
+        (xg, yg, zg)
+    };
+
+    OrbitState {
+        a,
+        n0,
+        n,
+        tk,
+        mk,
+        eccentric_anomaly: ecc_anom,
+        kepler_iterations: kepler.iterations,
+        sin_e,
+        cos_e,
+        nu,
+        phi,
+        s2,
+        c2,
+        du,
+        dr,
+        di,
+        u,
+        r,
+        i,
+        xp,
+        yp,
+        omega_k,
+        x_m: x,
+        y_m: y,
+        z_m: z,
+    }
+}
+
 /// The pinned controls and per-constellation constants in the Rust module must
 /// bit-match the recipe that produced the goldens, or every downstream value is
 /// trivially "0 ULP against the wrong input".
@@ -162,6 +260,26 @@ fn pinned_constants_match_the_recipe() {
             0,
             "{name} dtr_f"
         );
+    }
+}
+
+#[test]
+fn lnav_position_refactor_preserves_legacy_bits() {
+    let doc = read_fixture("broadcast_golden.json");
+    let cases = doc["cases"].as_array().expect("cases array");
+    assert!(!cases.is_empty(), "fixture has no cases");
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let system = case["system"].as_str().unwrap();
+        let consts = consts_for(system);
+        let elems = elements_from(&case["elements_hex"]);
+        let t_sow = bits(case["t_sow_hex"].as_str().unwrap());
+        let is_geo = case["is_geo"].as_bool().unwrap_or(false);
+
+        let before = legacy_satellite_position_ecef_reference(&elems, &consts, t_sow, is_geo);
+        let after = satellite_position_ecef_unchecked(&elems, &consts, t_sow, is_geo);
+        assert_eq!(after, before, "{name}: refactored legacy orbit changed");
     }
 }
 

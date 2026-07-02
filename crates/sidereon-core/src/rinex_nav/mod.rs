@@ -312,7 +312,10 @@ impl BroadcastGroupDelays {
     /// The delay term historically used for broadcast-clock evaluation.
     ///
     /// BeiDou has no signal choice at this store level, so it keeps the previous
-    /// TGD1 behavior. Callers that know their signal should use [`Self::get`].
+    /// TGD1 behavior. CNAV-family clock evaluation keeps the record-level
+    /// default of treating a missing TGD or L1 C/A ISC as zero. Callers that know
+    /// their signal should use [`Self::get`] or
+    /// [`Self::cnav_single_frequency_correction_s`].
     pub const fn for_message(self, system: GnssSystem, message: NavMessage) -> Option<f64> {
         match (system, message) {
             (GnssSystem::Gps, NavMessage::GpsLnav) => self.get(BroadcastGroupDelayTerm::GpsTgd),
@@ -333,7 +336,9 @@ impl BroadcastGroupDelays {
                 | NavMessage::QzssCnav2,
             ) => match (self.gps_tgd_s, self.cnav_isc_l1ca_s) {
                 (Some(tgd), Some(isc)) => Some(tgd - isc),
-                _ => None,
+                (Some(tgd), None) => Some(tgd),
+                (None, Some(isc)) => Some(-isc),
+                (None, None) => Some(0.0),
             },
             _ => None,
         }
@@ -528,10 +533,6 @@ impl BroadcastRecord {
 
     /// Group delay used by the broadcast-clock evaluator for this message.
     pub fn broadcast_clock_group_delay_s(&self) -> f64 {
-        if self.message.is_cnav_family() {
-            return self.group_delays.gps_tgd_s.unwrap_or(0.0)
-                - self.group_delays.cnav_isc_l1ca_s.unwrap_or(0.0);
-        }
         self.group_delays
             .for_message(self.satellite_id.system, self.message)
             .unwrap_or(0.0)

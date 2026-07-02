@@ -329,18 +329,39 @@ pub(crate) fn satellite_position_ecef_unchecked(
     t_sow_s: f64,
     is_geo: bool,
 ) -> OrbitState {
+    satellite_position_ecef_impl(elements, None, consts, t_sow_s, is_geo)
+}
+
+fn satellite_position_ecef_impl(
+    elements: &KeplerianElements,
+    cnav_rates: Option<&CnavRates>,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+    is_geo: bool,
+) -> OrbitState {
     let sqrt_a = elements.sqrt_a;
     let e = elements.e;
     let gm = consts.gm_m3_s2;
     let omega_e = consts.omega_e_rad_s;
 
-    // 1. Semi-major axis and mean motion. a^3 as an explicit multiply chain.
-    let a = sqrt_a * sqrt_a;
-    let n0 = (gm / (a * a * a)).sqrt();
-    let n = n0 + elements.delta_n;
+    let (a, n0, n, tk) = if let Some(rates) = cnav_rates {
+        let a0 = sqrt_a * sqrt_a;
+        let n0 = (gm / (a0 * a0 * a0)).sqrt();
+        let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
+        let a = a0 + rates.adot_m_s * tk;
+        let delta_n_a = elements.delta_n + 0.5 * rates.delta_n0_dot_rad_s2 * tk;
+        let n = n0 + delta_n_a;
+        (a, n0, n, tk)
+    } else {
+        // 1. Semi-major axis and mean motion. a^3 as an explicit multiply chain.
+        let a = sqrt_a * sqrt_a;
+        let n0 = (gm / (a * a * a)).sqrt();
+        let n = n0 + elements.delta_n;
 
-    // 2. Time from ephemeris reference epoch (half-week folded).
-    let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
+        // 2. Time from ephemeris reference epoch (half-week folded).
+        let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
+        (a, n0, n, tk)
+    };
 
     // 3. Mean anomaly and eccentric anomaly.
     let mk = elements.m0 + n * tk;
@@ -462,80 +483,7 @@ pub(crate) fn satellite_position_ecef_cnav_unchecked(
     consts: &ConstellationConstants,
     t_sow_s: f64,
 ) -> OrbitState {
-    let sqrt_a = elements.sqrt_a;
-    let e = elements.e;
-    let gm = consts.gm_m3_s2;
-    let omega_e = consts.omega_e_rad_s;
-
-    let a0 = sqrt_a * sqrt_a;
-    let n0 = (gm / (a0 * a0 * a0)).sqrt();
-    let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
-    let a = a0 + rates.adot_m_s * tk;
-    let delta_n_a = elements.delta_n + 0.5 * rates.delta_n0_dot_rad_s2 * tk;
-    let n = n0 + delta_n_a;
-
-    let mk = elements.m0 + n * tk;
-    let kepler = eccentric_anomaly_unchecked(mk, e);
-    let ecc_anom = kepler.value;
-    let sin_e = ecc_anom.sin();
-    let cos_e = ecc_anom.cos();
-
-    let e2 = e * e;
-    let nu = ((1.0 - e2).sqrt() * sin_e).atan2(cos_e - e);
-    let phi = nu + elements.omega;
-
-    let two_phi = 2.0 * phi;
-    let s2 = two_phi.sin();
-    let c2 = two_phi.cos();
-    let du = elements.cus * s2 + elements.cuc * c2;
-    let dr = elements.crs * s2 + elements.crc * c2;
-    let di = elements.cis * s2 + elements.cic * c2;
-
-    let u = phi + du;
-    let r = a * (1.0 - e * cos_e) + dr;
-    let i = elements.i0 + di + elements.idot * tk;
-
-    let xp = r * u.cos();
-    let yp = r * u.sin();
-
-    let omega_k =
-        elements.omega0 + (elements.omega_dot - omega_e) * tk - omega_e * elements.toe_sow;
-
-    let sin_o = omega_k.sin();
-    let cos_o = omega_k.cos();
-    let sin_i = i.sin();
-    let cos_i = i.cos();
-    let x = xp * cos_o - yp * cos_i * sin_o;
-    let y = xp * sin_o + yp * cos_i * cos_o;
-    let z = yp * sin_i;
-
-    OrbitState {
-        a,
-        n0,
-        n,
-        tk,
-        mk,
-        eccentric_anomaly: ecc_anom,
-        kepler_iterations: kepler.iterations,
-        sin_e,
-        cos_e,
-        nu,
-        phi,
-        s2,
-        c2,
-        du,
-        dr,
-        di,
-        u,
-        r,
-        i,
-        xp,
-        yp,
-        omega_k,
-        x_m: x,
-        y_m: y,
-        z_m: z,
-    }
+    satellite_position_ecef_impl(elements, Some(rates), consts, t_sow_s, false)
 }
 
 /// Evaluate the broadcast satellite clock offset (seconds).
