@@ -131,6 +131,7 @@ fn float_observations(input: &Input) -> Vec<FloatObservation> {
                     .unwrap_or(input.scalars[(idx + 1) % 16]),
                 freq1_hz: input.scalars[6],
                 freq2_hz: input.scalars[7],
+                glonass_channel: None,
             })
         })
         .collect()
@@ -238,6 +239,7 @@ fuzz_target!(|data: &[u8]| {
         },
         galileo_nequick: None,
         beidou_klobuchar: None,
+        sbas_iono: None,
         glonass_channels: BTreeMap::new(),
         met: SurfaceMet {
             pressure_hpa: input.scalars[2],

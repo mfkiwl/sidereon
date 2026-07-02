@@ -427,6 +427,7 @@ fuzz_target!(|data: &[u8]| {
             beta: [input.scalars[1]; 4],
         },
         galileo_nequick: None,
+        sbas_iono: None,
         beidou_klobuchar: None,
         glonass_channels: BTreeMap::new(),
         met: SurfaceMet {

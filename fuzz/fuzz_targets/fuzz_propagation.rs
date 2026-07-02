@@ -131,6 +131,7 @@ fuzz_target!(|data: &[u8]| {
         force_model,
         integrator,
         options: opts,
+        drag: None,
     };
     assert_ok_finite_or_err(
         "StatePropagator::propagate_to",
