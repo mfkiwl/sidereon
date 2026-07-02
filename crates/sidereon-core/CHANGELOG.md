@@ -2,14 +2,19 @@
 
 All notable changes to `sidereon-core` are documented here.
 
-## [0.10.1]
+## [Unreleased]
 
 ### Added
 
-- Added core 6x6 orbit covariance transport with frame-labeled nodes,
+- Core 6x6 orbit covariance transport with frame-labeled nodes,
   RTN acceleration process noise, caller-supplied transport segments,
   PSD-safe Log-Cholesky interpolation, covariance unit conversion helpers, and
   TCA Pc integration for propagated covariances.
+- Space-weather ingestion: CSSI space-weather CSV and txt parsing with a
+  time-indexed table, NRLMSISE-00 selection conventions (previous-day F10.7,
+  81-day centered average, daily and 3-hourly Ap), format-faithful
+  serializers, a CelesTrak data-catalog entry, and a `SpaceWeatherSource`
+  hook feeding atmospheric drag and orbital-decay estimation.
 
 ### Changed
 
@@ -17,6 +22,8 @@ All notable changes to `sidereon-core` are documented here.
   `NotFactorizable` and `InvalidInterpolationParameter` variants, and
   propagated-covariance TCA option structs now carry `process_noise`.
   Exhaustive matches and struct literals may need source updates.
+
+## [0.10.1]
 
 ### Fixed
 

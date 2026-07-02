@@ -146,6 +146,50 @@ impl FromStr for ProductType {
     }
 }
 
+/// CelesTrak space-weather product served by the data catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SpaceWeatherProduct {
+    /// `SW-All.csv`: full history plus daily and monthly predictions.
+    All,
+    /// `SW-Last5Years.csv`: observed rolling window.
+    Last5Years,
+}
+
+impl SpaceWeatherProduct {
+    /// The lower-case catalog code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::All => "sw_all",
+            Self::Last5Years => "sw_last5",
+        }
+    }
+
+    /// Parse a lower-case catalog code.
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "sw_all" => Some(Self::All),
+            "sw_last5" => Some(Self::Last5Years),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SpaceWeatherProduct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl FromStr for SpaceWeatherProduct {
+    type Err = DataCatalogError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_code(s).ok_or_else(|| DataCatalogError::UnknownProductType(s.to_string()))
+    }
+}
+
 /// Archive transport protocol recorded by the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchiveProtocol {
@@ -277,6 +321,19 @@ pub struct CenterCatalogEntry {
 /// Static catalog entry for one terrain source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerrainSourceEntry {
+    /// Archive URI scheme.
+    pub protocol: ArchiveProtocol,
+    /// Archive host.
+    pub host: &'static str,
+    /// Archive compression.
+    pub compression: ArchiveCompression,
+    /// Archive root URL without trailing slash.
+    pub root_url: &'static str,
+}
+
+/// Static catalog entry for the CelesTrak space-weather source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceWeatherSourceEntry {
     /// Archive URI scheme.
     pub protocol: ArchiveProtocol,
     /// Archive host.
@@ -585,12 +642,20 @@ const SKADI_SOURCE: TerrainSourceEntry = TerrainSourceEntry {
     root_url: "https://s3.amazonaws.com/elevation-tiles-prod",
 };
 
-const ALLOWED_HOSTS: [&str; 5] = [
+const CELESTRAK_SPACE_WEATHER_SOURCE: SpaceWeatherSourceEntry = SpaceWeatherSourceEntry {
+    protocol: ArchiveProtocol::Https,
+    host: "celestrak.org",
+    compression: ArchiveCompression::None,
+    root_url: "https://celestrak.org/SpaceData",
+};
+
+const ALLOWED_HOSTS: [&str; 6] = [
     "ftp.aiub.unibe.ch",
     "navigation-office.esa.int",
     "isdc-data.gfz.de",
     "igs.bkg.bund.de",
     "s3.amazonaws.com",
+    "celestrak.org",
 ];
 
 const NO_OPEN_MIRRORS: [NoOpenMirrorProduct; 7] = [
@@ -1127,6 +1192,37 @@ pub const fn allowed_hosts() -> &'static [&'static str] {
 #[must_use]
 pub const fn skadi_source_entry() -> TerrainSourceEntry {
     SKADI_SOURCE
+}
+
+/// Catalog entry for the CelesTrak CSSI space-weather source.
+#[must_use]
+pub const fn space_weather_source_entry() -> SpaceWeatherSourceEntry {
+    CELESTRAK_SPACE_WEATHER_SOURCE
+}
+
+/// Filename for a CelesTrak space-weather product.
+#[must_use]
+pub const fn space_weather_filename(product: SpaceWeatherProduct) -> &'static str {
+    match product {
+        SpaceWeatherProduct::All => "SW-All.csv",
+        SpaceWeatherProduct::Last5Years => "SW-Last5Years.csv",
+    }
+}
+
+/// Build the CelesTrak archive URL for a space-weather product.
+#[must_use]
+pub fn space_weather_archive_url(product: SpaceWeatherProduct) -> String {
+    format!(
+        "{}/{}",
+        CELESTRAK_SPACE_WEATHER_SOURCE.root_url,
+        space_weather_filename(product)
+    )
+}
+
+/// Build the cache relative path for a space-weather product.
+#[must_use]
+pub fn space_weather_cache_relpath(product: SpaceWeatherProduct) -> String {
+    format!("space-weather/{}", space_weather_filename(product))
 }
 
 /// Build the Skadi SRTM tile id, for example `N36W107`.

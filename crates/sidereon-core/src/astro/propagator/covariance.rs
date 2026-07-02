@@ -176,7 +176,7 @@ impl StatePropagator {
         validate_epochs_monotonic(self.initial.epoch_tdb_seconds, epochs_tdb_seconds)?;
         validate_process_noise(options.process_noise)?;
 
-        let force = self.build_force();
+        let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -254,9 +254,10 @@ pub fn transport_covariance(
             .map_err(map_covariance6_error)?
             .into_matrix();
         if let Some(q) = process_noise_increment(segment, process_noise)? {
+            let q_matrix = q.as_matrix();
             for (i, row) in matrix.iter_mut().enumerate() {
-                for (j, value) in row.iter_mut().enumerate() {
-                    *value += q.as_matrix()[i][j];
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell += q_matrix[i][j];
                 }
             }
             symmetrize6(&mut matrix);

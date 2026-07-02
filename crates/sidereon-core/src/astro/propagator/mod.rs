@@ -14,7 +14,9 @@ pub use covariance::{
     transport_covariance, CovarianceEphemeris, CovarianceFrame, CovarianceNode,
     CovariancePropagationOptions, CovarianceSegment, LabeledCovariance6, ProcessNoise,
 };
-pub use decay::{estimate_decay, DecayConfig, DecayError, DecayEstimate};
+pub use decay::{
+    estimate_decay, estimate_decay_with_source, DecayConfig, DecayError, DecayEstimate,
+};
 pub use driver::{propagate_states, PropagationConfig, PropagationForceModel};
 pub use dynamics::OrbitalDynamics;
 pub use numerical::{ForceModelKind, IntegratorKind, StatePropagator, StateTransitionMatrix};

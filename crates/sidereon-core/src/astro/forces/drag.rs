@@ -26,9 +26,11 @@ use crate::astro::frames::transforms::{
     FrameTransformError,
 };
 use crate::astro::propagator::api::PropagationContext;
+use crate::astro::space_weather::{SpaceWeatherError, SpaceWeatherTable};
 use crate::astro::state::CartesianState;
 use crate::astro::time::civil::{civil_from_j2000_seconds, day_of_year_int, second_of_day};
 use nalgebra::Vector3;
+use std::sync::Arc;
 
 const MAX_EPOCH_OFFSET_S: f64 = 1000.0 * DAYS_PER_JULIAN_YEAR * SECONDS_PER_DAY;
 
@@ -50,6 +52,25 @@ impl Default for SpaceWeather {
             f107: atmosphere::DEFAULT_F107,
             f107a: atmosphere::DEFAULT_F107A,
             ap: atmosphere::DEFAULT_AP,
+        }
+    }
+}
+
+/// Where drag evaluations obtain space-weather values.
+#[derive(Debug, Clone)]
+pub enum SpaceWeatherSource {
+    /// Constant values for every epoch.
+    Fixed(SpaceWeather),
+    /// Per-epoch values from a parsed CelesTrak table.
+    Table(Arc<SpaceWeatherTable>),
+}
+
+impl SpaceWeatherSource {
+    /// Resolve space-weather inputs at one J2000-second epoch.
+    pub fn at(&self, epoch_j2000_s: f64) -> Result<SpaceWeather, SpaceWeatherError> {
+        match self {
+            Self::Fixed(space_weather) => Ok(*space_weather),
+            Self::Table(table) => table.space_weather_at(epoch_j2000_s),
         }
     }
 }
@@ -135,60 +156,67 @@ impl ForceModel for DragForce {
         state: &CartesianState,
         _ctx: &PropagationContext,
     ) -> Result<Vector3<f64>, PropagationError> {
-        validate_drag_state(state)?;
-        let calendar = calendar_from_epoch(state.epoch_tdb_seconds);
-        let geodetic = geodetic_from_validated_state(state)?;
+        drag_acceleration(
+            self.space_weather,
+            self.bc_factor_m2_kg,
+            self.cutoff_altitude_km,
+            state,
+        )
+    }
+}
 
-        if geodetic.alt_km <= self.cutoff_altitude_km || geodetic.alt_km > MAX_ALTITUDE_KM {
-            return Ok(Vector3::zeros());
-        }
+/// Atmospheric drag whose space weather is resolved per evaluation epoch.
+#[derive(Debug, Clone)]
+pub struct SourcedDragForce {
+    bc_factor_m2_kg: f64,
+    source: SpaceWeatherSource,
+    cutoff_altitude_km: f64,
+}
 
-        let input = NrlmsiseInput {
-            year: calendar.year,
-            doy: calendar.doy,
-            sec: calendar.sec_of_day,
-            alt: geodetic.alt_km,
-            g_lat: geodetic.lat_deg,
-            g_long: geodetic.lon_deg,
-            lst: 0.0,
-            f107a: self.space_weather.f107a,
-            f107: self.space_weather.f107,
-            ap: self.space_weather.ap,
-            ap_array: None,
-        };
-        let density = atmosphere::nrlmsise00_with_lst(&input, None)
-            .map_err(|error| {
-                PropagationError::NumericalFailure(format!("drag atmosphere failed: {error}"))
-            })?
-            .density();
-        if !density.is_finite() {
-            return Err(PropagationError::NumericalFailure(
-                "drag density not finite".to_string(),
-            ));
+impl SourcedDragForce {
+    /// Build from validated drag parameters and a dynamic source.
+    ///
+    /// The source supplies the per-epoch values; the fixed [`SpaceWeather`] inside
+    /// `drag` is not consulted.
+    pub fn new(drag: DragParameters, source: SpaceWeatherSource) -> Self {
+        Self {
+            bc_factor_m2_kg: drag.bc_factor_m2_kg,
+            source,
+            cutoff_altitude_km: drag.cutoff_altitude_km,
         }
+    }
 
-        let v_rel_km_s = relative_velocity_km_s(state);
-        if !vector_is_finite(&v_rel_km_s) {
-            return Err(PropagationError::NumericalFailure(
-                "drag relative velocity not finite".to_string(),
-            ));
-        }
-        let v_rel_m_s = v_rel_km_s * M_PER_KM;
-        let speed_m_s = v_rel_m_s.norm();
-        if !speed_m_s.is_finite() {
-            return Err(PropagationError::NumericalFailure(
-                "drag relative speed not finite".to_string(),
-            ));
-        }
+    /// Drag ballistic-coefficient factor `B = C_D * A / m`, m^2/kg.
+    pub fn bc_factor_m2_kg(&self) -> f64 {
+        self.bc_factor_m2_kg
+    }
 
-        let accel_m_s2 = v_rel_m_s * (-0.5 * density * self.bc_factor_m2_kg * speed_m_s);
-        let accel_km_s2 = accel_m_s2 / M_PER_KM;
-        if !vector_is_finite(&accel_km_s2) {
-            return Err(PropagationError::NumericalFailure(
-                "drag acceleration not finite".to_string(),
-            ));
-        }
-        Ok(accel_km_s2)
+    /// Space-weather source used for density evaluation.
+    pub fn source(&self) -> &SpaceWeatherSource {
+        &self.source
+    }
+
+    /// Density cutoff altitude, km.
+    pub fn cutoff_altitude_km(&self) -> f64 {
+        self.cutoff_altitude_km
+    }
+}
+
+impl ForceModel for SourcedDragForce {
+    fn acceleration(
+        &self,
+        state: &CartesianState,
+        _ctx: &PropagationContext,
+    ) -> Result<Vector3<f64>, PropagationError> {
+        let space_weather = self.source.at(state.epoch_tdb_seconds).map_err(|error| {
+            PropagationError::ForceModelFailure(format!("space weather: {error}"))
+        })?;
+        drag_acceleration(
+            space_weather,
+            self.bc_factor_m2_kg,
+            self.cutoff_altitude_km,
+            state,
+        )
     }
 }
 
@@ -293,6 +321,68 @@ pub(crate) fn map_frame_error(
     error: FrameTransformError,
 ) -> PropagationError {
     PropagationError::NumericalFailure(format!("drag {context} failed: {error}"))
+}
+
+fn drag_acceleration(
+    space_weather: SpaceWeather,
+    bc_factor_m2_kg: f64,
+    cutoff_altitude_km: f64,
+    state: &CartesianState,
+) -> Result<Vector3<f64>, PropagationError> {
+    validate_drag_state(state)?;
+    let calendar = calendar_from_epoch(state.epoch_tdb_seconds);
+    let geodetic = geodetic_from_validated_state(state)?;
+
+    if geodetic.alt_km <= cutoff_altitude_km || geodetic.alt_km > MAX_ALTITUDE_KM {
+        return Ok(Vector3::zeros());
+    }
+
+    let input = NrlmsiseInput {
+        year: calendar.year,
+        doy: calendar.doy,
+        sec: calendar.sec_of_day,
+        alt: geodetic.alt_km,
+        g_lat: geodetic.lat_deg,
+        g_long: geodetic.lon_deg,
+        lst: 0.0,
+        f107a: space_weather.f107a,
+        f107: space_weather.f107,
+        ap: space_weather.ap,
+        ap_array: None,
+    };
+    let density = atmosphere::nrlmsise00_with_lst(&input, None)
+        .map_err(|error| {
+            PropagationError::NumericalFailure(format!("drag atmosphere failed: {error}"))
+        })?
+        .density();
+    if !density.is_finite() {
+        return Err(PropagationError::NumericalFailure(
+            "drag density not finite".to_string(),
+        ));
+    }
+
+    let v_rel_km_s = relative_velocity_km_s(state);
+    if !vector_is_finite(&v_rel_km_s) {
+        return Err(PropagationError::NumericalFailure(
+            "drag relative velocity not finite".to_string(),
+        ));
+    }
+    let v_rel_m_s = v_rel_km_s * M_PER_KM;
+    let speed_m_s = v_rel_m_s.norm();
+    if !speed_m_s.is_finite() {
+        return Err(PropagationError::NumericalFailure(
+            "drag relative speed not finite".to_string(),
+        ));
+    }
+
+    let accel_m_s2 = v_rel_m_s * (-0.5 * density * bc_factor_m2_kg * speed_m_s);
+    let accel_km_s2 = accel_m_s2 / M_PER_KM;
+    if !vector_is_finite(&accel_km_s2) {
+        return Err(PropagationError::NumericalFailure(
+            "drag acceleration not finite".to_string(),
+        ));
+    }
+    Ok(accel_km_s2)
 }
 
 fn validate_finite_positive(field: &'static str, value: f64) -> Result<(), PropagationError> {

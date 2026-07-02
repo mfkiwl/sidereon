@@ -1,8 +1,15 @@
-use sidereon::astro::forces::{DragForce as FacadeDragForce, SpaceWeather as FacadeSpaceWeather};
-use sidereon::propagator::{
-    estimate_decay, propagate_states, DecayConfig, DecayEstimate, DragParameters, PropagationConfig,
+use sidereon::astro::forces::{
+    DragForce as FacadeDragForce, SourcedDragForce as FacadeSourcedDragForce,
+    SpaceWeather as FacadeSpaceWeather, SpaceWeatherSource as FacadeSpaceWeatherSource,
 };
-use sidereon::{DragForce, SpaceWeather};
+use sidereon::propagator::{
+    estimate_decay, estimate_decay_with_source, propagate_states, DecayConfig, DecayEstimate,
+    DragParameters, PropagationConfig,
+};
+use sidereon::{
+    DragForce, ObservationClass, SourcedDragForce, SpaceWeather, SpaceWeatherPolicy,
+    SpaceWeatherSample, SpaceWeatherSource, SpaceWeatherTable,
+};
 
 #[test]
 fn facade_reexports_drag_decay_and_matches_core() {
@@ -11,6 +18,18 @@ fn facade_reexports_drag_decay_and_matches_core() {
         .expect("valid drag");
     let _: FacadeDragForce = DragForce::from_bc_factor_m2_kg(0.02, SpaceWeather::default(), 100.0)
         .expect("valid drag force");
+    let source = SpaceWeatherSource::Fixed(SpaceWeather::default());
+    let _: FacadeSpaceWeatherSource = source.clone();
+    let _: FacadeSourcedDragForce = SourcedDragForce::new(drag, source.clone());
+    let _: fn(
+        sidereon::astro::state::CartesianState,
+        &DecayConfig,
+        &SpaceWeatherSource,
+    ) -> Result<DecayEstimate, sidereon::propagator::DecayError> = estimate_decay_with_source;
+    let _policy = SpaceWeatherPolicy::default();
+    let _class = ObservationClass::Observed;
+    let _sample_type: Option<SpaceWeatherSample> = None;
+    let _table_type: Option<SpaceWeatherTable> = None;
     let _decay_api: fn(
         sidereon::astro::state::CartesianState,
         &DecayConfig,

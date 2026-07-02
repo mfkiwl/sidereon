@@ -1321,6 +1321,7 @@ fn propagate_position_covariance_to_tca(
         integrator: options.integrator,
         options: options.integrator_options,
         drag: None,
+        space_weather: None,
     };
     let ephemeris = propagator
         .propagate_covariance(
@@ -2915,6 +2916,7 @@ mod tests {
             integrator: options.integrator,
             options: options.integrator_options,
             drag: None,
+            space_weather: None,
         };
         let ephemeris = propagator
             .propagate_covariance(
@@ -2949,6 +2951,7 @@ mod tests {
             integrator: options.integrator,
             options: options.integrator_options,
             drag: None,
+            space_weather: None,
         };
         let (_, covariance_f) = propagator
             .propagate_state_with_covariance(covariance0, span_seconds)
