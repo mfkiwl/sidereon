@@ -10,7 +10,7 @@
 
 extern "C" {
 
-// Field counts — keep in sync with the Rust side.
+// Field counts: keep in sync with the Rust side.
 const int CPP_DUMP_DOUBLE_COUNT = 112;
 const int CPP_DUMP_INT_COUNT    = 5;
 
@@ -50,7 +50,7 @@ int cpp_sgp4init_dump(
         inclo, mo, no_kozai, nodeo, satrec
     );
 
-    // Restore the split epoch the way our Rust caller does — initl may have
+    // Restore the split epoch the way our Rust caller does; initl may have
     // overwritten satrec.jdsatepoch with a derived value.
     satrec.jdsatepoch  = jdsatepoch;
     satrec.jdsatepochF = jdsatepoch_frac;

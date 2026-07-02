@@ -10,8 +10,8 @@ robust-reweighting parameter; see [Status](#status) for details.
 It is built to be a general-purpose solver, not a one-off port. Give it a
 residual `r: Rⁿ → Rᵐ` and a starting point and it runs the same trust-region
 Newton iteration SciPy does, down to the last bit. The linear-algebra operations that
-determine the last bits of the trajectory — the thin SVD of the scaled Jacobian
-and the small BLAS reductions around it — are *injected* through the `ThinSvd`
+determine the last bits of the trajectory, the thin SVD of the scaled Jacobian
+and the small BLAS reductions around it, are *injected* through the `ThinSvd`
 trait. Backing that trait with a host LAPACK/BLAS lets the solver reproduce that
 backend's numerical trajectory exactly, which is what makes bit-for-bit
 agreement with a pinned SciPy/NumPy runtime achievable rather than merely
@@ -126,7 +126,7 @@ original `n = 3` regression fixtures.
 ### Reproducibility scope
 
 Bit-for-bit floating-point agreement with a numerical library is intrinsically
-**platform- and version-specific** — there is no cross-platform bit-exactness for
+**platform- and version-specific**: there is no cross-platform bit-exactness for
 BLAS- and libm-heavy code. The committed parity is certified on:
 
 - **Architecture:** Linux **x86_64** (glibc `libm`).
@@ -138,8 +138,8 @@ BLAS- and libm-heavy code. The committed parity is certified on:
 
 Change any of these and the low bits move: Apple **Accelerate** (the macOS arm64
 default), a different OpenBLAS build or CPU kernel (`AVX-512` vs `Haswell`), or a
-different `libm` each produce a *different* — internally still correct —
-trajectory. The contiguity-sensitive products are matched to the exact call NumPy
+different `libm` each produce a *different* trajectory, still internally correct.
+The contiguity-sensitive products are matched to the exact call NumPy
 makes on **this** stack: `Jᵀf` / `J·step` on the F-contiguous Jacobian via the
 column-major BLAS path, `Uᵀf` / `V·rhs` via the C-contiguous row-major path.
 
@@ -153,9 +153,9 @@ pinned backend's trajectory. The default pure-Rust `nalgebra` SVD is self-consis
 The crate's payoff is throughput on **small problems solved many times** (the
 GNSS/TDOA hot-path: tiny systems re-solved millions of times), where SciPy's
 per-call Python orchestration and array allocation dominate and a native Rust
-loop skips all of it. The numbers below time the crate's **native path** —
+loop skips all of it. The numbers below time the crate's **native path**:
 `trf_no_bounds` driving a pure-Rust `nalgebra` thin SVD plus the crate's own
-pure-Rust dot/matvec reductions, with no Python and no injected LAPACK — against
+pure-Rust dot/matvec reductions, with no Python and no injected LAPACK, against
 `scipy.optimize.least_squares` on the *same input data* (identical `matrix`,
 `target`, `x0`, loss, and `f_scale`, loaded from one shared file) and the *same
 mathematical residual* model. Each side evaluates that residual idiomatically (a
@@ -183,7 +183,7 @@ SVD-bound and the gap narrows toward parity (still ~1.5–1.7× here, with `nalg
 competitive with OpenBLAS `gesdd` at these sizes).
 
 Caveat on fairness: the parity (host-LAPACK) backend injects SciPy's *own*
-LAPACK/BLAS, so benchmarking it would be SciPy-vs-SciPy — these numbers
+LAPACK/BLAS, so benchmarking it would be SciPy-vs-SciPy; these numbers
 deliberately use the native Rust SVD instead. Each side evaluates the residual
 idiomatically (not a deliberately slow callback), so the comparison reflects
 solver overhead. Reproduce with:

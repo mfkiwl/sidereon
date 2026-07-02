@@ -572,8 +572,8 @@ pub fn select_sp3(
 ///    most-stale point). Requiring it to cover the start (`lo <= start`) keeps
 ///    out a product beginning after the range start, which could not serve the
 ///    start; a product entirely before the range qualifies trivially. This also
-///    admits a product that covers the start but ends before the end — the
-///    nearest-prior source for the worst-case end.
+///    admits a product that covers the start but ends before the end. That is
+///    the nearest-prior source for the worst-case end.
 /// 3. If that staleness exceeds the cap, or no prior product exists, a typed
 ///    [`SelectionError`] is returned.
 pub fn select_sp3_over_range(

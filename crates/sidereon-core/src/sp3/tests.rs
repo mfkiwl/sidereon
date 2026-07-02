@@ -9,7 +9,7 @@
 //!
 //! SP3 fixture provenance (all under `tests/fixtures/sp3/`):
 //!
-//!   * `GRG0MGXFIN_20201760000_01D_15M_ORB.SP3` (+ `.gz`) — IGS MGEX final combined
+//!   * `GRG0MGXFIN_20201760000_01D_15M_ORB.SP3` (+ `.gz`): IGS MGEX final combined
 //!     precise orbit+clock, AC CNES/CLS/GRGS, SP3-c, 2020 DOY 176 (GPS week 2111),
 //!     96 epochs at 900 s, 75 sats (GPS/GLONASS/Galileo). From
 //!     `https://raw.githubusercontent.com/nav-solutions/data/main/SP3/C/GRG0MGXFIN_20201760000_01D_15M_ORB.SP3.gz`
@@ -20,29 +20,29 @@
 //!     position-interpolation parity golden in `interp/interp_tests.rs` is generated
 //!     from RTKLIB `peph2pos`/`interppol` (degree-10 sliding-window Lagrange,
 //!     opt=0), certified sats G01/G15/G32; the clock channel uses scipy CubicSpline.
-//!   * `GAP_G01_20201760000_15M.sp3` — derived from the GRG product by removing
+//!   * `GAP_G01_20201760000_15M.sp3`: derived from the GRG product by removing
 //!     G01's position records for the contiguous block 07:30..10:00 (~2.5 h gap);
 //!     all other sats and the header verbatim, no values altered. Proves the
 //!     Lagrange window never interpolates across a gap.
-//!   * `degenerate_coincident_5sat.sp3` — hand-authored (no external source), valid
+//!   * `degenerate_coincident_5sat.sp3`: hand-authored (no external source), valid
 //!     SP3-c with five GPS sats (G01-G05) at identical ECEF (26560,0,0) km, zero
 //!     clock, two 15-min epochs. Rank-deficient geometry; proves graceful degrade
 //!     (position with no DOP, no panic).
-//!   * `GBM0MGXRAP_20201770000_01D_05M_ORB.SP3` — GFZ rapid MGEX, 2020 DOY 177,
+//!   * `GBM0MGXRAP_20201770000_01D_05M_ORB.SP3`: GFZ rapid MGEX, 2020 DOY 177,
 //!     5-min, 122 sats incl. BeiDou C01-C60. From
 //!     `ftp://ftp.gfz-potsdam.de/pub/GNSS/products/mgex/2111/GBM0MGXRAP_20201770000_01D_05M_ORB.SP3.gz`
 //!     (gz sha256 51971877df4b4bb6c43bb13ff5c850752100d38048526d6bf39ecd98b54aaf27).
 //!     The committed GRG product carries no BeiDou; GBM is the BeiDou physical
 //!     anchor. Full day not vendored into the crate; trims below are committed.
-//!   * `GBM0MGXRAP_20201770000_01D_05M_ORB_120epoch.sp3` — first 120 epochs + the
+//!   * `GBM0MGXRAP_20201770000_01D_05M_ORB_120epoch.sp3`: first 120 epochs + the
 //!     records the Wettzell RTK real-arc harness needs (243328 B sha256
 //!     769e61ab9153cac0c9103df1b1721cda8a8e04457188b862a5f63c431ca3cba2); no values
 //!     altered.
-//!   * `GBM_BDS_C21_C08_trim.sp3` — header + position records for BeiDou C21 (MEO)
+//!   * `GBM_BDS_C21_C08_trim.sp3`: header + position records for BeiDou C21 (MEO)
 //!     and C08 (IGSO) across all 288 epochs, other sats dropped (72293 B sha256
 //!     f77d83a0da91e7112c2890ba7aae29326b8c621cfee58ac18e4243d86e40238b); the
 //!     BeiDou drift gate for the reduced-orbit eccentric_secular model.
-//!   * `IGS0OPSFIN_20261200945_02H30M_15M_ORB.SP3` — IGS official combined final
+//!   * `IGS0OPSFIN_20261200945_02H30M_15M_ORB.SP3`: IGS official combined final
 //!     (GPS-only legacy combination), SP3-c, frame IGc20, 15-min, 2026 DOY 120 (GPS
 //!     week 2416), 11 epochs 09:45..12:15, all 31 GPS sats verbatim. From Wuhan
 //!     University IGS mirror
