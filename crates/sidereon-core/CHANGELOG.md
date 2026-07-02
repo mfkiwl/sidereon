@@ -2,6 +2,26 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [0.10.1]
+
+### Fixed
+
+- DTED ten-degree block directories now follow the layout production stores
+  use: the hemisphere letter comes from the tile index and the magnitude is the
+  truncated absolute value, so `n36_w107` buckets under `n30_w100/`,
+  `n32_w118` under `n30_w110/`, and `s01_w001` under `s00_w000/` (with `n00`
+  and `s00` kept distinct). The previous flooring convention mis-bucketed
+  every western and southern index that was not an exact multiple of ten,
+  making caches invisible to existing tile stores. Tile naming itself is
+  unchanged. A cache directory populated by 0.10.0 can be migrated by moving
+  the affected tiles into the corrected block directories, or simply
+  regenerated. The derivation is validated against an observed 888-tile
+  listing captured from a production-style store.
+- `PreciseEphemerisSamples::from_samples` now rejects a sample epoch whose
+  derived J2000 seconds is not finite and a finite clock offset that overflows
+  to a non-finite value in native microseconds, instead of poisoning the
+  interpolation node axis or emitting non-finite clock values downstream.
+
 ## [0.10.0]
 
 ### Added

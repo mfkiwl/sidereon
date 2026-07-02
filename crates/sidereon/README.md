@@ -117,17 +117,19 @@ of epochs across a rayon pool, bit-identical to the serial path.
 
 ## What's in the box
 
-- **Orbits:** SGP4/TLE and OMM, numerical propagation, passes, look angles
-- **Frames & time:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, UTC/TT/TDB/UT1
-- **Bodies:** Sun/Moon positions, eclipse events, plus JPL SPK (DAF/.bsp) kernels
-- **Positioning:** SPP, RTK (float/fixed), PPP (float/fixed), DOP, velocity
-- **GNSS data:** SP3, RINEX (obs/nav/clock), CRINEX, ANTEX, broadcast ephemeris
-- **Space situational awareness:** conjunction/TCA screening, collision probability, CDM, covariance
+- **Orbits:** SGP4/TLE and OMM, numerical propagation with atmospheric drag and decay/reentry prediction, Kepler and anomaly conversions, classical and equinoctial elements, passes, look angles
+- **Frames, time & geodesy:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, UTC/TT/TDB/UT1, EGM96 geoid, DTED terrain elevation
+- **Bodies & almanac:** Sun/Moon/planet apparent places (geocentric or topocentric RA/Dec), Sun and Moon rise/set, seasons, moon phases, eclipses, planetary transits, plus JPL SPK (DAF/.bsp) kernels
+- **Observation geometry:** angular separation and position angle, phase/beta/parallactic angles, sub-solar and sub-observer points, terminator, satellite visual magnitude
+- **Positioning:** SPP, RTK (float/fixed), PPP (float/fixed), DOP, velocity, robust fault detection and exclusion
+- **GNSS data:** SP3, RINEX (obs/nav/clock), CRINEX, ANTEX, broadcast ephemeris, Bias-SINEX / CODE DCB biases, source-agnostic ephemeris sampling
+- **Corrections:** SBAS, RTCM SSR and Galileo HAS orbit/clock/bias correction stores
+- **Space situational awareness:** conjunction/TCA screening, collision probability, CDM, covariance, relative motion (RIC/RTN/LVLH, Clohessy-Wiltshire)
 - **RF:** link budget (FSPL, EIRP, C/N0, antenna gain)
 
 The product parsers, look-angle helpers, and propagation shortcuts live at the
-crate root (`load_sp3`, `solve_spp`, `passes`, `sgp4`, `tle`, `tca`); the full
-astrodynamics tree is under `sidereon::astro`. Lower-level RTK/PPP internals stay
+crate root (`load_sp3`, `solve_spp`, `passes`, `sgp4`, `tle`, `tca`, `relative`,
+`almanac`); the full astrodynamics tree is under `sidereon::astro`. Lower-level RTK/PPP internals stay
 behind the explicit `sidereon::raw` escape hatch so the ergonomic surface stays
 small.
 

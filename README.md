@@ -8,13 +8,15 @@ sidereon is one engine: a Rust core for satellite orbit propagation, GNSS positi
 
 ## Capabilities
 
-- **Orbit propagation:** SGP4/SDP4 from TLE/OMM, numerical propagation, batch/constellation propagation, ground tracks, passes, visibility, and coverage.
-- **GNSS positioning:** single-point (SPP), RTK float and fixed (LAMBDA), PPP float and fixed, DGNSS, across GPS/GLONASS/Galileo/BeiDou/QZSS, with RAIM fault detection and exclusion and DOP (G/P/H/V/T).
-- **Ephemeris and time:** broadcast and precise (SP3) ephemeris, JPL SPK kernels, scale-aware time (UTC/TT/UT1/TDB/GNSS), leap seconds, Earth orientation (EOP).
-- **Geometry and events:** TEME/GCRS/ITRS/geodetic/topocentric transforms (IAU/IERS), look angles, eclipse, sub-solar and terminator geometry, conjunction screening with collision probability (TCA/Pc), initial orbit determination, and classical-element conversion.
-- **Atmosphere:** Klobuchar and full Galileo NeQuick-G ionosphere, IONEX grids (vertical TEC and slant delay), tropospheric delay, NRLMSISE-00 density.
+- **Orbit propagation:** SGP4/SDP4 from TLE/OMM, numerical propagation with atmospheric drag and decay/reentry prediction, Kepler propagation and anomaly conversion, batch/constellation propagation, ground tracks, passes, visibility, and coverage.
+- **GNSS positioning:** single-point (SPP), RTK float and fixed (LAMBDA), PPP float and fixed, DGNSS, across GPS/GLONASS/Galileo/BeiDou/QZSS, with robust solves, RAIM fault detection and exclusion, and DOP (G/P/H/V/T).
+- **GNSS corrections:** SBAS message decode and correction application, RTCM SSR and Galileo HAS orbit/clock/bias correction stores, and differential code biases (DCB/OSB) from Bias-SINEX and CODE products.
+- **Ephemeris and time:** broadcast and precise (SP3) ephemeris, JPL SPK kernels, source-agnostic satellite state sampling across all three, scale-aware time (UTC/TT/UT1/TDB/GNSS), leap seconds, Earth orientation (EOP).
+- **Geometry and events:** TEME/GCRS/ITRS/geodetic/topocentric transforms (IAU/IERS), look angles, eclipse, relative motion in RIC/RTN/LVLH frames with Clohessy-Wiltshire propagation, conjunction screening with collision probability (TCA/Pc), initial orbit determination, and classical and equinoctial element conversion.
+- **Observation and almanac:** apparent places (geocentric and topocentric RA/Dec) for the Sun, Moon, and planets, Sun and Moon rise/set, seasons, moon phases, planetary transits, lunar and solar eclipses, sub-solar/sub-observer and terminator geometry, angular separation and position/phase/beta angles, and satellite visual magnitude.
+- **Atmosphere and terrain:** Klobuchar and full Galileo NeQuick-G ionosphere, IONEX grids (vertical TEC and slant delay), tropospheric delay, NRLMSISE-00 density, and DTED terrain elevation lookup.
 - **RF link:** free-space path loss, EIRP, carrier-to-noise (C/N0), and link margin.
-- **Formats:** TLE/OMM, CCSDS OEM/OPM/CDM, RINEX observation/navigation/clock, CRINEX (Hatanaka), SP3, IONEX, ANTEX, RTCM 3.x, with forgiving parsers and round-trippable serializers for the formats that support it.
+- **Formats:** TLE/OMM, CCSDS OEM/OPM/CDM, RINEX observation/navigation/clock, CRINEX (Hatanaka), SP3, IONEX, ANTEX, Bias-SINEX, CODE DCB, RTCM 3.x, with forgiving parsers and round-trippable serializers for the formats that support it.
 
 ## Install
 
