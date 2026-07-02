@@ -12,7 +12,7 @@ use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::error::PropagationError;
 use crate::astro::events::root::{try_bisect_crossing_until, RootError};
 use crate::astro::forces::drag::geodetic_altitude_km;
-use crate::astro::forces::{DragForce, DragParameters};
+use crate::astro::forces::{DragForce, DragParameters, SpaceWeatherSource};
 use crate::astro::propagator::api::IntegratorOptions;
 use crate::astro::propagator::driver::PropagationForceModel;
 use crate::astro::propagator::numerical::{ForceModelKind, IntegratorKind, StatePropagator};
@@ -160,6 +160,26 @@ pub fn estimate_decay(
     initial: CartesianState,
     config: &DecayConfig,
 ) -> Result<DecayEstimate, DecayError> {
+    estimate_decay_driver(initial, config, None)
+}
+
+/// Estimate time to reentry using per-epoch space weather from `source`.
+///
+/// `config.drag` supplies the ballistic coefficient and cutoff altitude; its
+/// fixed [`crate::astro::forces::SpaceWeather`] value is not consulted.
+pub fn estimate_decay_with_source(
+    initial: CartesianState,
+    config: &DecayConfig,
+    source: &SpaceWeatherSource,
+) -> Result<DecayEstimate, DecayError> {
+    estimate_decay_driver(initial, config, Some(source))
+}
+
+fn estimate_decay_driver(
+    initial: CartesianState,
+    config: &DecayConfig,
+    source: Option<&SpaceWeatherSource>,
+) -> Result<DecayEstimate, DecayError> {
     validate_config(config)?;
 
     let initial_altitude = geodetic_altitude_km(&initial).map_err(DecayError::Propagation)?;
@@ -190,12 +210,20 @@ pub fn estimate_decay(
         }
 
         let next_elapsed_s = (elapsed_s + config.scan_step_s).min(config.max_duration_s);
-        let next_state = propagate_segment(current, initial_epoch + next_elapsed_s, config)?;
+        let next_state =
+            propagate_segment(current, initial_epoch + next_elapsed_s, config, source)?;
         samples += 1;
         let next_altitude = geodetic_altitude_km(&next_state).map_err(DecayError::Propagation)?;
 
         if next_altitude <= config.reentry_altitude_km {
-            return refine_reentry(initial_epoch, current, elapsed_s, next_elapsed_s, config);
+            return refine_reentry(
+                initial_epoch,
+                current,
+                elapsed_s,
+                next_elapsed_s,
+                config,
+                source,
+            );
         }
 
         elapsed_s = next_elapsed_s;
@@ -235,13 +263,14 @@ fn refine_reentry(
     low_elapsed_s: f64,
     high_elapsed_s: f64,
     config: &DecayConfig,
+    source: Option<&SpaceWeatherSource>,
 ) -> Result<DecayEstimate, DecayError> {
     let threshold = config.reentry_altitude_km;
     let root_elapsed_s = try_bisect_crossing_until(
         low_elapsed_s,
         high_elapsed_s,
         |elapsed_s| {
-            let state = propagate_segment(low_state, initial_epoch + elapsed_s, config)?;
+            let state = propagate_segment(low_state, initial_epoch + elapsed_s, config, source)?;
             let altitude = geodetic_altitude_km(&state).map_err(DecayError::Propagation)?;
             Ok(altitude - threshold)
         },
@@ -250,7 +279,8 @@ fn refine_reentry(
     )
     .map_err(map_root_error)?;
 
-    let reentry_state = propagate_segment(low_state, initial_epoch + root_elapsed_s, config)?;
+    let reentry_state =
+        propagate_segment(low_state, initial_epoch + root_elapsed_s, config, source)?;
     let reentry_altitude_km =
         geodetic_altitude_km(&reentry_state).map_err(DecayError::Propagation)?;
     Ok(DecayEstimate {
@@ -273,6 +303,7 @@ fn propagate_segment(
     initial: CartesianState,
     t_end_tdb_seconds: f64,
     config: &DecayConfig,
+    source: Option<&SpaceWeatherSource>,
 ) -> Result<CartesianState, DecayError> {
     let propagator = StatePropagator {
         initial,
@@ -280,6 +311,7 @@ fn propagate_segment(
         integrator: config.integrator,
         options: config.options,
         drag: Some(config.drag),
+        space_weather: source.cloned(),
     };
     Ok(propagator
         .propagate_to(t_end_tdb_seconds)
@@ -373,12 +405,14 @@ mod tests {
             initial,
             initial.epoch_tdb_seconds + estimate.time_to_decay_s - config.crossing_tolerance_s,
             &config,
+            None,
         )
         .expect("before crossing");
         let after = propagate_segment(
             initial,
             initial.epoch_tdb_seconds + estimate.time_to_decay_s + config.crossing_tolerance_s,
             &config,
+            None,
         )
         .expect("after crossing");
         let before_alt = geodetic_altitude_km(&before).expect("before altitude");

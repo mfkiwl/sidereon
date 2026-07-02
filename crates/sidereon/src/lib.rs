@@ -269,9 +269,14 @@ pub use sidereon_core::astro::bodies::{
     observe, observe_spk_body, Ecliptic, Equatorial, Horizontal, Observation, ObserveOptions,
     Refraction, Target,
 };
-pub use sidereon_core::astro::forces::{DragForce, SpaceWeather};
+pub use sidereon_core::astro::forces::{
+    DragForce, SourcedDragForce, SpaceWeather, SpaceWeatherSource,
+};
 pub use sidereon_core::astro::frames::transforms::gcrs_to_true_of_date_matrix;
-pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
+pub use sidereon_core::astro::space_weather::{
+    ObservationClass, SpaceWeatherPolicy, SpaceWeatherSample, SpaceWeatherTable,
+};
+pub use sidereon_core::astro::{passes, propagator, sgp4, space_weather, state, tca, tle};
 
 /// Root-level shortcut for satellite-relative frames and CW propagation.
 ///

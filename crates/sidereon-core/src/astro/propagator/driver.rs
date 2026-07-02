@@ -114,6 +114,7 @@ impl PropagationConfig {
             integrator: self.integrator,
             options: self.options,
             drag: self.drag,
+            space_weather: None,
         }
     }
 }
@@ -227,6 +228,7 @@ mod tests {
                 dense_output: false,
             },
             drag: None,
+            space_weather: None,
         }
         .ephemeris(&epochs)
         .expect("manual propagation");
@@ -267,6 +269,7 @@ mod tests {
             integrator: IntegratorKind::Rk4,
             options,
             drag: None,
+            space_weather: None,
         }
         .ephemeris(&epochs)
         .expect("manual propagation");

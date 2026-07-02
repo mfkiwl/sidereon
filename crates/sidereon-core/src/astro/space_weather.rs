@@ -3,6 +3,12 @@
 //! The parser is sans-IO: callers supply bytes or text from the CelesTrak
 //! CSV or fixed-width product. Lookups return the existing drag input type used
 //! by the NRLMSISE-00 drag path.
+//!
+//! References:
+//! - Picone, Hedin, Drob, and Aikin, "NRLMSISE-00 empirical model of the
+//!   atmosphere", JGR 107(A12), 2002.
+//! - CelesTrak CSSI space-weather format:
+//!   <https://celestrak.org/SpaceData/SpaceWx-format.php>.
 
 use crate::astro::atmosphere::{ApArray, DEFAULT_AP};
 use crate::astro::constants::time::SECONDS_PER_DAY_I64;
@@ -16,48 +22,93 @@ use crate::format::columns;
 pub use crate::format::{Diagnostics, Parsed, RecordRef, Skip, SkipReason, Warning, WarningKind};
 use crate::validate;
 use crate::validate::FieldError;
+use std::fmt::Write as _;
 
 const CSV_HEADER: &str = "DATE,BSRN,ND,KP1,KP2,KP3,KP4,KP5,KP6,KP7,KP8,KP_SUM,AP1,AP2,AP3,AP4,AP5,AP6,AP7,AP8,AP_AVG,CP,C9,ISN,F10.7_OBS,F10.7_ADJ,F10.7_DATA_TYPE,F10.7_OBS_CENTER81,F10.7_OBS_LAST81,F10.7_ADJ_CENTER81,F10.7_ADJ_LAST81";
+const TXT_HEADER_COMMENTS: &str = "\
+# --------------------------------------------------------------------------------------------------------------------------------\n\
+#                              SPACE WEATHER DATA\n\
+# --------------------------------------------------------------------------------------------------------------------------------\n\
+#\n\
+# See https://celestrak.org/SpaceData/SpaceWx-format.php for format details.\n\
+#\n\
+# FORMAT(I4,I3,I3,I5,I3,8I3,I4,8I4,I4,F4.1,I2,I4,F6.1,I2,5F6.1)\n\
+# --------------------------------------------------------------------------------------------------------------------------------\n\
+#                                                                                             Adj     Adj   Adj   Obs   Obs   Obs \n\
+# yy mm dd BSRN ND Kp Kp Kp Kp Kp Kp Kp Kp Sum Ap  Ap  Ap  Ap  Ap  Ap  Ap  Ap  Avg Cp C9 ISN F10.7 Q Ctr81 Lst81 F10.7 Ctr81 Lst81\n\
+# --------------------------------------------------------------------------------------------------------------------------------\n\
+#";
 
+/// Provenance class of one daily CelesTrak space-weather row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ObservationClass {
+    /// Observed row (`OBS` in CSV, `OBSERVED` txt section with qualifier other than 4).
     Observed,
+    /// Source-interpolated observed row (`INT` in CSV, `OBSERVED` txt with qualifier 4).
     Interpolated,
+    /// Daily predicted row (`PRD` in CSV, `DAILY_PREDICTED` txt section).
     DailyPredicted,
+    /// Monthly predicted row (`PRM` in CSV, `MONTHLY_PREDICTED` txt section).
     MonthlyPredicted,
 }
 
+/// One CelesTrak CSSI daily space-weather record.
+///
+/// Fields are stored at source quantization so serializers can reproduce the
+/// product widths and decimal precision. Missing source fields are `None`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpaceWeatherDay {
+    /// UTC civil year.
     pub year: i32,
+    /// UTC civil month in `1..=12`.
     pub month: u8,
+    /// UTC civil day of month.
     pub day: u8,
+    /// Row provenance and prediction class.
     pub class: ObservationClass,
+    /// Bartels solar rotation number.
     pub bsrn: Option<u16>,
+    /// Day within the 27-day Bartels rotation.
     pub nd: Option<u8>,
+    /// Kp per 3-hour UT bin, stored as source Kp times 10.
     pub kp_10: [Option<u16>; 8],
+    /// Daily sum of the eight stored Kp values.
     pub kp_sum_10: Option<u16>,
+    /// Planetary equivalent amplitude `ap` per 3-hour UT bin.
     pub ap: [Option<u16>; 8],
+    /// Daily Ap index (`AP_AVG`).
     pub ap_avg: Option<u16>,
+    /// Planetary daily character figure Cp, stored times 10.
     pub cp_10: Option<u8>,
+    /// C9 index.
     pub c9: Option<u8>,
+    /// International sunspot number.
     pub isn: Option<u16>,
+    /// Fixed-width text flux qualifier; absent in CSV.
     pub flux_qualifier: Option<u8>,
+    /// Observed F10.7 flux at actual Earth-Sun distance, sfu.
     pub f107_obs: Option<f64>,
+    /// F10.7 flux adjusted to 1 AU, sfu.
     pub f107_adj: Option<f64>,
+    /// Centered 81-day average of observed F10.7, sfu.
     pub f107_obs_center81: Option<f64>,
+    /// Trailing 81-day average of observed F10.7, sfu.
     pub f107_obs_last81: Option<f64>,
+    /// Centered 81-day average of adjusted F10.7, sfu.
     pub f107_adj_center81: Option<f64>,
+    /// Trailing 81-day average of adjusted F10.7, sfu.
     pub f107_adj_last81: Option<f64>,
 }
 
 impl SpaceWeatherDay {
+    /// Kp for one 3-hour bin as the physical Kp value, not times 10.
     pub fn kp(&self, bin: usize) -> Option<f64> {
         self.kp_10
             .get(bin)
             .and_then(|v| v.map(|v| f64::from(v) / 10.0))
     }
 
+    /// Cp as the physical one-decimal value.
     pub fn cp(&self) -> Option<f64> {
         self.cp_10.map(|v| f64::from(v) / 10.0)
     }
@@ -67,68 +118,108 @@ impl SpaceWeatherDay {
     }
 }
 
+/// Time-indexed CelesTrak CSSI space-weather table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpaceWeatherTable {
     days: Vec<SpaceWeatherDay>,
     monthly: Vec<SpaceWeatherDay>,
+    txt_updated: Option<String>,
 }
 
+/// Coverage summary for a parsed space-weather table.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpaceWeatherCoverage {
+    /// Start of the first covered UTC day, as J2000 seconds.
     pub first_j2000_s: f64,
+    /// Start of the last observed daily row, as J2000 seconds.
     pub last_observed_j2000_s: Option<f64>,
+    /// Start of the last daily-predicted row, as J2000 seconds.
     pub last_daily_predicted_j2000_s: Option<f64>,
+    /// End of the last covered day overall, as an exclusive J2000-second bound.
     pub end_j2000_s: f64,
 }
 
+/// Errors from parsing CelesTrak space-weather products or looking up samples.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum SpaceWeatherError {
+    /// Input is neither the CSV schema nor the CSSI fixed-width text schema.
     #[error("unrecognized space-weather format")]
     UnrecognizedFormat,
+    /// Structural failure that prevents a table from being built.
     #[error("malformed space-weather input at line {line}: {reason}")]
     Malformed { line: usize, reason: String },
+    /// Input bytes are not UTF-8 text.
     #[error("space-weather input is not valid UTF-8")]
     NotText,
+    /// Lookup before the table can supply required rows.
     #[error("space-weather lookup before coverage")]
     BeforeCoverage {
+        /// Requested epoch as J2000 seconds.
         requested_j2000_s: f64,
+        /// Start of table coverage as J2000 seconds.
         first_j2000_s: f64,
     },
+    /// Lookup at or beyond the table's exclusive coverage end.
     #[error("space-weather lookup after coverage")]
     AfterCoverage {
+        /// Requested epoch as J2000 seconds.
         requested_j2000_s: f64,
+        /// End of table coverage as J2000 seconds.
         end_j2000_s: f64,
     },
+    /// A covered day or required field is missing.
     #[error("space-weather data missing {field} on {year:04}-{month:02}-{day:02}")]
     MissingData {
+        /// UTC civil year.
         year: i32,
+        /// UTC civil month.
         month: u8,
+        /// UTC civil day.
         day: u8,
+        /// Missing field name.
         field: &'static str,
     },
+    /// Lookup policy rejected a row class.
     #[error("space-weather row class rejected by policy")]
     RejectedByPolicy {
+        /// Rejected row class.
         class: ObservationClass,
+        /// UTC civil year.
         year: i32,
+        /// UTC civil month.
         month: u8,
+        /// UTC civil day.
         day: u8,
     },
+    /// Lookup epoch was non-finite or outside the representable civil range.
     #[error("invalid space-weather epoch")]
-    InvalidEpoch { epoch_j2000_s_bits: u64 },
+    InvalidEpoch {
+        /// `f64::to_bits()` of the rejected epoch.
+        epoch_j2000_s_bits: u64,
+    },
 }
 
+/// NRLMSISE-00 drag input plus metadata about the consulted rows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpaceWeatherSample {
+    /// Space-weather values to feed the drag path.
     pub space_weather: SpaceWeather,
+    /// Least-trusted class among the rows consulted.
     pub class: ObservationClass,
+    /// True when monthly-predicted geomagnetic data defaulted to quiet Ap.
     pub ap_defaulted: bool,
 }
 
+/// Lookup policy for rejecting lower-trust rows or monthly Ap defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpaceWeatherPolicy {
+    /// Permit source-interpolated observed rows.
     pub allow_interpolated: bool,
+    /// Permit daily predicted rows.
     pub allow_daily_predicted: bool,
+    /// Permit monthly predicted rows.
     pub allow_monthly_predicted: bool,
+    /// Reject monthly rows instead of using the quiet geomagnetic default.
     pub require_geomagnetic: bool,
 }
 
@@ -144,19 +235,23 @@ impl Default for SpaceWeatherPolicy {
 }
 
 impl SpaceWeatherTable {
+    /// All daily-resolution rows, sorted by date.
     pub fn days(&self) -> &[SpaceWeatherDay] {
         &self.days
     }
 
+    /// All monthly-predicted rows, sorted by date.
     pub fn monthly(&self) -> &[SpaceWeatherDay] {
         &self.monthly
     }
 
+    /// Row for a UTC civil date, including monthly holdover when applicable.
     pub fn day(&self, year: i32, month: u8, day: u8) -> Option<&SpaceWeatherDay> {
         let jdn = julian_day_number(year, i32::from(month), i32::from(day));
         self.day_by_jdn(jdn)
     }
 
+    /// Summary of the dates covered by this table.
     pub fn coverage(&self) -> SpaceWeatherCoverage {
         let first_jdn = self.first_jdn().expect("nonempty table");
         let end_jdn = self.end_jdn().expect("nonempty table");
@@ -165,28 +260,33 @@ impl SpaceWeatherTable {
             last_observed_j2000_s: self
                 .days
                 .iter()
-                .filter(|row| matches!(row.class, ObservationClass::Observed))
-                .next_back()
+                .rfind(|row| matches!(row.class, ObservationClass::Observed))
                 .map(|row| day_start_j2000_s(row.jdn())),
             last_daily_predicted_j2000_s: self
                 .days
                 .iter()
-                .filter(|row| matches!(row.class, ObservationClass::DailyPredicted))
-                .next_back()
+                .rfind(|row| matches!(row.class, ObservationClass::DailyPredicted))
                 .map(|row| day_start_j2000_s(row.jdn())),
             end_j2000_s: day_start_j2000_s(end_jdn),
         }
     }
 
+    /// NRLMSISE-00 conventional space-weather inputs at an epoch.
+    ///
+    /// `epoch_j2000_s` is treated as UT seconds on the same convention used by
+    /// the drag module for `CartesianState::epoch_tdb_seconds`; the TDB-UT
+    /// difference is below one minute against daily and 3-hour source data.
     pub fn space_weather_at(&self, epoch_j2000_s: f64) -> Result<SpaceWeather, SpaceWeatherError> {
         self.sample_at(epoch_j2000_s)
             .map(|sample| sample.space_weather)
     }
 
+    /// Lookup a sample with default policy, returning values plus row metadata.
     pub fn sample_at(&self, epoch_j2000_s: f64) -> Result<SpaceWeatherSample, SpaceWeatherError> {
         self.sample_at_with_policy(epoch_j2000_s, SpaceWeatherPolicy::default())
     }
 
+    /// Lookup a sample with explicit row-class and geomagnetic-default policy.
     pub fn sample_at_with_policy(
         &self,
         epoch_j2000_s: f64,
@@ -215,6 +315,7 @@ impl SpaceWeatherTable {
         })
     }
 
+    /// Build the NRLMSISE-00 seven-element Ap history array at an epoch.
     pub fn ap_array_at(&self, epoch_j2000_s: f64) -> Result<ApArray, SpaceWeatherError> {
         let (jdn, bin) = epoch_day_and_ap_bin(epoch_j2000_s)?;
         self.check_epoch_coverage(epoch_j2000_s, jdn, false)?;
@@ -294,7 +395,7 @@ impl SpaceWeatherTable {
         if jdn < required_first {
             return Err(SpaceWeatherError::BeforeCoverage {
                 requested_j2000_s,
-                first_j2000_s: day_start_j2000_s(required_first),
+                first_j2000_s: self.coverage().first_j2000_s,
             });
         }
         if jdn >= end_jdn {
@@ -359,6 +460,7 @@ impl SpaceWeatherTable {
     }
 }
 
+/// Parse the CelesTrak CSV encoding.
 pub fn parse_csv(text: &str) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherError> {
     let mut lines = text.lines();
     let header = lines.next().ok_or_else(|| SpaceWeatherError::Malformed {
@@ -394,17 +496,17 @@ pub fn parse_csv(text: &str) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherEr
                 previous_jdn = Some(jdn);
                 records.push((line_no, row));
             }
-            Err(error) => {
-                diagnostics.push_skip(skip_line(line_no, SkipReason::MalformedField(error)))
-            }
+            Err(reason) => diagnostics.push_skip(skip_line(line_no, reason)),
         }
     }
-    build_table(records, diagnostics)
+    build_table(records, diagnostics, None)
 }
 
+/// Parse the CelesTrak CSSI fixed-width text encoding.
 pub fn parse_txt(text: &str) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherError> {
     let mut saw_datatype = false;
     let mut section = None;
+    let mut txt_updated = None;
     let mut records = Vec::new();
     let mut diagnostics = Diagnostics::new();
     let mut observed_count = None;
@@ -426,43 +528,83 @@ pub fn parse_txt(text: &str) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherEr
             saw_datatype = true;
             continue;
         }
-        if trimmed.starts_with("VERSION ") || trimmed.starts_with("UPDATED ") {
+        if trimmed.starts_with("VERSION ") {
+            continue;
+        }
+        if let Some(updated) = trimmed.strip_prefix("UPDATED ") {
+            txt_updated = Some(updated.to_string());
             continue;
         }
         if let Some(count) = trimmed.strip_prefix("NUM_OBSERVED_POINTS ") {
-            observed_count = parse_count(count);
+            observed_count = parse_count(count).map(|count| (line_no, count));
             continue;
         }
         if let Some(count) = trimmed.strip_prefix("NUM_DAILY_PREDICTED_POINTS ") {
-            daily_count = parse_count(count);
+            daily_count = parse_count(count).map(|count| (line_no, count));
             continue;
         }
         if let Some(count) = trimmed.strip_prefix("NUM_MONTHLY_PREDICTED_POINTS ") {
-            monthly_count = parse_count(count);
+            monthly_count = parse_count(count).map(|count| (line_no, count));
             continue;
         }
         match trimmed {
             "BEGIN OBSERVED" => {
+                if section.is_some() {
+                    return Err(SpaceWeatherError::Malformed {
+                        line: line_no,
+                        reason: "nested fixed-width section".to_string(),
+                    });
+                }
                 section = Some(TxtSection::Observed);
                 continue;
             }
             "END OBSERVED" => {
+                if section != Some(TxtSection::Observed) {
+                    return Err(SpaceWeatherError::Malformed {
+                        line: line_no,
+                        reason: "END OBSERVED without matching BEGIN".to_string(),
+                    });
+                }
                 section = None;
                 continue;
             }
             "BEGIN DAILY_PREDICTED" => {
+                if section.is_some() {
+                    return Err(SpaceWeatherError::Malformed {
+                        line: line_no,
+                        reason: "nested fixed-width section".to_string(),
+                    });
+                }
                 section = Some(TxtSection::DailyPredicted);
                 continue;
             }
             "END DAILY_PREDICTED" => {
+                if section != Some(TxtSection::DailyPredicted) {
+                    return Err(SpaceWeatherError::Malformed {
+                        line: line_no,
+                        reason: "END DAILY_PREDICTED without matching BEGIN".to_string(),
+                    });
+                }
                 section = None;
                 continue;
             }
             "BEGIN MONTHLY_PREDICTED" => {
+                if section.is_some() {
+                    return Err(SpaceWeatherError::Malformed {
+                        line: line_no,
+                        reason: "nested fixed-width section".to_string(),
+                    });
+                }
                 section = Some(TxtSection::MonthlyPredicted);
                 continue;
             }
             "END MONTHLY_PREDICTED" => {
+                if section != Some(TxtSection::MonthlyPredicted) {
+                    return Err(SpaceWeatherError::Malformed {
+                        line: line_no,
+                        reason: "END MONTHLY_PREDICTED without matching BEGIN".to_string(),
+                    });
+                }
                 section = None;
                 continue;
             }
@@ -505,69 +647,73 @@ pub fn parse_txt(text: &str) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherEr
             reason: "unterminated fixed-width section".to_string(),
         });
     }
-    warn_count_mismatch(observed_count, parsed_observed, 1, &mut diagnostics);
-    warn_count_mismatch(daily_count, parsed_daily, 1, &mut diagnostics);
-    warn_count_mismatch(monthly_count, parsed_monthly, 1, &mut diagnostics);
-    build_table(records, diagnostics)
+    warn_count_mismatch(observed_count, parsed_observed, &mut diagnostics);
+    warn_count_mismatch(daily_count, parsed_daily, &mut diagnostics);
+    warn_count_mismatch(monthly_count, parsed_monthly, &mut diagnostics);
+    build_table(records, diagnostics, txt_updated)
 }
 
+/// Sniff and parse either CelesTrak space-weather encoding from UTF-8 bytes.
 pub fn parse(data: &[u8]) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherError> {
     let text = std::str::from_utf8(data).map_err(|_| SpaceWeatherError::NotText)?;
     let first_content = text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or(SpaceWeatherError::UnrecognizedFormat)?;
     if first_content == CSV_HEADER {
         parse_csv(text)
-    } else if first_content == "DATATYPE CssiSpaceWeather" || text.contains("CssiSpaceWeather") {
+    } else if first_content == "DATATYPE CssiSpaceWeather" {
         parse_txt(text)
     } else {
         Err(SpaceWeatherError::UnrecognizedFormat)
     }
 }
 
-fn parse_csv_record(line: &str) -> Result<SpaceWeatherDay, FieldError> {
+fn parse_csv_record(line: &str) -> Result<SpaceWeatherDay, SkipReason> {
     let fields: Vec<_> = line.split(',').collect();
     if fields.len() != 31 {
-        return Err(FieldError::OutOfRange {
-            field: "CSV column count",
-            min: 31.0,
-            max: 31.0,
-            upper_inclusive: true,
+        return Err(if fields.len() < 31 {
+            SkipReason::Truncated
+        } else {
+            SkipReason::InconsistentRecord("CSV column count")
         });
     }
-    let (year, month, day) = parse_csv_date(fields[0])?;
-    let class = parse_csv_class(fields[26])?;
+    let (year, month, day) = parse_csv_date(fields[0]).map_err(SkipReason::MalformedField)?;
+    let class = parse_csv_class(fields[26]).map_err(SkipReason::MalformedField)?;
     let mut kp_10 = [None; 8];
     for (idx, slot) in kp_10.iter_mut().enumerate() {
-        *slot = opt_u16(fields[3 + idx], "KP")?;
+        *slot = opt_u16(fields[3 + idx], "KP").map_err(SkipReason::MalformedField)?;
     }
     let mut ap = [None; 8];
     for (idx, slot) in ap.iter_mut().enumerate() {
-        *slot = opt_u16(fields[12 + idx], "AP")?;
+        *slot = opt_u16(fields[12 + idx], "AP").map_err(SkipReason::MalformedField)?;
     }
     Ok(SpaceWeatherDay {
         year,
         month,
         day,
         class,
-        bsrn: opt_u16(fields[1], "BSRN")?,
-        nd: opt_u8(fields[2], "ND")?,
+        bsrn: opt_u16(fields[1], "BSRN").map_err(SkipReason::MalformedField)?,
+        nd: opt_u8(fields[2], "ND").map_err(SkipReason::MalformedField)?,
         kp_10,
-        kp_sum_10: opt_u16(fields[11], "KP_SUM")?,
+        kp_sum_10: opt_u16(fields[11], "KP_SUM").map_err(SkipReason::MalformedField)?,
         ap,
-        ap_avg: opt_u16(fields[20], "AP_AVG")?,
-        cp_10: opt_cp_10(fields[21])?,
-        c9: opt_u8(fields[22], "C9")?,
-        isn: opt_u16(fields[23], "ISN")?,
+        ap_avg: opt_u16(fields[20], "AP_AVG").map_err(SkipReason::MalformedField)?,
+        cp_10: opt_cp_10(fields[21]).map_err(SkipReason::MalformedField)?,
+        c9: opt_u8(fields[22], "C9").map_err(SkipReason::MalformedField)?,
+        isn: opt_u16(fields[23], "ISN").map_err(SkipReason::MalformedField)?,
         flux_qualifier: None,
-        f107_obs: opt_f64(fields[24], "F10.7_OBS")?,
-        f107_adj: opt_f64(fields[25], "F10.7_ADJ")?,
-        f107_obs_center81: opt_f64(fields[27], "F10.7_OBS_CENTER81")?,
-        f107_obs_last81: opt_f64(fields[28], "F10.7_OBS_LAST81")?,
-        f107_adj_center81: opt_f64(fields[29], "F10.7_ADJ_CENTER81")?,
-        f107_adj_last81: opt_f64(fields[30], "F10.7_ADJ_LAST81")?,
+        f107_obs: opt_f64(fields[24], "F10.7_OBS").map_err(SkipReason::MalformedField)?,
+        f107_adj: opt_f64(fields[25], "F10.7_ADJ").map_err(SkipReason::MalformedField)?,
+        f107_obs_center81: opt_f64(fields[27], "F10.7_OBS_CENTER81")
+            .map_err(SkipReason::MalformedField)?,
+        f107_obs_last81: opt_f64(fields[28], "F10.7_OBS_LAST81")
+            .map_err(SkipReason::MalformedField)?,
+        f107_adj_center81: opt_f64(fields[29], "F10.7_ADJ_CENTER81")
+            .map_err(SkipReason::MalformedField)?,
+        f107_adj_last81: opt_f64(fields[30], "F10.7_ADJ_LAST81")
+            .map_err(SkipReason::MalformedField)?,
     })
 }
 
@@ -656,6 +802,7 @@ fn parse_txt_record(line: &str, section: TxtSection) -> Result<SpaceWeatherDay, 
 fn build_table(
     records: Vec<(usize, SpaceWeatherDay)>,
     mut diagnostics: Diagnostics,
+    txt_updated: Option<String>,
 ) -> Result<Parsed<SpaceWeatherTable>, SpaceWeatherError> {
     let mut days = Vec::new();
     let mut monthly = Vec::new();
@@ -666,8 +813,8 @@ fn build_table(
             &mut days
         };
         if target
-            .iter()
-            .any(|existing: &SpaceWeatherDay| existing.jdn() == row.jdn())
+            .last()
+            .is_some_and(|existing: &SpaceWeatherDay| existing.jdn() == row.jdn())
         {
             diagnostics.push_skip(skip_line(
                 line,
@@ -686,9 +833,221 @@ fn build_table(
         });
     }
     Ok(Parsed::new(
-        SpaceWeatherTable { days, monthly },
+        SpaceWeatherTable {
+            days,
+            monthly,
+            txt_updated,
+        },
         diagnostics,
     ))
+}
+
+/// Serialize a table to the CelesTrak CSV encoding.
+pub fn encode_csv(table: &SpaceWeatherTable) -> String {
+    let mut out = String::new();
+    out.push_str(CSV_HEADER);
+    out.push('\n');
+    for row in table.days.iter().chain(table.monthly.iter()) {
+        push_csv_row(&mut out, row);
+    }
+    out
+}
+
+/// Serialize a table to the CelesTrak CSSI fixed-width text encoding.
+///
+/// When the table came from CSV, the text-only flux qualifier field is blank.
+/// When the table came from txt and had an `UPDATED` header, that header is
+/// reproduced.
+pub fn encode_txt(table: &SpaceWeatherTable) -> String {
+    let mut out = String::new();
+    out.push_str("DATATYPE CssiSpaceWeather\n");
+    out.push_str("VERSION 1.2\n");
+    if let Some(updated) = &table.txt_updated {
+        let _ = writeln!(out, "UPDATED {updated}");
+    }
+    out.push_str(TXT_HEADER_COMMENTS);
+    out.push('\n');
+
+    let observed_count = table
+        .days
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.class,
+                ObservationClass::Observed | ObservationClass::Interpolated
+            )
+        })
+        .count();
+    let daily_count = table
+        .days
+        .iter()
+        .filter(|row| row.class == ObservationClass::DailyPredicted)
+        .count();
+    write_txt_section(
+        &mut out,
+        "OBSERVED",
+        observed_count,
+        table.days.iter().filter(|row| {
+            matches!(
+                row.class,
+                ObservationClass::Observed | ObservationClass::Interpolated
+            )
+        }),
+    );
+    out.push('\n');
+    write_txt_section(
+        &mut out,
+        "DAILY_PREDICTED",
+        daily_count,
+        table
+            .days
+            .iter()
+            .filter(|row| row.class == ObservationClass::DailyPredicted),
+    );
+    out.push('\n');
+    write_txt_section(
+        &mut out,
+        "MONTHLY_PREDICTED",
+        table.monthly.len(),
+        table.monthly.iter(),
+    );
+    out
+}
+
+fn push_csv_row(out: &mut String, row: &SpaceWeatherDay) {
+    let class = match row.class {
+        ObservationClass::Observed => "OBS",
+        ObservationClass::Interpolated => "INT",
+        ObservationClass::DailyPredicted => "PRD",
+        ObservationClass::MonthlyPredicted => "PRM",
+    };
+    let _ = write!(out, "{:04}-{:02}-{:02}", row.year, row.month, row.day);
+    push_csv_opt_u16(out, row.bsrn);
+    push_csv_opt_u8(out, row.nd);
+    for value in row.kp_10 {
+        push_csv_opt_u16(out, value);
+    }
+    push_csv_opt_u16(out, row.kp_sum_10);
+    for value in row.ap {
+        push_csv_opt_u16(out, value);
+    }
+    push_csv_opt_u16(out, row.ap_avg);
+    push_csv_opt_cp(out, row.cp_10);
+    push_csv_opt_u8(out, row.c9);
+    push_csv_opt_u16(out, row.isn);
+    push_csv_opt_f64(out, row.f107_obs);
+    push_csv_opt_f64(out, row.f107_adj);
+    out.push(',');
+    out.push_str(class);
+    push_csv_opt_f64(out, row.f107_obs_center81);
+    push_csv_opt_f64(out, row.f107_obs_last81);
+    push_csv_opt_f64(out, row.f107_adj_center81);
+    push_csv_opt_f64(out, row.f107_adj_last81);
+    out.push('\n');
+}
+
+fn push_csv_opt_u16(out: &mut String, value: Option<u16>) {
+    out.push(',');
+    if let Some(value) = value {
+        let _ = write!(out, "{value}");
+    }
+}
+
+fn push_csv_opt_u8(out: &mut String, value: Option<u8>) {
+    out.push(',');
+    if let Some(value) = value {
+        let _ = write!(out, "{value}");
+    }
+}
+
+fn push_csv_opt_cp(out: &mut String, value: Option<u8>) {
+    out.push(',');
+    if let Some(value) = value {
+        let _ = write!(out, "{:.1}", f64::from(value) / 10.0);
+    }
+}
+
+fn push_csv_opt_f64(out: &mut String, value: Option<f64>) {
+    out.push(',');
+    if let Some(value) = value {
+        let _ = write!(out, "{value:.1}");
+    }
+}
+
+fn write_txt_section<'a, I>(out: &mut String, name: &str, count: usize, rows: I)
+where
+    I: IntoIterator<Item = &'a SpaceWeatherDay>,
+{
+    let _ = writeln!(out, "NUM_{name}_POINTS {count}");
+    let _ = writeln!(out, "BEGIN {name}");
+    for row in rows {
+        push_txt_row(out, row);
+    }
+    let _ = writeln!(out, "END {name}");
+}
+
+fn push_txt_row(out: &mut String, row: &SpaceWeatherDay) {
+    let _ = write!(out, "{:4} {:02} {:02}", row.year, row.month, row.day);
+    push_txt_opt_u16(out, row.bsrn, 5);
+    push_txt_opt_u8(out, row.nd, 3);
+    for value in row.kp_10 {
+        push_txt_opt_u16(out, value, 3);
+    }
+    push_txt_opt_u16(out, row.kp_sum_10, 4);
+    for value in row.ap {
+        push_txt_opt_u16(out, value, 4);
+    }
+    push_txt_opt_u16(out, row.ap_avg, 4);
+    push_txt_opt_cp(out, row.cp_10);
+    push_txt_opt_u8(out, row.c9, 2);
+    push_txt_opt_u16(out, row.isn, 4);
+    push_txt_opt_f64(out, row.f107_adj, 6);
+    push_txt_opt_u8(out, row.flux_qualifier, 2);
+    push_txt_opt_f64(out, row.f107_adj_center81, 6);
+    push_txt_opt_f64(out, row.f107_adj_last81, 6);
+    push_txt_opt_f64(out, row.f107_obs, 6);
+    push_txt_opt_f64(out, row.f107_obs_center81, 6);
+    push_txt_opt_f64(out, row.f107_obs_last81, 6);
+    out.push('\n');
+}
+
+fn push_txt_opt_u16(out: &mut String, value: Option<u16>, width: usize) {
+    if let Some(value) = value {
+        let _ = write!(out, "{value:width$}");
+    } else {
+        push_spaces(out, width);
+    }
+}
+
+fn push_txt_opt_u8(out: &mut String, value: Option<u8>, width: usize) {
+    if let Some(value) = value {
+        let _ = write!(out, "{value:width$}");
+    } else {
+        push_spaces(out, width);
+    }
+}
+
+fn push_txt_opt_cp(out: &mut String, value: Option<u8>) {
+    if let Some(value) = value {
+        let _ = write!(out, "{:4.1}", f64::from(value) / 10.0);
+    } else {
+        push_spaces(out, 4);
+    }
+}
+
+fn push_txt_opt_f64(out: &mut String, value: Option<f64>, width: usize) {
+    if let Some(value) = value {
+        let formatted = format!("{value:.1}");
+        let _ = write!(out, "{formatted:>width$}");
+    } else {
+        push_spaces(out, width);
+    }
+}
+
+fn push_spaces(out: &mut String, count: usize) {
+    for _ in 0..count {
+        out.push(' ');
+    }
 }
 
 fn parse_csv_date(text: &str) -> Result<(i32, u8, u8), FieldError> {
@@ -823,12 +1182,11 @@ fn parse_count(text: &str) -> Option<usize> {
 }
 
 fn warn_count_mismatch(
-    declared: Option<usize>,
+    declared: Option<(usize, usize)>,
     actual: usize,
-    line: usize,
     diagnostics: &mut Diagnostics,
 ) {
-    if declared.is_some_and(|declared| declared != actual) {
+    if let Some((line, _)) = declared.filter(|(_, declared)| *declared != actual) {
         diagnostics.push_warning(Warning {
             at: RecordRef::at_line(line),
             kind: WarningKind::Mismatch,
@@ -1006,6 +1364,10 @@ mod tests {
             ap[5],
             (18.0 + 22.0 + 39.0 + 67.0 + 111.0 + 132.0 + 80.0 + 48.0) / 8.0
         );
+        assert_eq!(
+            ap[6],
+            (12.0 + 15.0 + 18.0 + 27.0 + 48.0 + 39.0 + 22.0 + 27.0) / 8.0
+        );
     }
 
     #[test]
@@ -1015,15 +1377,70 @@ mod tests {
             parse(b"not cssi"),
             Err(SpaceWeatherError::UnrecognizedFormat)
         ));
+        assert!(matches!(
+            parse(b"not a header\nCssiSpaceWeather"),
+            Err(SpaceWeatherError::UnrecognizedFormat)
+        ));
         assert_eq!(parse(CSV.as_bytes()).unwrap().value.days().len(), 3);
     }
 
     #[test]
-    fn malformed_csv_rows_are_diagnostics() {
-        let input = format!("{CSV}2024-05-12,bad\n");
-        let parsed = parse_csv(&input).expect("forgiving parse");
+    fn parser_diagnostics_cover_bad_duplicate_and_ordered_rows() {
+        let truncated = format!("{CSV}2024-05-12,bad\n");
+        let parsed = parse_csv(&truncated).expect("forgiving parse");
         assert_eq!(parsed.value.days().len(), 3);
-        assert_eq!(parsed.diagnostics.skips.len(), 1);
+        assert!(matches!(
+            parsed.diagnostics.skips[0].reason,
+            SkipReason::Truncated
+        ));
+
+        let bad_kp = format!(
+            "{CSV}{}",
+            "2024-05-12,2556,4,bad,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n"
+        );
+        let parsed = parse_csv(&bad_kp).expect("forgiving parse");
+        assert_eq!(parsed.value.days().len(), 3);
+        assert!(matches!(
+            parsed.diagnostics.skips[0].reason,
+            SkipReason::MalformedField(FieldError::IntParse { field: "KP", .. })
+        ));
+
+        let duplicate = format!(
+            "{CSV_HEADER}\n{}{}",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n"
+        );
+        let parsed = parse_csv(&duplicate).expect("forgiving duplicate");
+        assert_eq!(parsed.value.days().len(), 1);
+        assert!(matches!(
+            parsed.diagnostics.skips[0].reason,
+            SkipReason::InconsistentRecord("duplicate date")
+        ));
+
+        let out_of_order = format!(
+            "{CSV_HEADER}\n{}{}",
+            "2024-05-10,2556,2,40,50,60,70,67,57,47,37,428,27,48,80,132,111,67,39,22,66,1.8,7,121,190.2,187.1,OBS,151.2,150.9,148.0,147.6\n",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n"
+        );
+        let parsed = parse_csv(&out_of_order).expect("forgiving order check");
+        assert_eq!(parsed.value.days().len(), 1);
+        assert!(matches!(
+            parsed.diagnostics.skips[0].reason,
+            SkipReason::InconsistentRecord("out-of-order date")
+        ));
+    }
+
+    #[test]
+    fn txt_count_mismatch_warns_without_rejecting_observed_only() {
+        let text = format!(
+            "DATATYPE CssiSpaceWeather\nVERSION 1.2\nNUM_OBSERVED_POINTS 2\nBEGIN OBSERVED\n{}\nEND OBSERVED\n",
+            txt_row_observed()
+        );
+        let parsed = parse_txt(&text).expect("txt parses with warning");
+        assert_eq!(parsed.value.days().len(), 1);
+        assert_eq!(parsed.value.monthly().len(), 0);
+        assert_eq!(parsed.diagnostics.warnings.len(), 1);
+        assert_eq!(parsed.value.coverage().last_daily_predicted_j2000_s, None);
     }
 
     #[test]
@@ -1041,6 +1458,160 @@ mod tests {
         assert_eq!(row.f107_obs_center81, Some(150.1));
         assert_eq!(row.f107_adj, Some(162.0));
         assert_eq!(row.f107_adj_center81, Some(147.0));
+    }
+
+    #[test]
+    fn observed_only_file_has_exclusive_end_no_holdover() {
+        let input = format!(
+            "{CSV_HEADER}\n{}{}",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n",
+            "2024-05-10,2556,2,40,50,60,70,67,57,47,37,428,27,48,80,132,111,67,39,22,66,1.8,7,121,190.2,187.1,OBS,151.2,150.9,148.0,147.6\n"
+        );
+        let table = parse_csv(&input).unwrap().value;
+        assert_eq!(table.coverage().last_daily_predicted_j2000_s, None);
+        assert!(matches!(
+            table.sample_at(j2000_seconds(2024, 5, 11, 0, 0, 0.0)),
+            Err(SpaceWeatherError::AfterCoverage { .. })
+        ));
+    }
+
+    #[test]
+    fn gap_days_and_boundaries_report_typed_errors() {
+        let input = format!(
+            "{CSV_HEADER}\n{}{}",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n",
+            "2024-05-11,2556,3,33,30,27,23,20,17,13,10,173,18,15,12,9,7,6,5,4,10,0.8,3,119,176.3,173.0,OBS,152.3,151.1,149.0,148.2\n"
+        );
+        let table = parse_csv(&input).unwrap().value;
+        assert!(matches!(
+            table.sample_at(j2000_seconds(2024, 5, 10, 12, 0, 0.0)),
+            Err(SpaceWeatherError::MissingData {
+                year: 2024,
+                month: 5,
+                day: 10,
+                field: "record"
+            })
+        ));
+        assert!(matches!(
+            table.sample_at(j2000_seconds(2024, 5, 11, 12, 0, 0.0)),
+            Err(SpaceWeatherError::MissingData {
+                year: 2024,
+                month: 5,
+                day: 10,
+                field: "record"
+            })
+        ));
+
+        let table = parse_csv(CSV).unwrap().value;
+        let boundary = table
+            .sample_at(j2000_seconds(2024, 5, 10, 0, 0, 0.0))
+            .expect("day boundary belongs to starting day");
+        assert_eq!(boundary.space_weather.f107, 165.1);
+        assert_eq!(boundary.space_weather.ap, 66.0);
+        assert!(matches!(
+            table.sample_at(j2000_seconds(2024, 5, 9, 0, 0, 0.0)),
+            Err(SpaceWeatherError::BeforeCoverage { .. })
+        ));
+        assert!(matches!(
+            table.sample_at(f64::NAN),
+            Err(SpaceWeatherError::InvalidEpoch { .. })
+        ));
+    }
+
+    #[test]
+    fn policy_rejects_each_non_observed_class_and_geomagnetic_default() {
+        let input = format!(
+            "{CSV_HEADER}\n{}{}{}{}",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n",
+            "2024-05-10,2556,2,40,50,60,70,67,57,47,37,428,27,48,80,132,111,67,39,22,66,1.8,7,121,190.2,187.1,INT,151.2,150.9,148.0,147.6\n",
+            "2024-05-11,2556,3,33,30,27,23,20,17,13,10,173,18,15,12,9,7,6,5,4,10,0.8,3,119,176.3,173.0,PRD,152.3,151.1,149.0,148.2\n",
+            "2024-06-01,2557,24,,,,,,,,,,,,,,,,,,,,,118,171.0,168.0,PRM,153.0,152.0,150.0,149.0\n"
+        );
+        let table = parse_csv(&input).unwrap().value;
+        assert!(matches!(
+            table.sample_at_with_policy(
+                j2000_seconds(2024, 5, 10, 12, 0, 0.0),
+                SpaceWeatherPolicy {
+                    allow_interpolated: false,
+                    ..SpaceWeatherPolicy::default()
+                }
+            ),
+            Err(SpaceWeatherError::RejectedByPolicy {
+                class: ObservationClass::Interpolated,
+                ..
+            })
+        ));
+        assert!(matches!(
+            table.sample_at_with_policy(
+                j2000_seconds(2024, 5, 11, 12, 0, 0.0),
+                SpaceWeatherPolicy {
+                    allow_daily_predicted: false,
+                    ..SpaceWeatherPolicy::default()
+                }
+            ),
+            Err(SpaceWeatherError::RejectedByPolicy {
+                class: ObservationClass::DailyPredicted,
+                ..
+            })
+        ));
+        assert!(matches!(
+            table.sample_at_with_policy(
+                j2000_seconds(2024, 6, 15, 12, 0, 0.0),
+                SpaceWeatherPolicy {
+                    allow_monthly_predicted: false,
+                    ..SpaceWeatherPolicy::default()
+                }
+            ),
+            Err(SpaceWeatherError::RejectedByPolicy {
+                class: ObservationClass::MonthlyPredicted,
+                ..
+            })
+        ));
+        assert!(matches!(
+            table.sample_at_with_policy(
+                j2000_seconds(2024, 6, 15, 12, 0, 0.0),
+                SpaceWeatherPolicy {
+                    require_geomagnetic: true,
+                    ..SpaceWeatherPolicy::default()
+                }
+            ),
+            Err(SpaceWeatherError::RejectedByPolicy {
+                class: ObservationClass::MonthlyPredicted,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn monthly_prediction_is_piecewise_constant_and_ap_slots_fallback_to_daily() {
+        let monthly_input = format!(
+            "{CSV}{}",
+            "2024-07-01,2558,27,,,,,,,,,,,,,,,,,,,,,116,160.0,157.0,PRM,140.0,151.0,147.0,148.0\n"
+        );
+        let table = parse_csv(&monthly_input).unwrap().value;
+        let june_15 = table
+            .sample_at(j2000_seconds(2024, 6, 15, 12, 0, 0.0))
+            .expect("June monthly sample");
+        let june_20 = table
+            .sample_at(j2000_seconds(2024, 6, 20, 12, 0, 0.0))
+            .expect("same monthly sample");
+        let july_15 = table
+            .sample_at(j2000_seconds(2024, 7, 15, 12, 0, 0.0))
+            .expect("next monthly sample");
+        assert_eq!(june_15, june_20);
+        assert_ne!(june_15.space_weather.f107a, july_15.space_weather.f107a);
+
+        let input = format!(
+            "{CSV_HEADER}\n{}{}{}",
+            "2024-05-09,2556,1,23,27,30,33,40,50,47,37,287,9,12,15,18,27,48,39,22,24,1.2,5,120,165.1,162.0,OBS,150.1,149.8,147.0,146.6\n",
+            "2024-05-10,2556,2,40,50,60,70,67,57,47,37,428,27,48,80,132,111,67,39,22,66,1.8,7,121,190.2,187.1,OBS,151.2,150.9,148.0,147.6\n",
+            "2024-05-11,2556,3,33,30,27,23,20,17,13,10,173,18,15,12,9,,6,5,4,10,0.8,3,119,176.3,173.0,OBS,152.3,151.1,149.0,148.2\n"
+        );
+        let table = parse_csv(&input).unwrap().value;
+        let ap = table
+            .ap_array_at(j2000_seconds(2024, 5, 11, 13, 0, 0.0))
+            .expect("AP fallback");
+        assert_eq!(ap[1], 10.0);
     }
 
     fn txt_row_observed() -> String {

@@ -3,9 +3,11 @@ use sidereon_core::data::{
     dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk, mgex_ionex, mgex_nav,
     mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3, parse_skadi_tile_id,
     predicted_ionex, product_convention, rapid_ionex, skadi_archive_url, skadi_band,
-    skadi_source_entry, skadi_tile_id, station_obs, station_obs_filename, station_obs_protocol,
-    station_obs_url, terrain_tile_index, AnalysisCenter, ArchiveCompression, ArchiveProtocol,
-    DataCatalogError, ProductDate, ProductDateTime, ProductType, UltraIssue,
+    skadi_source_entry, skadi_tile_id, space_weather_archive_url, space_weather_cache_relpath,
+    space_weather_filename, space_weather_source_entry, station_obs, station_obs_filename,
+    station_obs_protocol, station_obs_url, terrain_tile_index, AnalysisCenter, ArchiveCompression,
+    ArchiveProtocol, DataCatalogError, ProductDate, ProductDateTime, ProductType,
+    SpaceWeatherProduct, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
@@ -244,6 +246,52 @@ fn skadi_source_entry_and_host_allowlist_are_cataloged() {
         "https://s3.amazonaws.com/elevation-tiles-prod"
     );
     assert!(allowed_hosts().contains(&"s3.amazonaws.com"));
+}
+
+#[test]
+fn celestrak_space_weather_catalog_entry_and_paths_are_stable() {
+    let source = space_weather_source_entry();
+    assert_eq!(source.protocol, ArchiveProtocol::Https);
+    assert_eq!(source.host, "celestrak.org");
+    assert_eq!(source.compression, ArchiveCompression::None);
+    assert_eq!(source.compression.as_str(), "none");
+    assert_eq!(source.root_url, "https://celestrak.org/SpaceData");
+    assert!(allowed_hosts().contains(&"celestrak.org"));
+
+    assert_eq!(SpaceWeatherProduct::All.code(), "sw_all");
+    assert_eq!(
+        SpaceWeatherProduct::from_code("sw_last5"),
+        Some(SpaceWeatherProduct::Last5Years)
+    );
+    assert_eq!("sw_all".parse(), Ok(SpaceWeatherProduct::All));
+    assert_eq!(
+        "bad".parse::<SpaceWeatherProduct>(),
+        Err(DataCatalogError::UnknownProductType("bad".to_string()))
+    );
+    assert_eq!(
+        space_weather_filename(SpaceWeatherProduct::All),
+        "SW-All.csv"
+    );
+    assert_eq!(
+        space_weather_filename(SpaceWeatherProduct::Last5Years),
+        "SW-Last5Years.csv"
+    );
+    assert_eq!(
+        space_weather_archive_url(SpaceWeatherProduct::All),
+        "https://celestrak.org/SpaceData/SW-All.csv"
+    );
+    assert_eq!(
+        space_weather_archive_url(SpaceWeatherProduct::Last5Years),
+        "https://celestrak.org/SpaceData/SW-Last5Years.csv"
+    );
+    assert_eq!(
+        space_weather_cache_relpath(SpaceWeatherProduct::All),
+        "space-weather/SW-All.csv"
+    );
+    assert_eq!(
+        space_weather_cache_relpath(SpaceWeatherProduct::Last5Years),
+        "space-weather/SW-Last5Years.csv"
+    );
 }
 
 #[test]

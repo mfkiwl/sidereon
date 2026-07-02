@@ -209,13 +209,8 @@ impl NtripClientMachine {
             self.headers.clear();
             self.header_bytes = 0;
             self.state = NtripState::AwaitingHeaders;
-            if status != 200 && status != 401 && status != 404 && !(300..400).contains(&status) {
-                self.headers.push((":status".into(), status.to_string()));
-                self.headers.push((":reason".into(), reason.to_string()));
-            } else {
-                self.headers.push((":status".into(), status.to_string()));
-                self.headers.push((":reason".into(), reason.to_string()));
-            }
+            self.headers.push((":status".into(), status.to_string()));
+            self.headers.push((":reason".into(), reason.to_string()));
             return true;
         }
 

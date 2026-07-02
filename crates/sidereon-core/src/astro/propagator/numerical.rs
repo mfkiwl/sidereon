@@ -16,7 +16,8 @@ use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::covariance::{Covariance6, Covariance6Error};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{
-    CompositeForceModel, DragParameters, ForceModel, J2Gravity, TwoBodyGravity,
+    CompositeForceModel, DragParameters, ForceModel, J2Gravity, SourcedDragForce,
+    SpaceWeatherSource, TwoBodyGravity,
 };
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
@@ -127,6 +128,8 @@ pub struct StatePropagator {
     pub options: IntegratorOptions,
     /// Optional atmospheric drag perturbation layered on the gravity model.
     pub drag: Option<DragParameters>,
+    /// Optional per-epoch space-weather source for atmospheric drag.
+    pub space_weather: Option<SpaceWeatherSource>,
 }
 
 impl StatePropagator {
@@ -146,6 +149,7 @@ impl StatePropagator {
             integrator,
             options: IntegratorOptions::default(),
             drag: None,
+            space_weather: None,
         }
     }
 
@@ -161,6 +165,12 @@ impl StatePropagator {
         self
     }
 
+    /// Use a per-epoch space-weather source for the drag perturbation.
+    pub fn with_space_weather(mut self, source: SpaceWeatherSource) -> Self {
+        self.space_weather = Some(source);
+        self
+    }
+
     /// Propagate from the initial epoch to `t_end_tdb_seconds` (an absolute TDB
     /// epoch), returning the underlying integrator's full
     /// [`PropagationResult`]. Bit-for-bit identical to building the force model,
@@ -169,7 +179,7 @@ impl StatePropagator {
         &self,
         t_end_tdb_seconds: f64,
     ) -> Result<PropagationResult, PropagationError> {
-        let force = self.build_force();
+        let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -229,7 +239,7 @@ impl StatePropagator {
         t_end_tdb_seconds: f64,
     ) -> Result<StateTransitionMatrix, PropagationError> {
         crate::validate::finite(t_end_tdb_seconds, "t_end_tdb_seconds").map_err(map_field_error)?;
-        let force = self.build_force();
+        let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -258,10 +268,10 @@ impl StatePropagator {
             let minus = perturb_state(initial, column, -delta);
 
             let plus_final = self
-                .run(plus, t_end_tdb_seconds, &dynamics, &ctx)?
+                .run(plus, t_end_tdb_seconds, dynamics, ctx)?
                 .final_state;
             let minus_final = self
-                .run(minus, t_end_tdb_seconds, &dynamics, &ctx)?
+                .run(minus, t_end_tdb_seconds, dynamics, ctx)?
                 .final_state;
             let plus_vector = state_vector(&plus_final);
             let minus_vector = state_vector(&minus_final);
@@ -292,7 +302,7 @@ impl StatePropagator {
         validate_epoch_finite(self.initial.epoch_tdb_seconds, "initial.epoch_tdb_seconds")?;
         validate_ephemeris_epochs(epochs_tdb_seconds)?;
 
-        let force = self.build_force();
+        let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -332,15 +342,25 @@ impl StatePropagator {
         }
     }
 
-    pub(super) fn build_force(&self) -> Box<dyn ForceModel> {
+    pub(super) fn build_force(&self) -> Result<Box<dyn ForceModel>, PropagationError> {
         let gravity = self.force_model.build();
-        if let Some(drag) = self.drag {
-            let mut composite = CompositeForceModel::new();
-            composite.add(gravity);
-            composite.add(Box::new(drag.to_force()));
-            Box::new(composite)
-        } else {
-            gravity
+        match (self.drag, self.space_weather.clone()) {
+            (Some(drag), Some(source)) => {
+                let mut composite = CompositeForceModel::new();
+                composite.add(gravity);
+                composite.add(Box::new(SourcedDragForce::new(drag, source)));
+                Ok(Box::new(composite))
+            }
+            (Some(drag), None) => {
+                let mut composite = CompositeForceModel::new();
+                composite.add(gravity);
+                composite.add(Box::new(drag.to_force()));
+                Ok(Box::new(composite))
+            }
+            (None, Some(_)) => Err(PropagationError::InvalidInput(
+                "space weather source without drag".to_string(),
+            )),
+            (None, None) => Ok(gravity),
         }
     }
 }
@@ -433,7 +453,7 @@ fn validate_epoch_finite(value: f64, field: &'static str) -> Result<(), Propagat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::astro::forces::{DragParameters, SpaceWeather};
+    use crate::astro::forces::{DragParameters, SpaceWeather, SpaceWeatherSource};
     use crate::astro::integrators::Integrator;
     use nalgebra::Vector3;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -494,10 +514,42 @@ mod tests {
         .expect("valid drag")
     }
 
+    fn assert_states_bit_for_bit(left: &[CartesianState], right: &[CartesianState]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right.iter()) {
+            assert_eq!(
+                left.epoch_tdb_seconds.to_bits(),
+                right.epoch_tdb_seconds.to_bits()
+            );
+            for idx in 0..3 {
+                assert_eq!(
+                    left.position_array()[idx].to_bits(),
+                    right.position_array()[idx].to_bits()
+                );
+                assert_eq!(
+                    left.velocity_array()[idx].to_bits(),
+                    right.velocity_array()[idx].to_bits()
+                );
+            }
+        }
+    }
+
     fn rk4_test_options() -> IntegratorOptions {
         IntegratorOptions {
             initial_step: 1.0,
             ..IntegratorOptions::default()
+        }
+    }
+
+    fn dp54_drag_options() -> IntegratorOptions {
+        IntegratorOptions {
+            abs_tol: 1.0e-9,
+            rel_tol: 1.0e-11,
+            initial_step: 30.0,
+            min_step: 1.0e-6,
+            max_step: 120.0,
+            max_steps: 200_000,
+            dense_output: false,
         }
     }
 
@@ -508,6 +560,7 @@ mod tests {
             integrator: IntegratorKind::Rk4,
             options: rk4_test_options(),
             drag: None,
+            space_weather: None,
         }
     }
 
@@ -529,6 +582,7 @@ mod tests {
             integrator: IntegratorKind::Rk4,
             options,
             drag: None,
+            space_weather: None,
         }
         .propagate_to(120.0)
         .expect("two-body propagation")
@@ -539,6 +593,7 @@ mod tests {
             integrator: IntegratorKind::Rk4,
             options,
             drag: None,
+            space_weather: None,
         }
         .propagate_to(120.0)
         .expect("J2 propagation")
@@ -580,6 +635,59 @@ mod tests {
                 4_599_620_700_962_266_984,
             ]
         );
+    }
+
+    #[test]
+    fn fixed_space_weather_source_matches_fixed_drag_ephemeris_bit_for_bit() {
+        let initial = leo_state(250.0);
+        let drag = test_drag_parameters(0.15);
+        let fixed = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::two_body(),
+            IntegratorKind::Dp54,
+        )
+        .with_options(dp54_drag_options())
+        .with_drag(drag);
+        let sourced = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::two_body(),
+            IntegratorKind::Dp54,
+        )
+        .with_options(dp54_drag_options())
+        .with_drag(drag)
+        .with_space_weather(SpaceWeatherSource::Fixed(drag.space_weather()));
+        let epochs: Vec<f64> = (0..=6)
+            .map(|i| initial.epoch_tdb_seconds + i as f64 * 300.0)
+            .collect();
+
+        let fixed_states = fixed.ephemeris(&epochs).expect("fixed ephemeris");
+        let sourced_states = sourced.ephemeris(&epochs).expect("sourced ephemeris");
+        assert_states_bit_for_bit(&fixed_states, &sourced_states);
+    }
+
+    #[test]
+    fn space_weather_source_without_drag_is_invalid_input() {
+        let initial = leo_state(250.0);
+        let err = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::two_body(),
+            IntegratorKind::Rk4,
+        )
+        .with_space_weather(SpaceWeatherSource::Fixed(SpaceWeather::default()))
+        .propagate_to(initial.epoch_tdb_seconds + 60.0)
+        .expect_err("source without drag fails");
+        match err {
+            PropagationError::InvalidInput(message) => {
+                assert!(message.contains("space weather source without drag"));
+            }
+            other => panic!("expected invalid input, got {other:?}"),
+        }
     }
 
     #[test]

@@ -28,9 +28,10 @@ pub struct LabeledCovariance6 {
 }
 
 /// Process-noise model for covariance transport.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum ProcessNoise {
     /// Pure Phi P Phi^T transport.
+    #[default]
     None,
     /// Per-axis white acceleration PSD in RTN, km^2/s^3.
     RtnAccelerationPsd {
@@ -38,12 +39,6 @@ pub enum ProcessNoise {
         q_transverse_km2_s3: f64,
         q_normal_km2_s3: f64,
     },
-}
-
-impl Default for ProcessNoise {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Options for a covariance propagation run.
@@ -124,7 +119,7 @@ impl StatePropagator {
         validate_epochs_monotonic(self.initial.epoch_tdb_seconds, epochs_tdb_seconds)?;
         validate_process_noise(options.process_noise)?;
 
-        let force = self.build_force();
+        let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
@@ -201,9 +196,10 @@ pub fn transport_covariance(
             .map_err(map_covariance6_error)?
             .into_matrix();
         if let Some(q) = process_noise_increment(segment, process_noise)? {
-            for i in 0..6 {
-                for j in 0..6 {
-                    matrix[i][j] += q.as_matrix()[i][j];
+            let q_matrix = q.as_matrix();
+            for (i, row) in matrix.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell += q_matrix[i][j];
                 }
             }
             symmetrize6(&mut matrix);
