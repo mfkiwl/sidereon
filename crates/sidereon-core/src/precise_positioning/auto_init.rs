@@ -369,6 +369,7 @@ fn spp_seed_inputs(epoch: &FloatEpoch, options: PppAutoInitOptions) -> spp::Solv
         },
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels: BTreeMap::new(),
         met: options.spp_met,
         robust: None,

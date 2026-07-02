@@ -72,8 +72,8 @@
 //! ```
 
 mod antenna;
-mod bits;
-mod crc;
+pub(crate) mod bits;
+pub(crate) mod crc;
 mod ephemeris;
 mod framing;
 mod msm;

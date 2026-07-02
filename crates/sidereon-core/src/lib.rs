@@ -95,6 +95,7 @@ mod rinex_nav; // RINEX 3 navigation-message parsing (GPS/Galileo broadcast)
 mod rinex_obs; // RINEX 3 observation parsing + single-frequency pseudoranges
 pub mod rtcm; // RTCM 3 differential-GNSS stream decode/encode (MSM, station, ephemeris)
 pub mod rtk; // RTK double-difference construction
+pub mod sbas;
 pub mod signal; // GPS C/A code, coherent correlation, and acquisition
 mod sp3; // SP3-c / SP3-d parser + arbitrary-epoch interpolation
 mod spp; // single-point positioning (least-squares PVT)

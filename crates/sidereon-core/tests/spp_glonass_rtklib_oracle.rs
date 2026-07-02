@@ -5,7 +5,7 @@
 //! ionosphere scaling. It drives the SPP solver on a real multi-GNSS RINEX
 //! observation with GLONASS pseudoranges and the ionosphere correction enabled
 //! and asserts the solved ECEF position agrees with the committed RTKLIB-demo5
-//! `.pos` to a meter-level bound. That bound is the honest cross-implementation
+//! `.pos` to a meter-level bound. That bound is the cross-implementation
 //! floor: two independent broadcast SPP implementations legitimately differ at
 //! the ~meter level from their elevation weighting, GPS TGD handling, and
 //! satellite-clock/relativity/troposphere internals. The position is also not
@@ -44,7 +44,7 @@
 //! `pos2-armode=off`, `out-solformat=xyz` (tropo off isolates the GLONASS
 //! measurement model). Used sats epoch 1: 9 GPS (G05 G07 G09 G13 G15 G18 G27 G28
 //! G30) + 8 GLONASS (R01 R02 R08 R09 R10 R11 R17 R18); RTKLIB ECEF
-//! 3582110.6334/532590.1127/5232764.8971 m, sidereon delta ~1.41 m (the honest
+//! 3582110.6334/532590.1127/5232764.8971 m, sidereon delta ~1.41 m (the
 //! cross-implementation floor). Repro at
 //! `test/fixtures/rtk/generators/glo_spp_repro.sh`.
 #![cfg(sidereon_repo_tests)]
@@ -215,6 +215,7 @@ fn glonass_spp_agrees_with_rtklib_demo5_l1_single() {
         klobuchar,
         beidou_klobuchar: None,
         galileo_nequick: None,
+        sbas_iono: None,
         glonass_channels,
         met: SurfaceMet {
             pressure_hpa: 1013.25,

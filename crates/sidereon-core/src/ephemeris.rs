@@ -109,6 +109,7 @@ mod tests {
             satellite_id: crate::GnssSatelliteId::new(GnssSystem::Galileo, 1)
                 .expect("valid satellite"),
             message: NavMessage::GalileoInav,
+            iode: None,
             week: 2_400,
             toe: crate::astro::time::model::GnssWeekTow::new(
                 crate::astro::time::model::TimeScale::Gst,
