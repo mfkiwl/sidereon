@@ -680,6 +680,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "trust-region-least-squares",
 ]
 
 [[package]]

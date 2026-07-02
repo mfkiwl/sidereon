@@ -24,6 +24,7 @@
 //! let _ = pred.velocity;
 //! ```
 
+pub mod fit;
 #[allow(
     dead_code,
     unused_variables,
@@ -48,6 +49,10 @@ mod vallado;
 use crate::astro::tle;
 use crate::validate::{self, FieldError};
 use thiserror::Error;
+
+pub use fit::{
+    fit_tle, FitConfig, FitEpoch, FitSample, FitStatistics, TleFit, TleFitError, TleMetadata,
+};
 
 const MAX_VALLADO_SATNUM: u32 = 99_999;
 

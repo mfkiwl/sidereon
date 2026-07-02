@@ -218,13 +218,7 @@ impl Finding {
             Self::NavFatalParse { .. } => "NAV-H01",
             Self::NavLeapSecondsAbsent { .. } => "NAV-H02",
             Self::NavIonoMalformed { .. } => "NAV-H03",
-            Self::NavDuplicateRecord { same_payload, .. } => {
-                if *same_payload {
-                    "NAV-B02"
-                } else {
-                    "NAV-B02"
-                }
-            }
+            Self::NavDuplicateRecord { .. } => "NAV-B02",
             Self::NavUnsortedRecords { .. } => "NAV-B03",
             Self::NavImplausibleRecord { .. } => "NAV-B04",
             Self::NavUnhealthyRecords { .. } => "NAV-B05",

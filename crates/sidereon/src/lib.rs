@@ -270,7 +270,9 @@ pub use sidereon_core::astro::bodies::{
     Refraction, Target,
 };
 pub use sidereon_core::astro::forces::{DragForce, SpaceWeather};
-pub use sidereon_core::astro::frames::transforms::gcrs_to_true_of_date_matrix;
+pub use sidereon_core::astro::frames::transforms::{
+    gcrs_to_teme_compute, gcrs_to_true_of_date_matrix,
+};
 pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
 
 /// Root-level shortcut for satellite-relative frames and CW propagation.
@@ -1648,6 +1650,13 @@ mod tests {
         let tod =
             gcrs_to_true_of_date_matrix(&observe_time.time_scales()).expect("true-of-date matrix");
         assert!(tod[0][0].is_finite());
+        let gcrs_state = astro::frames::transforms::TemeStateKm {
+            position_km: [7000.0, 100.0, -50.0],
+            velocity_km_s: [0.0, 7.5, 0.1],
+        };
+        let (teme_pos, _) = gcrs_to_teme_compute(&gcrs_state, &observe_time.time_scales(), false)
+            .expect("TEME inverse transform");
+        assert!(teme_pos.0.is_finite());
     }
 
     #[test]

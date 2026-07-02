@@ -66,7 +66,7 @@ const FIELD_TAGS: &[&str] = &[
 /// UTC calendar epoch as carried by an OMM, split into the components a KVN/XML
 /// `EPOCH` (or JSON `EPOCH`) string spells out. Stored as integers so the epoch
 /// re-encodes losslessly and converts directly to the SGP4 epoch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OmmEpoch {
     pub year: i32,
     pub month: u32,
@@ -85,7 +85,7 @@ pub struct OmmEpoch {
 /// motion in revolutions/day, its derivatives in rev/day^2 and rev/day^3, B\*
 /// in inverse earth-radii) and are stored as directly parsed `f64`s, so every
 /// encoding decodes to the same value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Omm {
     // -- Header / metadata --
     pub ccsds_omm_vers: String,
