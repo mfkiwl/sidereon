@@ -46,6 +46,7 @@ pub mod propagator;
 pub mod relative;
 pub mod rf;
 pub mod sgp4;
+pub mod space_weather;
 pub mod spk;
 pub mod state;
 pub mod tca;
