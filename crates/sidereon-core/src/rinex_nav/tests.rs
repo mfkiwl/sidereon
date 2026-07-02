@@ -7,7 +7,7 @@
 //! Fixture provenance (all under `tests/fixtures/nav/`; the nav-solutions/data
 //! repo redistributes public IGS/MGEX products, original source CDDIS/BKG/IGS):
 //!
-//!   * `ESBC00DNK_R_20201770000_01D_MN.rnx` — IGS MGEX daily merged broadcast nav
+//!   * `ESBC00DNK_R_20201770000_01D_MN.rnx`: IGS MGEX daily merged broadcast nav
 //!     (RINEX 3.05 MIXED, station ESBC00DNK Esbjerg DK, 2020 DOY 177, GPS week
 //!     2111). From
 //!     `https://raw.githubusercontent.com/nav-solutions/data/main/NAV/V3/ESBC00DNK_R_20201770000_01D_MN.rnx.gz`
@@ -19,19 +19,19 @@
 //!     a deterministic awk pass keeping `^[GEC]` records (1452728 B sha256
 //!     069f73afc10e9c1a8b87b7fbbb774f3eb9be94fb4da4ac365cfd4356c6ebfd36; 257 GPS,
 //!     1602 Galileo, 357 BeiDou records; BeiDou C05-C37 exercises GEO/IGSO/MEO).
-//!   * `ESBC00DNK_R_20201770000_01D_RN.rnx` — GLONASS (`^R`) records of the same
+//!   * `ESBC00DNK_R_20201770000_01D_RN.rnx`: GLONASS (`^R`) records of the same
 //!     original ESBC00DNK product (decompressed sha256 ad6af3c2…), header verbatim,
 //!     same awk pass keeping `^R`. 510 GLONASS broadcast records (5-line PZ-90.11
 //!     3.05 layout); header LEAP SECONDS = 18.
-//!   * `KMS300DNK_R_20221591000_01H_MN.rnx` — RINEX 4.00 MIXED nav, 1 hour (2022 DOY
+//!   * `KMS300DNK_R_20221591000_01H_MN.rnx`: RINEX 4.00 MIXED nav, 1 hour (2022 DOY
 //!     159), committed verbatim (decompressed) from nav-solutions/data NAV/V4
 //!     (gz sha256 2bae4217cb71ad4a2b9c0067bd1c5b56915e42d2007a94e91eb408468cc4763f).
 //!     Tests version-4 frame-marker parsing; 174 supported Keplerian records parsed,
 //!     GLONASS/QZSS/SBAS/STO/ION skipped.
-//!   * `BRDC00GOP_R_20210010000_01D_MN.rnx` — merged BRDC header (GOP/Pecny),
+//!   * `BRDC00GOP_R_20210010000_01D_MN.rnx`: merged BRDC header (GOP/Pecny),
 //!     header-only, from nav-solutions/data NAV/V3 (gz sha256
 //!     1bb7bb0ca70fb1e11e366abd9126881d62b238b687ace7fba360002b61a12f09). Carries
-//!     IONOSPHERIC CORR for GPS/Galileo/QZSS/NavIC and — the reason it is committed —
+//!     IONOSPHERIC CORR for GPS/Galileo/QZSS/NavIC, with committed coverage for
 //!     BeiDou (BDSA/BDSB Klobuchar-8). No orbit records.
 
 use super::*;

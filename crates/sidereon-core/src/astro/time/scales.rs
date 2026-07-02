@@ -854,7 +854,7 @@ fn scale_minus_tai_s(scale: TimeScale, utc_jd: f64) -> Result<f64, TimeOffsetErr
 /// ICDs (see [`scale_minus_tai_s`] for the per-scale citations).
 ///
 /// Returns [`TimeOffsetError::EpochRequired`] if either scale is UTC-based
-/// (UTC/GLONASST) — those need [`timescale_offset_at_s`] — and
+/// (UTC/GLONASST), which need [`timescale_offset_at_s`], and
 /// [`TimeOffsetError::Unsupported`] for TDB.
 ///
 /// # Note on the brief's `(from, to)` signature

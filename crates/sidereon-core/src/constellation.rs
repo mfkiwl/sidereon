@@ -14,14 +14,14 @@
 //! names its satellites differently, so [`from_celestrak_omm`] dispatches on
 //! [`GnssSystem`] to a per-system identity adapter:
 //!
-//! - **GPS** — `(PRN nn)` in the object name is the PRN directly.
-//! - **BeiDou** — `(Cnn)` in the object name is the PRN directly.
-//! - **QZSS** — `(QZSS/PRN nnn)` carries the broadcast PRN (193..=201); the
+//! - **GPS:** `(PRN nn)` in the object name is the PRN directly.
+//! - **BeiDou:** `(Cnn)` in the object name is the PRN directly.
+//! - **QZSS:** `(QZSS/PRN nnn)` carries the broadcast PRN (193..=201); the
 //!   RINEX slot is `nnn - 192` (`J01`..`J09`), per RINEX 3.0x.
-//! - **Galileo** — the object name is the `GSATdddd` build id, which carries no
+//! - **Galileo:** the object name is the `GSATdddd` build id, which carries no
 //!   PRN; the SVID/PRN is resolved from the published GSAT->SVID table
 //!   [`galileo_prn_for_gsat`].
-//! - **GLONASS** — the parenthesized number is the GLONASS (Uragan) number, not
+//! - **GLONASS:** the parenthesized number is the GLONASS (Uragan) number, not
 //!   the orbital slot; the slot is resolved from the published slot table
 //!   [`glonass_slot_for_number`], and the FDMA frequency-channel number (which
 //!   is not in OMM at all) from [`glonass_fdma_channel`].

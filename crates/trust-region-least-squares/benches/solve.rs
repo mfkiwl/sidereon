@@ -2,7 +2,7 @@
 //!
 //! This times the crate's NATIVE path: the trust-region iteration driving a
 //! pure-Rust `nalgebra` SVD (`tests/support/nalgebra_svd.rs`) with the crate's
-//! own pure-Rust dot/matvec reductions — i.e. what a Rust user gets with no
+//! own pure-Rust dot/matvec reductions, i.e. what a Rust user gets with no
 //! Python and no injected LAPACK. It deliberately does NOT use the bit-exact
 //! parity backend (that injects SciPy's own LAPACK/BLAS, so timing it would be
 //! scipy-vs-scipy).

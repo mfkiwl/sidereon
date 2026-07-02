@@ -691,7 +691,7 @@ fn diff_norad_25544_iss_clean_baseline() {
 /// same way the 'i' diagnostics do for improved mode.
 #[test]
 fn afspc_opsmode_a_sgp4init_field_diff() {
-    // Deep-space, low-inclination sats from the fixture — these are where
+    // Deep-space, low-inclination sats from the fixture, these are where
     // opsmode 'a' diverges from 'i' (geosync / Molniya-class resonance sats).
     let deep_low_incl = [
         "04632", "09998", "14128", "20413", "23177", "23599", "24208", "25954", "26900", "28626",

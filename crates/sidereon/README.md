@@ -2,7 +2,7 @@
 
 GNSS and astrodynamics for Rust: propagate satellites, predict passes, solve
 precise positions (SPP / RTK / PPP), and convert between coordinate frames and
-time scales — checked against the references the field trusts (Vallado, Skyfield,
+time scales, checked against the references the field trusts (Vallado, Skyfield,
 IGS, IERS).
 
 It's a pure-Rust engine, fast and `#![forbid(unsafe_code)]` at the surface, with
@@ -17,7 +17,7 @@ cargo add sidereon
 
 ## Quickstart: when does the ISS fly over you?
 
-No data files, no setup — give it a two-line element set and a ground station,
+No data files, no setup: give it a two-line element set and a ground station,
 and ask when the satellite is above the horizon.
 
 ```rust
@@ -104,26 +104,26 @@ let inputs = SolveInputs {
 };
 
 let fix = solve_spp(&sp3, &inputs, /* with_geodetic */ true, policy)?;
-println!("{:?}", fix.position);    // ItrfPositionM — ECEF metres
-println!("{:?}", fix.geodetic);    // Some(Wgs84Geodetic) — lat / lon / height
+println!("{:?}", fix.position);    // ItrfPositionM: ECEF metres
+println!("{:?}", fix.geodetic);    // Some(Wgs84Geodetic): lat / lon / height
 println!("{:?}", fix.used_sats);   // the satellites that contributed
 ```
 
 `solve_rtk_float_with`, `solve_rtk_fixed_with`, `solve_ppp_float_with`, and
-`solve_ppp_fixed_with` follow the same shape — a typed config in, a result struct
+`solve_ppp_fixed_with` follow the same pattern: a typed config in, a result struct
 with ECEF/geodetic position, residuals, DOP, and status out. One [`Error`] enum
 unifies every product-parse and solve failure, and `solve_spp_batch` fans a fleet
 of epochs across a rayon pool, bit-identical to the serial path.
 
 ## What's in the box
 
-- **Orbits** — SGP4/TLE and OMM, numerical propagation, passes, look angles
-- **Frames & time** — TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, UTC/TT/TDB/UT1
-- **Bodies** — Sun/Moon positions, eclipse events, plus JPL SPK (DAF/.bsp) kernels
-- **Positioning** — SPP, RTK (float/fixed), PPP (float/fixed), DOP, velocity
-- **GNSS data** — SP3, RINEX (obs/nav/clock), CRINEX, ANTEX, broadcast ephemeris
-- **Space situational awareness** — conjunction/TCA screening, collision probability, CDM, covariance
-- **RF** — link budget (FSPL, EIRP, C/N0, antenna gain)
+- **Orbits:** SGP4/TLE and OMM, numerical propagation, passes, look angles
+- **Frames & time:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, UTC/TT/TDB/UT1
+- **Bodies:** Sun/Moon positions, eclipse events, plus JPL SPK (DAF/.bsp) kernels
+- **Positioning:** SPP, RTK (float/fixed), PPP (float/fixed), DOP, velocity
+- **GNSS data:** SP3, RINEX (obs/nav/clock), CRINEX, ANTEX, broadcast ephemeris
+- **Space situational awareness:** conjunction/TCA screening, collision probability, CDM, covariance
+- **RF:** link budget (FSPL, EIRP, C/N0, antenna gain)
 
 The product parsers, look-angle helpers, and propagation shortcuts live at the
 crate root (`load_sp3`, `solve_spp`, `passes`, `sgp4`, `tle`, `tca`); the full
@@ -134,7 +134,7 @@ small.
 ## Other languages
 
 sidereon is one validated engine with first-class interfaces in **Rust**,
-**Python**, **C**, **Elixir**, and **WebAssembly** — same numbers everywhere.
+**Python**, **C**, **Elixir**, and **WebAssembly**: same numbers everywhere.
 See the live demo and docs at [sidereon.dev](https://sidereon.dev).
 
 ## How it's validated
