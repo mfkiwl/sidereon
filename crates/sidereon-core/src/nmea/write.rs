@@ -6,11 +6,19 @@ use super::sentence::checksum_body;
 use super::{Gga, NmeaCoordinate, NmeaError, NmeaTalker, NmeaTime};
 
 pub fn write_gga(talker: NmeaTalker, gga: &Gga) -> Result<String, NmeaError> {
-    if gga.time.is_some_and(|time| time.nanos % 10_000_000 != 0) {
-        return Err(NmeaError::InvalidInput {
-            field: "time",
-            reason: "GGA writer emits exactly two fractional decimals",
-        });
+    if let Some(time) = gga.time {
+        if time.decimals != 2 {
+            return Err(NmeaError::InvalidInput {
+                field: "time",
+                reason: "GGA writer requires NmeaTime.decimals == 2",
+            });
+        }
+        if time.nanos % 10_000_000 != 0 {
+            return Err(NmeaError::InvalidInput {
+                field: "time",
+                reason: "GGA writer emits exactly two fractional decimals",
+            });
+        }
     }
     if gga.latitude.is_some() != gga.longitude.is_some() {
         return Err(NmeaError::InvalidInput {

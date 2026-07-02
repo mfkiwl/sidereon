@@ -1,4 +1,4 @@
-use crate::Result;
+use crate::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Field<T> {
@@ -99,8 +99,7 @@ pub fn parse_sourcetable(text: &str) -> Result<Sourcetable> {
         if line.is_empty() {
             continue;
         }
-        let field_storage = split_fields(line);
-        let fields: Vec<&str> = field_storage.iter().map(String::as_str).collect();
+        let fields: Vec<&str> = line.split(';').collect();
         let tag = fields[0].trim();
         if tag.eq_ignore_ascii_case("ENDSOURCETABLE") {
             break;
@@ -113,8 +112,8 @@ pub fn parse_sourcetable(text: &str) -> Result<Sourcetable> {
             SourcetableRecord::Net(parse_net(&fields))
         } else {
             SourcetableRecord::Other(OtherRecord {
-                type_tag: unescape_text(fields[0]),
-                fields: fields.iter().skip(1).map(|s| unescape_text(s)).collect(),
+                type_tag: fields[0].to_string(),
+                fields: fields.iter().skip(1).map(|s| (*s).to_string()).collect(),
             })
         };
         records.push(record);
@@ -123,14 +122,14 @@ pub fn parse_sourcetable(text: &str) -> Result<Sourcetable> {
 }
 
 impl Sourcetable {
-    pub fn to_text(&self) -> String {
+    pub fn to_text(&self) -> Result<String> {
         let mut out = String::new();
         for record in &self.records {
-            out.push_str(&record.to_line());
+            out.push_str(&record.to_line()?);
             out.push_str("\r\n");
         }
         out.push_str("ENDSOURCETABLE\r\n");
-        out
+        Ok(out)
     }
 
     pub fn streams(&self) -> impl Iterator<Item = &StrRecord> {
@@ -142,100 +141,102 @@ impl Sourcetable {
 }
 
 impl SourcetableRecord {
-    fn to_line(&self) -> String {
+    fn to_line(&self) -> Result<String> {
         match self {
             SourcetableRecord::Str(record) => record.to_line(),
             SourcetableRecord::Cas(record) => record.to_line(),
             SourcetableRecord::Net(record) => record.to_line(),
             SourcetableRecord::Other(record) => {
-                let mut fields = vec![escape_text(&record.type_tag)];
-                fields.extend(record.fields.iter().map(|field| escape_text(field)));
-                fields.join(";")
+                let mut fields = vec![ordinary_text(&record.type_tag, "other type tag")?];
+                for field in &record.fields {
+                    fields.push(ordinary_text(field, "other field")?);
+                }
+                Ok(fields.join(";"))
             }
         }
     }
 }
 
 impl StrRecord {
-    fn to_line(&self) -> String {
-        [
+    fn to_line(&self) -> Result<String> {
+        Ok([
             "STR".to_string(),
-            escape_text(&self.mountpoint),
-            escape_text(&self.identifier),
-            escape_text(&self.format),
-            escape_text(&self.format_details),
-            field_to_string(&self.carrier),
-            escape_text(&self.nav_system),
-            escape_text(&self.network),
-            escape_text(&self.country),
-            field_to_string(&self.lat_deg),
-            field_to_string(&self.lon_deg),
-            bool01_to_string(&self.nmea_required),
-            bool01_to_string(&self.network_solution),
-            escape_text(&self.generator),
-            escape_text(&self.compression),
-            auth_to_string(&self.authentication),
-            boolyn_to_string(&self.fee),
-            field_to_string(&self.bitrate),
-            escape_text(&self.misc),
+            ordinary_text(&self.mountpoint, "STR mountpoint")?,
+            ordinary_text(&self.identifier, "STR identifier")?,
+            ordinary_text(&self.format, "STR format")?,
+            ordinary_text(&self.format_details, "STR format details")?,
+            field_to_string(&self.carrier, "STR carrier")?,
+            ordinary_text(&self.nav_system, "STR nav system")?,
+            ordinary_text(&self.network, "STR network")?,
+            ordinary_text(&self.country, "STR country")?,
+            field_to_string(&self.lat_deg, "STR latitude")?,
+            field_to_string(&self.lon_deg, "STR longitude")?,
+            bool01_to_string(&self.nmea_required, "STR NMEA required")?,
+            bool01_to_string(&self.network_solution, "STR network solution")?,
+            ordinary_text(&self.generator, "STR generator")?,
+            ordinary_text(&self.compression, "STR compression")?,
+            auth_to_string(&self.authentication, "STR authentication")?,
+            boolyn_to_string(&self.fee, "STR fee")?,
+            field_to_string(&self.bitrate, "STR bitrate")?,
+            tail_text(&self.misc, "STR misc")?,
         ]
-        .join(";")
+        .join(";"))
     }
 }
 
 impl CasRecord {
-    fn to_line(&self) -> String {
-        [
+    fn to_line(&self) -> Result<String> {
+        Ok([
             "CAS".to_string(),
-            escape_text(&self.host),
-            field_to_string(&self.port),
-            escape_text(&self.identifier),
-            escape_text(&self.operator),
-            bool01_to_string(&self.nmea_required),
-            escape_text(&self.country),
-            field_to_string(&self.lat_deg),
-            field_to_string(&self.lon_deg),
-            escape_text(&self.fallback_host),
-            field_to_string(&self.fallback_port),
-            escape_text(&self.misc),
+            ordinary_text(&self.host, "CAS host")?,
+            field_to_string(&self.port, "CAS port")?,
+            ordinary_text(&self.identifier, "CAS identifier")?,
+            ordinary_text(&self.operator, "CAS operator")?,
+            bool01_to_string(&self.nmea_required, "CAS NMEA required")?,
+            ordinary_text(&self.country, "CAS country")?,
+            field_to_string(&self.lat_deg, "CAS latitude")?,
+            field_to_string(&self.lon_deg, "CAS longitude")?,
+            ordinary_text(&self.fallback_host, "CAS fallback host")?,
+            field_to_string(&self.fallback_port, "CAS fallback port")?,
+            tail_text(&self.misc, "CAS misc")?,
         ]
-        .join(";")
+        .join(";"))
     }
 }
 
 impl NetRecord {
-    fn to_line(&self) -> String {
-        [
+    fn to_line(&self) -> Result<String> {
+        Ok([
             "NET".to_string(),
-            escape_text(&self.identifier),
-            escape_text(&self.operator),
-            auth_to_string(&self.authentication),
-            boolyn_to_string(&self.fee),
-            escape_text(&self.web_net),
-            escape_text(&self.web_str),
-            escape_text(&self.web_reg),
-            escape_text(&self.misc),
+            ordinary_text(&self.identifier, "NET identifier")?,
+            ordinary_text(&self.operator, "NET operator")?,
+            auth_to_string(&self.authentication, "NET authentication")?,
+            boolyn_to_string(&self.fee, "NET fee")?,
+            ordinary_text(&self.web_net, "NET web net")?,
+            ordinary_text(&self.web_str, "NET web str")?,
+            ordinary_text(&self.web_reg, "NET web reg")?,
+            tail_text(&self.misc, "NET misc")?,
         ]
-        .join(";")
+        .join(";"))
     }
 }
 
 fn parse_str(fields: &[&str]) -> StrRecord {
     StrRecord {
-        mountpoint: unescape_text(get(fields, 1)),
-        identifier: unescape_text(get(fields, 2)),
-        format: unescape_text(get(fields, 3)),
-        format_details: unescape_text(get(fields, 4)),
+        mountpoint: get(fields, 1).to_string(),
+        identifier: get(fields, 2).to_string(),
+        format: get(fields, 3).to_string(),
+        format_details: get(fields, 4).to_string(),
         carrier: parse_field(get(fields, 5)),
-        nav_system: unescape_text(get(fields, 6)),
-        network: unescape_text(get(fields, 7)),
-        country: unescape_text(get(fields, 8)),
+        nav_system: get(fields, 6).to_string(),
+        network: get(fields, 7).to_string(),
+        country: get(fields, 8).to_string(),
         lat_deg: parse_finite_f64_field(get(fields, 9)),
         lon_deg: parse_finite_f64_field(get(fields, 10)),
         nmea_required: parse_bool01(get(fields, 11)),
         network_solution: parse_bool01(get(fields, 12)),
-        generator: unescape_text(get(fields, 13)),
-        compression: unescape_text(get(fields, 14)),
+        generator: get(fields, 13).to_string(),
+        compression: get(fields, 14).to_string(),
         authentication: parse_auth(get(fields, 15)),
         fee: parse_boolyn(get(fields, 16)),
         bitrate: parse_field(get(fields, 17)),
@@ -245,15 +246,15 @@ fn parse_str(fields: &[&str]) -> StrRecord {
 
 fn parse_cas(fields: &[&str]) -> CasRecord {
     CasRecord {
-        host: unescape_text(get(fields, 1)),
+        host: get(fields, 1).to_string(),
         port: parse_field(get(fields, 2)),
-        identifier: unescape_text(get(fields, 3)),
-        operator: unescape_text(get(fields, 4)),
+        identifier: get(fields, 3).to_string(),
+        operator: get(fields, 4).to_string(),
         nmea_required: parse_bool01(get(fields, 5)),
-        country: unescape_text(get(fields, 6)),
+        country: get(fields, 6).to_string(),
         lat_deg: parse_finite_f64_field(get(fields, 7)),
         lon_deg: parse_finite_f64_field(get(fields, 8)),
-        fallback_host: unescape_text(get(fields, 9)),
+        fallback_host: get(fields, 9).to_string(),
         fallback_port: parse_field(get(fields, 10)),
         misc: join_tail(fields, 11),
     }
@@ -261,13 +262,13 @@ fn parse_cas(fields: &[&str]) -> CasRecord {
 
 fn parse_net(fields: &[&str]) -> NetRecord {
     NetRecord {
-        identifier: unescape_text(get(fields, 1)),
-        operator: unescape_text(get(fields, 2)),
+        identifier: get(fields, 1).to_string(),
+        operator: get(fields, 2).to_string(),
         authentication: parse_auth(get(fields, 3)),
         fee: parse_boolyn(get(fields, 4)),
-        web_net: unescape_text(get(fields, 5)),
-        web_str: unescape_text(get(fields, 6)),
-        web_reg: unescape_text(get(fields, 7)),
+        web_net: get(fields, 5).to_string(),
+        web_str: get(fields, 6).to_string(),
+        web_reg: get(fields, 7).to_string(),
         misc: join_tail(fields, 8),
     }
 }
@@ -280,29 +281,8 @@ fn join_tail(fields: &[&str], index: usize) -> String {
     if index >= fields.len() {
         String::new()
     } else {
-        unescape_text(&fields[index..].join(";"))
+        fields[index..].join(";")
     }
-}
-
-fn split_fields(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut chars = line.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            field.push(ch);
-            if let Some(next) = chars.next() {
-                field.push(next);
-            }
-        } else if ch == ';' {
-            fields.push(field);
-            field = String::new();
-        } else {
-            field.push(ch);
-        }
-    }
-    fields.push(field);
-    fields
 }
 
 fn parse_field<T>(value: &str) -> Field<T>
@@ -357,74 +337,59 @@ fn parse_auth(value: &str) -> StrAuth {
     }
 }
 
-fn field_to_string<T: ToString>(field: &Field<T>) -> String {
+fn field_to_string<T: ToString>(field: &Field<T>, name: &str) -> Result<String> {
     match field {
-        Field::Parsed(value) => value.to_string(),
-        Field::Empty => String::new(),
-        Field::Raw(value) => escape_text(value),
+        Field::Parsed(value) => ordinary_text(&value.to_string(), name),
+        Field::Empty => Ok(String::new()),
+        Field::Raw(value) => ordinary_text(value, name),
     }
 }
 
-fn bool01_to_string(field: &Field<bool>) -> String {
+fn bool01_to_string(field: &Field<bool>, name: &str) -> Result<String> {
     match field {
-        Field::Parsed(false) => "0".into(),
-        Field::Parsed(true) => "1".into(),
-        Field::Empty => String::new(),
-        Field::Raw(value) => value.clone(),
+        Field::Parsed(false) => Ok("0".into()),
+        Field::Parsed(true) => Ok("1".into()),
+        Field::Empty => Ok(String::new()),
+        Field::Raw(value) => ordinary_text(value, name),
     }
 }
 
-fn boolyn_to_string(field: &Field<bool>) -> String {
+fn boolyn_to_string(field: &Field<bool>, name: &str) -> Result<String> {
     match field {
-        Field::Parsed(false) => "N".into(),
-        Field::Parsed(true) => "Y".into(),
-        Field::Empty => String::new(),
-        Field::Raw(value) => value.clone(),
+        Field::Parsed(false) => Ok("N".into()),
+        Field::Parsed(true) => Ok("Y".into()),
+        Field::Empty => Ok(String::new()),
+        Field::Raw(value) => ordinary_text(value, name),
     }
 }
 
-fn auth_to_string(auth: &StrAuth) -> String {
+fn auth_to_string(auth: &StrAuth, name: &str) -> Result<String> {
     match auth {
-        StrAuth::None => "N".into(),
-        StrAuth::Basic => "B".into(),
-        StrAuth::Digest => "D".into(),
-        StrAuth::Other(value) => escape_text(value),
+        StrAuth::None => Ok("N".into()),
+        StrAuth::Basic => Ok("B".into()),
+        StrAuth::Digest => Ok("D".into()),
+        StrAuth::Other(value) => ordinary_text(value, name),
     }
 }
 
-fn escape_text(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            ';' => out.push_str("\\;"),
-            '\r' => out.push_str("\\r"),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(ch),
-        }
-    }
-    out
+fn ordinary_text(value: &str, name: &str) -> Result<String> {
+    checked_text(value, name, false)
 }
 
-fn unescape_text(value: &str) -> String {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('\\') => out.push('\\'),
-                Some(';') => out.push(';'),
-                Some('r') => out.push('\r'),
-                Some('n') => out.push('\n'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
-        }
+fn tail_text(value: &str, name: &str) -> Result<String> {
+    checked_text(value, name, true)
+}
+
+fn checked_text(value: &str, name: &str, allow_semicolon: bool) -> Result<String> {
+    if value.contains('\r') || value.contains('\n') {
+        return Err(Error::InvalidInput(format!(
+            "sourcetable {name} contains a line break"
+        )));
     }
-    out
+    if !allow_semicolon && value.contains(';') {
+        return Err(Error::InvalidInput(format!(
+            "sourcetable {name} contains a semicolon"
+        )));
+    }
+    Ok(value.to_string())
 }

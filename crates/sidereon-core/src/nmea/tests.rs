@@ -48,6 +48,26 @@ fn rejects_checksum_mismatch_before_decoding() {
 }
 
 #[test]
+fn rejects_every_wrong_checksum_byte_before_decoding() {
+    let body = "GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,";
+    let computed = body.bytes().fold(0, |acc, byte| acc ^ byte);
+    for stated in 0..=u8::MAX {
+        if stated == computed {
+            continue;
+        }
+        let sentence = format!("${body}*{stated:02X}");
+        let error = parse_sentence(&sentence).expect_err("checksum mismatch");
+        assert!(matches!(
+            error,
+            NmeaError::ChecksumMismatch {
+                computed: got_computed,
+                stated: got_stated,
+            } if got_computed == computed && got_stated == stated
+        ));
+    }
+}
+
+#[test]
 fn unsupported_and_proprietary_sentences_are_typed_skips() {
     let parsed = parse_nmea_str("$GPTXT,01,01,02,message*26\n$PUBX,00*33\n");
     assert!(parsed.value.sentences.is_empty());
@@ -151,7 +171,7 @@ fn write_gga_round_trips_and_emits_checksum() {
             minute: 35,
             second: 19,
             nanos: 0,
-            decimals: 0,
+            decimals: 2,
         }),
         latitude: Some(NmeaCoordinate::parse("4807.038", "N", true).unwrap()),
         longitude: Some(NmeaCoordinate::parse("01131.000", "E", false).unwrap()),
@@ -172,19 +192,93 @@ fn write_gga_round_trips_and_emits_checksum() {
     let NmeaBody::Gga(parsed_gga) = round_trip.value.body else {
         panic!("expected GGA");
     };
-    assert_eq!(
-        parsed_gga.time,
-        gga.time.map(|mut time| {
-            time.decimals = 2;
-            time
-        })
-    );
-    assert_eq!(parsed_gga.latitude, gga.latitude);
-    assert_eq!(parsed_gga.longitude, gga.longitude);
+    assert_eq!(parsed_gga, gga);
     assert_eq!(
         write_gga(round_trip.value.talker, &parsed_gga).unwrap(),
         sentence
     );
+}
+
+#[test]
+fn write_gga_rejects_time_without_exact_two_decimal_contract() {
+    let mut gga = Gga {
+        time: Some(NmeaTime {
+            hour: 12,
+            minute: 35,
+            second: 19,
+            nanos: 0,
+            decimals: 0,
+        }),
+        latitude: Some(NmeaCoordinate::parse("4807.038", "N", true).unwrap()),
+        longitude: Some(NmeaCoordinate::parse("01131.000", "E", false).unwrap()),
+        quality: Some(GgaQuality::GpsSps),
+        satellites_used: Some(8),
+        hdop: Some(0.9),
+        altitude_msl_m: Some(545.4),
+        geoid_separation_m: Some(46.9),
+        differential_age_s: None,
+        differential_station_id: None,
+    };
+    let error = write_gga(NmeaTalker::System(crate::GnssSystem::Gps), &gga)
+        .expect_err("decimal count is part of writer contract");
+    assert!(matches!(
+        error,
+        NmeaError::InvalidInput {
+            field: "time",
+            reason: "GGA writer requires NmeaTime.decimals == 2",
+        }
+    ));
+
+    gga.time.as_mut().unwrap().decimals = 2;
+    gga.time.as_mut().unwrap().nanos = 123_000_000;
+    let error = write_gga(NmeaTalker::System(crate::GnssSystem::Gps), &gga)
+        .expect_err("centisecond grid is part of writer contract");
+    assert!(matches!(
+        error,
+        NmeaError::InvalidInput {
+            field: "time",
+            reason: "GGA writer emits exactly two fractional decimals",
+        }
+    ));
+}
+
+#[test]
+fn coordinate_degrees_f64_keeps_expected_bit_pattern() {
+    let latitude = NmeaCoordinate::parse("4807.038", "N", true).unwrap();
+    let longitude = NmeaCoordinate::parse("01131.000", "W", false).unwrap();
+    assert_eq!(latitude.degrees_f64().to_bits(), 0x4048_0f03_afb7_e910);
+    assert_eq!(longitude.degrees_f64().to_bits(), 0xc027_0888_8888_8889);
+}
+
+#[test]
+fn vrs_position_carries_coordinate_rounding_into_next_degree() {
+    let position = crate::Wgs84Geodetic::new(
+        (12.0_f64 + 59.999_9 / 60.0).to_radians(),
+        -(1.0_f64 + 59.999_9 / 60.0).to_radians(),
+        10.0,
+    )
+    .unwrap();
+    let gga = Gga::vrs_position(
+        position,
+        NmeaTime {
+            hour: 1,
+            minute: 2,
+            second: 3,
+            nanos: 450_000_000,
+            decimals: 2,
+        },
+        GgaQuality::GpsSps,
+        8,
+        0.9,
+        2,
+    )
+    .unwrap();
+    let latitude = gga.latitude.unwrap();
+    let longitude = gga.longitude.unwrap();
+    assert_eq!((latitude.degrees, latitude.minutes_scaled), (13, 0));
+    assert_eq!((longitude.degrees, longitude.minutes_scaled), (2, 0));
+    assert!(!latitude.negative);
+    assert!(longitude.negative);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 use crate::frequencies::CarrierBand;
 use crate::validate::{self, FieldError};
 use crate::{GnssSatelliteId, GnssSystem, Wgs84Geodetic};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NmeaTime {
@@ -77,6 +78,25 @@ impl NmeaTime {
 
     pub fn key(self) -> (u8, u8, u8, u32) {
         (self.hour, self.minute, self.second, self.nanos)
+    }
+
+    pub fn from_seconds_of_day_floor_centis(seconds: f64) -> Result<Self, crate::nmea::NmeaError> {
+        if !seconds.is_finite() || !(0.0..86_400.0).contains(&seconds) {
+            return Err(crate::nmea::NmeaError::InvalidInput {
+                field: "time",
+                reason: "must be finite and in [0, 86400)",
+            });
+        }
+        let whole = seconds.floor() as u32;
+        let fractional = (seconds - f64::from(whole)).clamp(0.0, 1.0);
+        let centis = (Duration::from_secs_f64(fractional).as_nanos() / 10_000_000).min(99) as u32;
+        Ok(Self {
+            hour: (whole / 3600) as u8,
+            minute: ((whole % 3600) / 60) as u8,
+            second: (whole % 60) as u8,
+            nanos: centis * 10_000_000,
+            decimals: 2,
+        })
     }
 }
 

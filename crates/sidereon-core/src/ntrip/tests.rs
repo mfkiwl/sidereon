@@ -125,6 +125,26 @@ fn rev1_icy_optional_blank_line_can_be_split() {
 }
 
 #[test]
+fn reset_then_reuse_matches_fresh_machine() {
+    let wire = b"HTTP/1.1 200 OK\r\nContent-Type: gnss/data\r\n\r\nabc";
+
+    let mut reused = NtripClientMachine::new(config(NtripVersion::Rev2));
+    reused.connection_request().unwrap();
+    reused.push(b"HTTP/1.1 200");
+    reused.reset();
+    let reused_request = reused.connection_request().unwrap();
+    let reused_events = reused.push(wire);
+
+    let mut fresh = NtripClientMachine::new(config(NtripVersion::Rev2));
+    let fresh_request = fresh.connection_request().unwrap();
+    let fresh_events = fresh.push(wire);
+
+    assert_eq!(reused_request, fresh_request);
+    assert_eq!(reused_events, fresh_events);
+    assert_eq!(reused.state(), fresh.state());
+}
+
+#[test]
 fn rev2_http_stream_emits_dechunked_payload_split_across_pushes() {
     let frame = rtcm::encode_frame(&[0xff, 0xf0]).unwrap();
     let mut wire =
@@ -188,6 +208,35 @@ fn chunk_decoder_handles_extensions_trailers_and_poisoning() {
     let mut decoder = ChunkedDecoder::new();
     assert!(decoder.push(b"Z\r\n").is_err());
     assert!(decoder.push(b"1\r\na\r\n").is_err());
+}
+
+#[test]
+fn chunk_decoder_accepts_zero_size_first() {
+    let mut decoder = ChunkedDecoder::new();
+    assert_eq!(decoder.push(b"0\r\n\r\n").unwrap(), b"");
+    assert!(decoder.finished());
+    assert_eq!(decoder.push(b"ignored").unwrap(), b"");
+}
+
+#[test]
+fn handshake_header_values_drop_exactly_one_leading_space() {
+    let mut machine = NtripClientMachine::new(config(NtripVersion::Rev2));
+    machine.connection_request().unwrap();
+    let events = machine.push(
+        b"HTTP/1.1 200 OK\r\nContent-Type: gnss/data\r\nX-One: value\r\nX-Two:  value\r\nX-Tab:\tvalue\r\n\r\n",
+    );
+    let NtripEvent::Connected(handshake) = &events[0] else {
+        panic!("expected connected event");
+    };
+    assert_eq!(
+        handshake.headers,
+        vec![
+            ("Content-Type".into(), "gnss/data".into()),
+            ("X-One".into(), "value".into()),
+            ("X-Two".into(), " value".into()),
+            ("X-Tab".into(), "\tvalue".into()),
+        ]
+    );
 }
 
 #[test]
@@ -297,23 +346,27 @@ fn bad_auth_status_digest_and_content_type_are_rejections() {
 
 #[test]
 fn sourcetable_round_trip_preserves_unknown_and_raw_fields() {
-    let text = "STR;MP;ID;RTCM;details;bad;GPS;NET;USA;badlat;1.0;2;0;gen;none;Z;maybe;badrate;tail;more\r\nXYZ;a;b\r\nENDSOURCETABLE\r\n";
+    let text = "STR;MP\\nRAW;ID;RTCM;details;bad;GPS;NET;USA;badlat;1.0;2;0;gen;none;Z;maybe;badrate;tail\\nraw;more\r\nXYZ;a;b\\nraw\r\nENDSOURCETABLE\r\n";
     let table = parse_sourcetable(text).unwrap();
-    let reparsed = parse_sourcetable(&table.to_text()).unwrap();
+    let rendered = table.to_text().unwrap();
+    let reparsed = parse_sourcetable(&rendered).unwrap();
     assert_eq!(reparsed, table);
 
     let stream = table.streams().next().unwrap();
+    assert_eq!(stream.mountpoint, "MP\\nRAW");
     assert_eq!(stream.carrier, Field::Raw("bad".into()));
     assert_eq!(stream.lat_deg, Field::Raw("badlat".into()));
-    assert_eq!(stream.misc, "tail;more");
+    assert_eq!(stream.misc, "tail\\nraw;more");
+    assert!(rendered.contains("MP\\nRAW"));
+    assert!(!rendered.contains("MP\nRAW"));
 
     let table = Sourcetable {
         records: vec![SourcetableRecord::Other(OtherRecord {
             type_tag: " weird tag ".into(),
-            fields: vec!["a;b".into(), "c\\d".into()],
+            fields: vec!["a".into(), "c\\d".into()],
         })],
     };
-    assert_eq!(parse_sourcetable(&table.to_text()).unwrap(), table);
+    assert_eq!(parse_sourcetable(&table.to_text().unwrap()).unwrap(), table);
 
     let nan =
         parse_sourcetable("STR;MP;ID;RTCM;;2;GPS;NET;USA;NaN;inf;0;0;gen;none;N;N;9600;tail\r\n")
@@ -321,6 +374,33 @@ fn sourcetable_round_trip_preserves_unknown_and_raw_fields() {
     let stream = nan.streams().next().unwrap();
     assert_eq!(stream.lat_deg, Field::Raw("NaN".into()));
     assert_eq!(stream.lon_deg, Field::Raw("inf".into()));
+}
+
+#[test]
+fn sourcetable_to_text_rejects_unrepresentable_synthetic_fields() {
+    let mut table = parse_sourcetable(
+        "STR;MP;ID;RTCM;;2;GPS;NET;USA;1.0;2.0;0;0;gen;none;N;N;9600;tail;ok\r\n",
+    )
+    .unwrap();
+    assert_eq!(table.to_text().unwrap().matches("tail;ok").count(), 1);
+
+    let SourcetableRecord::Str(stream) = &mut table.records[0] else {
+        panic!("expected STR record");
+    };
+    stream.mountpoint = "bad\nmount".into();
+    assert!(matches!(
+        table.to_text(),
+        Err(crate::Error::InvalidInput(message)) if message.contains("line break")
+    ));
+
+    let SourcetableRecord::Str(stream) = &mut table.records[0] else {
+        panic!("expected STR record");
+    };
+    stream.mountpoint = "bad;mount".into();
+    assert!(matches!(
+        table.to_text(),
+        Err(crate::Error::InvalidInput(message)) if message.contains("semicolon")
+    ));
 }
 
 #[test]

@@ -34,7 +34,7 @@ pub fn format_gga(position: &GgaPosition, utc_seconds_of_day: f64) -> Result<Vec
     .map_err(|err| Error::InvalidInput(err.to_string()))?;
     let mut gga = Gga::vrs_position(
         geodetic,
-        format_time(utc_seconds_of_day),
+        format_time(utc_seconds_of_day)?,
         quality(position.fix_quality),
         position.num_satellites,
         position.hdop,
@@ -73,16 +73,9 @@ fn validate(position: &GgaPosition, utc_seconds_of_day: f64) -> Result<()> {
     Ok(())
 }
 
-fn format_time(seconds: f64) -> NmeaTime {
-    let centis = (seconds * 100.0).floor() as u32;
-    let whole = centis / 100;
-    NmeaTime {
-        hour: (whole / 3600) as u8,
-        minute: ((whole % 3600) / 60) as u8,
-        second: (whole % 60) as u8,
-        nanos: (centis % 100) * 10_000_000,
-        decimals: 2,
-    }
+fn format_time(seconds: f64) -> Result<NmeaTime> {
+    NmeaTime::from_seconds_of_day_floor_centis(seconds)
+        .map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
 fn quality(value: u8) -> GgaQuality {
