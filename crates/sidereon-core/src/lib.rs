@@ -99,6 +99,7 @@ mod rinex_clock; // RINEX clock satellite-bias parsing and interpolation
 mod rinex_common; // shared RINEX header concepts (time-system label mapping)
 mod rinex_nav; // RINEX 3 navigation-message parsing (GPS/Galileo broadcast)
 mod rinex_obs; // RINEX 3 observation parsing + single-frequency pseudoranges
+mod rinex_qc; // RINEX observation/navigation lint and mechanical repair
 pub mod rtcm; // RTCM 3 differential-GNSS stream decode/encode (MSM, station, ephemeris)
 pub mod rtk; // RTK double-difference construction
 pub mod sbas;

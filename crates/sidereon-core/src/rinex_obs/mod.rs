@@ -1,7 +1,7 @@
-//! RINEX 3.0x observation-file parser and single-frequency pseudorange
+//! RINEX 3.0x/4.0x observation-file parser and single-frequency pseudorange
 //! extraction.
 //!
-//! Parses a RINEX **version 3** observation file (`OBSERVATION DATA`) into a
+//! Parses a RINEX **version 3 or 4** observation file (`OBSERVATION DATA`) into a
 //! typed [`RinexObs`] product: the header (including the surveyed
 //! [`ObsHeader::approx_position_m`] a-priori receiver position and optional
 //! [`ObsHeader::antenna_delta_hen_m`] antenna offset), the per-constellation
@@ -127,10 +127,10 @@ pub struct ObsEpoch {
     pub sats: BTreeMap<GnssSatelliteId, Vec<ObsValue>>,
 }
 
-/// Parsed RINEX 3 observation header.
+/// Parsed RINEX 3/4 observation header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObsHeader {
-    /// The full RINEX version (e.g. `3.05`); the major must be 3.
+    /// The full RINEX version (e.g. `3.05`); the major must be 3 or 4.
     pub version: f64,
     /// The surveyed a-priori receiver position (ECEF meters), if the file
     /// carries an `APPROX POSITION XYZ` record.
@@ -177,10 +177,10 @@ pub struct RinexObs {
 }
 
 impl RinexObs {
-    /// Parse RINEX 3 observation text into a typed product.
+    /// Parse RINEX 3/4 observation text into a typed product.
     ///
     /// Returns [`Error::Parse`] if the file is not observation data, is not RINEX
-    /// major version 3, is missing a required header record, or has a malformed
+    /// major version 3 or 4, is missing a required header record, or has a malformed
     /// epoch record.
     pub fn parse(text: &str) -> Result<Self> {
         let mut parser = Parser::new();
@@ -677,9 +677,9 @@ impl Parser {
                 "RINEX file is not observation data: {type_field:?}"
             )));
         }
-        if version.floor() as i64 != 3 {
+        if !matches!(version.floor() as i64, 3 | 4) {
             return Err(Error::Parse(format!(
-                "RINEX OBS parser requires major version 3, got {version}"
+                "RINEX OBS parser requires major version 3 or 4, got {version}"
             )));
         }
         self.version = Some(version);

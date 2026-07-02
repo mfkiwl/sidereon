@@ -47,6 +47,15 @@ pub mod observations {
     pub type ObservationFile = RinexObs;
 }
 
+/// RINEX observation/navigation lint and mechanical repair.
+pub mod qc {
+    pub use crate::rinex_qc::{
+        lint_nav_text, lint_obs, lint_obs_text, repair_nav, repair_nav_text, repair_obs,
+        repair_obs_text, repair_obs_to_crinex_string, Finding, FindingRef, LintReport, NavRepair,
+        ObsRepair, RepairAction, RepairOptions, Severity,
+    };
+}
+
 pub use clock::RinexClock;
 pub use crinex::{decode as decode_crinex, decode_to as decode_crinex_to, encode_crinex};
 pub use nav::{parse_glonass, parse_iono_corrections, parse_leap_seconds, parse_nav};

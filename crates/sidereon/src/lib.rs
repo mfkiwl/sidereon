@@ -11,6 +11,8 @@
 //! - [`parse_rinex_nav`] / [`load_rinex_nav`] parse RINEX broadcast navigation
 //!   products into a queryable broadcast ephemeris store,
 //! - [`parse_rinex_obs`] / [`load_rinex_obs`] parse RINEX observation products,
+//! - [`lint_rinex_obs`] / [`lint_rinex_nav`] check RINEX observation/navigation
+//!   text and [`repair_rinex_obs`] / [`repair_rinex_nav`] apply mechanical fixes,
 //! - [`parse_rinex_clock`] / [`load_rinex_clock`] parse RINEX clock products,
 //!   with lossy variants for best-effort recovery,
 //! - [`decode_crinex`] / [`load_crinex`] expand Hatanaka-compressed
@@ -305,6 +307,14 @@ pub mod least_squares {
     };
 }
 
+/// RINEX observation/navigation lint and mechanical repair types.
+pub mod rinex_qc {
+    pub use sidereon_core::rinex::qc::{
+        Finding, FindingRef, LintReport, NavRepair, ObsRepair, RepairAction, RepairOptions,
+        Severity,
+    };
+}
+
 use sidereon_core::antex::{Antex, AntexError};
 use sidereon_core::bias::{BiasError, BiasSet, CodeDcbOptions, Parsed as BiasParsed};
 use sidereon_core::ephemeris::{BroadcastEphemeris, Sp3};
@@ -319,6 +329,7 @@ use sidereon_core::precise_positioning::{
 use sidereon_core::rinex::clock::{RinexClock, RinexClockError};
 use sidereon_core::rinex::nav::NavParseError;
 use sidereon_core::rinex::observations::ObservationFile;
+use sidereon_core::rinex::qc::{LintReport, NavRepair, ObsRepair, RepairOptions};
 use sidereon_core::rtk_filter::{
     AmbiguitySet, Epoch, FloatBaselineSolution, FloatSolveError as RtkFloatSolveError,
     FloatSolveOpts, MeasModel, ReceiverAntennaCorrections, ValidatedFixedBaselineSolution,
@@ -772,6 +783,26 @@ pub fn parse_rinex_obs(text: &str) -> Result<ObservationFile> {
 pub fn load_rinex_obs(path: impl AsRef<Path>) -> Result<ObservationFile> {
     let text = std::fs::read_to_string(path)?;
     parse_rinex_obs(&text)
+}
+
+/// Lint RINEX OBS text, decoding CRINEX input when needed.
+pub fn lint_rinex_obs(text: &str) -> LintReport {
+    sidereon_core::rinex::qc::lint_obs_text(text)
+}
+
+/// Lint RINEX NAV text.
+pub fn lint_rinex_nav(text: &str) -> LintReport {
+    sidereon_core::rinex::qc::lint_nav_text(text)
+}
+
+/// Repair RINEX OBS text with mechanical fixes supported by the core writer.
+pub fn repair_rinex_obs(text: &str, options: &RepairOptions) -> Result<ObsRepair> {
+    sidereon_core::rinex::qc::repair_obs_text(text, options).map_err(Error::RinexObs)
+}
+
+/// Repair RINEX NAV text with mechanical fixes supported by the core writer.
+pub fn repair_rinex_nav(text: &str, options: &RepairOptions) -> Result<NavRepair> {
+    sidereon_core::rinex::qc::repair_nav_text(text, options).map_err(Error::RinexNav)
 }
 
 /// Strictly parse RINEX clock text into satellite clock-bias series.
