@@ -30,6 +30,11 @@ pub type Error = DopError;
 const DEFAULT_ELEVATION_MASK_DEG: f64 = 5.0;
 const DEG_TO_RAD: f64 = PI / 180.0;
 
+/// Returns whether an elevation is at or above an elevation mask.
+pub fn visible_at_elevation_mask(elevation_deg: f64, mask_deg: f64) -> bool {
+    elevation_deg >= mask_deg
+}
+
 /// Closed-form Sagnac/Earth-rotation transport of a transmit-time ECEF satellite
 /// position into the receive-time ECEF frame.
 ///
@@ -212,7 +217,7 @@ pub fn visible(
         let Ok(obs) = prediction else {
             continue;
         };
-        if obs.elevation_deg >= options.elevation_mask_deg {
+        if visible_at_elevation_mask(obs.elevation_deg, options.elevation_mask_deg) {
             visible.push(VisibleSatellite {
                 satellite: sat,
                 elevation_deg: obs.elevation_deg,
@@ -375,7 +380,9 @@ pub fn passes(
                 },
             );
             let above = match prediction {
-                Ok(obs) if obs.elevation_deg >= options.elevation_mask_deg => {
+                Ok(obs)
+                    if visible_at_elevation_mask(obs.elevation_deg, options.elevation_mask_deg) =>
+                {
                     Some(VisibilitySample {
                         step_index,
                         elevation_deg: obs.elevation_deg,
@@ -540,6 +547,14 @@ mod sampling_tests {
             sagnac_range_first_order_m(sat, recv).to_bits(),
             want.to_bits()
         );
+    }
+
+    #[test]
+    fn elevation_mask_predicate_is_inclusive() {
+        assert!(visible_at_elevation_mask(10.0, 10.0));
+        assert!(visible_at_elevation_mask(10.000_001, 10.0));
+        assert!(!visible_at_elevation_mask(9.999_999, 10.0));
+        assert!(!visible_at_elevation_mask(f64::NAN, 10.0));
     }
 
     struct FinalOnlySource {

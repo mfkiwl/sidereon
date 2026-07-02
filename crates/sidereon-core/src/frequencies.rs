@@ -4,6 +4,8 @@
 //! policy cannot drift between combinations, RINEX observation decoding, SPP,
 //! and ionosphere models.
 
+use core::fmt;
+
 use crate::constants::{C_M_S, F_B1I_HZ, F_B3I_HZ, F_E1_HZ, F_E5A_HZ, F_L1_HZ, F_L2_HZ};
 use crate::validate;
 use crate::GnssSystem;
@@ -91,8 +93,8 @@ impl CarrierBand {
     }
 
     /// The canonical lower-case band token.
-    pub const fn name(self) -> &'static str {
-        match self {
+    pub const fn as_str(&self) -> &'static str {
+        match *self {
             Self::L1 => "l1",
             Self::L2 => "l2",
             Self::L5 => "l5",
@@ -110,6 +112,17 @@ impl CarrierBand {
             Self::G1 => "g1",
             Self::G2 => "g2",
         }
+    }
+
+    /// The canonical lower-case band token.
+    pub const fn name(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for CarrierBand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -473,6 +486,34 @@ mod tests {
         );
         assert_eq!(default_iono_free_pair(GnssSystem::Glonass), None);
         assert_eq!(iono_free_carrier_frequencies().len(), 6);
+    }
+
+    #[test]
+    fn carrier_band_labels_are_canonical_lowercase() {
+        let cases = [
+            (CarrierBand::L1, "l1"),
+            (CarrierBand::L2, "l2"),
+            (CarrierBand::L5, "l5"),
+            (CarrierBand::E1, "e1"),
+            (CarrierBand::E5a, "e5a"),
+            (CarrierBand::E5b, "e5b"),
+            (CarrierBand::E5, "e5"),
+            (CarrierBand::E6, "e6"),
+            (CarrierBand::B1c, "b1c"),
+            (CarrierBand::B1i, "b1i"),
+            (CarrierBand::B2a, "b2a"),
+            (CarrierBand::B2b, "b2b"),
+            (CarrierBand::B2, "b2"),
+            (CarrierBand::B3i, "b3i"),
+            (CarrierBand::G1, "g1"),
+            (CarrierBand::G2, "g2"),
+        ];
+        for (band, label) in cases {
+            assert_eq!(band.as_str(), label);
+            assert_eq!(band.name(), label);
+            assert_eq!(band.to_string(), label);
+            assert_eq!(CarrierBand::from_name(label), Some(band));
+        }
     }
 
     #[test]

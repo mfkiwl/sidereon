@@ -41,6 +41,19 @@ pub enum GnssSystem {
 }
 
 impl GnssSystem {
+    /// The canonical lower-case display label.
+    pub const fn as_str(&self) -> &'static str {
+        match *self {
+            GnssSystem::Gps => "gps",
+            GnssSystem::Glonass => "glonass",
+            GnssSystem::Galileo => "galileo",
+            GnssSystem::BeiDou => "beidou",
+            GnssSystem::Qzss => "qzss",
+            GnssSystem::Navic => "navic",
+            GnssSystem::Sbas => "sbas",
+        }
+    }
+
     /// The canonical RINEX / IGS single-letter system identifier.
     pub const fn letter(self) -> char {
         match self {
@@ -74,15 +87,7 @@ impl GnssSystem {
 
 impl fmt::Display for GnssSystem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            GnssSystem::Gps => "GPS",
-            GnssSystem::Glonass => "GLO",
-            GnssSystem::Galileo => "GAL",
-            GnssSystem::BeiDou => "BDS",
-            GnssSystem::Qzss => "QZSS",
-            GnssSystem::Navic => "NavIC",
-            GnssSystem::Sbas => "SBAS",
-        })
+        f.write_str(self.as_str())
     }
 }
 
@@ -216,6 +221,23 @@ mod tests {
             assert_eq!(GnssSystem::from_letter(sys.letter()), Some(sys));
         }
         assert_eq!(GnssSystem::from_letter('X'), None);
+    }
+
+    #[test]
+    fn system_labels_are_canonical_lowercase() {
+        let cases = [
+            (GnssSystem::Gps, "gps"),
+            (GnssSystem::Glonass, "glonass"),
+            (GnssSystem::Galileo, "galileo"),
+            (GnssSystem::BeiDou, "beidou"),
+            (GnssSystem::Qzss, "qzss"),
+            (GnssSystem::Navic, "navic"),
+            (GnssSystem::Sbas, "sbas"),
+        ];
+        for (system, label) in cases {
+            assert_eq!(system.as_str(), label);
+            assert_eq!(system.to_string(), label);
+        }
     }
 
     #[test]
