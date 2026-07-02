@@ -92,11 +92,11 @@ pub fn relative_state(
 
     let dr = vec3::sub3(deputy.position_array(), chief.position_array());
     let dv = vec3::sub3(deputy.velocity_array(), chief.velocity_array());
-    let rho = mat3_vec_mul(&rt, dr);
+    let rho = mat3::mul_vec3(&rt, dr);
     validate_vec3("relative.position", rho)?;
 
     let omega = chief_frame_omega(chief);
-    let inertial_rate_in_frame = mat3_vec_mul(&rt, dv);
+    let inertial_rate_in_frame = mat3::mul_vec3(&rt, dv);
     let rho_dot = vec3::sub3(inertial_rate_in_frame, vec3::cross3(omega, rho));
     validate_vec3("relative.velocity", rho_dot)?;
 
@@ -118,9 +118,9 @@ pub fn absolute_from_relative(
     validate_vec3("rel.velocity", rho_dot)?;
 
     let omega = chief_frame_omega(chief);
-    let dr = mat3_vec_mul(&r, rho);
+    let dr = mat3::mul_vec3(&r, rho);
     let velocity_in_frame = vec3::add3(rho_dot, vec3::cross3(omega, rho));
-    let dv = mat3_vec_mul(&r, velocity_in_frame);
+    let dv = mat3::mul_vec3(&r, velocity_in_frame);
 
     let position = vec3::add3(chief.position_array(), dr);
     let velocity = vec3::add3(chief.velocity_array(), dv);
@@ -288,14 +288,6 @@ fn chief_frame_omega(chief: &CartesianState) -> [f64; 3] {
     let h = vec3::cross3(r, v);
     let r_norm = vec3::norm3(r);
     [0.0, 0.0, vec3::norm3(h) / (r_norm * r_norm)]
-}
-
-fn mat3_vec_mul(m: &Mat3, v: [f64; 3]) -> [f64; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
 }
 
 fn mat6_vec_mul(m: &Mat6, v: [f64; 6]) -> [f64; 6] {

@@ -39,6 +39,8 @@ mod tables;
 /// 36 to 57 hr prior.
 pub type ApArray = [f64; 7];
 
+use crate::astro::constants::time::SECONDS_PER_HOUR;
+
 /// Documented upper bound of the NRLMSISE-00 altitude domain (km).
 ///
 /// The model spans the surface to the lower exosphere; above this the profile
@@ -240,7 +242,7 @@ impl Flags {
 
 /// Local apparent solar time (hours) from UT seconds and longitude (deg).
 pub fn local_solar_time(sec: f64, g_long: f64) -> f64 {
-    let lst = sec / 3600.0 + g_long / 15.0;
+    let lst = sec / SECONDS_PER_HOUR + g_long / 15.0;
     ((lst % 24.0) + 24.0) % 24.0
 }
 

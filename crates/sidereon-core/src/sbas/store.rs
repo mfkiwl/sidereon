@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::astro::time::model::GnssWeekTow;
-use crate::constants::{F_L1_HZ, GPS_EPOCH_TO_J2000_S, MEAN_EARTH_RADIUS_M, SECONDS_PER_DAY};
+use crate::constants::{F_L1_HZ, GPS_EPOCH_TO_J2000_S, MEAN_EARTH_RADIUS_KM, SECONDS_PER_DAY};
 use crate::error::{Error, Result};
 use crate::frame::Wgs84Geodetic;
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::ionex::pierce_point;
 use crate::staleness::StalenessPolicy;
+use crate::tolerances::SBAS_IGP_COORD_EPS_DEG;
 
 use super::message::{
     SbasGeoNav, SbasIgpMask, SbasIntegrity, SbasIonoDelays, SbasLongTermHalf, SbasLongTermRecord,
@@ -87,7 +88,7 @@ impl SbasIonoGrid {
             receiver.lon_rad,
             azimuth_rad,
             elevation_rad,
-            MEAN_EARTH_RADIUS_M / 1000.0,
+            MEAN_EARTH_RADIUS_KM,
             SBAS_SHELL_HEIGHT_KM,
         );
         let vertical_delay_m =
@@ -100,10 +101,10 @@ impl SbasIonoGrid {
     fn vertical_delay_at_ipp(&self, lat_deg: f64, lon_deg: f64) -> Option<f64> {
         let mut lats: Vec<f64> = self.igps.iter().map(|p| p.lat_deg).collect();
         lats.sort_by(f64_total_cmp);
-        lats.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+        lats.dedup_by(|a, b| (*a - *b).abs() < SBAS_IGP_COORD_EPS_DEG);
         let mut lons: Vec<f64> = self.igps.iter().map(|p| normalize_lon(p.lon_deg)).collect();
         lons.sort_by(f64_total_cmp);
-        lons.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+        lons.dedup_by(|a, b| (*a - *b).abs() < SBAS_IGP_COORD_EPS_DEG);
         let (lat0, lat1) = bracket_pair(&lats, lat_deg)?;
         let (lon0, lon1) = bracket_pair(&lons, lon_deg)?;
         if (lat1 - lat0).abs() < f64::EPSILON || (lon1 - lon0).abs() < f64::EPSILON {
@@ -141,8 +142,8 @@ impl SbasIonoGrid {
         self.igps
             .iter()
             .find(|p| {
-                (p.lat_deg - lat_deg).abs() < 1.0e-9
-                    && (normalize_lon(p.lon_deg) - lon_deg).abs() < 1.0e-9
+                (p.lat_deg - lat_deg).abs() < SBAS_IGP_COORD_EPS_DEG
+                    && (normalize_lon(p.lon_deg) - lon_deg).abs() < SBAS_IGP_COORD_EPS_DEG
             })
             .cloned()
     }
@@ -591,8 +592,9 @@ fn ingest_iono(partition: &mut GeoPartition, delays: &SbasIonoDelays, epoch_j200
             give_variance_m2: None,
         };
         if let Some(existing) = igps.iter_mut().find(|p| {
-            (p.lat_deg - lat_deg).abs() < 1.0e-9
-                && (normalize_lon(p.lon_deg) - normalize_lon(lon_deg)).abs() < 1.0e-9
+            (p.lat_deg - lat_deg).abs() < SBAS_IGP_COORD_EPS_DEG
+                && (normalize_lon(p.lon_deg) - normalize_lon(lon_deg)).abs()
+                    < SBAS_IGP_COORD_EPS_DEG
         }) {
             *existing = point;
         } else {
@@ -1295,7 +1297,8 @@ fn bracket_pair(values: &[f64], value: f64) -> Option<(f64, f64)> {
 
 fn active_point(points: &[SbasIgp], lat_deg: f64, lon_deg: f64) -> Option<&SbasIgp> {
     points.iter().find(|p| {
-        (p.lat_deg - lat_deg).abs() < 1.0e-9 && (normalize_lon(p.lon_deg) - lon_deg).abs() < 1.0e-9
+        (p.lat_deg - lat_deg).abs() < SBAS_IGP_COORD_EPS_DEG
+            && (normalize_lon(p.lon_deg) - lon_deg).abs() < SBAS_IGP_COORD_EPS_DEG
     })
 }
 

@@ -21,7 +21,7 @@ mod write;
 #[cfg(all(test, sidereon_repo_tests))]
 mod tests;
 
-use crate::astro::constants::time::SECONDS_PER_DAY;
+use crate::astro::constants::time::{DAYS_PER_JULIAN_YEAR, SECONDS_PER_DAY, SECONDS_PER_HOUR};
 use crate::astro::time::civil::{
     fractional_day_of_year_from_instant, j2000_seconds_from_split, second_of_day_from_instant,
     split_julian_date_from_j2000_seconds,
@@ -321,11 +321,12 @@ pub(crate) fn galileo_nequick_g_native_unchecked(
     let mu_deg = galileo_modified_dip_latitude_deg(lat_deg, lon_deg);
     let az = galileo_effective_ionisation_level(coeffs, mu_deg);
 
-    let local_time_h = (t_gal_s / 3600.0 + lon_deg / 15.0).rem_euclid(24.0);
+    let local_time_h = (t_gal_s / SECONDS_PER_HOUR + lon_deg / 15.0).rem_euclid(24.0);
     let solar = 0.5 + 0.5 * ((local_time_h - 14.0) * (2.0 * std::f64::consts::PI / 24.0)).cos();
     let diurnal = 0.35 + 0.65 * solar.max(0.0);
-    let seasonal =
-        1.0 + 0.08 * ((day_of_year - 172.0) * (2.0 * std::f64::consts::PI / 365.25)).cos();
+    let seasonal = 1.0
+        + 0.08
+            * ((day_of_year - 172.0) * (2.0 * std::f64::consts::PI / DAYS_PER_JULIAN_YEAR)).cos();
     let equatorial = 1.0 + 0.35 * (-(mu_deg / 22.0).powi(2)).exp();
 
     let vertical_tecu = (2.5 + 0.135 * az) * diurnal * seasonal * equatorial;

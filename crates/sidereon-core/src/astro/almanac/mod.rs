@@ -9,7 +9,13 @@ use crate::astro::frames::transforms::{geodetic_to_itrs, FrameTransformError, Ge
 use crate::astro::math::vec3::{dot3, norm3};
 use crate::astro::passes::UtcInstant;
 use crate::astro::spk::{Spk, SpkError};
-use crate::astro::{constants::units::MICROSECONDS_PER_SECOND, events::CrossingEvent};
+use crate::astro::{
+    constants::{
+        time::{SECONDS_PER_DAY, SECONDS_PER_HOUR},
+        units::MICROSECONDS_PER_SECOND,
+    },
+    events::CrossingEvent,
+};
 use crate::validate;
 
 mod eclipse;
@@ -31,9 +37,9 @@ pub use transits::meridian_transits;
 pub(crate) const NAIF_SUN: i32 = 10;
 pub(crate) const NAIF_MOON: i32 = 301;
 
-pub(crate) const SEASON_PLANET_STEP_MAX_SECONDS: f64 = 86_400.0;
-pub(crate) const PHASE_STEP_MAX_SECONDS: f64 = 3.0 * 86_400.0;
-pub(crate) const TRANSIT_STEP_MAX_SECONDS: f64 = 3_600.0;
+pub(crate) const SEASON_PLANET_STEP_MAX_SECONDS: f64 = SECONDS_PER_DAY;
+pub(crate) const PHASE_STEP_MAX_SECONDS: f64 = 3.0 * SECONDS_PER_DAY;
+pub(crate) const TRANSIT_STEP_MAX_SECONDS: f64 = SECONDS_PER_HOUR;
 
 /// Which ephemeris backs an almanac computation.
 #[derive(Clone, Copy)]

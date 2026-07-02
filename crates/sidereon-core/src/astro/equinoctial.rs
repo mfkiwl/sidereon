@@ -9,7 +9,7 @@ use crate::astro::anomaly::{mean_to_true, true_to_mean, AnomalyError};
 use crate::astro::elements::{
     clamp_acos, classify, coe2rv, rv2coe, ClassicalElements, ElementsError, OrbitType,
 };
-use crate::astro::math::{normalize_angle, SMALL, TWO_PI};
+use crate::astro::math::{normalize_angle, wrap_to_pi, SMALL, TWO_PI};
 
 const PI: f64 = std::f64::consts::PI;
 const HALF_PI: f64 = std::f64::consts::FRAC_PI_2;
@@ -142,7 +142,7 @@ pub fn coe2eq(
     check_retrograde_pole(coe.incl, factor)?;
 
     let resolved = resolve_classical_angles(coe)?;
-    let varpi = principal_angle(resolved.argp + factor.sign() * resolved.raan);
+    let varpi = wrap_to_pi(resolved.argp + factor.sign() * resolved.raan);
     let mean = true_to_mean(resolved.nu, coe.ecc)?;
     let lambda = mean_longitude(mean, varpi, coe.ecc);
     let scale = inclination_scale(coe.incl, factor)?;
@@ -174,7 +174,7 @@ pub fn coe2mee(
     check_retrograde_pole(coe.incl, factor)?;
 
     let resolved = resolve_classical_angles(coe)?;
-    let varpi = principal_angle(resolved.argp + factor.sign() * resolved.raan);
+    let varpi = wrap_to_pi(resolved.argp + factor.sign() * resolved.raan);
     let l = normalize_angle(varpi + resolved.nu);
     let scale = inclination_scale(coe.incl, factor)?;
 
@@ -607,15 +607,6 @@ fn is_parabolic(ecc: f64) -> bool {
     (ecc - 1.0).abs() < SMALL
 }
 
-fn principal_angle(angle: f64) -> f64 {
-    let wrapped = angle.sin().atan2(angle.cos());
-    if wrapped <= -PI {
-        PI
-    } else {
-        wrapped
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,8 +804,8 @@ mod tests {
 
         let got_resolved = resolve_classical_angles(got).unwrap();
         let want_resolved = resolve_classical_angles(want).unwrap();
-        let got_varpi = principal_angle(got_resolved.argp + factor.sign() * got_resolved.raan);
-        let want_varpi = principal_angle(want_resolved.argp + factor.sign() * want_resolved.raan);
+        let got_varpi = wrap_to_pi(got_resolved.argp + factor.sign() * got_resolved.raan);
+        let want_varpi = wrap_to_pi(want_resolved.argp + factor.sign() * want_resolved.raan);
         assert_angle_close(got_varpi, want_varpi, 1.0e-10, &format!("{label} varpi"));
         assert_angle_close(
             normalize_angle(got_varpi + got_resolved.nu),
@@ -904,7 +895,7 @@ mod tests {
         // state. The expected components below are recomputed from those values
         // with the definitions in this module. The rounded check uses Vallado's
         // printed Example 2-5 elements only as a loose external anchor.
-        let varpi = principal_angle(coe.argp + coe.raan);
+        let varpi = wrap_to_pi(coe.argp + coe.raan);
         let mean = true_to_mean(coe.nu, coe.ecc).unwrap();
         let scale = (0.5 * coe.incl).tan();
         assert_close(eq.a, coe.a, 1.0e-12, "eq a full");
@@ -926,7 +917,7 @@ mod tests {
         let raan = 227.898 * DEG;
         let argp = 53.38 * DEG;
         let nu = 92.335 * DEG;
-        let varpi = principal_angle(argp + raan);
+        let varpi = wrap_to_pi(argp + raan);
         let mean = true_to_mean(nu, e).unwrap();
         let scale = (0.5 * incl).tan();
 

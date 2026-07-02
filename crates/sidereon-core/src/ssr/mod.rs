@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::astro::time::model::{GnssWeekTow, TimeScale};
 use crate::broadcast::satellite_state_unchecked;
-use crate::constants::{C_M_S, GPS_EPOCH_TO_J2000_S, SECONDS_PER_WEEK};
+use crate::constants::{C_M_S, GPS_EPOCH_TO_J2000_S, SECONDS_PER_HOUR, SECONDS_PER_WEEK};
 use crate::ephemeris::{BroadcastEphemeris, BroadcastIssue, NavMessage};
 use crate::error::{Error, Result};
 use crate::id::{GnssSatelliteId, GnssSystem};
@@ -21,6 +21,16 @@ use crate::staleness::StalenessPolicy;
 
 const DEFAULT_SSR_STALENESS_S: f64 = 90.0;
 const FD_HALF_S: f64 = 0.5;
+/// RTCM 10403.x SSR radial orbit and clock C0 resolution, meters.
+const RTCM_SSR_RADIAL_CLOCK_SCALE_M: f64 = 1.0e-4;
+/// RTCM 10403.x SSR along-track and cross-track orbit resolution, meters.
+const RTCM_SSR_ALONG_CROSS_SCALE_M: f64 = 4.0e-4;
+/// RTCM 10403.x SSR radial-rate and clock C1 resolution, meters per second.
+const RTCM_SSR_RADIAL_CLOCK_RATE_SCALE_M_S: f64 = 1.0e-6;
+/// RTCM 10403.x SSR along/cross-rate resolution, meters per second.
+const RTCM_SSR_ALONG_CROSS_RATE_SCALE_M_S: f64 = 4.0e-6;
+/// RTCM 10403.x SSR clock C2 resolution, meters per second squared.
+const RTCM_SSR_CLOCK_ACCEL_SCALE_M_S2: f64 = 2.0e-8;
 
 /// Which stream produced a correction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -236,9 +246,9 @@ impl SsrCorrectionStore {
                     let mut clock = SsrClockCorrection {
                         solution,
                         iod_ssr: message.header.iod_ssr,
-                        c0_m: f64::from(record.c0) * 1.0e-4,
-                        c1_m_s: f64::from(record.c1) * 1.0e-6,
-                        c2_m_s2: f64::from(record.c2) * 2.0e-8,
+                        c0_m: f64::from(record.c0) * RTCM_SSR_RADIAL_CLOCK_SCALE_M,
+                        c1_m_s: f64::from(record.c1) * RTCM_SSR_RADIAL_CLOCK_RATE_SCALE_M_S,
+                        c2_m_s2: f64::from(record.c2) * RTCM_SSR_CLOCK_ACCEL_SCALE_M_S2,
                         ref_epoch_j2000_s,
                         update_interval_s,
                         high_rate: None,
@@ -267,9 +277,9 @@ impl SsrCorrectionStore {
                     entry.clock = Some(SsrClockCorrection {
                         solution,
                         iod_ssr: message.header.iod_ssr,
-                        c0_m: f64::from(clock_record.c0) * 1.0e-4,
-                        c1_m_s: f64::from(clock_record.c1) * 1.0e-6,
-                        c2_m_s2: f64::from(clock_record.c2) * 2.0e-8,
+                        c0_m: f64::from(clock_record.c0) * RTCM_SSR_RADIAL_CLOCK_SCALE_M,
+                        c1_m_s: f64::from(clock_record.c1) * RTCM_SSR_RADIAL_CLOCK_RATE_SCALE_M_S,
+                        c2_m_s2: f64::from(clock_record.c2) * RTCM_SSR_CLOCK_ACCEL_SCALE_M_S2,
                         ref_epoch_j2000_s,
                         update_interval_s,
                         high_rate: entry.pending_high_rate,
@@ -288,7 +298,7 @@ impl SsrCorrectionStore {
                     let high_rate = SsrHighRateClock {
                         solution,
                         iod_ssr: message.header.iod_ssr,
-                        c0_m: f64::from(record.c0) * 1.0e-4,
+                        c0_m: f64::from(record.c0) * RTCM_SSR_RADIAL_CLOCK_SCALE_M,
                         ref_epoch_j2000_s,
                         update_interval_s,
                     };
@@ -357,12 +367,12 @@ fn orbit_from_rtcm(
         basis: OrbitBasis::VelocityAligned,
         crs_regional: message.header.satellite_reference_datum.unwrap_or(false),
         reference_point,
-        radial_m: -f64::from(record.delta_radial) * 1.0e-4,
-        along_m: -f64::from(record.delta_along) * 4.0e-4,
-        cross_m: -f64::from(record.delta_cross) * 4.0e-4,
-        radial_rate_m_s: -f64::from(record.dot_delta_radial) * 1.0e-6,
-        along_rate_m_s: -f64::from(record.dot_delta_along) * 4.0e-6,
-        cross_rate_m_s: -f64::from(record.dot_delta_cross) * 4.0e-6,
+        radial_m: -f64::from(record.delta_radial) * RTCM_SSR_RADIAL_CLOCK_SCALE_M,
+        along_m: -f64::from(record.delta_along) * RTCM_SSR_ALONG_CROSS_SCALE_M,
+        cross_m: -f64::from(record.delta_cross) * RTCM_SSR_ALONG_CROSS_SCALE_M,
+        radial_rate_m_s: -f64::from(record.dot_delta_radial) * RTCM_SSR_RADIAL_CLOCK_RATE_SCALE_M_S,
+        along_rate_m_s: -f64::from(record.dot_delta_along) * RTCM_SSR_ALONG_CROSS_RATE_SCALE_M_S,
+        cross_rate_m_s: -f64::from(record.dot_delta_cross) * RTCM_SSR_ALONG_CROSS_RATE_SCALE_M_S,
         ref_epoch_j2000_s,
         update_interval_s,
     }
@@ -646,8 +656,22 @@ impl ObservableEphemerisSource for SsrCorrectedEphemerisOwned {
 
 fn update_interval_s(index: u8) -> f64 {
     const TABLE: [f64; 16] = [
-        1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 240.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
-        7200.0, 10800.0,
+        1.0,
+        2.0,
+        5.0,
+        10.0,
+        15.0,
+        30.0,
+        60.0,
+        120.0,
+        240.0,
+        300.0,
+        600.0,
+        900.0,
+        1800.0,
+        SECONDS_PER_HOUR,
+        7200.0,
+        10800.0,
     ];
     TABLE[usize::from(index)]
 }

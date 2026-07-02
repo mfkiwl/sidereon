@@ -7,7 +7,8 @@
 //! return degrees unless their names state otherwise.
 
 use crate::astro::constants::earth::WGS84_A_KM;
-use crate::astro::constants::units::DEGREES_PER_SEMICIRCLE;
+use crate::astro::constants::units::{DEGREES_PER_CIRCLE, DEGREES_PER_SEMICIRCLE};
+use crate::astro::elements::clamp_acos;
 use crate::astro::math::vec3;
 
 /// A right angle in degrees: elevation is the complement of the zenith angle.
@@ -65,8 +66,7 @@ fn angle_between(
     validate_nonzero_vec3(b, b_field)?;
     let cos_theta = vec3::dot3(a, b) / (vec3::norm3(a) * vec3::norm3(b));
     // Clamp into the valid cosine domain for numerical safety.
-    let cos_theta = cos_theta.clamp(-1.0, 1.0);
-    Ok(rad_to_deg_ref(cos_theta.acos()))
+    Ok(rad_to_deg_ref(clamp_acos(cos_theta)))
 }
 
 /// On-sky angle (degrees) between two direction vectors, via the stable
@@ -119,8 +119,12 @@ pub fn position_angle(
 
     let numerator = lat2.cos() * dlon.sin();
     let denominator = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let pa = rad_to_deg_ref(numerator.atan2(denominator)).rem_euclid(360.0);
-    Ok(if pa == 360.0 || pa == 0.0 { 0.0 } else { pa })
+    let pa = rad_to_deg_ref(numerator.atan2(denominator)).rem_euclid(DEGREES_PER_CIRCLE);
+    Ok(if pa == DEGREES_PER_CIRCLE || pa == 0.0 {
+        0.0
+    } else {
+        pa
+    })
 }
 
 /// Angle (degrees) between the satellite nadir (toward Earth center) and the
@@ -232,8 +236,8 @@ fn validate_lon_lat_deg(lon_lat_deg: (f64, f64), field: &'static str) -> Result<
 }
 
 fn reduce_lon_deg(lon: f64) -> f64 {
-    let reduced = lon.rem_euclid(360.0);
-    if reduced == 360.0 || reduced == 0.0 {
+    let reduced = lon.rem_euclid(DEGREES_PER_CIRCLE);
+    if reduced == DEGREES_PER_CIRCLE || reduced == 0.0 {
         0.0
     } else {
         reduced
@@ -543,7 +547,10 @@ mod tests {
     #[test]
     fn longitude_reduction_wraps_and_canonicalizes_zero() {
         assert_eq!(reduce_lon_deg(-0.0).to_bits(), 0.0_f64.to_bits());
-        assert_eq!(reduce_lon_deg(360.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(
+            reduce_lon_deg(DEGREES_PER_CIRCLE).to_bits(),
+            0.0_f64.to_bits()
+        );
         assert_eq!(reduce_lon_deg(720.0).to_bits(), 0.0_f64.to_bits());
         assert_eq!(reduce_lon_deg(-10.0).to_bits(), 350.0_f64.to_bits());
         assert_eq!(reduce_lon_deg(123.456).to_bits(), 123.456_f64.to_bits());
@@ -822,12 +829,12 @@ mod tests {
 
     fn assert_finite_pa(pa: f64) {
         assert!(pa.is_finite(), "pa={pa}");
-        assert!((0.0..360.0).contains(&pa), "pa={pa}");
+        assert!((0.0..DEGREES_PER_CIRCLE).contains(&pa), "pa={pa}");
     }
 
     fn circular_diff_deg(actual: f64, expected: f64) -> f64 {
         let diff = (actual - expected).abs();
-        diff.min(360.0 - diff)
+        diff.min(DEGREES_PER_CIRCLE - diff)
     }
 
     fn relative_error(actual: f64, expected: f64) -> f64 {

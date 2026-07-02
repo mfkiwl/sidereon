@@ -9,12 +9,13 @@ use crate::astro::almanac::{
 use crate::astro::constants::{
     astro::{MOON_RADIUS_KM, SOLAR_RADIUS_KM},
     earth::MEAN_EARTH_RADIUS_KM,
+    time::SECONDS_PER_HOUR,
 };
 use crate::astro::events::ExtremumKind;
 use crate::astro::math::vec3::{dot3, norm3, scale3, sub3, unit3};
 use crate::astro::passes::UtcInstant;
 
-const ECLIPSE_PAD_SECONDS: f64 = 6.0 * 3_600.0;
+const ECLIPSE_PAD_SECONDS: f64 = 6.0 * SECONDS_PER_HOUR;
 const ECLIPSE_EXTREMUM_STEP_SECONDS: f64 = 120.0;
 const SOLAR_NODE_LIMIT_DEG: f64 = 1.58;
 const LUNAR_NODE_LIMIT_DEG: f64 = 1.05;

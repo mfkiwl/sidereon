@@ -2,6 +2,7 @@
 
 use sidereon_core::astro::time::civil::seconds_between_splits;
 use sidereon_core::astro::time::model::TimeScale;
+use sidereon_core::constants::SECONDS_PER_DAY;
 use sidereon_core::rinex::clock::{
     civil_to_clock_instant, civil_to_gps_seconds, ClockEpoch, RinexClock, RinexClockError,
 };
@@ -275,7 +276,7 @@ fn civil_gps_seconds_match_gps_epoch_boundary() {
     );
     assert_eq!(
         civil_to_gps_seconds(1980, 1, 7, 0, 0, 0.0).expect("next day"),
-        86_400.0
+        SECONDS_PER_DAY
     );
 }
 

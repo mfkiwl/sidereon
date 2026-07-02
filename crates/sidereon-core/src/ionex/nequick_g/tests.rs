@@ -19,6 +19,7 @@ use super::*;
 use crate::atmosphere::ionosphere::{
     galileo_nequick_g_native, klobuchar_native, GalileoNequickCoeffs,
 };
+use crate::constants::SECONDS_PER_HOUR;
 
 const AZ_HIGH: GalileoNequickCoeffs = GalileoNequickCoeffs {
     ai0: 236.831641,
@@ -410,7 +411,7 @@ fn galileo_single_frequency_path_uses_nequick_g_not_klobuchar() {
             // the compact helper takes longitude in [-180, 180]
             lon_deg: b.ray.station_lon_deg - 360.0,
             el_deg: 40.0,
-            t_gal_s: 3600.0 * b.ray.utc_hours,
+            t_gal_s: SECONDS_PER_HOUR * b.ray.utc_hours,
             day_of_year: 101.0,
             frequency_hz: GALILEO_E1_HZ,
         },
@@ -428,7 +429,7 @@ fn galileo_single_frequency_path_uses_nequick_g_not_klobuchar() {
         b.ray.station_lon_deg - 360.0,
         0.0,
         40.0,
-        3600.0 * b.ray.utc_hours,
+        SECONDS_PER_HOUR * b.ray.utc_hours,
         GALILEO_E1_HZ,
     )
     .expect("valid Klobuchar eval");

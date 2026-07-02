@@ -21,7 +21,7 @@
 use super::model::{Instant, InstantRepr, JulianDateSplit, TimeModelError, TimeScale};
 use super::scales::julian_day_number;
 use crate::astro::constants::time::SECONDS_PER_DAY_I64;
-use crate::constants::{J2000_JD, SECONDS_PER_DAY};
+use crate::constants::{J2000_JD, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE};
 
 /// Julian Date of the Modified Julian Date origin (`MJD = JD - 2_400_000.5`).
 pub const MJD_JD_OFFSET: f64 = 2_400_000.5;
@@ -49,7 +49,7 @@ pub fn split_julian_date(
     second: f64,
 ) -> (f64, f64) {
     let jd_whole = julian_day_number(year, month, day) as f64 - 0.5;
-    let day_seconds = hour as f64 * 3600.0 + minute as f64 * 60.0 + second;
+    let day_seconds = hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + second;
     let fraction = day_seconds / SECONDS_PER_DAY;
     (jd_whole, fraction)
 }
@@ -127,7 +127,7 @@ pub fn j2000_seconds(year: i32, month: i32, day: i32, hour: i32, minute: i32, se
 /// is exact, with no split-Julian-date round trip.
 #[must_use]
 pub fn second_of_day(hour: i32, minute: i32, second: f64) -> f64 {
-    hour as f64 * 3600.0 + minute as f64 * 60.0 + second
+    hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + second
 }
 
 /// Fractional day-of-year for a civil instant; January 1 00:00 is `1.0`.
@@ -281,9 +281,11 @@ pub fn civil_from_split_julian_date(
     let jdn = (jd_whole + 0.5).round() as i64;
     let (year, month, day) = civil_from_julian_day_number(jdn);
     let seconds_of_day = fraction * SECONDS_PER_DAY;
-    let hour = (seconds_of_day / 3600.0).floor() as i64;
-    let minute = ((seconds_of_day - hour as f64 * 3600.0) / 60.0).floor() as i64;
-    let second = seconds_of_day - hour as f64 * 3600.0 - minute as f64 * 60.0;
+    let hour = (seconds_of_day / SECONDS_PER_HOUR).floor() as i64;
+    let minute =
+        ((seconds_of_day - hour as f64 * SECONDS_PER_HOUR) / SECONDS_PER_MINUTE).floor() as i64;
+    let second =
+        seconds_of_day - hour as f64 * SECONDS_PER_HOUR - minute as f64 * SECONDS_PER_MINUTE;
     (year, month, day, hour, minute, second)
 }
 
@@ -398,7 +400,7 @@ mod tests {
     fn j2000_seconds_epoch_is_zero() {
         assert_eq!(j2000_seconds(2000, 1, 1, 12, 0, 0.0), 0.0);
         // Whole-second epochs land on integers.
-        assert_eq!(j2000_seconds(2000, 1, 2, 12, 0, 0.0), 86_400.0);
+        assert_eq!(j2000_seconds(2000, 1, 2, 12, 0, 0.0), SECONDS_PER_DAY);
         // Sub-second remainder is carried.
         assert_eq!(j2000_seconds(2000, 1, 1, 12, 0, 0.25), 0.25);
     }
@@ -561,10 +563,10 @@ mod tests {
     #[test]
     fn split_add_seconds_carries_across_midnight() {
         // Add 6 hours within a day: no carry.
-        let (w, f) = split_julian_date_add_seconds(2_451_544.5, 0.25, 6.0 * 3600.0);
+        let (w, f) = split_julian_date_add_seconds(2_451_544.5, 0.25, 6.0 * SECONDS_PER_HOUR);
         assert_eq!((w, f), (2_451_544.5, 0.5));
         // Add 18 hours from 12:00: carry one whole day.
-        let (w, f) = split_julian_date_add_seconds(2_451_544.5, 0.5, 18.0 * 3600.0);
+        let (w, f) = split_julian_date_add_seconds(2_451_544.5, 0.5, 18.0 * SECONDS_PER_HOUR);
         assert_eq!(w, 2_451_545.5);
         assert!((f - 0.25).abs() < 1e-12);
     }
@@ -581,7 +583,7 @@ mod tests {
         assert_eq!(julian_date_from_instant(epoch), whole + frac);
         // 2020 is a leap year; June 25 is day 177, plus 6h = 0.25 day fraction.
         assert!((fractional_day_of_year_from_instant(epoch) - (177.0 + 0.25)).abs() < 1e-9);
-        assert!((second_of_day_from_instant(epoch) - 6.0 * 3600.0).abs() < 1e-6);
+        assert!((second_of_day_from_instant(epoch) - 6.0 * SECONDS_PER_HOUR).abs() < 1e-6);
     }
 
     #[test]

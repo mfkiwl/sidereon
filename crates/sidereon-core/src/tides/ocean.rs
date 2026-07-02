@@ -66,7 +66,10 @@
 #[cfg(test)]
 mod tests;
 
-use crate::astro::constants::units::{DEG_TO_RAD, KM_TO_M};
+use crate::astro::constants::{
+    time::SECONDS_PER_HOUR,
+    units::{DEG_TO_RAD, KM_TO_M},
+};
 use crate::astro::frames::transforms::itrs_to_geodetic_compute;
 use crate::astro::math::vec3::norm3_ref as norm;
 use crate::validate;
@@ -245,7 +248,7 @@ fn arg2_angles(year: i32, month: i32, day: i32, fhr: f64) -> [f64; NUM_OCEAN_CON
     let doy = day_of_year(year, month, day);
     // `DAY` of ARG2 is the fractional day of year; `ID` its integer part and
     // `FDAY` the seconds into the day, i.e. `(DAY - ID) * 86400 = fhr * 3600`.
-    let fday = fhr * 3600.0;
+    let fday = fhr * SECONDS_PER_HOUR;
 
     // ARG2.F day count and Julian centuries from the 1975 reference epoch.
     // Fortran integer division (truncating toward zero, == floor for years

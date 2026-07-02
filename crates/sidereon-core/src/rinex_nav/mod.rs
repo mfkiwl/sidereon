@@ -32,7 +32,7 @@ pub use write::encode_nav;
 use crate::astro::time::model::{GnssWeekTow, TimeScale};
 use crate::astro::time::{civil, gnss};
 use crate::broadcast::{ClockPolynomial, ConstellationConstants, KeplerianElements};
-use crate::constants::KM_TO_M;
+use crate::constants::{KM_TO_M, SECONDS_PER_HOUR};
 use crate::format::columns::{field, raw_field};
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::ionex::GalileoNequickCoeffs;
@@ -59,14 +59,14 @@ fn parse_f64(line: &str, start: usize, end: usize) -> Option<f64> {
 /// "no ephemeris" rather than silently extrapolating. GPS records carry an
 /// explicit curve-fit interval (see [`BroadcastRecord::fit_interval_s`]) and use
 /// half of that instead.
-pub(crate) const MAX_EPHEMERIS_AGE_S: f64 = 4.0 * 3600.0;
+pub(crate) const MAX_EPHEMERIS_AGE_S: f64 = 4.0 * SECONDS_PER_HOUR;
 
 /// GLONASS broadcast records are valid +/-15 minutes around their reference
 /// epoch (the nominal half-hour upload cadence), so a query farther than this
 /// reports no ephemeris rather than extrapolating the RK4 integration.
 pub(crate) const GLONASS_MAX_AGE_S: f64 = 15.0 * 60.0;
-const GPS_NOMINAL_FIT_INTERVAL_S: f64 = 4.0 * 3600.0;
-const GPS_LEGACY_EXTENDED_FIT_INTERVAL_S: f64 = 8.0 * 3600.0;
+const GPS_NOMINAL_FIT_INTERVAL_S: f64 = 4.0 * SECONDS_PER_HOUR;
+const GPS_LEGACY_EXTENDED_FIT_INTERVAL_S: f64 = 8.0 * SECONDS_PER_HOUR;
 const GLONASS_FREQ_CHANNEL_MIN: i32 = -7;
 const GLONASS_FREQ_CHANNEL_MAX: i32 = 6;
 
@@ -487,10 +487,10 @@ fn gps_ura_index_to_meters(index: i64) -> Option<f64> {
     Some(meters)
 }
 
-const GPS_FIT_INTERVAL_6H_S: f64 = 6.0 * 3600.0;
-const GPS_FIT_INTERVAL_8H_S: f64 = 8.0 * 3600.0;
-const GPS_FIT_INTERVAL_14H_S: f64 = 14.0 * 3600.0;
-const GPS_FIT_INTERVAL_26H_S: f64 = 26.0 * 3600.0;
+const GPS_FIT_INTERVAL_6H_S: f64 = 6.0 * SECONDS_PER_HOUR;
+const GPS_FIT_INTERVAL_8H_S: f64 = 8.0 * SECONDS_PER_HOUR;
+const GPS_FIT_INTERVAL_14H_S: f64 = 14.0 * SECONDS_PER_HOUR;
+const GPS_FIT_INTERVAL_26H_S: f64 = 26.0 * SECONDS_PER_HOUR;
 
 /// Curve-fit interval (seconds) for a GPS LNAV record from its fit-interval flag
 /// plus IODE/IODC, per IS-GPS-200N 20.3.3.4.3.1, 6.2.3, and Table 20-XII (the
@@ -1383,7 +1383,7 @@ fn gps_fit_interval_s(orbit7: &str, version: RinexVersion) -> Result<f64, ()> {
     } else if version.gps_fit_interval_uses_legacy_flag() && value == 1.0 {
         Ok(GPS_LEGACY_EXTENDED_FIT_INTERVAL_S)
     } else {
-        Ok(value * 3600.0)
+        Ok(value * SECONDS_PER_HOUR)
     }
 }
 

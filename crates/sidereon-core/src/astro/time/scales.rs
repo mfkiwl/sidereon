@@ -12,7 +12,8 @@
 
 use crate::astro::constants::time::{BDT_MINUS_TAI_S, GPST_MINUS_TAI_S};
 use crate::astro::constants::time::{
-    DAYS_PER_JULIAN_CENTURY, J2000_JD, SECONDS_PER_DAY, TT_MINUS_TAI_S,
+    DAYS_PER_JULIAN_CENTURY, J2000_JD, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
+    TT_MINUS_TAI_S,
 };
 use crate::astro::data::iers::UT1_DATA;
 use crate::astro::time::civil;
@@ -29,7 +30,7 @@ const ROUND_1E7: f64 = 10_000_000.0;
 /// three-hour advance with no leap-second term of its own (ICD GLONASS Edition
 /// 5.1, 2008, sec. 3.3.3). GLONASST still tracks UTC's leap seconds because UTC
 /// does, so any GLONASST<->atomic-scale offset is epoch-dependent.
-pub const GLONASST_MINUS_UTC_S: f64 = 3.0 * 3600.0;
+pub const GLONASST_MINUS_UTC_S: f64 = 3.0 * SECONDS_PER_HOUR;
 
 /// Resolved set of Julian-date split time scales for one UTC instant.
 ///
@@ -321,10 +322,13 @@ impl TimeScales {
     ) -> Self {
         let jd_day = julian_day_number(year, month, day);
         let jd1 = jd_day as f64 - 0.5;
-        let utc_seconds_of_day = hour as f64 * 3600.0 + minute as f64 * 60.0 + second;
+        let utc_seconds_of_day =
+            hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + second;
         let leap_lookup_second = if second >= 60.0 { 59.0 } else { second };
-        let jd2 =
-            (leap_lookup_second + minute as f64 * 60.0 + hour as f64 * 3600.0) / SECONDS_PER_DAY;
+        let jd2 = (leap_lookup_second
+            + minute as f64 * SECONDS_PER_MINUTE
+            + hour as f64 * SECONDS_PER_HOUR)
+            / SECONDS_PER_DAY;
         let jd_utc_total = jd1 + jd2;
 
         let leap_seconds = find_leap_seconds(jd_utc_total);
@@ -529,13 +533,15 @@ fn positive_leap_second_utc_label(tai: ScaleCal) -> Option<ScaleCal> {
 fn leap_seconds_at_utc_label(cal: ScaleCal) -> f64 {
     let jd1 = julian_day_number(cal.year, cal.month, cal.day) as f64 - 0.5;
     let lookup_second = if cal.second >= 60.0 { 59.0 } else { cal.second };
-    let jd2 =
-        (cal.hour as f64 * 3600.0 + cal.minute as f64 * 60.0 + lookup_second) / SECONDS_PER_DAY;
+    let jd2 = (cal.hour as f64 * SECONDS_PER_HOUR
+        + cal.minute as f64 * SECONDS_PER_MINUTE
+        + lookup_second)
+        / SECONDS_PER_DAY;
     find_leap_seconds(jd1 + jd2)
 }
 
 fn seconds_of_day(cal: ScaleCal) -> f64 {
-    cal.hour as f64 * 3600.0 + cal.minute as f64 * 60.0 + cal.second
+    cal.hour as f64 * SECONDS_PER_HOUR + cal.minute as f64 * SECONDS_PER_MINUTE + cal.second
 }
 
 fn normalize_calendar_seconds(mut cal: ScaleCal, second: f64) -> ScaleCal {
@@ -978,7 +984,7 @@ mod tests {
     /// same instant the production code would.
     fn utc_jd(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: f64) -> f64 {
         let jd1 = julian_day_number(year, month, day) as f64 - 0.5;
-        let sod = hour as f64 * 3600.0 + minute as f64 * 60.0 + second;
+        let sod = hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + second;
         jd1 + sod / SECONDS_PER_DAY
     }
 

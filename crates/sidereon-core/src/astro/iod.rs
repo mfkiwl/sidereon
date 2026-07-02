@@ -32,6 +32,7 @@ const VALLADO_TUSEC: f64 = 806.8109913067327;
 // Seconds per day; the canonical core value (bit-identical to the Vallado 86400)
 // under the local `DAY2SEC` name the epoch-difference factors below read.
 use crate::astro::math::linear::invert_3x3_adjugate;
+use crate::astro::math::mat3::mul_vec3;
 use crate::astro::math::vec3;
 use crate::constants::SECONDS_PER_DAY as DAY2SEC;
 const SMALL: f64 = 1e-10;
@@ -121,15 +122,6 @@ fn det3(m: &[[f64; 3]; 3]) -> f64 {
     m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-}
-
-/// 3x3 matrix-vector multiply.
-fn mat3_vec3(m: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
 }
 
 // IOD-local 3x3 product. Kept distinct from `astro::math::mat3::inline_rxr`
@@ -550,7 +542,7 @@ pub fn gauss_angles(
     ];
     let lir_full = mat3_mat3(&lmati, &rsmat);
     let cmat = [-c1, -c2, -c3];
-    let rhomat = mat3_vec3(&lir_full, &cmat);
+    let rhomat = mul_vec3(&lir_full, cmat);
 
     // Form position vectors
     let r1 = vadd(&smul(rhomat[0] / c1, &l1), &rseci[0]);
@@ -613,8 +605,8 @@ mod tests {
         let r2 = [2935.91195, 6326.18324, 2660.59584];
         let r3 = [2434.95202, 6597.38674, 2521.52311];
         let jd1 = 0.0;
-        let jd2 = (60.0 + 16.48) / 86400.0;
-        let jd3 = (120.0 + 33.04) / 86400.0;
+        let jd2 = (60.0 + 16.48) / crate::constants::SECONDS_PER_DAY;
+        let jd3 = (120.0 + 33.04) / crate::constants::SECONDS_PER_DAY;
 
         let (v2, theta12, theta23, _copa) = hgibbs(&r1, &r2, &r3, jd1, jd2, jd3).unwrap();
         assert_ulp(v2[0], -6.441557227511062, 0, "v2_x");
@@ -747,7 +739,15 @@ mod tests {
         // jd1 == jd2 -> zero time difference.
         let jd = 0.0;
         assert_eq!(
-            hgibbs(&r1, &r2, &r3, jd, jd, (120.0 + 33.04) / 86400.0).unwrap_err(),
+            hgibbs(
+                &r1,
+                &r2,
+                &r3,
+                jd,
+                jd,
+                (120.0 + 33.04) / crate::constants::SECONDS_PER_DAY
+            )
+            .unwrap_err(),
             IodError::InvalidTimeGeometry
         );
     }
@@ -757,8 +757,8 @@ mod tests {
         let r2 = [2935.91195, 6326.18324, 2660.59584];
         let r3 = [2434.95202, 6597.38674, 2521.52311];
         let jd1 = 0.0;
-        let jd2 = (60.0 + 16.48) / 86400.0;
-        let jd3 = (120.0 + 33.04) / 86400.0;
+        let jd2 = (60.0 + 16.48) / crate::constants::SECONDS_PER_DAY;
+        let jd3 = (120.0 + 33.04) / crate::constants::SECONDS_PER_DAY;
         assert_eq!(
             hgibbs(&[0.0, 0.0, 0.0], &r2, &r3, jd1, jd2, jd3).unwrap_err(),
             IodError::ZeroVector

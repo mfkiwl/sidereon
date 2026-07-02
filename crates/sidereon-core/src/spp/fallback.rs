@@ -345,6 +345,7 @@ fn broadcast_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR};
     use crate::staleness::DegradationKind;
 
     fn meta(kind: DegradationKind, staleness_s: f64) -> StalenessMetadata {
@@ -353,7 +354,7 @@ mod tests {
             requested_epoch_j2000_s: 1000.0,
             source_epoch_j2000_s: 1000.0 - staleness_s,
             staleness_s,
-            staleness_days: staleness_s / 86_400.0,
+            staleness_days: staleness_s / SECONDS_PER_DAY,
         }
     }
 
@@ -368,10 +369,13 @@ mod tests {
 
     #[test]
     fn fix_source_precise_degraded_is_not_exact() {
-        let degraded = FixSource::Precise(meta(DegradationKind::NearestPrior, 3600.0));
+        let degraded = FixSource::Precise(meta(DegradationKind::NearestPrior, SECONDS_PER_HOUR));
         assert!(degraded.is_precise());
         assert!(!degraded.is_precise_exact());
-        assert_eq!(degraded.staleness().map(|m| m.staleness_s), Some(3600.0));
+        assert_eq!(
+            degraded.staleness().map(|m| m.staleness_s),
+            Some(SECONDS_PER_HOUR)
+        );
     }
 
     #[test]

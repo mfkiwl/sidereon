@@ -560,7 +560,7 @@ fn clock_spline_unit_scaling() {
 /// domain; the sub-second term round-trips to under 1 ULP at magnitude 86400.
 #[test]
 fn instant_to_j2000_seconds_query_exactness_bound() {
-    const D: f64 = 86_400.0;
+    const D: f64 = crate::constants::SECONDS_PER_DAY;
 
     let lo = julian_day_number(1994, 1, 1);
     let hi = julian_day_number(2100, 1, 1);

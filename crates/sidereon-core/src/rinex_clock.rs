@@ -16,7 +16,9 @@ use crate::astro::time::civil::{
 };
 use crate::astro::time::model::{Instant, InstantRepr, JulianDateSplit, TimeScale};
 use crate::astro::time::scales::julian_day_number;
-use crate::constants::{GPS_EPOCH_TO_J2000_S, J2000_JD, SECONDS_PER_DAY};
+use crate::constants::{
+    GPS_EPOCH_TO_J2000_S, J2000_JD, MICROSECONDS_PER_SECOND, SECONDS_PER_DAY, SECONDS_PER_HOUR,
+};
 use crate::validate::{self, FieldError};
 
 const INSTANT_SCALE_ORDER_STRIDE_S: f64 = 1.0e15;
@@ -341,7 +343,8 @@ fn instant_civil_microsecond(epoch: &Instant) -> (i64, i64, i64, i64, i64, i64) 
             // into a single JD and subtracting the seven-digit day number would
             // lose microsecond precision to catastrophic cancellation.
             let day_number = (split.jd_whole + 0.5).round() as i64;
-            let total_us = (split.fraction * 86_400.0 * 1_000_000.0).round() as i64;
+            let total_us =
+                (split.fraction * SECONDS_PER_DAY * MICROSECONDS_PER_SECOND).round() as i64;
             (day_number, total_us)
         }
         // Nanoseconds count from J2000 (2000-01-01 12:00:00) in the instant's own
@@ -704,7 +707,7 @@ fn civil_microsecond_to_julian_split(
         );
     }
 
-    let day_seconds = civil.hour as f64 * 3600.0
+    let day_seconds = civil.hour as f64 * SECONDS_PER_HOUR
         + civil.minute as f64 * 60.0
         + civil.second as f64
         + civil.microsecond as f64 / 1_000_000.0;

@@ -51,6 +51,7 @@
 
 use sidereon_core::astro::time::model::JulianDateSplit;
 use sidereon_core::astro::time::split_julian_date;
+use sidereon_core::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE};
 use sidereon_core::ephemeris::BroadcastEphemeris;
 use sidereon_core::observables::j2000_seconds_from_split;
 use sidereon_core::positioning::{
@@ -150,10 +151,10 @@ fn glonass_spp_agrees_with_rtklib_demo5_l1_single() {
 
     let epoch = obs.epochs().first().expect("at least one obs epoch");
     let t_rx_j2000_s = j2000_seconds(epoch.epoch);
-    let sod = f64::from(epoch.epoch.hour) * 3600.0
-        + f64::from(epoch.epoch.minute) * 60.0
+    let sod = f64::from(epoch.epoch.hour) * SECONDS_PER_HOUR
+        + f64::from(epoch.epoch.minute) * SECONDS_PER_MINUTE
         + epoch.epoch.second;
-    let day_of_year = 177.0 + sod / 86_400.0;
+    let day_of_year = 177.0 + sod / SECONDS_PER_DAY;
 
     // Broadcast Klobuchar coefficients (GPSA/GPSB) from the nav header; the same
     // L1 set RTKLIB scales per carrier, GLONASS G1 included.

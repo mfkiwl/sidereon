@@ -24,7 +24,10 @@
 
 use core::f64::consts::PI;
 
-use crate::astro::constants::units::{KM_TO_M, RAD_TO_DEG};
+use crate::astro::constants::{
+    time::DAYS_PER_JULIAN_YEAR,
+    units::{KM_TO_M, RAD_TO_DEG},
+};
 
 use crate::frame::Wgs84Geodetic;
 
@@ -257,7 +260,7 @@ pub(crate) fn niell_mapping(
 ) -> MappingComponents {
     let lat_deg = lat_rad * RAD_TO_DEG;
     // Seasonal phase: day-28 reference, plus half a year for southern latitudes.
-    let y = (doy - 28.0) / 365.25 + if lat_deg < 0.0 { 0.5 } else { 0.0 };
+    let y = (doy - 28.0) / DAYS_PER_JULIAN_YEAR + if lat_deg < 0.0 { 0.5 } else { 0.0 };
     let cosy = (2.0 * PI * y).cos();
     let alat = lat_deg.abs();
 

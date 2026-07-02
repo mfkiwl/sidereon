@@ -5,6 +5,7 @@ use sidereon_core::astro::propagator::{
     api::IntegratorOptions, OrbitalDynamics, PropagationContext,
 };
 use sidereon_core::astro::state::CartesianState;
+use sidereon_core::constants::SECONDS_PER_HOUR;
 
 #[test]
 fn test_dense_output_endpoint_exactness() {
@@ -32,7 +33,7 @@ fn test_dense_output_endpoint_exactness() {
     };
 
     let result = integrator
-        .propagate(initial_state, 3600.0, &dynamics, &ctx, &opts)
+        .propagate(initial_state, SECONDS_PER_HOUR, &dynamics, &ctx, &opts)
         .expect("Propagation failed");
     let dense = result.dense.expect("Dense output missing");
 
@@ -99,7 +100,7 @@ fn test_dense_output_circular_orbit_parity() {
         ..IntegratorOptions::default()
     };
 
-    let t_end = 3600.0;
+    let t_end = SECONDS_PER_HOUR;
     let result = integrator
         .propagate(initial_state, t_end, &dynamics, &ctx, &opts)
         .expect("Propagation failed");

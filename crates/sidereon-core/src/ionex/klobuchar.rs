@@ -24,7 +24,7 @@
 use core::f64::consts::PI;
 
 /// Speed of light in vacuum (m/s), the IS-GPS-200 defined value.
-use crate::constants::C_M_S as C;
+use crate::constants::{C_M_S as C, SECONDS_PER_DAY};
 
 /// All intermediate quantities of one Klobuchar evaluation.
 ///
@@ -104,11 +104,11 @@ pub(crate) fn klobuchar_l1_components(
 
     // 5. Local time at the pierce point (seconds), wrapped to [0, 86400).
     let mut t = 43200.0 * lambda_i + t_gps_s;
-    if t >= 86400.0 {
-        t -= 86400.0;
+    if t >= SECONDS_PER_DAY {
+        t -= SECONDS_PER_DAY;
     }
     if t < 0.0 {
-        t += 86400.0;
+        t += SECONDS_PER_DAY;
     }
 
     // 6. Obliquity (slant) factor. Integer cube as explicit multiply.

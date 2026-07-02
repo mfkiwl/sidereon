@@ -1601,8 +1601,11 @@ mod tests {
         let secondary_tle = station_tle("CSS (TIANHE)");
         let primary = sgp4::Satellite::from_tle(primary_tle.line1, primary_tle.line2)
             .expect("station TLE parses");
-        let window = tca::TcaWindow::from_start_and_duration_seconds(primary.epoch_jd(), 86_400.0)
-            .expect("valid one-day window");
+        let window = tca::TcaWindow::from_start_and_duration_seconds(
+            primary.epoch_jd(),
+            sidereon_core::constants::SECONDS_PER_DAY,
+        )
+        .expect("valid one-day window");
         let options = tca::TcaFinderOptions {
             coarse_step_seconds: 120.0,
             time_tolerance_seconds: 1.0e-2,
@@ -1618,7 +1621,7 @@ mod tests {
             .min_by(|a, b| a.miss_distance_km.total_cmp(&b.miss_distance_km))
             .expect("candidate set is nonempty");
         assert!(best.tca_seconds_since_window_start > 0.0);
-        assert!(best.tca_seconds_since_window_start < 86_400.0);
+        assert!(best.tca_seconds_since_window_start < sidereon_core::constants::SECONDS_PER_DAY);
         assert!(best.miss_distance_km.is_finite());
         assert!(best.miss_distance_km > 0.0);
         assert!((norm3(best.relative_position_km) - best.miss_distance_km).abs() < 1.0e-9);

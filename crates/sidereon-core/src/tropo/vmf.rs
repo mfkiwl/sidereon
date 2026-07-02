@@ -23,7 +23,7 @@
 //!
 //! b, c source (vmf1.f / Böhm 2006, corrected-coefficient errata):
 //!   * hydrostatic: `bh = 0.0029`; `ch` is the seasonal expression
-//!     `ch = c0h + ((cos(doy/365.25*2π + φ) + 1)*c11h/2 + c10h)*(1 - cos φ_lat)`
+//!     `ch = c0h + ((cos(doy/DAYS_PER_JULIAN_YEAR*2π + φ) + 1)*c11h/2 + c10h)*(1 - cos φ_lat)`
 //!     with `c0h = 0.062` and, for the northern hemisphere, `φ = 0`,
 //!     `c10h = 0.001`, `c11h = 0.005`; for the southern hemisphere `φ = π`,
 //!     `c10h = 0.002`, `c11h = 0.007`. `φ_lat` is the ellipsoidal latitude.
@@ -41,6 +41,8 @@
 //! delay), and the reference-parity test reports the achieved agreement.
 
 use core::f64::consts::PI;
+
+use crate::astro::constants::time::DAYS_PER_JULIAN_YEAR;
 
 use super::saastamoinen::mapf;
 
@@ -81,7 +83,7 @@ pub(crate) fn vmf1_mapping(
         (0.0, 0.005, 0.001)
     };
     let ch = c0h
-        + (((doy / 365.25 * 2.0 * PI + phh).cos() + 1.0) * c11h / 2.0 + c10h)
+        + (((doy / DAYS_PER_JULIAN_YEAR * 2.0 * PI + phh).cos() + 1.0) * c11h / 2.0 + c10h)
             * (1.0 - lat_rad.cos());
     let mh = mapf(el_rad, ah, bh, ch);
 

@@ -58,15 +58,12 @@
 #[cfg(test)]
 mod tests;
 
-use crate::astro::constants::time::J2000_JD;
+use crate::astro::constants::time::{DAYS_PER_JULIAN_YEAR, J2000_JD};
 use crate::astro::constants::units::MM_PER_M;
 use crate::astro::math::vec3::norm3_ref as norm;
 use crate::validate;
 
 use super::{cal2jd, invalid_tide_input, TideError};
-
-/// Julian days per Julian year, used to form the mean-pole epoch argument.
-const DAYS_PER_JULIAN_YEAR: f64 = 365.25;
 
 /// IERS (2018) linear secular pole coefficients, in milliarcseconds and
 /// milliarcseconds per year (revised IERS Conventions 2010, updated Chapter 7).

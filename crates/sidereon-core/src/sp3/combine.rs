@@ -1886,7 +1886,7 @@ mod tests {
             merged.header.seconds_of_week
         );
         assert!(
-            (merged.header.mjd_fraction - 900.0 / 86_400.0).abs() < 1.0e-9,
+            (merged.header.mjd_fraction - 900.0 / SECONDS_PER_DAY).abs() < 1.0e-9,
             "header MJD fraction must describe 00:15, got {}",
             merged.header.mjd_fraction
         );

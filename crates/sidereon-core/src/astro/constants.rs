@@ -55,6 +55,10 @@ pub mod geometry {
 pub mod time {
     use super::units::MICROSECONDS_PER_SECOND_I64;
 
+    /// Seconds per civil minute.
+    pub const SECONDS_PER_MINUTE: f64 = 60.0;
+    /// Seconds per civil hour.
+    pub const SECONDS_PER_HOUR: f64 = 3_600.0;
     /// Seconds per civil day.
     pub const SECONDS_PER_DAY: f64 = 86_400.0;
     /// Seconds per civil day, integer form for calendar arithmetic.
@@ -65,6 +69,8 @@ pub mod time {
     pub const SECONDS_PER_WEEK: f64 = 604_800.0;
     /// Julian Date of the J2000 epoch.
     pub const J2000_JD: f64 = 2_451_545.0;
+    /// Days per Julian year.
+    pub const DAYS_PER_JULIAN_YEAR: f64 = 365.25;
     /// Days per Julian century.
     pub const DAYS_PER_JULIAN_CENTURY: f64 = 36_525.0;
     /// TT - TAI, seconds.

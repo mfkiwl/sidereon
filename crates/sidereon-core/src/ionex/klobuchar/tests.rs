@@ -18,6 +18,8 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::constants::SECONDS_PER_DAY;
+
 use super::klobuchar_l1_components;
 
 /// Parse a C99 / Python `float.hex()` hex-float string into the exact `f64`.
@@ -324,7 +326,8 @@ fn klobuchar_public_wrapper_matches_golden_within_conversion_bound() {
         let t_gps_s = hexf(inp, "t_gps_s");
         let epoch = Instant::from_julian_date(
             TimeScale::Gpst,
-            JulianDateSplit::new(2_451_544.5, t_gps_s / 86_400.0).expect("valid split Julian date"),
+            JulianDateSplit::new(2_451_544.5, t_gps_s / SECONDS_PER_DAY)
+                .expect("valid split Julian date"),
         );
 
         // Report on L1 so the dispersive factor is exactly 1

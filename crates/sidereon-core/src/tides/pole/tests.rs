@@ -8,6 +8,7 @@
 //! IERS Bulletin A (`finals.daily`).
 
 use super::{mean_pole_arcsec, solid_earth_pole_tide};
+use crate::constants::DAYS_PER_JULIAN_YEAR;
 use crate::tides::{TideError, TideInputErrorKind};
 
 // IERS (2018) conventional mean pole, hard-coded per displacement-test epoch
@@ -19,7 +20,7 @@ use crate::tides::{TideError, TideInputErrorKind};
 //   y_bar(t) = 320.5 + 3.460 (t - 2000.0)  mas
 //
 // with `t` the epoch in Julian years from J2000.0
-// (t - 2000.0 = (MJD - 51544.5 + fhr/24) / 365.25). Values are in arcseconds.
+// (t - 2000.0 = (MJD - 51544.5 + fhr/24) / DAYS_PER_JULIAN_YEAR). Values are in arcseconds.
 //
 // 2026-05-13 12.5h (t - 2000.0 = 26.36282226793...): the ZIM2 real-EOP epoch.
 const ZIM2_MEAN_POLE_X_ARCSEC: f64 = 0.099_210_452_943_189_61;
@@ -104,9 +105,9 @@ fn mean_pole_secular_matches_iers_2018_coefficients() {
     assert!(approx_eq(y_bar, 0.320_5, 1.0e-12), "y_bar = {y_bar}");
 
     // One Julian-year-ish step recovers the secular rates (1.677, 3.460 mas/yr).
-    // 2000 is a leap year, so the step is 366/365.25 = 1.002053 yr.
+    // 2000 is a leap year, so the step is 366/DAYS_PER_JULIAN_YEAR = 1.002053 yr.
     let (x1, y1) = mean_pole_arcsec(2001, 1, 1, 12.0);
-    let step_yr = 366.0 / 365.25;
+    let step_yr = 366.0 / DAYS_PER_JULIAN_YEAR;
     assert!(
         approx_eq((x1 - x_bar) * 1000.0, 1.677 * step_yr, 1.0e-9),
         "x rate {}",

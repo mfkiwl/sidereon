@@ -206,7 +206,7 @@ mod tests {
         // The driver path: high-level config -> propagate_states.
         let (epoch, pos, vel) = circular_state();
         let config = PropagationConfig::new(epoch, pos, vel);
-        let epochs = [0.0, 600.0, 1800.0, 3600.0];
+        let epochs = [0.0, 600.0, 1800.0, crate::constants::SECONDS_PER_HOUR];
         let via_driver = propagate_states(&config, &epochs).expect("driver propagation");
 
         // The hand-assembled path the Python / WASM / C bindings each spell out:
@@ -222,7 +222,7 @@ mod tests {
                 rel_tol: 1.0e-12,
                 initial_step: 60.0,
                 min_step: 1.0e-6,
-                max_step: 3600.0,
+                max_step: crate::constants::SECONDS_PER_HOUR,
                 max_steps: 1_000_000,
                 dense_output: false,
             },

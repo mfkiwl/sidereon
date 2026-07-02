@@ -94,7 +94,7 @@
 //! is returned in **meters**, in ECEF by default or GCRS on request. ECEF
 //! velocity includes the Earth-rotation (transport) term.
 
-use crate::astro::constants::time::SECONDS_PER_DAY;
+use crate::astro::constants::time::{SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE};
 use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::frames::transforms::{
     gcrs_to_itrs_compute, gcrs_to_itrs_matrix, itrs_to_gcrs_compute, mat3_vec3_mul_unchecked,
@@ -1662,8 +1662,8 @@ fn rounded_segment_s(segment_s: f64) -> Result<i64, ReducedOrbitSourceError> {
 // inclusion. The forward/inverse pair below is that exact legacy arithmetic.
 fn calendar_seconds(t: CalendarEpoch) -> f64 {
     julian_day_number(t.year, t.month, t.day) as f64 * SECONDS_PER_DAY
-        + (t.hour as f64) * 3600.0
-        + (t.minute as f64) * 60.0
+        + (t.hour as f64) * SECONDS_PER_HOUR
+        + (t.minute as f64) * SECONDS_PER_MINUTE
         + t.second
 }
 
@@ -1680,10 +1680,10 @@ fn calendar_from_seconds(total_s: f64) -> CalendarEpoch {
     }
 
     let (year, month, day) = civil_from_julian_day_number(jdn);
-    let hour = (sod / 3600.0).floor() as i32;
-    let rem = sod - hour as f64 * 3600.0;
-    let minute = (rem / 60.0).floor() as i32;
-    let second = rem - minute as f64 * 60.0;
+    let hour = (sod / SECONDS_PER_HOUR).floor() as i32;
+    let rem = sod - hour as f64 * SECONDS_PER_HOUR;
+    let minute = (rem / SECONDS_PER_MINUTE).floor() as i32;
+    let second = rem - minute as f64 * SECONDS_PER_MINUTE;
 
     CalendarEpoch::new(year as i32, month as i32, day as i32, hour, minute, second)
 }

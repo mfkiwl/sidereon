@@ -938,11 +938,11 @@ mod tests {
             })
         ));
         assert!(matches!(
-            second_of_day(86_400.0, "second_of_day"),
+            second_of_day(crate::constants::SECONDS_PER_DAY, "second_of_day"),
             Err(FieldError::OutOfRange {
                 field: "second_of_day",
                 min: 0.0,
-                max: 86_400.0,
+                max: crate::constants::SECONDS_PER_DAY,
                 upper_inclusive: false
             })
         ));

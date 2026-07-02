@@ -14,7 +14,11 @@
 //! evaluation is reproducible from the instantaneous state.
 
 use crate::astro::atmosphere::{self, NrlmsiseInput, MAX_ALTITUDE_KM};
-use crate::astro::constants::{earth::OMEGA_E_DOT_RAD_S, units::M_PER_KM};
+use crate::astro::constants::{
+    earth::OMEGA_E_DOT_RAD_S,
+    time::{DAYS_PER_JULIAN_YEAR, SECONDS_PER_DAY},
+    units::M_PER_KM,
+};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::r#trait::ForceModel;
 use crate::astro::frames::transforms::{
@@ -26,7 +30,7 @@ use crate::astro::state::CartesianState;
 use crate::astro::time::civil::{civil_from_j2000_seconds, day_of_year_int, second_of_day};
 use nalgebra::Vector3;
 
-const MAX_EPOCH_OFFSET_S: f64 = 1000.0 * 365.25 * 86_400.0;
+const MAX_EPOCH_OFFSET_S: f64 = 1000.0 * DAYS_PER_JULIAN_YEAR * SECONDS_PER_DAY;
 
 /// Space-weather inputs to NRLMSISE-00 for drag.
 #[derive(Debug, Clone, Copy, PartialEq)]

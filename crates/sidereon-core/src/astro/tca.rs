@@ -2085,7 +2085,9 @@ mod tests {
 
         let day_fraction = tca_time.1 + 0.5;
         let seconds_of_day = day_fraction * SECONDS_PER_DAY;
-        let expected_second = seconds_of_day - 23.0 * 3600.0 - 59.0 * 60.0;
+        let expected_second = seconds_of_day
+            - 23.0 * crate::constants::SECONDS_PER_HOUR
+            - 59.0 * crate::constants::SECONDS_PER_MINUTE;
         let expected =
             TimeScales::from_utc(2018, 7, 3, 23, 59, expected_second).expect("valid UTC instant");
         let actual =
@@ -2637,9 +2639,13 @@ mod tests {
         let jdn = (jd_midnight + 0.5).round() as i64;
         let (year, month, day) = civil_from_julian_day_number(jdn);
         let seconds_of_day = day_fraction * SECONDS_PER_DAY;
-        let hour = (seconds_of_day / 3600.0).floor() as i32;
-        let minute = ((seconds_of_day - f64::from(hour) * 3600.0) / 60.0).floor() as i32;
-        let second = seconds_of_day - f64::from(hour) * 3600.0 - f64::from(minute) * 60.0;
+        let hour = (seconds_of_day / crate::constants::SECONDS_PER_HOUR).floor() as i32;
+        let minute = ((seconds_of_day - f64::from(hour) * crate::constants::SECONDS_PER_HOUR)
+            / crate::constants::SECONDS_PER_MINUTE)
+            .floor() as i32;
+        let second = seconds_of_day
+            - f64::from(hour) * crate::constants::SECONDS_PER_HOUR
+            - f64::from(minute) * crate::constants::SECONDS_PER_MINUTE;
 
         TimeScales::from_utc(year as i32, month as i32, day as i32, hour, minute, second)
             .expect("summed JD test instant is valid")

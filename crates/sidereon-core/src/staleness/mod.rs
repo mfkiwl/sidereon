@@ -119,9 +119,10 @@ impl StalenessMetadata {
 ///
 /// ```
 /// use sidereon_core::staleness::StalenessPolicy;
+/// use sidereon_core::constants::SECONDS_PER_DAY;
 /// let policy = StalenessPolicy::default();
-/// assert_eq!(policy.max_staleness_s, 3.0 * 86_400.0);
-/// assert_eq!(StalenessPolicy::days(1.0).max_staleness_s, 86_400.0);
+/// assert_eq!(policy.max_staleness_s, 3.0 * SECONDS_PER_DAY);
+/// assert_eq!(StalenessPolicy::days(1.0).max_staleness_s, SECONDS_PER_DAY);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StalenessPolicy {

@@ -593,7 +593,10 @@ mod tests {
             rel_tol: 1e-12,
             ..IntegratorOptions::default()
         });
-        let via_entry = propagator.propagate_to(3600.0).unwrap().final_state;
+        let via_entry = propagator
+            .propagate_to(crate::constants::SECONDS_PER_HOUR)
+            .unwrap()
+            .final_state;
 
         // Integrator called directly, the way the entry point assembles it.
         let force = TwoBodyGravity::default();
@@ -604,7 +607,7 @@ mod tests {
         let via_direct = DP54
             .propagate(
                 CartesianState::new(0.0, pos, vel),
-                3600.0,
+                crate::constants::SECONDS_PER_HOUR,
                 &dynamics,
                 &ctx,
                 &opts,

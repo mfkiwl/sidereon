@@ -16,7 +16,10 @@ use std::f64::consts::PI;
 
 use crate::antenna;
 use crate::bias::{BiasError, BiasSet, ClockReferenceObservables};
-use crate::constants::{C_M_S, F_L1_HZ, J2000_JD, OMEGA_E_DOT_RAD_S, RAD_TO_DEG, SECONDS_PER_DAY};
+use crate::constants::{
+    C_M_S, F_L1_HZ, J2000_JD, MICROSECONDS_PER_SECOND, OMEGA_E_DOT_RAD_S, RAD_TO_DEG,
+    SECONDS_PER_DAY, SECONDS_PER_HOUR,
+};
 use crate::ephemeris::Sp3;
 use crate::frequencies;
 use crate::observables::{
@@ -33,10 +36,11 @@ use crate::tides::{ocean_tide_loading, solid_earth_pole_tide, solid_earth_tide, 
 // PPP-correction switch with no role in the tide math itself; this keeps the
 // `PppCorrectionsOptions` surface coherent from one module.
 pub use crate::tides::{OceanLoadingBlq, NUM_OCEAN_CONSTITUENTS};
-use crate::tolerances::{FREQUENCY_DENOMINATOR_EPS_HZ, YAW_SINGULARITY_EPS_RAD};
+use crate::tolerances::{
+    FREQUENCY_DENOMINATOR_EPS_HZ, PPP_FREQUENCY_ABS_EPS_HZ, PPP_FREQUENCY_REL_EPS,
+    YAW_SINGULARITY_EPS_RAD,
+};
 use crate::{GnssSatelliteId, GnssSystem};
-
-const TWO_PI: f64 = 2.0 * PI;
 
 /// Civil date/time fields used by Sidereon PPP correction tables.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -585,7 +589,8 @@ fn validate_code_observable_frequency(
     ) else {
         return Ok(());
     };
-    let tol_hz = (expected_hz.abs().max(actual_hz.abs()) * 1.0e-12).max(1.0e-3);
+    let tol_hz = (expected_hz.abs().max(actual_hz.abs()) * PPP_FREQUENCY_REL_EPS)
+        .max(PPP_FREQUENCY_ABS_EPS_HZ);
     if (expected_hz - actual_hz).abs() > tol_hz {
         return Err(PppCorrectionsError::CodeBiasObservable {
             epoch_index,
@@ -623,8 +628,8 @@ fn infer_glonass_channel(sat: GnssSatelliteId, freq1_hz: f64, freq2_hz: f64) -> 
         matches!(
             (g1, g2),
             (Some(expected1), Some(expected2))
-                if (expected1 - freq1_hz).abs() <= 1.0e-3
-                    && (expected2 - freq2_hz).abs() <= 1.0e-3
+                if (expected1 - freq1_hz).abs() <= PPP_FREQUENCY_ABS_EPS_HZ
+                    && (expected2 - freq2_hz).abs() <= PPP_FREQUENCY_ABS_EPS_HZ
         )
     })
 }
@@ -707,7 +712,7 @@ fn tide_at(
     sun_ecef_m: [f64; 3],
     moon_ecef_m: [f64; 3],
 ) -> Result<[f64; 3], TideError> {
-    let fhr = epoch.hour as f64 + epoch.minute as f64 / 60.0 + epoch.second / 3600.0;
+    let fhr = epoch.hour as f64 + epoch.minute as f64 / 60.0 + epoch.second / SECONDS_PER_HOUR;
     solid_earth_tide(
         &receiver_ecef_m,
         epoch.year,
@@ -724,7 +729,7 @@ fn pole_tide_at(
     epoch: CivilDateTime,
     pole: PoleTideOptions,
 ) -> Result<[f64; 3], TideError> {
-    let fhr = epoch.hour as f64 + epoch.minute as f64 / 60.0 + epoch.second / 3600.0;
+    let fhr = epoch.hour as f64 + epoch.minute as f64 / 60.0 + epoch.second / SECONDS_PER_HOUR;
     solid_earth_pole_tide(
         &receiver_ecef_m,
         epoch.year,
@@ -741,7 +746,7 @@ fn ocean_loading_at(
     epoch: CivilDateTime,
     blq: &OceanLoadingBlq,
 ) -> Result<[f64; 3], TideError> {
-    let fhr = epoch.hour as f64 + epoch.minute as f64 / 60.0 + epoch.second / 3600.0;
+    let fhr = epoch.hour as f64 + epoch.minute as f64 / 60.0 + epoch.second / SECONDS_PER_HOUR;
     ocean_tide_loading(
         &receiver_ecef_m,
         epoch.year,
@@ -789,7 +794,7 @@ fn windup_cycles(
     }
 
     let cosp = clamp(dot3(ds, dr) / nds / ndr);
-    let mut ph = cosp.acos() / TWO_PI;
+    let mut ph = cosp.acos() / std::f64::consts::TAU;
     let drs = cross3(ds, dr);
     if dot3(ek, drs) < 0.0 {
         ph = -ph;
@@ -820,9 +825,9 @@ fn sat_yaw(rs: [f64; 3], vs: [f64; 3], sun_ecef_m: [f64; 3]) -> Option<([f64; 3]
     let mut mu = PI / 2.0 + if dot3(es, esun) <= 0.0 { -ee } else { ee };
 
     if mu < -PI / 2.0 {
-        mu += TWO_PI;
+        mu += std::f64::consts::TAU;
     } else if mu >= PI / 2.0 {
-        mu -= TWO_PI;
+        mu -= std::f64::consts::TAU;
     }
 
     let yaw = yaw_nominal(beta, mu);
@@ -951,7 +956,7 @@ fn civil_cmp(a: CivilDateTime, b: CivilDateTime) -> std::cmp::Ordering {
 }
 
 fn ordered_seconds(second: f64) -> i64 {
-    (second * 1_000_000.0).round() as i64
+    (second * MICROSECONDS_PER_SECOND).round() as i64
 }
 
 fn interpolate_samples(samples: &[(f64, f64)], zenith_deg: f64) -> Option<f64> {

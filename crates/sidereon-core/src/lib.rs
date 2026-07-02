@@ -52,6 +52,8 @@
 //! every call site. Matrix/vector linear algebra uses `nalgebra`
 //! (`DMatrix`/`DVector`) per the spec.
 
+extern crate self as sidereon_core;
+
 // ---------------------------------------------------------------------------
 // Astro / propagation layer. Always present. The GNSS layer below depends on
 // it via `crate::astro::*`.

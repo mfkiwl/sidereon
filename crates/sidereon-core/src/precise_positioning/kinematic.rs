@@ -1902,7 +1902,7 @@ mod tests {
                         second: 0.0,
                     },
                     jd_whole: 2_459_024.5,
-                    jd_fraction: 0.5 + t_rx_j2000_s / 86_400.0,
+                    jd_fraction: 0.5 + t_rx_j2000_s / crate::constants::SECONDS_PER_DAY,
                     t_rx_j2000_s,
                     observations,
                 }

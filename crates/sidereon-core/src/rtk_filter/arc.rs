@@ -2694,7 +2694,7 @@ mod tests {
         let epochs = (0..3)
             .map(|idx| RtkDualFrequencyArcEpoch {
                 jd_whole: 2_460_100.5,
-                jd_fraction: 0.25 + idx as f64 / 86_400.0,
+                jd_fraction: 0.25 + idx as f64 / crate::constants::SECONDS_PER_DAY,
                 epoch_sort_key: Some(format!("{idx:03}")),
                 gap_time_s: Some(idx as f64),
                 observations: vec![

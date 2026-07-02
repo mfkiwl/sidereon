@@ -13,7 +13,7 @@ use crate::astro::constants::time::SECONDS_PER_DAY_I64;
 use crate::astro::time::civil::{day_of_year_int, seconds_between_splits, split_julian_date};
 use crate::astro::time::model::{Instant, InstantRepr, JulianDateSplit, TimeScale};
 use crate::astro::time::scales::julian_day_number;
-use crate::constants::{C_M_S, SECONDS_PER_DAY};
+use crate::constants::{C_M_S, NS_TO_S, SECONDS_PER_DAY};
 use crate::format::columns::{field, fortran_f64, raw_field};
 pub use crate::format::{Diagnostics, Parsed, RecordRef, Skip, SkipReason, Warning, WarningKind};
 pub use crate::validate::FieldError;
@@ -21,7 +21,6 @@ use crate::validate::{self, CivilSecondPolicy};
 use crate::{frequencies, GnssSatelliteId, GnssSystem};
 
 const BIAS_SINEX_MAJOR_VERSION: &str = "1";
-const NS_TO_S: f64 = 1.0e-9;
 pub const SINEX_BIAS_SLOPE_DENOMINATOR_S: f64 = 1.0;
 const DSB_INCONSISTENCY_TOL_S: f64 = 1.0e-15;
 const RINEX_VERSION_FOR_BIAS_CODES: f64 = 3.04;
@@ -1640,7 +1639,7 @@ fn instant_split(epoch: Instant) -> Option<JulianDateSplit> {
     match epoch.repr {
         InstantRepr::JulianDate(split) => Some(split),
         InstantRepr::Nanos(nanos) => {
-            let seconds = nanos as f64 / 1.0e9;
+            let seconds = nanos as f64 * NS_TO_S;
             let days = seconds.div_euclid(SECONDS_PER_DAY);
             let rem = seconds.rem_euclid(SECONDS_PER_DAY);
             JulianDateSplit::new(crate::constants::J2000_JD + days, rem / SECONDS_PER_DAY).ok()

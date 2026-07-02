@@ -5,6 +5,7 @@ use sidereon_core::astro::propagator::{
     api::IntegratorOptions, OrbitalDynamics, PropagationContext,
 };
 use sidereon_core::astro::state::CartesianState;
+use sidereon_core::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR};
 
 #[test]
 fn test_kepler_circular_orbit_full_period() {
@@ -104,7 +105,7 @@ fn test_kepler_elliptic_orbit_invariants() {
     };
 
     // Propagate half an orbit (approx)
-    let t_end = 3600.0;
+    let t_end = SECONDS_PER_HOUR;
     let result = integrator
         .propagate(initial_state, t_end, &dynamics, &ctx, &opts)
         .expect("Propagation failed");
@@ -163,7 +164,7 @@ fn test_j2_secular_drift_oracle() {
     };
 
     // Propagate for one day
-    let t_end = 86400.0;
+    let t_end = SECONDS_PER_DAY;
     let result = integrator
         .propagate(initial_state, t_end, &dynamics, &ctx, &opts)
         .expect("Propagation failed");

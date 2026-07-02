@@ -346,10 +346,10 @@ impl Sp3 {
 mod tests {
     use super::*;
     use crate::astro::time::model::{InstantRepr, JulianDateSplit};
+    use crate::constants::SECONDS_PER_DAY;
     use crate::GnssSystem;
 
     const J2000_JD_WHOLE: f64 = 2_451_545.0;
-    const SECONDS_PER_DAY: f64 = 86_400.0;
 
     fn gps(prn: u8) -> GnssSatelliteId {
         GnssSatelliteId::new(GnssSystem::Gps, prn).expect("valid satellite id")

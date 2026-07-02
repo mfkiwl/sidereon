@@ -369,6 +369,7 @@ pub use vallado_time::{days2mdhms_SGP4, gstime_SGP4, jday_SGP4};
 /// +, *, -, / must happen in the same order as the Vallado C++.
 pub mod vallado_time {
     use super::PI_VAL;
+    use sidereon_core::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE};
 
     // ========================================================================
     //                           procedure gstime_SGP4
@@ -380,7 +381,7 @@ pub mod vallado_time {
         let tut1 = (jdut1 - 2451545.0) / 36525.0;
         let mut temp = -6.2e-6 * tut1 * tut1 * tut1
             + 0.093104 * tut1 * tut1
-            + (876600.0 * 3600.0 + 8640184.812866) * tut1
+            + (876600.0 * SECONDS_PER_HOUR + 8640184.812866) * tut1
             + 67310.54841; // sec
         temp = (temp * deg2rad / 240.0) % twopi; //360/86400 = 1/240, to deg, to rad
 
@@ -401,7 +402,8 @@ pub mod vallado_time {
             + (275.0 * mon as f64 / 9.0).floor()
             + day as f64
             + 1721013.5;
-        let mut jdFrac = (sec + minute as f64 * 60.0 + hr as f64 * 3600.0) / 86400.0;
+        let mut jdFrac = (sec + minute as f64 * SECONDS_PER_MINUTE + hr as f64 * SECONDS_PER_HOUR)
+            / SECONDS_PER_DAY;
 
         // check that the day and fractional day are correct
         if jdFrac.abs() > 1.0 {

@@ -237,7 +237,10 @@ fn epoch_julian_split_is_consistent() {
     let e0 = sp3.epochs[0].julian_date().unwrap();
     let e1 = sp3.epochs[1].julian_date().unwrap();
     assert_eq!(e0.jd_whole, e1.jd_whole, "same civil day");
-    assert_eq!(e1.fraction - e0.fraction, 900.0 / 86_400.0);
+    assert_eq!(
+        e1.fraction - e0.fraction,
+        900.0 / crate::constants::SECONDS_PER_DAY
+    );
     // 2020-06-24 is JD 2459024.5 at midnight.
     assert_eq!(e0.jd_whole + e0.fraction, 2_459_024.5);
 }
@@ -472,7 +475,7 @@ fn utc_time_system_accepts_fractional_leap_second_epoch_label() {
     assert_eq!(sp3.header.time_system, Sp3TimeSystem::Utc);
     assert_eq!(sp3.epochs[0].scale, TimeScale::Utc);
     assert_eq!(split.jd_whole, 2_457_754.5);
-    assert!((split.fraction - 0.5 / 86_400.0).abs() < 1.0e-15);
+    assert!((split.fraction - 0.5 / crate::constants::SECONDS_PER_DAY).abs() < 1.0e-15);
 }
 
 #[test]

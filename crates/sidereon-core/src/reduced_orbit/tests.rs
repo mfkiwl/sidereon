@@ -10,6 +10,7 @@ use crate::astro::frames::transforms::{
 use crate::astro::sgp4::{JulianDate, Satellite};
 use crate::astro::time::civil::split_julian_date;
 use crate::astro::time::model::{Instant, JulianDateSplit, TimeScale};
+use crate::constants::SECONDS_PER_HOUR;
 use crate::sp3::Sp3;
 use crate::{GnssSatelliteId, GnssSystem};
 
@@ -286,7 +287,7 @@ fn piecewise_segment_selection_rejects_unsorted_segments() {
     };
     let second = PiecewiseSegment {
         t0: epoch_at(base, 1800.0),
-        t1: epoch_at(base, 3600.0),
+        t1: epoch_at(base, SECONDS_PER_HOUR),
         orbit,
     };
     let piecewise = PiecewiseOrbit {

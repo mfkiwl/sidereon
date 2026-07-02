@@ -27,8 +27,7 @@ use sidereon_core::astro::time::scales::{
     find_leap_seconds, julian_day_number, leap_second_table, ut1_coverage,
 };
 use sidereon_core::astro::time::{GnssWeekTow, TimeScale, TimeScales};
-
-const SECONDS_PER_DAY: f64 = 86_400.0;
+use sidereon_core::constants::SECONDS_PER_DAY;
 
 /// (year, month, day, hour, minute, second, microsecond) UTC epochs to dump.
 /// Real instants spanning the embedded EOP coverage.

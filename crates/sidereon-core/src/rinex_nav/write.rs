@@ -16,7 +16,7 @@
 
 use core::fmt::Write as _;
 
-use crate::astro::constants::time::SECONDS_PER_DAY_I64;
+use crate::astro::constants::time::{SECONDS_PER_DAY_I64, SECONDS_PER_HOUR};
 use crate::astro::time::civil::civil_from_julian_day_number;
 use crate::astro::time::gnss::week_epoch_julian_day_number;
 use crate::astro::time::model::TimeScale;
@@ -158,7 +158,7 @@ fn group_delay_field(record: &BroadcastRecord, index: usize) -> f64 {
 /// non-legacy header.
 fn fit_interval_hours(record: &BroadcastRecord) -> f64 {
     match (record.satellite_id.system, record.fit_interval_s) {
-        (GnssSystem::Gps, Some(seconds)) => seconds / 3600.0,
+        (GnssSystem::Gps, Some(seconds)) => seconds / SECONDS_PER_HOUR,
         _ => 0.0,
     }
 }

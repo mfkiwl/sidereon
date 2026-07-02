@@ -1,4 +1,5 @@
 use crate::astro::error::PropagationError;
+use crate::constants::SECONDS_PER_HOUR;
 
 #[derive(Debug, Clone, Default)]
 pub struct PropagationContext {
@@ -22,7 +23,7 @@ impl Default for IntegratorOptions {
             abs_tol: 1e-9,
             rel_tol: 1e-12,
             min_step: 1e-6,
-            max_step: 3600.0,
+            max_step: SECONDS_PER_HOUR,
             initial_step: 60.0,
             max_steps: 1_000_000,
             dense_output: false,

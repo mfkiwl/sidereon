@@ -31,6 +31,17 @@ pub const GLONASS_TIME_EPS_S: f64 = 1.0e-9;
 /// Signal Doppler-grid endpoint tolerance.
 pub const DOPPLER_GRID_EDGE_EPS_HZ: f64 = 1.0e-9;
 
+/// SBAS IGP coordinate equality tolerance in degrees for grid merge/lookups.
+pub const SBAS_IGP_COORD_EPS_DEG: f64 = 1.0e-9;
+
+/// Relative carrier-frequency tolerance for PPP code-bias observable checks;
+/// scaled by the larger compared frequency to preserve the existing bound.
+pub const PPP_FREQUENCY_REL_EPS: f64 = 1.0e-12;
+
+/// Absolute carrier-frequency tolerance floor for PPP observable matching and
+/// GLONASS channel inference, covering decimal lookup/parse roundoff in Hz.
+pub const PPP_FREQUENCY_ABS_EPS_HZ: f64 = 1.0e-3;
+
 /// RTKLIB LAMBDA reduction permutation hysteresis.
 pub const LAMBDA_REDUCTION_EPS: f64 = 1.0e-6;
 

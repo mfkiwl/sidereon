@@ -14,6 +14,7 @@
 
 use super::*;
 
+use crate::constants::SECONDS_PER_DAY;
 use crate::frame::Wgs84Geodetic;
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::ionex::ionex_slant_delay;
@@ -277,7 +278,7 @@ fn ionex_beyond_cap_is_a_typed_error() {
             ..
         } => {
             assert!(staleness_s > max_staleness_s);
-            assert_eq!(max_staleness_s, 3.0 * 86_400.0);
+            assert_eq!(max_staleness_s, 3.0 * SECONDS_PER_DAY);
         }
         other => panic!("expected BeyondStalenessCap, got {other:?}"),
     }
@@ -369,7 +370,7 @@ fn sp3_missing_day_selects_nearest_prior_with_correct_staleness() {
     let day2 = make_sp3(2024, 3, 12);
     let d0_span = day0.epochs_j2000_seconds();
     let d0_last = d0_span[d0_span.len() - 1]; // D 00:15
-    let requested = d0_span[0] + 86_400.0 + 7.0 * 60.0; // D+1 00:07
+    let requested = d0_span[0] + SECONDS_PER_DAY + 7.0 * 60.0; // D+1 00:07
 
     let set = [day2, day0.clone()];
     let selection =
@@ -380,7 +381,7 @@ fn sp3_missing_day_selects_nearest_prior_with_correct_staleness() {
     assert_eq!(meta.source_epoch_j2000_s, d0_last);
     assert_eq!(meta.requested_epoch_j2000_s, requested);
     assert_eq!(meta.staleness_s, requested - d0_last);
-    assert_eq!(meta.staleness_days, (requested - d0_last) / 86_400.0);
+    assert_eq!(meta.staleness_days, (requested - d0_last) / SECONDS_PER_DAY);
 
     // The selected product is the prior day (D), not the later one.
     assert_eq!(selection.sp3().epochs_j2000_seconds(), d0_span);
@@ -390,7 +391,7 @@ fn sp3_missing_day_selects_nearest_prior_with_correct_staleness() {
 fn sp3_beyond_cap_is_a_typed_error() {
     let day0 = make_sp3(2024, 3, 10);
     let span = day0.epochs_j2000_seconds();
-    let requested = span[span.len() - 1] + 5.0 * 86_400.0; // 5 days past
+    let requested = span[span.len() - 1] + 5.0 * SECONDS_PER_DAY; // 5 days past
 
     let set = [day0];
     let err =
@@ -564,7 +565,7 @@ fn ionex_non_finite_or_negative_cap_is_a_typed_error() {
 fn sp3_non_finite_or_negative_cap_is_a_typed_error() {
     let day0 = make_sp3(2024, 3, 10);
     let span = day0.epochs_j2000_seconds();
-    let requested = span[span.len() - 1] + 5.0 * 86_400.0;
+    let requested = span[span.len() - 1] + 5.0 * SECONDS_PER_DAY;
     let set = [day0];
 
     for cap in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {

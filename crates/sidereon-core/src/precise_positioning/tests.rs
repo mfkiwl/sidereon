@@ -892,7 +892,7 @@ fn static_float_solver_recovers_synthetic_arc() {
                 second: 0.0,
             },
             jd_whole: 2_459_024.5,
-            jd_fraction: 0.5 + epoch_idx as f64 * 900.0 / 86_400.0,
+            jd_fraction: 0.5 + epoch_idx as f64 * 900.0 / crate::constants::SECONDS_PER_DAY,
             t_rx_j2000_s: epoch_idx as f64 * 900.0,
             observations,
         });
@@ -1874,7 +1874,7 @@ fn static_fixed_solver_has_frozen_bits_golden() {
                 second: 0.0,
             },
             jd_whole: 2_459_024.5,
-            jd_fraction: 0.5 + epoch_idx as f64 * 900.0 / 86_400.0,
+            jd_fraction: 0.5 + epoch_idx as f64 * 900.0 / crate::constants::SECONDS_PER_DAY,
             t_rx_j2000_s: epoch_idx as f64 * 900.0,
             observations,
         });
@@ -2345,7 +2345,7 @@ fn ppp_row_trace_arc() -> (FakeSource, Vec<FloatEpoch>, FloatState, Vec<Ambiguit
                 second: 0.0,
             },
             jd_whole: 2_459_024.5,
-            jd_fraction: 0.5 + epoch_idx as f64 * 900.0 / 86_400.0,
+            jd_fraction: 0.5 + epoch_idx as f64 * 900.0 / crate::constants::SECONDS_PER_DAY,
             t_rx_j2000_s: epoch_idx as f64 * 900.0,
             observations,
         });

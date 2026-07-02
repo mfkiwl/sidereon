@@ -20,7 +20,7 @@
 
 use crate::astro::math::vec3::{cross3, dot3, norm3, scale3, sub3, unit3};
 use crate::astro::time::model::{Instant, JulianDateSplit, TimeScale};
-use crate::constants::C_M_S;
+use crate::constants::{C_M_S, SECONDS_PER_DAY};
 use crate::ephemeris::{BroadcastEphemeris, Sp3};
 use crate::error::{Error, Result};
 use crate::observables::ObservableEphemerisSource;
@@ -205,10 +205,6 @@ pub fn compare(
         missing,
     })
 }
-
-/// Seconds in one Julian day, the scale between a window's second-of-J2000 axis
-/// and the split-Julian-date day fraction.
-const SECONDS_PER_DAY: f64 = 86_400.0;
 
 /// A regularly sampled comparison window, the window-form input to
 /// [`compare_window`].
@@ -636,7 +632,7 @@ mod tests {
         // start anchor by the elapsed seconds (and +/- the velocity half step).
         let (t0, _t1) = window.broadcast_window_j2000_s;
         let advance = |seconds: f64| {
-            let total = window.precise_start.fraction + seconds / 86_400.0;
+            let total = window.precise_start.fraction + seconds / SECONDS_PER_DAY;
             let days = total.trunc();
             JulianDateSplit {
                 jd_whole: window.precise_start.jd_whole + days,

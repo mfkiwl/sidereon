@@ -648,7 +648,7 @@ mod tests {
     fn hours_after(start: UtcInstant, time: UtcInstant) -> f64 {
         (time.unix_microseconds() - start.unix_microseconds()) as f64
             / MICROSECONDS_PER_SECOND
-            / 3600.0
+            / crate::astro::constants::time::SECONDS_PER_HOUR
     }
 
     fn assert_invalid_field(

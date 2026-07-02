@@ -1,6 +1,6 @@
 //! Exponential-scale-height ZWD troposphere delay variant.
 
-use crate::astro::constants::units::DEGREES_PER_SEMICIRCLE;
+use crate::astro::constants::{time::DAYS_PER_JULIAN_YEAR, units::DEGREES_PER_SEMICIRCLE};
 use crate::astro::math::vec3::{
     dot3_z_yx_ref as dot_three_reference, unit3_ref_unchecked as unit_vector,
 };
@@ -114,7 +114,7 @@ pub(crate) fn niell_mapping_function_unchecked(
     // The ZWD 0-ULP fixture pins this multiply-then-divide order.
     let lat_rad = latitude_deg * PI / DEGREES_PER_SEMICIRCLE;
     let sin_lat = lat_rad.sin();
-    let phi = 2.0 * PI * (day_of_year as f64 - 1.0) / 365.25;
+    let phi = 2.0 * PI * (day_of_year as f64 - 1.0) / DAYS_PER_JULIAN_YEAR;
 
     let a_h_base = 2.65e-3;
     let b_h_base = 2.3e-4;

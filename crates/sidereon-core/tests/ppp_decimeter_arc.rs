@@ -43,7 +43,7 @@ use sidereon_core::astro::time::split_julian_date;
 use sidereon_core::atmosphere::troposphere::Met;
 use sidereon_core::bias::BiasSet;
 use sidereon_core::combinations::{ionosphere_free, ionosphere_free_phase_cycles};
-use sidereon_core::constants::{F_L1_HZ, F_L2_HZ};
+use sidereon_core::constants::{F_L1_HZ, F_L2_HZ, SECONDS_PER_DAY};
 use sidereon_core::ephemeris::Sp3;
 use sidereon_core::frame::{itrf_to_geodetic, ItrfPositionM};
 use sidereon_core::observables::{j2000_seconds_from_split, predict, PredictOptions};
@@ -483,7 +483,7 @@ const GPS_MINUS_UTC_S: f64 = 18.0;
 /// `civil_from_split_julian_date`. The leap-shifted JD is re-split onto the
 /// `*.5` civil-midnight boundary (`z - 0.5`, `jd - z`) the helper expects.
 fn gpst_civil_to_utc(jd_whole: f64, jd_fraction: f64) -> CivilDateTime {
-    let jd = jd_whole + jd_fraction - GPS_MINUS_UTC_S / 86_400.0 + 0.5;
+    let jd = jd_whole + jd_fraction - GPS_MINUS_UTC_S / SECONDS_PER_DAY + 0.5;
     let z = jd.floor();
     let (year, month, day, hour, minute, second) = civil_from_split_julian_date(z - 0.5, jd - z);
     CivilDateTime {

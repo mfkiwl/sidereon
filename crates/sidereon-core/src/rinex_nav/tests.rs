@@ -37,6 +37,7 @@
 use super::*;
 use crate::astro::time::model::{GnssWeekTow, TimeScale};
 use crate::broadcast::satellite_state;
+use crate::constants::{SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_WEEK};
 
 fn fixture_text() -> String {
     let path = concat!(
@@ -132,7 +133,7 @@ fn parses_and_evaluates_glonass_records() {
     // an hour later would instead be served by the next half-hourly record.)
     assert!(
         store
-            .position_clock_at_j2000_s(r0.satellite_id, t_toe_gpst - 86_400.0)
+            .position_clock_at_j2000_s(r0.satellite_id, t_toe_gpst - SECONDS_PER_DAY)
             .is_none(),
         "a query a day before any record is outside every validity window"
     );
@@ -231,7 +232,7 @@ fn spp_solves_from_broadcast_glonass() {
     // record. The ionosphere correction is unsupported for GLONASS (no modeled
     // single-frequency carrier), so this geometry-only solve leaves it off.
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.0;
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0, 0.0];
     let corr = Corrections::NONE;
@@ -335,7 +336,7 @@ fn beidou_uses_its_own_klobuchar_coefficients() {
     )
     .expect("valid manual BeiDou broadcast store");
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.0;
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0];
     // The broadcast BeiDou Klobuchar-8 set (BDSA/BDSB).
@@ -898,7 +899,7 @@ fn spp_solves_from_broadcast_gps() {
     // 2020-06-25 12:00 GPST (DOY 177 noon), as a J2000 second; mid-day so every
     // GPS satellite has a near-toe record.
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.0;
     // A true receiver on the ground near the ESBC station (Esbjerg, Denmark).
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0, 0.0];
@@ -1733,7 +1734,7 @@ fn a_wrong_week_epoch_has_no_ephemeris() {
     // The same wall-clock one week earlier: the nearest record is a week stale,
     // so the store must report no ephemeris rather than extrapolating a wrong
     // week's elements.
-    let t_wrong_week = t_ok - 604_800.0;
+    let t_wrong_week = t_ok - SECONDS_PER_WEEK;
     assert!(
         store.position_clock_at_j2000_s(sat, t_wrong_week).is_none(),
         "a wrong-week epoch must not silently produce an ephemeris"
@@ -1744,10 +1745,10 @@ fn a_wrong_week_epoch_has_no_ephemeris() {
 /// satellite's timescale. BeiDou runs on BDT (= GPST - 14 s) with its week epoch
 /// 1356 weeks after the GPS epoch; GPS/Galileo are GPST-aligned.
 fn toe_as_j2000_s(rec: &BroadcastRecord) -> f64 {
-    let toe_continuous = f64::from(rec.week) * 604_800.0 + rec.elements.toe_sow;
+    let toe_continuous = f64::from(rec.week) * SECONDS_PER_WEEK + rec.elements.toe_sow;
     let gps_epoch_to_j2000 = 630_763_200.0;
     if rec.satellite_id.system == GnssSystem::BeiDou {
-        toe_continuous + 14.0 + 1356.0 * 604_800.0 - gps_epoch_to_j2000
+        toe_continuous + 14.0 + 1356.0 * SECONDS_PER_WEEK - gps_epoch_to_j2000
     } else {
         toe_continuous - gps_epoch_to_j2000
     }
@@ -1942,19 +1943,19 @@ fn gps_fit_interval_bounds_record_validity() {
     };
 
     // `toe` at GPS week 2111, second-of-week 0, expressed as a J2000 second.
-    let toe_j2000 = 2111.0 * 604_800.0 - 630_763_200.0;
+    let toe_j2000 = 2111.0 * SECONDS_PER_WEEK - 630_763_200.0;
 
     // GPS with a four-hour fit interval is valid within +/-2 h of toe only.
     let g = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
-    let gps = BroadcastStore::new(vec![make(GnssSystem::Gps, Some(4.0 * 3600.0))])
+    let gps = BroadcastStore::new(vec![make(GnssSystem::Gps, Some(4.0 * SECONDS_PER_HOUR))])
         .expect("valid manual GPS fit store");
     assert!(
-        gps.position_clock_at_j2000_s(g, toe_j2000 + 3600.0)
+        gps.position_clock_at_j2000_s(g, toe_j2000 + SECONDS_PER_HOUR)
             .is_some(),
         "1 h after toe is inside the 4 h fit interval"
     );
     assert!(
-        gps.position_clock_at_j2000_s(g, toe_j2000 + 3.0 * 3600.0)
+        gps.position_clock_at_j2000_s(g, toe_j2000 + 3.0 * SECONDS_PER_HOUR)
             .is_none(),
         "3 h after toe is outside the 4 h fit interval"
     );
@@ -1965,7 +1966,7 @@ fn gps_fit_interval_bounds_record_validity() {
     let gal = BroadcastStore::new(vec![make(GnssSystem::Galileo, None)])
         .expect("valid manual Galileo fit store");
     assert!(
-        gal.position_clock_at_j2000_s(e, toe_j2000 + 3.0 * 3600.0)
+        gal.position_clock_at_j2000_s(e, toe_j2000 + 3.0 * SECONDS_PER_HOUR)
             .is_some(),
         "without a fit interval the coarse 4 h bound applies"
     );
@@ -2020,8 +2021,8 @@ fn select_prefers_a_valid_farther_record_over_an_expired_nearer_one() {
     // Two records for one satellite: a nearer one with the nominal 4 h fit
     // (valid +/-2 h) and a farther one (toe 3 h earlier) with an extended 26 h
     // fit (valid +/-13 h).
-    let near = rec(10_800.0, Some(4.0 * 3600.0));
-    let far = rec(0.0, Some(26.0 * 3600.0));
+    let near = rec(10_800.0, Some(4.0 * SECONDS_PER_HOUR));
+    let far = rec(0.0, Some(26.0 * SECONDS_PER_HOUR));
     let store = BroadcastStore::new(vec![near, far]).expect("valid manual nearest-store records");
 
     let g = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
@@ -2029,8 +2030,8 @@ fn select_prefers_a_valid_farther_record_over_an_expired_nearer_one() {
     // the farther record's +/-13 h window. Selecting nearest-then-checking would
     // wrongly reject this; filtering by validity first serves it from the farther
     // record.
-    let near_toe_j2000 = 2111.0 * 604_800.0 + 10_800.0 - 630_763_200.0;
-    let q = near_toe_j2000 + 3.0 * 3600.0;
+    let near_toe_j2000 = 2111.0 * SECONDS_PER_WEEK + 10_800.0 - 630_763_200.0;
+    let q = near_toe_j2000 + 3.0 * SECONDS_PER_HOUR;
     assert!(
         store.position_clock_at_j2000_s(g, q).is_some(),
         "a query past the nearest record's fit interval must fall back to a \
@@ -2056,7 +2057,7 @@ fn rinex_302_gps_fit_interval_flag_one_keeps_extended_validity() {
     );
 
     let sat = rec.satellite_id;
-    let query = toe_as_j2000_s(&rec) + 2.5 * 3600.0;
+    let query = toe_as_j2000_s(&rec) + 2.5 * SECONDS_PER_HOUR;
     let store = BroadcastStore::new(recs).expect("valid manual fit-boundary records");
     assert!(
         store.position_clock_at_j2000_s(sat, query).is_some(),
@@ -2077,12 +2078,12 @@ fn modern_gps_fit_interval_field_remains_hours_valued() {
     let rec = recs[0];
     assert_eq!(
         rec.fit_interval_s,
-        Some(6.0 * 3600.0),
+        Some(6.0 * SECONDS_PER_HOUR),
         "modern fit interval is hours"
     );
 
     let sat = rec.satellite_id;
-    let query = toe_as_j2000_s(&rec) + 2.5 * 3600.0;
+    let query = toe_as_j2000_s(&rec) + 2.5 * SECONDS_PER_HOUR;
     let store = BroadcastStore::new(recs).expect("valid manual fallback-boundary records");
     assert!(
         store.position_clock_at_j2000_s(sat, query).is_some(),
@@ -2117,12 +2118,12 @@ fn gps_fit_interval_field_distinguishes_blank_zero_value_and_malformed() {
     // Modern RINEX keeps the same numeric field hours-valued.
     assert_eq!(
         gps_fit_interval_s(&with_field2("1.000000000000e+00"), modern),
-        Ok(3600.0)
+        Ok(SECONDS_PER_HOUR)
     );
     // A nonzero interval is taken verbatim (hours -> seconds).
     assert_eq!(
         gps_fit_interval_s(&with_field2("6.000000000000e+00"), modern),
-        Ok(6.0 * 3600.0)
+        Ok(6.0 * SECONDS_PER_HOUR)
     );
     // Present but non-numeric -> an error, not a silent nominal substitution.
     assert!(gps_fit_interval_s(&with_field2("garbage"), modern).is_err());
@@ -2138,7 +2139,7 @@ fn mixed_constellation_solve_recovers_the_receiver() {
     // The default store carries both GPS LNAV and Galileo I/NAV (healthy).
     let store = BroadcastStore::from_nav(&fixture_text()).expect("parse NAV");
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.5;
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0];
     let corr = Corrections::NONE;
@@ -2286,7 +2287,7 @@ fn mixed_constellation_solve_recovers_a_nonzero_inter_system_bias() {
 
     let store = BroadcastStore::from_nav(&fixture_text()).expect("parse NAV");
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.5;
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0];
     // The Galileo receiver clock leads the GPS one by a real inter-system bias.
@@ -2402,7 +2403,7 @@ fn mixed_solve_recovers_with_gps_galileo_and_beidou() {
 
     let store = BroadcastStore::from_nav(&fixture_text()).expect("parse NAV");
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.5;
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0];
     let corr = Corrections::NONE;
@@ -2526,7 +2527,7 @@ fn ionosphere_correction_is_applied_to_beidou_b1i() {
 
     let store = BroadcastStore::from_nav(&fixture_text()).expect("parse NAV");
     let t_rx = 646_358_400.0_f64;
-    let sod = 12.0 * 3600.0;
+    let sod = 12.0 * SECONDS_PER_HOUR;
     let doy = 177.5;
     let x_true = [3_512_900.0, 780_500.0, 5_248_700.0];
     // Ionosphere on. The broadcast Klobuchar L1 delay is scaled to each carrier
@@ -2744,7 +2745,7 @@ fn from_lnav_scales_semicircles_to_radians_and_passes_radian_terms_through() {
     assert_eq!(record.message, NavMessage::GpsLnav);
     assert_eq!(record.sv_health, 0.0);
     assert_eq!(record.sv_accuracy_m, 2.4); // URA index 0 (IS-GPS-200N 20.3.3.3.1.3)
-    assert_eq!(record.fit_interval_s, Some(4.0 * 3600.0));
+    assert_eq!(record.fit_interval_s, Some(4.0 * SECONDS_PER_HOUR));
     assert_eq!(
         record.group_delays.gps_tgd_s.map(f64::to_bits),
         Some(decoded.tgd.to_bits())
@@ -2861,19 +2862,46 @@ fn from_lnav_rejects_ura_index_15() {
 fn gps_fit_interval_mapping_matches_is_gps_200n_table_20_xii() {
     // flag 0 -> 4 hours regardless of IODE/IODC (IODE values are in the 0-239
     // normal-operations range, IS-GPS-200N 20.3.3.4.3.1 / Table 20-XII).
-    assert_eq!(gps_fit_interval_from_flag(0, 12, 12), Ok(4.0 * 3600.0));
+    assert_eq!(
+        gps_fit_interval_from_flag(0, 12, 12),
+        Ok(4.0 * SECONDS_PER_HOUR)
+    );
 
     // flag 1, short-term extended (IODE < 240) -> 6 hours.
-    assert_eq!(gps_fit_interval_from_flag(1, 12, 12), Ok(6.0 * 3600.0));
-    assert_eq!(gps_fit_interval_from_flag(1, 239, 239), Ok(6.0 * 3600.0));
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 12, 12),
+        Ok(6.0 * SECONDS_PER_HOUR)
+    );
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 239, 239),
+        Ok(6.0 * SECONDS_PER_HOUR)
+    );
 
     // flag 1, long-term extended (IODE 240-255) -> IODC selects the fit length.
-    assert_eq!(gps_fit_interval_from_flag(1, 240, 240), Ok(8.0 * 3600.0));
-    assert_eq!(gps_fit_interval_from_flag(1, 247, 247), Ok(8.0 * 3600.0));
-    assert_eq!(gps_fit_interval_from_flag(1, 248, 248), Ok(14.0 * 3600.0));
-    assert_eq!(gps_fit_interval_from_flag(1, 255, 496), Ok(14.0 * 3600.0));
-    assert_eq!(gps_fit_interval_from_flag(1, 250, 497), Ok(26.0 * 3600.0));
-    assert_eq!(gps_fit_interval_from_flag(1, 250, 1023), Ok(26.0 * 3600.0));
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 240, 240),
+        Ok(8.0 * SECONDS_PER_HOUR)
+    );
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 247, 247),
+        Ok(8.0 * SECONDS_PER_HOUR)
+    );
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 248, 248),
+        Ok(14.0 * SECONDS_PER_HOUR)
+    );
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 255, 496),
+        Ok(14.0 * SECONDS_PER_HOUR)
+    );
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 250, 497),
+        Ok(26.0 * SECONDS_PER_HOUR)
+    );
+    assert_eq!(
+        gps_fit_interval_from_flag(1, 250, 1023),
+        Ok(26.0 * SECONDS_PER_HOUR)
+    );
 
     // Reserved IODC for long-term extended (504-511, 752-767, 1008-1020).
     assert_eq!(
@@ -2923,7 +2951,7 @@ fn from_lnav_uses_extended_fit_interval_for_flag_1() {
     decoded.fit_interval_flag = 1; // short-term extended, IODE 12 < 240
     let sat = GnssSatelliteId::new(GnssSystem::Gps, 7).expect("valid GPS id");
     let record = BroadcastRecord::from_lnav(&decoded, sat, 2110).expect("GPS LNAV record");
-    assert_eq!(record.fit_interval_s, Some(6.0 * 3600.0));
+    assert_eq!(record.fit_interval_s, Some(6.0 * SECONDS_PER_HOUR));
 }
 
 #[test]

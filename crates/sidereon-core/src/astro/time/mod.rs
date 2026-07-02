@@ -190,8 +190,8 @@ mod tests {
     #[test]
     fn time_scales_from_utc_maps_positive_leap_second_between_neighbors() {
         fn tt_delta_seconds(later: TimeScales, earlier: TimeScales) -> f64 {
-            (later.jd_whole - earlier.jd_whole) * 86_400.0
-                + (later.tt_fraction - earlier.tt_fraction) * 86_400.0
+            (later.jd_whole - earlier.jd_whole) * crate::constants::SECONDS_PER_DAY
+                + (later.tt_fraction - earlier.tt_fraction) * crate::constants::SECONDS_PER_DAY
         }
 
         let before = TimeScales::from_utc(2016, 12, 31, 23, 59, 59.0).expect("leap eve second");

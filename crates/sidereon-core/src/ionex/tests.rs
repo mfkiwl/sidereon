@@ -23,6 +23,7 @@ use std::path::PathBuf;
 
 use crate::astro::time::model::{Instant, InstantRepr, JulianDateSplit, TimeScale};
 use crate::astro::time::split_julian_date;
+use crate::constants::SECONDS_PER_DAY;
 use serde_json::Value;
 
 use super::grid::Ionex;
@@ -660,7 +661,7 @@ fn ionosphere_native_helpers_reject_invalid_domains() {
             lat_deg: 45.0,
             lon_deg: 8.0,
             el_deg: 30.0,
-            t_gal_s: 86_400.0,
+            t_gal_s: SECONDS_PER_DAY,
             day_of_year: 80.0,
             frequency_hz: 1_575_420_000.0,
         },

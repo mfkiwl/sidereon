@@ -987,7 +987,10 @@ mod tests {
     fn visibility_series_matches_orbis_sampling_counts() {
         let sp3 = sp3_fixture();
         let rx = trace_receiver();
-        let window = (j2000(2_459_024.5, 0.5), j2000(2_459_024.5, 0.5) + 3_600.0);
+        let window = (
+            j2000(2_459_024.5, 0.5),
+            j2000(2_459_024.5, 0.5) + crate::constants::SECONDS_PER_HOUR,
+        );
 
         let got = visibility_series(&sp3, sp3.satellites(), rx, window, 300, &gps_options(5.0))
             .expect("valid visibility step");
@@ -1005,7 +1008,10 @@ mod tests {
     fn dop_series_matches_orbis_first_sample_bits() {
         let sp3 = sp3_fixture();
         let rx = trace_receiver();
-        let window = (j2000(2_459_024.5, 0.5), j2000(2_459_024.5, 0.5) + 3_600.0);
+        let window = (
+            j2000(2_459_024.5, 0.5),
+            j2000(2_459_024.5, 0.5) + crate::constants::SECONDS_PER_HOUR,
+        );
 
         let got = dop_series(
             &sp3,
@@ -1076,7 +1082,10 @@ mod tests {
     fn sampled_geometry_rejects_zero_step() {
         let sp3 = sp3_fixture();
         let rx = trace_receiver();
-        let window = (j2000(2_459_024.5, 0.5), j2000(2_459_024.5, 0.5) + 3_600.0);
+        let window = (
+            j2000(2_459_024.5, 0.5),
+            j2000(2_459_024.5, 0.5) + crate::constants::SECONDS_PER_HOUR,
+        );
 
         assert_invalid_geometry_field(
             visibility_series(&sp3, sp3.satellites(), rx, window, 0, &gps_options(5.0))

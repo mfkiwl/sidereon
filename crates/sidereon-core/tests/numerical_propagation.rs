@@ -31,6 +31,7 @@ use sidereon_core::astro::propagator::{
     ForceModelKind, IntegratorKind, OrbitalDynamics, StatePropagator,
 };
 use sidereon_core::astro::state::{CartesianState, StateDerivative};
+use sidereon_core::constants::SECONDS_PER_HOUR;
 
 /// Stumpff functions c2(psi), c3(psi) for the universal-variable Kepler solve.
 fn stumpff(psi: f64) -> (f64, f64) {
@@ -369,7 +370,7 @@ const DUMP_ABS_TOL: f64 = 1.0e-12;
 const DUMP_REL_TOL: f64 = 1.0e-12;
 const DUMP_INITIAL_STEP_S: f64 = 60.0;
 const DUMP_MIN_STEP_S: f64 = 1.0e-6;
-const DUMP_MAX_STEP_S: f64 = 3600.0;
+const DUMP_MAX_STEP_S: f64 = SECONDS_PER_HOUR;
 const DUMP_MAX_STEPS: u32 = 1_000_000;
 
 fn dump_propagator() -> StatePropagator {
