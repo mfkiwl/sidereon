@@ -269,6 +269,13 @@ pub use sidereon_core::astro::bodies::{
     observe, observe_spk_body, Ecliptic, Equatorial, Horizontal, Observation, ObserveOptions,
     Refraction, Target,
 };
+pub mod covariance {
+    pub use sidereon_core::astro::covariance::{
+        covariance6_km_to_m, covariance6_m_to_km, eci_to_rtn_covariance6,
+        interpolate_covariance_psd, rtn_to_eci, rtn_to_eci_covariance6, rtn_to_eci_rotation,
+        symmetric, Covariance6, Covariance6Error, Mat6, RtnFrameError,
+    };
+}
 pub use sidereon_core::astro::forces::{DragForce, SpaceWeather};
 pub use sidereon_core::astro::frames::transforms::gcrs_to_true_of_date_matrix;
 pub use sidereon_core::astro::{passes, propagator, sgp4, state, tca, tle};
