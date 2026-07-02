@@ -24,10 +24,11 @@ pub mod crinex {
 pub mod nav {
     pub use crate::ionex::GalileoNequickCoeffs;
     pub use crate::rinex_nav::{
-        encode_nav, parse_glonass, parse_glonass_lenient, parse_iono_corrections,
-        parse_leap_seconds, parse_nav, BroadcastGroupDelayTerm, BroadcastGroupDelays,
-        BroadcastRecord, GlonassParse, GlonassRecord, IonoCorrections, KlobucharAlphaBeta,
-        NavMessage, NavParseError, SkippedGlonass,
+        cnav_ura_ned_m, cnav_ura_nominal_m, encode_nav, parse_glonass, parse_glonass_lenient,
+        parse_iono_corrections, parse_leap_seconds, parse_nav, BroadcastGroupDelayTerm,
+        BroadcastGroupDelays, BroadcastRecord, CnavParameters, CnavSignal, GlonassParse,
+        GlonassRecord, IonoCorrections, KlobucharAlphaBeta, NavMessage, NavMessagePreference,
+        NavParseError, SkippedGlonass,
     };
 
     /// Parse a RINEX NAV text into an evaluated broadcast ephemeris store.

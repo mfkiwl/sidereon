@@ -218,13 +218,7 @@ impl Finding {
             Self::NavFatalParse { .. } => "NAV-H01",
             Self::NavLeapSecondsAbsent { .. } => "NAV-H02",
             Self::NavIonoMalformed { .. } => "NAV-H03",
-            Self::NavDuplicateRecord { same_payload, .. } => {
-                if *same_payload {
-                    "NAV-B02"
-                } else {
-                    "NAV-B02"
-                }
-            }
+            Self::NavDuplicateRecord { .. } => "NAV-B02",
             Self::NavUnsortedRecords { .. } => "NAV-B03",
             Self::NavImplausibleRecord { .. } => "NAV-B04",
             Self::NavUnhealthyRecords { .. } => "NAV-B05",
@@ -1150,10 +1144,14 @@ fn nav_sort_key(record: &BroadcastRecord) -> (GnssSystem, u8, u32, u64, u8) {
 const fn nav_message_rank(message: NavMessage) -> u8 {
     match message {
         NavMessage::GpsLnav => 0,
-        NavMessage::GalileoInav => 1,
-        NavMessage::GalileoFnav => 2,
-        NavMessage::BeidouD1 => 3,
-        NavMessage::BeidouD2 => 4,
+        NavMessage::GpsCnav => 1,
+        NavMessage::GpsCnav2 => 2,
+        NavMessage::QzssCnav => 3,
+        NavMessage::QzssCnav2 => 4,
+        NavMessage::GalileoInav => 5,
+        NavMessage::GalileoFnav => 6,
+        NavMessage::BeidouD1 => 7,
+        NavMessage::BeidouD2 => 8,
     }
 }
 

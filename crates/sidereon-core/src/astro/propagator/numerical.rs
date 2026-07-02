@@ -258,10 +258,10 @@ impl StatePropagator {
             let minus = perturb_state(initial, column, -delta);
 
             let plus_final = self
-                .run(plus, t_end_tdb_seconds, &dynamics, &ctx)?
+                .run(plus, t_end_tdb_seconds, dynamics, ctx)?
                 .final_state;
             let minus_final = self
-                .run(minus, t_end_tdb_seconds, &dynamics, &ctx)?
+                .run(minus, t_end_tdb_seconds, dynamics, ctx)?
                 .final_state;
             let plus_vector = state_vector(&plus_final);
             let minus_vector = state_vector(&minus_final);

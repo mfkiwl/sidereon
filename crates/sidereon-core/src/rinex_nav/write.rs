@@ -1,9 +1,10 @@
 //! RINEX navigation serialization - the inverse of [`super::parse_nav`].
 //!
 //! Pure and deterministic: a given record set always produces byte-identical
-//! text and no I/O is performed. The output is a minimal, well-formed RINEX 3
-//! navigation file carrying the eight-line Keplerian broadcast-orbit block for
-//! each supported (GPS, Galileo, BeiDou) record, so re-parsing it with
+//! text and no I/O is performed. Legacy-only record sets produce a minimal,
+//! well-formed RINEX 3 navigation file carrying the eight-line Keplerian
+//! broadcast-orbit block for each supported legacy record. Any CNAV-family
+//! record switches the output to RINEX 4.02 EPH frames so re-parsing it with
 //! [`super::parse_nav`] reconstructs the same [`BroadcastRecord`]s.
 //!
 //! Round-trip scope. The canonical IR is the parsed [`BroadcastRecord`] set, not
@@ -25,26 +26,40 @@ use crate::id::GnssSystem;
 
 use super::{BroadcastRecord, NavMessage};
 
-/// Serialize broadcast navigation records to standard RINEX 3 navigation text.
+/// Serialize broadcast navigation records to standard RINEX navigation text.
 ///
 /// The inverse of [`super::parse_nav`]: re-parsing the output yields the same
 /// records. See the module documentation for the round-trip scope.
 pub fn encode_nav(records: &[BroadcastRecord]) -> String {
     let mut out = String::with_capacity(64 + records.len() * 8 * 81);
-    write_header(&mut out);
+    let use_v4 = records.iter().any(|record| record.message.is_cnav_family());
+    write_header(&mut out, use_v4);
     for record in records {
-        write_record(&mut out, record);
+        if use_v4 {
+            let _ = writeln!(
+                out,
+                "> EPH {} {}",
+                record.satellite_id,
+                message_token(record.message)
+            );
+        }
+        if record.message.is_cnav_family() {
+            write_cnav_record(&mut out, record);
+        } else {
+            write_record(&mut out, record);
+        }
     }
     out
 }
 
-fn write_header(out: &mut String) {
+fn write_header(out: &mut String, use_v4: bool) {
     // Column 0-8 holds the version; column 20 the file type ('N' = NAV). Minor 4
     // keeps the parser off the legacy 3.02 fit-interval-flag path.
+    let version = if use_v4 { "     4.02" } else { "     3.04" };
     let _ = writeln!(
         out,
         "{:<20}{:<40}{:<20}",
-        "     3.04", "N: GNSS NAV DATA    M (MIXED)", "RINEX VERSION / TYPE"
+        version, "N: GNSS NAV DATA    M (MIXED)", "RINEX VERSION / TYPE"
     );
     let _ = writeln!(out, "{:<60}{:<20}", "", "END OF HEADER");
 }
@@ -100,6 +115,78 @@ fn write_record(out: &mut String, record: &BroadcastRecord) {
         ],
     );
     write_orbit(out, [0.0, fit_interval_hours(record), 0.0, 0.0]);
+}
+
+fn write_cnav_record(out: &mut String, record: &BroadcastRecord) {
+    let cnav = record.cnav.expect("CNAV-family record carries cnav data");
+
+    let (year, month, day, hour, minute, second) = clock_epoch_civil(record);
+    let sat_token = record.satellite_id.to_string();
+    let _ = write!(
+        out,
+        "{sat_token:<3} {year:04} {month:02} {day:02} {hour:02} {minute:02} {second:02}",
+    );
+    push_d19_12(out, record.clock.af0);
+    push_d19_12(out, record.clock.af1);
+    push_d19_12(out, record.clock.af2);
+    out.push('\n');
+
+    let e = &record.elements;
+    let gd = &record.group_delays;
+    write_orbit(out, [cnav.adot_m_s, e.crs, e.delta_n, e.m0]);
+    write_orbit(out, [e.cuc, e.e, e.cus, e.sqrt_a]);
+    write_orbit(out, [cnav.top.tow_s, e.cic, e.omega0, e.cis]);
+    write_orbit(out, [e.i0, e.crc, e.omega, e.omega_dot]);
+    write_orbit(
+        out,
+        [
+            e.idot,
+            cnav.delta_n0_dot_rad_s2,
+            f64::from(cnav.ura_ned0_index),
+            f64::from(cnav.ura_ned1_index),
+        ],
+    );
+    write_orbit_opt(
+        out,
+        [
+            Some(f64::from(cnav.ura_ed_index)),
+            Some(record.sv_health),
+            gd.gps_tgd_s,
+            Some(f64::from(cnav.ura_ned2_index)),
+        ],
+    );
+    write_orbit_opt(
+        out,
+        [
+            gd.cnav_isc_l1ca_s,
+            gd.cnav_isc_l2c_s,
+            gd.cnav_isc_l5i5_s,
+            gd.cnav_isc_l5q5_s,
+        ],
+    );
+
+    if matches!(record.message, NavMessage::GpsCnav2 | NavMessage::QzssCnav2) {
+        write_orbit_opt(out, [gd.cnav_isc_l1cd_s, gd.cnav_isc_l1cp_s, None, None]);
+        write_orbit_opt(
+            out,
+            [
+                Some(cnav.transmission_time_sow),
+                Some(f64::from(cnav.top.week)),
+                cnav.flags.map(f64::from),
+                None,
+            ],
+        );
+    } else {
+        write_orbit_opt(
+            out,
+            [
+                Some(cnav.transmission_time_sow),
+                Some(f64::from(cnav.top.week)),
+                cnav.flags.map(f64::from),
+                None,
+            ],
+        );
+    }
 }
 
 /// Reconstruct the civil toc epoch (integer seconds) from a record's `toc`
@@ -171,10 +258,33 @@ fn write_orbit(out: &mut String, values: [f64; 4]) {
     out.push('\n');
 }
 
+fn write_orbit_opt(out: &mut String, values: [Option<f64>; 4]) {
+    out.push_str("    ");
+    for value in values {
+        match value {
+            Some(value) => push_d19_12(out, value),
+            None => out.push_str("                   "),
+        }
+    }
+    out.push('\n');
+}
+
+fn message_token(message: NavMessage) -> &'static str {
+    match message {
+        NavMessage::GpsLnav => "LNAV",
+        NavMessage::GpsCnav | NavMessage::QzssCnav => "CNAV",
+        NavMessage::GpsCnav2 | NavMessage::QzssCnav2 => "CNV2",
+        NavMessage::GalileoInav => "INAV",
+        NavMessage::GalileoFnav => "FNAV",
+        NavMessage::BeidouD1 => "D1",
+        NavMessage::BeidouD2 => "D2",
+    }
+}
+
 /// Append a value in RINEX `D19.12` fixed-width form: a leading sign or space,
 /// one mantissa digit, twelve fraction digits, and a signed two-digit exponent
 /// (e.g. ` 1.000000000000e+00`, `-2.907656250000e+02`), always 19 columns.
-fn push_d19_12(out: &mut String, value: f64) {
+pub(super) fn push_d19_12(out: &mut String, value: f64) {
     let negative = value.is_sign_negative() && value != 0.0;
     let magnitude = value.abs();
     let base = format!("{magnitude:.12e}");

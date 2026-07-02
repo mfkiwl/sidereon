@@ -1,5 +1,5 @@
-//! Broadcast-ephemeris orbit and clock evaluation (GPS LNAV, Galileo I/NAV,
-//! BeiDou D1/D2).
+//! Broadcast-ephemeris orbit and clock evaluation (GPS LNAV/CNAV/CNAV-2,
+//! QZSS CNAV/CNAV-2, Galileo I/NAV, BeiDou D1/D2).
 //!
 //! Evaluates a broadcast navigation message into an ECEF satellite position and
 //! a satellite clock offset, by the standard Keplerian construction of
@@ -11,14 +11,14 @@
 //! (the `is_geo` path of [`satellite_position_ecef`]); GPS, Galileo, and BeiDou
 //! MEO/IGSO satellites use the direct rotation.
 //!
-//! This is a 0-ULP parity target: the operation order reproduces the canonical
-//! reference recipe (`parity/generator/broadcast_eval.py`) bit-for-bit. The
-//! transcendentals are the libm scalar `sin`/`cos`/`sqrt`/`atan2` (matching the
-//! recipe's CPython `math` calls on the pinned Apple-libm target); separate
-//! `.sin()` and `.cos()` calls are used deliberately (never `.sin_cos()`, whose
-//! fused evaluation can differ in the last bit). Integer powers are explicit
-//! repeated multiplies and there is no fused multiply-add (Rust does not
-//! auto-contract `a * b + c`).
+//! This is a 0-ULP parity target for the legacy evaluator: the operation order
+//! reproduces the canonical reference recipe (`parity/generator/broadcast_eval.py`)
+//! bit-for-bit. The CNAV evaluator is pinned separately by
+//! `fixtures-generators/broadcast_eval_cnav.py`, using the same scalar libm,
+//! no-FMA, explicit-multiply discipline. Separate `.sin()` and `.cos()` calls
+//! are used deliberately (never `.sin_cos()`, whose fused evaluation can differ
+//! in the last bit). Integer powers are explicit repeated multiplies and there
+//! is no fused multiply-add (Rust does not auto-contract `a * b + c`).
 
 use crate::astro::constants::models::broadcast::{
     BEIDOU_OMEGA_E_RAD_S, GALILEO_BEIDOU_DTR_F, GALILEO_GM_M3_S2, GPS_DTR_F,
@@ -123,6 +123,15 @@ pub struct ClockPolynomial {
     pub af2: f64,
     /// Clock reference time, seconds of week.
     pub toc_sow: f64,
+}
+
+/// CNAV ephemeris rate terms absent from the legacy parameterization.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CnavRates {
+    /// Semi-major axis rate ADOT (m/s).
+    pub adot_m_s: f64,
+    /// Rate of the mean-motion difference (rad/s^2).
+    pub delta_n0_dot_rad_s2: f64,
 }
 
 /// A solved eccentric anomaly and the iteration count that produced it.
@@ -424,6 +433,111 @@ pub(crate) fn satellite_position_ecef_unchecked(
     }
 }
 
+/// Evaluate a GPS/QZSS CNAV-family broadcast orbit at `t_sow_s`.
+///
+/// CNAV uses a time-varying semi-major axis and mean-motion correction:
+/// `Ak = A0 + ADOT * tk` and
+/// `delta_nA = delta_n0 + 0.5 * delta_n0_dot * tk`. The downstream Keplerian
+/// construction is the same as the legacy path, with the standard non-GEO
+/// rotation for both GPS and QZSS.
+pub fn satellite_position_ecef_cnav(
+    elements: &KeplerianElements,
+    rates: &CnavRates,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+) -> Result<OrbitState> {
+    validate_elements(elements)?;
+    validate_cnav_rates(rates)?;
+    validate_constants(consts)?;
+    validate_finite(t_sow_s, "t_sow_s")?;
+
+    let state = satellite_position_ecef_cnav_unchecked(elements, rates, consts, t_sow_s);
+    validate_orbit_state(&state)?;
+    Ok(state)
+}
+
+pub(crate) fn satellite_position_ecef_cnav_unchecked(
+    elements: &KeplerianElements,
+    rates: &CnavRates,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+) -> OrbitState {
+    let sqrt_a = elements.sqrt_a;
+    let e = elements.e;
+    let gm = consts.gm_m3_s2;
+    let omega_e = consts.omega_e_rad_s;
+
+    let a0 = sqrt_a * sqrt_a;
+    let n0 = (gm / (a0 * a0 * a0)).sqrt();
+    let tk = time_from_reference_s(t_sow_s, elements.toe_sow);
+    let a = a0 + rates.adot_m_s * tk;
+    let delta_n_a = elements.delta_n + 0.5 * rates.delta_n0_dot_rad_s2 * tk;
+    let n = n0 + delta_n_a;
+
+    let mk = elements.m0 + n * tk;
+    let kepler = eccentric_anomaly_unchecked(mk, e);
+    let ecc_anom = kepler.value;
+    let sin_e = ecc_anom.sin();
+    let cos_e = ecc_anom.cos();
+
+    let e2 = e * e;
+    let nu = ((1.0 - e2).sqrt() * sin_e).atan2(cos_e - e);
+    let phi = nu + elements.omega;
+
+    let two_phi = 2.0 * phi;
+    let s2 = two_phi.sin();
+    let c2 = two_phi.cos();
+    let du = elements.cus * s2 + elements.cuc * c2;
+    let dr = elements.crs * s2 + elements.crc * c2;
+    let di = elements.cis * s2 + elements.cic * c2;
+
+    let u = phi + du;
+    let r = a * (1.0 - e * cos_e) + dr;
+    let i = elements.i0 + di + elements.idot * tk;
+
+    let xp = r * u.cos();
+    let yp = r * u.sin();
+
+    let omega_k =
+        elements.omega0 + (elements.omega_dot - omega_e) * tk - omega_e * elements.toe_sow;
+
+    let sin_o = omega_k.sin();
+    let cos_o = omega_k.cos();
+    let sin_i = i.sin();
+    let cos_i = i.cos();
+    let x = xp * cos_o - yp * cos_i * sin_o;
+    let y = xp * sin_o + yp * cos_i * cos_o;
+    let z = yp * sin_i;
+
+    OrbitState {
+        a,
+        n0,
+        n,
+        tk,
+        mk,
+        eccentric_anomaly: ecc_anom,
+        kepler_iterations: kepler.iterations,
+        sin_e,
+        cos_e,
+        nu,
+        phi,
+        s2,
+        c2,
+        du,
+        dr,
+        di,
+        u,
+        r,
+        i,
+        xp,
+        yp,
+        omega_k,
+        x_m: x,
+        y_m: y,
+        z_m: z,
+    }
+}
+
 /// Evaluate the broadcast satellite clock offset (seconds).
 ///
 /// `sin_e` is the eccentric-anomaly sine from the position evaluation at the
@@ -535,6 +649,42 @@ pub(crate) fn satellite_state_unchecked(
     SatelliteState { orbit, clock }
 }
 
+/// Evaluate a GPS/QZSS CNAV-family broadcast orbit and clock at one instant.
+pub fn satellite_state_cnav(
+    elements: &KeplerianElements,
+    rates: &CnavRates,
+    clock: &ClockPolynomial,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+    tgd_s: f64,
+) -> Result<SatelliteState> {
+    validate_elements(elements)?;
+    validate_cnav_rates(rates)?;
+    validate_clock(clock)?;
+    validate_constants(consts)?;
+    validate_finite(t_sow_s, "t_sow_s")?;
+    validate_finite(tgd_s, "tgd_s")?;
+
+    let state = satellite_state_cnav_unchecked(elements, rates, clock, consts, t_sow_s, tgd_s);
+    validate_orbit_state(&state.orbit)?;
+    validate_clock_offset(&state.clock)?;
+    Ok(state)
+}
+
+pub(crate) fn satellite_state_cnav_unchecked(
+    elements: &KeplerianElements,
+    rates: &CnavRates,
+    clock: &ClockPolynomial,
+    consts: &ConstellationConstants,
+    t_sow_s: f64,
+    tgd_s: f64,
+) -> SatelliteState {
+    let orbit = satellite_position_ecef_cnav_unchecked(elements, rates, consts, t_sow_s);
+    let clock =
+        satellite_clock_offset_s_unchecked(clock, consts, elements, orbit.sin_e, t_sow_s, tgd_s);
+    SatelliteState { orbit, clock }
+}
+
 fn validate_elements(elements: &KeplerianElements) -> Result<()> {
     validate_positive(elements.sqrt_a, "elements.sqrt_a")?;
     validate_eccentricity(elements.e)?;
@@ -552,6 +702,11 @@ fn validate_elements(elements: &KeplerianElements) -> Result<()> {
     validate_finite(elements.cic, "elements.cic")?;
     validate_finite(elements.cis, "elements.cis")?;
     validate_sow(elements.toe_sow, "elements.toe_sow")
+}
+
+fn validate_cnav_rates(rates: &CnavRates) -> Result<()> {
+    validate_finite(rates.adot_m_s, "rates.adot_m_s")?;
+    validate_finite(rates.delta_n0_dot_rad_s2, "rates.delta_n0_dot_rad_s2")
 }
 
 fn validate_clock(clock: &ClockPolynomial) -> Result<()> {

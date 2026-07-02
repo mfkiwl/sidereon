@@ -1,11 +1,12 @@
-//! RINEX 3.x and 4.xx navigation-message parsing (GPS LNAV, Galileo I/NAV and
-//! F/NAV, BeiDou D1/D2).
+//! RINEX 3.x and 4.xx navigation-message parsing (GPS LNAV/CNAV/CNAV-2, QZSS
+//! CNAV/CNAV-2, Galileo I/NAV and F/NAV, BeiDou D1/D2).
 //!
 //! Version 4 wraps each record in a `> EPH|STO|EOP|ION SVNN MSG` frame marker but
-//! keeps the same fixed-column broadcast-orbit layout, so the two versions share
-//! the block parser; only the record grouping differs. CNAV-family messages
-//! (CNAV/CNV1/CNV2/CNV3) reorder the orbit roster and are recognized but not
-//! parsed.
+//! keeps the same fixed-column broadcast-orbit layout for legacy messages, so
+//! those versions share the block parser; only the record grouping differs.
+//! GPS/QZSS CNAV and CNAV-2 use a separate RINEX 4 roster and are parsed into a
+//! CNAV extension. BeiDou CNV1/CNV2/CNV3, QZSS LNAV, NavIC, SBAS, and RINEX 4
+//! GLONASS FDMA frames are recognized as frame boundaries and skipped.
 //!
 //! Reads broadcast ephemeris records out of a RINEX navigation file into the
 //! typed [`BroadcastRecord`]s the [`crate::broadcast`] evaluator consumes. This
@@ -15,16 +16,14 @@
 //! crate pulls ~90 transitive crates, including computational-geometry stacks,
 //! for what is a fixed-width text read).
 //!
-//! Scope: the GPS, Galileo, and BeiDou Keplerian record layouts (eight lines:
-//! the SV/epoch/clock line plus seven broadcast-orbit lines), plus the GLONASS
-//! four-line state-vector layout (parsed by [`parse_glonass`] and evaluated by
-//! the [`crate::glonass`] RK4 propagator, not the Keplerian path). Other
-//! constellations' records (SBAS, QZSS) are recognized as record boundaries and
-//! skipped, so a mixed file parses without error but yields only the supported
-//! systems.
+//! Scope: the GPS, QZSS, Galileo, and BeiDou Keplerian record layouts, plus the
+//! GLONASS four-line state-vector layout (parsed by [`parse_glonass`] and
+//! evaluated by the [`crate::glonass`] RK4 propagator, not the Keplerian path).
+//! Unsupported constellations and message rosters are skipped so a mixed file
+//! parses without error while yielding only the supported systems.
 
 mod store;
-pub use store::BroadcastStore;
+pub use store::{BroadcastStore, NavMessagePreference};
 
 mod write;
 pub use write::encode_nav;
@@ -32,7 +31,7 @@ pub use write::encode_nav;
 use crate::astro::time::model::{GnssWeekTow, TimeScale};
 use crate::astro::time::{civil, gnss};
 use crate::broadcast::{ClockPolynomial, ConstellationConstants, KeplerianElements};
-use crate::constants::{KM_TO_M, SECONDS_PER_HOUR};
+use crate::constants::{KM_TO_M, SECONDS_PER_HOUR, SECONDS_PER_WEEK};
 use crate::format::columns::{field, raw_field};
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::ionex::GalileoNequickCoeffs;
@@ -91,6 +90,14 @@ impl RinexVersion {
 pub enum NavMessage {
     /// GPS legacy navigation message.
     GpsLnav,
+    /// GPS CNAV message (L2C/L5), RINEX 4 token `CNAV`.
+    GpsCnav,
+    /// GPS CNAV-2 message (L1C), RINEX 4 token `CNV2`.
+    GpsCnav2,
+    /// QZSS CNAV message, RINEX 4 token `CNAV`.
+    QzssCnav,
+    /// QZSS CNAV-2 message, RINEX 4 token `CNV2`.
+    QzssCnav2,
     /// Galileo integrity navigation message (E1/E5b dual, E1 single-frequency).
     GalileoInav,
     /// Galileo F/NAV message (E5a).
@@ -99,6 +106,16 @@ pub enum NavMessage {
     BeidouD1,
     /// BeiDou D2 message (geostationary satellites).
     BeidouD2,
+}
+
+impl NavMessage {
+    /// Whether this is a GPS/QZSS CNAV-family message.
+    pub const fn is_cnav_family(self) -> bool {
+        matches!(
+            self,
+            Self::GpsCnav | Self::GpsCnav2 | Self::QzssCnav | Self::QzssCnav2
+        )
+    }
 }
 
 /// Broadcast issue-of-data plus the navigation message identity.
@@ -123,6 +140,35 @@ pub enum BroadcastGroupDelayTerm {
     BeidouTgd1,
     /// BeiDou TGD2.
     BeidouTgd2,
+    /// GPS/QZSS CNAV ISC for L1 C/A.
+    CnavIscL1Ca,
+    /// GPS/QZSS CNAV ISC for L2C.
+    CnavIscL2C,
+    /// GPS/QZSS CNAV ISC for L5 I5.
+    CnavIscL5I5,
+    /// GPS/QZSS CNAV ISC for L5 Q5.
+    CnavIscL5Q5,
+    /// GPS/QZSS CNAV-2 ISC for L1C data.
+    CnavIscL1Cd,
+    /// GPS/QZSS CNAV-2 ISC for L1C pilot.
+    CnavIscL1Cp,
+}
+
+/// A GPS/QZSS signal a CNAV-family group-delay correction applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CnavSignal {
+    /// L1 C/A.
+    L1Ca,
+    /// L2C.
+    L2C,
+    /// L5 I5.
+    L5I5,
+    /// L5 Q5.
+    L5Q5,
+    /// L1C pilot.
+    L1Cp,
+    /// L1C data.
+    L1Cd,
 }
 
 /// Per-signal broadcast group delays preserved from one NAV record.
@@ -138,6 +184,18 @@ pub struct BroadcastGroupDelays {
     pub beidou_tgd1_s: Option<f64>,
     /// BeiDou TGD2, seconds.
     pub beidou_tgd2_s: Option<f64>,
+    /// GPS/QZSS CNAV ISC for L1 C/A, seconds.
+    pub cnav_isc_l1ca_s: Option<f64>,
+    /// GPS/QZSS CNAV ISC for L2C, seconds.
+    pub cnav_isc_l2c_s: Option<f64>,
+    /// GPS/QZSS CNAV ISC for L5 I5, seconds.
+    pub cnav_isc_l5i5_s: Option<f64>,
+    /// GPS/QZSS CNAV ISC for L5 Q5, seconds.
+    pub cnav_isc_l5q5_s: Option<f64>,
+    /// GPS/QZSS CNAV-2 ISC for L1C data, seconds.
+    pub cnav_isc_l1cd_s: Option<f64>,
+    /// GPS/QZSS CNAV-2 ISC for L1C pilot, seconds.
+    pub cnav_isc_l1cp_s: Option<f64>,
 }
 
 impl BroadcastGroupDelays {
@@ -149,6 +207,12 @@ impl BroadcastGroupDelays {
             galileo_bgd_e5b_e1_s: None,
             beidou_tgd1_s: None,
             beidou_tgd2_s: None,
+            cnav_isc_l1ca_s: None,
+            cnav_isc_l2c_s: None,
+            cnav_isc_l5i5_s: None,
+            cnav_isc_l5q5_s: None,
+            cnav_isc_l1cd_s: None,
+            cnav_isc_l1cp_s: None,
         }
     }
 
@@ -160,6 +224,12 @@ impl BroadcastGroupDelays {
             galileo_bgd_e5b_e1_s: Some(bgd_e5b_e1_s),
             beidou_tgd1_s: None,
             beidou_tgd2_s: None,
+            cnav_isc_l1ca_s: None,
+            cnav_isc_l2c_s: None,
+            cnav_isc_l5i5_s: None,
+            cnav_isc_l5q5_s: None,
+            cnav_isc_l1cd_s: None,
+            cnav_isc_l1cp_s: None,
         }
     }
 
@@ -171,6 +241,37 @@ impl BroadcastGroupDelays {
             galileo_bgd_e5b_e1_s: None,
             beidou_tgd1_s: Some(tgd1_s),
             beidou_tgd2_s: Some(tgd2_s),
+            cnav_isc_l1ca_s: None,
+            cnav_isc_l2c_s: None,
+            cnav_isc_l5i5_s: None,
+            cnav_isc_l5q5_s: None,
+            cnav_isc_l1cd_s: None,
+            cnav_isc_l1cp_s: None,
+        }
+    }
+
+    /// Build a GPS/QZSS CNAV-family delay set.
+    pub const fn cnav(
+        tgd_s: Option<f64>,
+        isc_l1ca_s: Option<f64>,
+        isc_l2c_s: Option<f64>,
+        isc_l5i5_s: Option<f64>,
+        isc_l5q5_s: Option<f64>,
+        isc_l1cd_s: Option<f64>,
+        isc_l1cp_s: Option<f64>,
+    ) -> Self {
+        Self {
+            gps_tgd_s: tgd_s,
+            galileo_bgd_e5a_e1_s: None,
+            galileo_bgd_e5b_e1_s: None,
+            beidou_tgd1_s: None,
+            beidou_tgd2_s: None,
+            cnav_isc_l1ca_s: isc_l1ca_s,
+            cnav_isc_l2c_s: isc_l2c_s,
+            cnav_isc_l5i5_s: isc_l5i5_s,
+            cnav_isc_l5q5_s: isc_l5q5_s,
+            cnav_isc_l1cd_s: isc_l1cd_s,
+            cnav_isc_l1cp_s: isc_l1cp_s,
         }
     }
 
@@ -182,7 +283,30 @@ impl BroadcastGroupDelays {
             BroadcastGroupDelayTerm::GalileoBgdE5bE1 => self.galileo_bgd_e5b_e1_s,
             BroadcastGroupDelayTerm::BeidouTgd1 => self.beidou_tgd1_s,
             BroadcastGroupDelayTerm::BeidouTgd2 => self.beidou_tgd2_s,
+            BroadcastGroupDelayTerm::CnavIscL1Ca => self.cnav_isc_l1ca_s,
+            BroadcastGroupDelayTerm::CnavIscL2C => self.cnav_isc_l2c_s,
+            BroadcastGroupDelayTerm::CnavIscL5I5 => self.cnav_isc_l5i5_s,
+            BroadcastGroupDelayTerm::CnavIscL5Q5 => self.cnav_isc_l5q5_s,
+            BroadcastGroupDelayTerm::CnavIscL1Cd => self.cnav_isc_l1cd_s,
+            BroadcastGroupDelayTerm::CnavIscL1Cp => self.cnav_isc_l1cp_s,
         }
+    }
+
+    /// The total CNAV single-frequency clock adjustment (TGD - ISC), seconds.
+    ///
+    /// Callers subtract this from the satellite clock offset by passing it as the
+    /// `tgd_s` argument to the broadcast evaluator. Returns `None` when TGD or
+    /// the selected ISC is unavailable.
+    pub fn cnav_single_frequency_correction_s(&self, signal: CnavSignal) -> Option<f64> {
+        let isc = match signal {
+            CnavSignal::L1Ca => self.cnav_isc_l1ca_s,
+            CnavSignal::L2C => self.cnav_isc_l2c_s,
+            CnavSignal::L5I5 => self.cnav_isc_l5i5_s,
+            CnavSignal::L5Q5 => self.cnav_isc_l5q5_s,
+            CnavSignal::L1Cp => self.cnav_isc_l1cp_s,
+            CnavSignal::L1Cd => self.cnav_isc_l1cd_s,
+        }?;
+        Some(self.gps_tgd_s? - isc)
     }
 
     /// The delay term historically used for broadcast-clock evaluation.
@@ -201,8 +325,71 @@ impl BroadcastGroupDelays {
             (GnssSystem::BeiDou, NavMessage::BeidouD1 | NavMessage::BeidouD2) => {
                 self.get(BroadcastGroupDelayTerm::BeidouTgd1)
             }
+            (
+                GnssSystem::Gps | GnssSystem::Qzss,
+                NavMessage::GpsCnav
+                | NavMessage::GpsCnav2
+                | NavMessage::QzssCnav
+                | NavMessage::QzssCnav2,
+            ) => match (self.gps_tgd_s, self.cnav_isc_l1ca_s) {
+                (Some(tgd), Some(isc)) => Some(tgd - isc),
+                _ => None,
+            },
             _ => None,
         }
+    }
+}
+
+/// CNAV/CNAV-2 parameters that have no legacy counterpart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CnavParameters {
+    /// Semi-major axis rate ADOT (m/s), ORBIT-1 field 1.
+    pub adot_m_s: f64,
+    /// Rate of the mean-motion difference (rad/s^2), ORBIT-5 field 2.
+    pub delta_n0_dot_rad_s2: f64,
+    /// CEI data-sequence propagation epoch: WNop week plus top seconds of week.
+    pub top: GnssWeekTow,
+    /// URA_ED index, [-16, 15].
+    pub ura_ed_index: i8,
+    /// URA_NED0 index, [-16, 15].
+    pub ura_ned0_index: i8,
+    /// URA_NED1 index, [0, 7].
+    pub ura_ned1_index: u8,
+    /// URA_NED2 index, [0, 7].
+    pub ura_ned2_index: u8,
+    /// Transmission time of message t_tm, seconds of week.
+    pub transmission_time_sow: f64,
+    /// Optional decimal-coded flag bits.
+    pub flags: Option<u32>,
+}
+
+/// Nominal URA meters for a CNAV ED/NED0 index.
+///
+/// Returns `None` for the no-prediction indices 15 and -16.
+pub fn cnav_ura_nominal_m(index: i8) -> Option<f64> {
+    match index {
+        -16 | 15 => None,
+        1 => Some(2.8),
+        3 => Some(5.7),
+        5 => Some(11.3),
+        -15..=6 => Some(2.0_f64.powf(1.0 + f64::from(index) / 2.0)),
+        7..=14 => Some(2.0_f64.powi(i32::from(index) - 2)),
+        _ => None,
+    }
+}
+
+/// Time-dependent CNAV URA_NED bound in meters at GPST `t`.
+pub fn cnav_ura_ned_m(params: &CnavParameters, t: GnssWeekTow) -> Option<f64> {
+    let ned0 = cnav_ura_nominal_m(params.ura_ned0_index)?;
+    let ned1 = 2.0_f64.powi(-(14 + i32::from(params.ura_ned1_index)));
+    let ned2 = 2.0_f64.powi(-(28 + i32::from(params.ura_ned2_index)));
+    let dt_op = (f64::from(t.week) - f64::from(params.top.week)) * SECONDS_PER_WEEK
+        + (t.tow_s - params.top.tow_s);
+    let linear = ned0 + ned1 * dt_op;
+    if dt_op <= 93_600.0 {
+        Some(linear)
+    } else {
+        Some(linear + ned2 * (dt_op - 93_600.0) * (dt_op - 93_600.0))
     }
 }
 
@@ -310,6 +497,8 @@ pub struct BroadcastRecord {
     pub clock: ClockPolynomial,
     /// Broadcast group-delay terms carried by this message.
     pub group_delays: BroadcastGroupDelays,
+    /// CNAV/CNAV-2 extension, present only for GPS/QZSS CNAV-family records.
+    pub cnav: Option<CnavParameters>,
     /// Satellite health word (0 is healthy for the GPS/Galileo nominal case).
     pub sv_health: f64,
     /// Signal-in-space accuracy: GPS URA (m) / Galileo SISA (m).
@@ -339,6 +528,10 @@ impl BroadcastRecord {
 
     /// Group delay used by the broadcast-clock evaluator for this message.
     pub fn broadcast_clock_group_delay_s(&self) -> f64 {
+        if self.message.is_cnav_family() {
+            return self.group_delays.gps_tgd_s.unwrap_or(0.0)
+                - self.group_delays.cnav_isc_l1ca_s.unwrap_or(0.0);
+        }
         self.group_delays
             .for_message(self.satellite_id.system, self.message)
             .unwrap_or(0.0)
@@ -451,6 +644,7 @@ impl BroadcastRecord {
             elements,
             clock,
             group_delays: BroadcastGroupDelays::gps_lnav(decoded.tgd),
+            cnav: None,
             sv_health: decoded.sv_health as f64,
             sv_accuracy_m,
             fit_interval_s: Some(fit_interval_s),
@@ -609,7 +803,7 @@ fn broadcast_time_scale(system: GnssSystem) -> TimeScale {
 /// Why a RINEX NAV file could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavParseError {
-    /// The header did not declare a supported RINEX 3 navigation file.
+    /// The header did not declare a supported RINEX navigation file.
     UnsupportedHeader(String),
     /// No `END OF HEADER` line was found.
     MissingHeaderEnd,
@@ -647,15 +841,13 @@ impl core::fmt::Display for NavParseError {
 
 impl std::error::Error for NavParseError {}
 
-/// Parse a RINEX 3.x or 4.xx navigation file into the supported (GPS, Galileo,
-/// BeiDou) Keplerian records.
+/// Parse a RINEX 3.x or 4.xx navigation file into the supported GPS, QZSS,
+/// Galileo, and BeiDou Keplerian records.
 ///
-/// Records of other constellations (GLONASS state-vector, SBAS) are skipped, as
-/// are version-4 CNAV-family messages (CNAV/CNV1/CNV2/CNV3): their broadcast-orbit
-/// roster reorders the fixed columns (`t_op` for `toe`, `wn_op` for `week`, extra
-/// `adot`/`deltaN0Dot` terms), so they are recognized but not parsed rather than
-/// fed wrong values. The records are returned in file order; selection (by epoch,
-/// health, message type) is the caller's job.
+/// Unsupported RINEX 4 message rosters, including BeiDou CNV1/CNV2/CNV3 and
+/// QZSS LNAV, are skipped rather than fed through the wrong layout. The records
+/// are returned in file order; selection by epoch, health, and message type is
+/// the caller's job.
 pub fn parse_nav(text: &str) -> Result<Vec<BroadcastRecord>, NavParseError> {
     let mut lines = text.lines();
     let version = verify_and_skip_header(&mut lines)?;
@@ -699,13 +891,12 @@ where
 }
 
 /// Version-4 body: each record is introduced by a `> EPH|STO|EOP|ION SVNN MSG`
-/// frame marker. Only `EPH` frames carrying a supported Keplerian message are
-/// parsed; the broadcast-orbit lines that follow the marker have the same
-/// fixed-column layout as version 3, so they reuse [`parse_keplerian_block`].
-/// The message type is taken from the marker token (so I/NAV vs F/NAV and D1 vs
-/// D2 are explicit, not inferred) after the marker SV and message family are
-/// cross-checked against the body line. STO/EOP/ION frames, other
-/// constellations, and CNAV-family messages are skipped.
+/// frame marker. `EPH` frames carrying a supported legacy Keplerian message use
+/// [`parse_keplerian_block`]; GPS/QZSS CNAV-family messages use
+/// [`parse_cnav_block`]. The message type is taken from the marker token (so
+/// I/NAV vs F/NAV, D1 vs D2, and GPS/QZSS CNV2 vs BeiDou CNV2 are explicit)
+/// after the marker SV and message family are cross-checked against the body
+/// line. STO/EOP/ION frames and unsupported message rosters are skipped.
 fn parse_nav_v4<'a, I>(
     lines: I,
     version: RinexVersion,
@@ -725,18 +916,30 @@ where
             continue; // STO/EOP/ION carry no ephemeris.
         }
         let letter = sv.as_bytes().first().copied().map_or(' ', char::from);
+        let Some(system) = GnssSystem::from_letter(letter) else {
+            continue;
+        };
         let supported = matches!(
-            GnssSystem::from_letter(letter),
-            Some(GnssSystem::Gps) | Some(GnssSystem::Galileo) | Some(GnssSystem::BeiDou)
+            system,
+            GnssSystem::Gps | GnssSystem::Galileo | GnssSystem::BeiDou | GnssSystem::Qzss
         );
         if !supported {
-            continue; // GLONASS/SBAS/QZSS/NavIC: not a supported Keplerian system.
+            continue; // GLONASS/SBAS/NavIC: not a supported Keplerian system here.
         }
-        // Only messages whose orbit roster matches the version-3 column layout
-        // are parsed; CNAV-family (and anything unrecognized) is skipped.
-        if let Some(message) = nav_message_from_v4_token(msg_token) {
+        if let Some(message) = nav_message_from_v4_token(msg_token, system) {
             validate_v4_ephemeris_marker(sv, message, body)?;
-            records.push(parse_keplerian_block(body, Some(message), version)?);
+            if message.is_cnav_family() {
+                records.push(parse_cnav_block(body, message)?);
+            } else {
+                records.push(parse_keplerian_block(body, Some(message), version)?);
+            }
+        } else if known_v4_ephemeris_token(msg_token)
+            && !explicitly_skipped_v4_message(msg_token, system)
+        {
+            return Err(NavParseError::BadField {
+                satellite: sv.to_string(),
+                field: "message",
+            });
         }
     }
     Ok(records)
@@ -775,17 +978,35 @@ fn parse_v4_marker(line: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// Map a version-4 EPH message token to the [`NavMessage`] for the supported
-/// Keplerian messages, or `None` for a message whose orbit layout does not match
-/// the version-3 columns (CNAV-family) or is otherwise unsupported here.
-fn nav_message_from_v4_token(token: &str) -> Option<NavMessage> {
-    match token {
-        "LNAV" => Some(NavMessage::GpsLnav),
-        "INAV" => Some(NavMessage::GalileoInav),
-        "FNAV" => Some(NavMessage::GalileoFnav),
-        "D1" => Some(NavMessage::BeidouD1),
-        "D2" => Some(NavMessage::BeidouD2),
+/// Keplerian messages. `CNV2` is system-overloaded: GPS/QZSS CNV2 is supported
+/// as CNAV-2, while BeiDou CNV2 is a different roster and remains skipped.
+fn nav_message_from_v4_token(token: &str, system: GnssSystem) -> Option<NavMessage> {
+    match (token, system) {
+        ("LNAV", GnssSystem::Gps) => Some(NavMessage::GpsLnav),
+        ("CNAV", GnssSystem::Gps) => Some(NavMessage::GpsCnav),
+        ("CNV2", GnssSystem::Gps) => Some(NavMessage::GpsCnav2),
+        ("CNAV", GnssSystem::Qzss) => Some(NavMessage::QzssCnav),
+        ("CNV2", GnssSystem::Qzss) => Some(NavMessage::QzssCnav2),
+        ("INAV", GnssSystem::Galileo) => Some(NavMessage::GalileoInav),
+        ("FNAV", GnssSystem::Galileo) => Some(NavMessage::GalileoFnav),
+        ("D1", GnssSystem::BeiDou) => Some(NavMessage::BeidouD1),
+        ("D2", GnssSystem::BeiDou) => Some(NavMessage::BeidouD2),
         _ => None,
     }
+}
+
+fn known_v4_ephemeris_token(token: &str) -> bool {
+    matches!(
+        token,
+        "LNAV" | "CNAV" | "CNV1" | "CNV2" | "CNV3" | "INAV" | "FNAV" | "D1" | "D2"
+    )
+}
+
+fn explicitly_skipped_v4_message(token: &str, system: GnssSystem) -> bool {
+    matches!(
+        (token, system),
+        ("LNAV", GnssSystem::Qzss) | ("CNV1" | "CNV2" | "CNV3", GnssSystem::BeiDou)
+    )
 }
 
 fn validate_v4_ephemeris_marker(
@@ -831,6 +1052,11 @@ fn nav_message_matches_system(message: NavMessage, system: GnssSystem) -> bool {
     matches!(
         (message, system),
         (NavMessage::GpsLnav, GnssSystem::Gps)
+            | (NavMessage::GpsCnav | NavMessage::GpsCnav2, GnssSystem::Gps)
+            | (
+                NavMessage::QzssCnav | NavMessage::QzssCnav2,
+                GnssSystem::Qzss,
+            )
             | (
                 NavMessage::GalileoInav | NavMessage::GalileoFnav,
                 GnssSystem::Galileo,
@@ -1222,6 +1448,12 @@ fn orbit_row(line: &str) -> [Option<f64>; 4] {
     ]
 }
 
+fn raw_orbit_field(line: &str, field_index: usize) -> &str {
+    const RANGES: [(usize, usize); 4] = [(4, 23), (23, 42), (42, 61), (61, 80)];
+    let (start, end) = RANGES[field_index];
+    raw_field(line, start, end)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ClockReferenceEpoch {
     week: u32,
@@ -1356,9 +1588,161 @@ fn parse_keplerian_block(
         elements,
         clock,
         group_delays,
+        cnav: None,
         sv_health,
         sv_accuracy_m,
         fit_interval_s,
+    })
+}
+
+fn parse_cnav_block(block: &[&str], message: NavMessage) -> Result<BroadcastRecord, NavParseError> {
+    let l0 = block.first().copied().unwrap_or("");
+    let sat = l0.get(0..3).unwrap_or("").trim().to_string();
+    let is_cnav2 = matches!(message, NavMessage::GpsCnav2 | NavMessage::QzssCnav2);
+    let required_lines = if is_cnav2 { 10 } else { 9 };
+    if block.len() < required_lines {
+        return Err(NavParseError::TruncatedRecord(sat));
+    }
+    let bad = |what: &'static str| NavParseError::BadField {
+        satellite: sat.clone(),
+        field: what,
+    };
+
+    let letter = l0
+        .as_bytes()
+        .first()
+        .copied()
+        .map(|b| b as char)
+        .ok_or_else(|| bad("system"))?;
+    GnssSystem::from_letter(letter).ok_or_else(|| bad("system"))?;
+    let satellite_id: GnssSatelliteId = sat.parse().map_err(|_| bad("prn"))?;
+    let toc_epoch = parse_toc(l0, &sat, TimeScale::Gpst)?;
+    let af0 = parse_f64(l0, 23, 42).ok_or_else(|| bad("af0"))?;
+    let af1 = parse_f64(l0, 42, 61).ok_or_else(|| bad("af1"))?;
+    let af2 = parse_f64(l0, 61, 80).ok_or_else(|| bad("af2"))?;
+
+    let o1 = orbit_row(block[1]);
+    let o2 = orbit_row(block[2]);
+    let o3 = orbit_row(block[3]);
+    let o4 = orbit_row(block[4]);
+    let o5 = orbit_row(block[5]);
+    let o6 = orbit_row(block[6]);
+    let o8 = orbit_row(block[8]);
+    let o9 = if is_cnav2 {
+        Some(orbit_row(block[9]))
+    } else {
+        None
+    };
+
+    let g = |v: Option<f64>, what: &'static str| v.ok_or_else(|| bad(what));
+    let elements = KeplerianElements {
+        crs: g(o1[1], "crs")?,
+        delta_n: g(o1[2], "deltaN0")?,
+        m0: g(o1[3], "m0")?,
+        cuc: g(o2[0], "cuc")?,
+        e: g(o2[1], "e")?,
+        cus: g(o2[2], "cus")?,
+        sqrt_a: g(o2[3], "sqrtA0")?,
+        toe_sow: toc_epoch.sow,
+        cic: g(o3[1], "cic")?,
+        omega0: g(o3[2], "omega0")?,
+        cis: g(o3[3], "cis")?,
+        i0: g(o4[0], "i0")?,
+        crc: g(o4[1], "crc")?,
+        omega: g(o4[2], "omega")?,
+        omega_dot: g(o4[3], "omegaDot")?,
+        idot: g(o5[0], "idot")?,
+    };
+    let clock = ClockPolynomial {
+        af0,
+        af1,
+        af2,
+        toc_sow: toc_epoch.sow,
+    };
+
+    let week = toc_epoch.week;
+    let toe = GnssWeekTow::new(TimeScale::Gpst, week, elements.toe_sow)
+        .and_then(GnssWeekTow::normalized)
+        .map_err(|_| bad("toe"))?;
+    let toc = GnssWeekTow::new(TimeScale::Gpst, week, clock.toc_sow)
+        .and_then(GnssWeekTow::normalized)
+        .map_err(|_| bad("toc"))?;
+    let wn_op = finite_integral_u32(
+        g(if is_cnav2 { o9.unwrap()[1] } else { o8[1] }, "wn_op")?,
+        "wn_op",
+        &sat,
+    )?;
+    let top_sow = g(o3[0], "top")?;
+    let top = GnssWeekTow::new(TimeScale::Gpst, wn_op, top_sow)
+        .and_then(GnssWeekTow::normalized)
+        .map_err(|_| bad("top"))?;
+    let ura_ed_index = finite_integral_i8(g(o6[0], "ura_ed")?, "ura_ed", -16, 15, &sat)?;
+    let ura_ned0_index = finite_integral_i8(g(o5[2], "ura_ned0")?, "ura_ned0", -16, 15, &sat)?;
+    let ura_ned1_index = finite_integral_u8(g(o5[3], "ura_ned1")?, "ura_ned1", 0, 7, &sat)?;
+    let ura_ned2_index = finite_integral_u8(g(o6[3], "ura_ned2")?, "ura_ned2", 0, 7, &sat)?;
+    let health_max = if is_cnav2 { 1 } else { 7 };
+    let sv_health = f64::from(finite_integral_u8(
+        g(o6[1], "health")?,
+        "health",
+        0,
+        health_max,
+        &sat,
+    )?);
+    let transmission_time_sow = g(if is_cnav2 { o9.unwrap()[0] } else { o8[0] }, "t_tm")?;
+    let flags = optional_integral_u32(
+        if is_cnav2 {
+            raw_orbit_field(block[9], 2)
+        } else {
+            raw_orbit_field(block[8], 2)
+        },
+        "flags",
+        &sat,
+    )?;
+
+    let tgd = optional_cnav_delay(raw_orbit_field(block[6], 2), "tgd", &sat)?;
+    let isc_l1ca = optional_cnav_delay(raw_orbit_field(block[7], 0), "isc_l1ca", &sat)?;
+    let isc_l2c = optional_cnav_delay(raw_orbit_field(block[7], 1), "isc_l2c", &sat)?;
+    let isc_l5i5 = optional_cnav_delay(raw_orbit_field(block[7], 2), "isc_l5i5", &sat)?;
+    let isc_l5q5 = optional_cnav_delay(raw_orbit_field(block[7], 3), "isc_l5q5", &sat)?;
+    let (isc_l1cd, isc_l1cp) = if is_cnav2 {
+        (
+            optional_cnav_delay(raw_orbit_field(block[8], 0), "isc_l1cd", &sat)?,
+            optional_cnav_delay(raw_orbit_field(block[8], 1), "isc_l1cp", &sat)?,
+        )
+    } else {
+        (None, None)
+    };
+
+    let cnav = CnavParameters {
+        adot_m_s: g(o1[0], "adot")?,
+        delta_n0_dot_rad_s2: g(o5[1], "deltaN0Dot")?,
+        top,
+        ura_ed_index,
+        ura_ned0_index,
+        ura_ned1_index,
+        ura_ned2_index,
+        transmission_time_sow,
+        flags,
+    };
+    let sv_accuracy_m = cnav_ura_nominal_m(ura_ed_index).unwrap_or(8192.0);
+    let issue = (elements.toe_sow / 300.0).round() as u32;
+
+    Ok(BroadcastRecord {
+        satellite_id,
+        message,
+        issue_of_data: BroadcastIssue { issue, message },
+        week,
+        toe,
+        toc,
+        elements,
+        clock,
+        group_delays: BroadcastGroupDelays::cnav(
+            tgd, isc_l1ca, isc_l2c, isc_l5i5, isc_l5q5, isc_l1cd, isc_l1cp,
+        ),
+        cnav: Some(cnav),
+        sv_health,
+        sv_accuracy_m,
+        fit_interval_s: Some(3.0 * SECONDS_PER_HOUR),
     })
 }
 
@@ -1411,6 +1795,80 @@ fn finite_integral_u32(value: f64, field: &'static str, sat: &str) -> Result<u32
         });
     }
     Ok(value as u32)
+}
+
+fn finite_integral_i8(
+    value: f64,
+    field: &'static str,
+    min: i8,
+    max: i8,
+    sat: &str,
+) -> Result<i8, NavParseError> {
+    validate::finite(value, field).map_err(|error| map_record_field_error(error, sat))?;
+    if value < f64::from(min) || value > f64::from(max) || value.trunc() != value {
+        return Err(NavParseError::BadField {
+            satellite: sat.to_string(),
+            field,
+        });
+    }
+    Ok(value as i8)
+}
+
+fn finite_integral_u8(
+    value: f64,
+    field: &'static str,
+    min: u8,
+    max: u8,
+    sat: &str,
+) -> Result<u8, NavParseError> {
+    validate::finite(value, field).map_err(|error| map_record_field_error(error, sat))?;
+    if value < f64::from(min) || value > f64::from(max) || value.trunc() != value {
+        return Err(NavParseError::BadField {
+            satellite: sat.to_string(),
+            field,
+        });
+    }
+    Ok(value as u8)
+}
+
+fn optional_integral_u32(
+    raw: &str,
+    field: &'static str,
+    sat: &str,
+) -> Result<Option<u32>, NavParseError> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let value =
+        validate::strict_f64(raw, field).map_err(|error| map_record_field_error(error, sat))?;
+    finite_integral_u32(value, field, sat).map(Some)
+}
+
+fn optional_cnav_delay(
+    raw: &str,
+    field: &'static str,
+    sat: &str,
+) -> Result<Option<f64>, NavParseError> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let value =
+        validate::strict_f64(raw, field).map_err(|error| map_record_field_error(error, sat))?;
+    if !write::d19_12_representable(value) {
+        return Err(NavParseError::BadField {
+            satellite: sat.to_string(),
+            field,
+        });
+    }
+    let mut rendered = String::new();
+    write::push_d19_12(&mut rendered, value);
+    let mut sentinel = String::new();
+    write::push_d19_12(&mut sentinel, -4096.0 * 2.0_f64.powi(-35));
+    if rendered == sentinel {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn glonass_frequency_channel(value: f64, sat: &str) -> Result<i32, NavParseError> {
