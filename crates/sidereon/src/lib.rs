@@ -25,7 +25,7 @@
 //! - GNSS utility modules such as [`frequencies`], [`combinations`],
 //!   [`quality`], [`carrier_phase`], [`signal`], [`velocity`],
 //!   [`broadcast_comparison`], [`constants`], [`navigation`], [`geometry`],
-//!   [`dgnss`], [`constellation`], [`ppp_corrections`], [`rtk`],
+//!   [`data`], [`dgnss`], [`constellation`], [`ppp_corrections`], [`rtk`],
 //!   [`staleness`], [`tides`], [`ils`], and [`terrain`] expose the core helper
 //!   surface,
 //! - [`astro`] exposes time/frame conversions, Sun/Moon positions, RF link
@@ -174,9 +174,9 @@ use std::path::Path;
 // the ergonomic crate surface.
 pub use sidereon_core::{
     antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
-    constellation, dgnss, ephemeris, frequencies, geometry, ils, navigation, observables, orbit,
-    positioning, ppp_corrections, quality, rinex, rtcm, rtk, sbas, signal, ssr, staleness, terrain,
-    tides, velocity,
+    constellation, data, dgnss, ephemeris, frequencies, geometry, ils, navigation, observables,
+    orbit, positioning, ppp_corrections, quality, rinex, rtcm, rtk, sbas, signal, ssr, staleness,
+    terrain, tides, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,

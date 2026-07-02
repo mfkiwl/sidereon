@@ -82,6 +82,7 @@ pub mod carrier_phase; // carrier-phase combinations, cycle-slip detection, Hatc
 pub mod constants; // shared physical/time constants (used by astro + gnss)
 pub mod constellation; // GNSS constellation identity catalog (CelesTrak/NAVCEN)
 mod crinex; // Hatanaka (CRINEX) observation-file decoder
+pub mod data; // sans-IO GNSS product filename and archive URL catalog
 mod dop; // dilution-of-precision geometry (GDOP/PDOP/HDOP/VDOP/TDOP)
 pub mod frequencies; // canonical GNSS carrier-frequency table
 mod glonass; // GLONASS PZ-90.11 state-vector RK4 propagation
