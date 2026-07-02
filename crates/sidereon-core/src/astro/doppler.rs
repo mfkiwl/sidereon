@@ -65,7 +65,7 @@ pub fn range_rate_and_ratio(
     let vel_gcrs = [sat_vx, sat_vy, sat_vz];
     let vel_itrs_rot = mat3_vec3_mul(&r_mat, &vel_gcrs)?;
 
-    // [Claude] Standard rotating-frame transport: v_ecef = R*v_gcrs - omega x r_ecef.
+    // Standard rotating-frame transport: v_ecef = R*v_gcrs - omega x r_ecef.
     // Since omega x r = [-OMEGA*y, OMEGA*x, 0], subtracting it contributes [+OMEGA*y, -OMEGA*x, 0].
     let transport_x = OMEGA_EARTH * pos_itrs[1];
     let transport_y = -OMEGA_EARTH * pos_itrs[0];
@@ -263,7 +263,7 @@ mod tests {
         )
         .expect("valid Doppler shift");
 
-        // [Claude] Pinned to the corrected (-omega x r) physics validated by numerical_derivative_oracle.
+        // Pinned to the corrected (-omega x r) physics validated by numerical_derivative_oracle.
         let expected_range_rate_km_s: f64 = 2.11937962917790934e-1;
         let expected_doppler_ratio: f64 = -7.06948948388124429e-7;
         let expected_doppler_hz: f64 = -3.08936690445610395e2;

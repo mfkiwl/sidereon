@@ -1703,7 +1703,7 @@ fn candidate_gdop(solution: &ReceiverSolution) -> f64 {
 /// Root-mean-square of post-fit pseudorange residuals (0.0 when empty).
 ///
 /// Exposed so language bindings can delegate residual-RMS reporting to the core
-/// rather than recomputing the formula. [Claude]
+/// rather than recomputing the formula.
 pub fn residual_rms(residuals: &[f64]) -> f64 {
     if residuals.is_empty() {
         return 0.0;
