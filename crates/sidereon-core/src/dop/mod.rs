@@ -328,7 +328,7 @@ fn enu_rotation(
 }
 
 /// ECEF -> ENU rotation matrix at geodetic latitude/longitude (radians).
-fn ecef_to_enu_rotation(lat_rad: f64, lon_rad: f64) -> [[f64; 3]; 3] {
+pub(crate) fn ecef_to_enu_rotation(lat_rad: f64, lon_rad: f64) -> [[f64; 3]; 3] {
     let sphi = lat_rad.sin();
     let cphi = lat_rad.cos();
     let slam = lon_rad.sin();

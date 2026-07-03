@@ -176,8 +176,8 @@ use std::path::Path;
 // the ergonomic crate surface.
 pub use sidereon_core::quality::spp_robust_fde_driver;
 pub use sidereon_core::{
-    antex, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations, constants,
-    constellation, data, dgnss, ephemeris, frequencies, geometry, ils, navigation, nmea,
+    antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, combinations,
+    constants, constellation, data, dgnss, ephemeris, frequencies, geometry, ils, navigation, nmea,
     observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas,
     signal, ssr, staleness, terrain, tides, velocity,
 };
