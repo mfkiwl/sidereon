@@ -76,6 +76,7 @@ pub(crate) mod format;
 mod ambiguity; // shared RTK/PPP cycle-slip policy + wide-lane/narrow-lane prep
 mod antenna; // shared ANTEX PCV/PCO zenith/azimuth interpolation kernels
 pub mod antex; // ANTEX receiver/satellite antenna parser + PCO/PCV lookup
+pub mod araim; // advanced RAIM multi-hypothesis protection levels
 pub mod bias; // Bias-SINEX and DCB bias products
 mod broadcast; // broadcast-ephemeris (GPS LNAV / Galileo I/NAV) orbit + clock
 pub mod broadcast_comparison; // broadcast-vs-precise (SISRE orbit/clock) accuracy
