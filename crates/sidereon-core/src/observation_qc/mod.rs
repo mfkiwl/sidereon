@@ -6,7 +6,14 @@
 
 use std::collections::BTreeMap;
 
-use crate::frequencies::rinex_observation_frequency_hz;
+mod multipath;
+
+pub use multipath::{
+    arc_multipath_rms, mp_combination, multipath_stats, MpStats, MultipathReport,
+    SatelliteMultipathQc, SystemMultipathQc,
+};
+
+use crate::frequencies::{default_iono_free_pair, frequency_hz, rinex_observation_frequency_hz};
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::precise_positioning::{
     detect_cycle_slips as detect_dual_frequency_cycle_slips, CycleSlipConfig, DualFrequencyEpoch,
@@ -101,6 +108,8 @@ pub struct ObservationQcReport {
     pub clock_jumps: Vec<ClockJump>,
     /// Aggregate dual-frequency cycle-slip counts.
     pub cycle_slips: CycleSlipQc,
+    /// MP1/MP2 teqc moving-average multipath RMS.
+    pub multipath: MultipathReport,
     /// Per-satellite observation completeness.
     pub satellites: Vec<SatelliteObservationQc>,
     /// Per-satellite, per-code observation completeness and SSI statistics.
@@ -305,6 +314,7 @@ pub fn observation_qc_with_options(
     let missing_epochs = data_gaps.iter().map(|gap| gap.missing_epochs).sum();
     let clock_jumps = detect_clock_jumps(obs, options.clock_jump_threshold_s);
     let cycle_slips = aggregate_cycle_slips(obs);
+    let multipath = multipath_stats(obs, &CycleSlipConfig::default());
 
     Ok(ObservationQcReport {
         total_epoch_records: obs.epochs().len(),
@@ -318,6 +328,7 @@ pub fn observation_qc_with_options(
         data_gaps,
         clock_jumps,
         cycle_slips,
+        multipath,
         satellites: satellites
             .into_iter()
             .map(|(satellite, acc)| SatelliteObservationQc {
@@ -641,8 +652,10 @@ fn dual_frequency_epochs(obs: &RinexObs) -> Vec<DualFrequencyEpoch> {
 #[derive(Debug, Clone, Copy)]
 struct DualFrequencyBand {
     first_index: usize,
+    rinex_band: char,
     frequency_hz: f64,
     pseudorange_m: Option<f64>,
+    pseudorange_rank: u8,
     carrier_phase_cyc: Option<f64>,
     lli: Option<i64>,
 }
@@ -651,6 +664,39 @@ fn dual_frequency_observation(
     obs: &RinexObs,
     satellite: GnssSatelliteId,
     values: &[crate::rinex::observations::ObsValue],
+) -> Option<DualFrequencyObservation> {
+    dual_frequency_observation_with_pseudorange_selection(
+        obs,
+        satellite,
+        values,
+        PseudorangeSelection::HeaderOrder,
+    )
+}
+
+fn multipath_dual_frequency_observation(
+    obs: &RinexObs,
+    satellite: GnssSatelliteId,
+    values: &[crate::rinex::observations::ObsValue],
+) -> Option<DualFrequencyObservation> {
+    dual_frequency_observation_with_pseudorange_selection(
+        obs,
+        satellite,
+        values,
+        PseudorangeSelection::PreferPreciseCode,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PseudorangeSelection {
+    HeaderOrder,
+    PreferPreciseCode,
+}
+
+fn dual_frequency_observation_with_pseudorange_selection(
+    obs: &RinexObs,
+    satellite: GnssSatelliteId,
+    values: &[crate::rinex::observations::ObsValue],
+    pseudorange_selection: PseudorangeSelection,
 ) -> Option<DualFrequencyObservation> {
     let codes = obs.header().obs_codes.get(&satellite.system)?;
     let glonass_channel = obs.header().glonass_slots.get(&satellite.prn).copied();
@@ -661,6 +707,7 @@ fn dual_frequency_observation(
         if !matches!(kind, Some(b'C' | b'L')) {
             continue;
         }
+        let rinex_band = code.chars().nth(1)?;
         let Some(raw_value) = value.value else {
             continue;
         };
@@ -682,8 +729,10 @@ fn dual_frequency_observation(
         } else {
             bands.push(DualFrequencyBand {
                 first_index: index,
+                rinex_band,
                 frequency_hz,
                 pseudorange_m: None,
+                pseudorange_rank: u8::MAX,
                 carrier_phase_cyc: None,
                 lli: None,
             });
@@ -692,7 +741,8 @@ fn dual_frequency_observation(
 
         let band = &mut bands[band_index];
         match kind {
-            Some(b'C') if band.pseudorange_m.is_none() => {
+            Some(b'C') if pseudorange_rank(code, pseudorange_selection) < band.pseudorange_rank => {
+                band.pseudorange_rank = pseudorange_rank(code, pseudorange_selection);
                 band.pseudorange_m = Some(raw_value);
             }
             Some(b'L') if band.carrier_phase_cyc.is_none() => {
@@ -707,12 +757,7 @@ fn dual_frequency_observation(
         .into_iter()
         .filter(|band| band.pseudorange_m.is_some() && band.carrier_phase_cyc.is_some())
         .collect::<Vec<_>>();
-    usable.sort_by_key(|band| band.first_index);
-    let band1 = *usable.first()?;
-    let band2 = usable
-        .iter()
-        .copied()
-        .find(|band| !same_frequency_hz(band.frequency_hz, band1.frequency_hz))?;
+    let (band1, band2) = select_dual_frequency_bands(satellite.system, &mut usable)?;
 
     Some(DualFrequencyObservation {
         satellite_id: satellite.to_string(),
@@ -729,6 +774,56 @@ fn dual_frequency_observation(
         lli1: band1.lli,
         lli2: band2.lli,
     })
+}
+
+fn select_dual_frequency_bands(
+    system: GnssSystem,
+    usable: &mut [DualFrequencyBand],
+) -> Option<(DualFrequencyBand, DualFrequencyBand)> {
+    if let Some(pair) = default_iono_free_pair(system) {
+        let pair_f1_hz = frequency_hz(system, pair.band1)?;
+        let pair_f2_hz = frequency_hz(system, pair.band2)?;
+        let band1 = usable
+            .iter()
+            .copied()
+            .find(|band| same_frequency_hz(band.frequency_hz, pair_f1_hz));
+        let band2 = usable
+            .iter()
+            .copied()
+            .find(|band| same_frequency_hz(band.frequency_hz, pair_f2_hz));
+        if let (Some(band1), Some(band2)) = (band1, band2) {
+            return Some((band1, band2));
+        }
+    }
+
+    usable.sort_by_key(|band| (rinex_band_sort_key(band.rinex_band), band.first_index));
+    let band1 = *usable.first()?;
+    let band2 = usable
+        .iter()
+        .copied()
+        .find(|band| !same_frequency_hz(band.frequency_hz, band1.frequency_hz))?;
+    Some((band1, band2))
+}
+
+fn rinex_band_sort_key(band: char) -> u32 {
+    band.to_digit(10).unwrap_or(u32::MAX)
+}
+
+fn pseudorange_rank(code: &str, selection: PseudorangeSelection) -> u8 {
+    match selection {
+        PseudorangeSelection::HeaderOrder => 0,
+        PseudorangeSelection::PreferPreciseCode => pseudorange_preference_rank(code),
+    }
+}
+
+fn pseudorange_preference_rank(code: &str) -> u8 {
+    match code.chars().nth(2) {
+        Some('W' | 'P' | 'Y' | 'M' | 'N') => 0,
+        Some('X') => 1,
+        Some('C' | 'S' | 'L') => 2,
+        Some(_) => 3,
+        None => 4,
+    }
 }
 
 fn same_frequency_hz(a: f64, b: f64) -> bool {
@@ -834,6 +929,9 @@ impl SnrAccum {
 
 #[cfg(test)]
 mod tests {
+    //! Teqc oracle provenance is retained in `tests/fixtures/qc/teqc_algo0010_2015001_v1_trim.json`;
+    //! the MP regression below uses teqc 2019Feb25 on the decoded RINEX 2 fixture.
+
     use super::*;
     use crate::constants::{C_M_S, F_L1_HZ, F_L2_HZ};
     use crate::crinex;
@@ -895,6 +993,7 @@ mod tests {
         assert_eq!(report.skipped_records, 0);
         assert!(report.clock_jumps.is_empty());
         assert_eq!(report.cycle_slips, CycleSlipQc::default());
+        assert_eq!(report.multipath, MultipathReport::default());
         assert_eq!(report.satellites.len(), 2);
         assert_eq!(
             report.satellites[0],
@@ -1185,6 +1284,119 @@ mod tests {
     }
 
     #[test]
+    fn multipath_combination_and_arc_rms_match_closed_form() {
+        let p1_m = 20_000_010.0;
+        let l1_m = 20_000_003.0;
+        let l2_m = 20_000_001.0;
+        let f2sq = F_L2_HZ * F_L2_HZ;
+        let denom = F_L1_HZ * F_L1_HZ - f2sq;
+        let expected = p1_m - l1_m - (2.0 * f2sq / denom) * (l1_m - l2_m);
+
+        assert_close(
+            mp_combination(p1_m, l1_m, l2_m, F_L1_HZ, F_L2_HZ),
+            expected,
+            "MP1 combination",
+        );
+        assert_close(
+            arc_multipath_rms(&[1.0, 3.0, 5.0]),
+            (8.0_f64 / 3.0).sqrt(),
+            "arc RMS",
+        );
+    }
+
+    #[test]
+    fn multipath_stats_splits_arc_on_injected_lli_slip() {
+        let g01 = sat(1);
+        let high_threshold_config = CycleSlipConfig {
+            melbourne_wubbena_threshold_cycles: 1.0e6,
+            geometry_free_threshold_m: 1.0e6,
+            minimum_arc_length: 10,
+            maximum_gap_s: 1.0e6,
+            ..CycleSlipConfig::default()
+        };
+        let with_slip = observation_file(
+            (0usize..4)
+                .map(|epoch_index| {
+                    let bias_m = if epoch_index >= 2 { 10.0 } else { 0.0 };
+                    epoch(
+                        (epoch_index / 2) as u8,
+                        if epoch_index % 2 == 0 { 0.0 } else { 30.0 },
+                        0,
+                        BTreeMap::from([(
+                            g01,
+                            dual_frequency_values_with_mp_bias(
+                                epoch_index,
+                                bias_m,
+                                epoch_index == 2,
+                            ),
+                        )]),
+                    )
+                })
+                .collect(),
+        );
+        let without_slip = observation_file(
+            (0usize..4)
+                .map(|epoch_index| {
+                    let bias_m = if epoch_index >= 2 { 10.0 } else { 0.0 };
+                    epoch(
+                        (epoch_index / 2) as u8,
+                        if epoch_index % 2 == 0 { 0.0 } else { 30.0 },
+                        0,
+                        BTreeMap::from([(
+                            g01,
+                            dual_frequency_values_with_mp_bias(epoch_index, bias_m, false),
+                        )]),
+                    )
+                })
+                .collect(),
+        );
+
+        let split = multipath_stats(&with_slip, &high_threshold_config);
+        let unsplit = multipath_stats(&without_slip, &high_threshold_config);
+        let split_mp1 = split.satellites[0].mp1.expect("split MP1");
+        let unsplit_mp1 = unsplit.satellites[0].mp1.expect("unsplit MP1");
+
+        assert_eq!(split_mp1.n, 4);
+        assert_eq!(unsplit_mp1.n, 4);
+        assert_close(split_mp1.rms_m, 0.0, "split MP1 RMS");
+        assert_close(unsplit_mp1.rms_m, 25.0 / 6.0, "unsplit MP1 RMS");
+    }
+
+    #[test]
+    fn multipath_matches_teqc_algo0010_oracle() {
+        let oracle = read_json_fixture("qc/teqc_algo0010_2015001_v1_trim.json");
+        let path = fixture_path("tests/fixtures/obs/algo0010_2015001_v1_trim.crx");
+        let crx = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let decoded = crinex::decode(&crx).expect("decode CRINEX v1 fixture");
+        let obs = RinexObs::parse(&decoded).expect("parse decoded RINEX 2 OBS");
+        let report = observation_qc(&obs);
+        let gps = report
+            .multipath
+            .systems
+            .iter()
+            .find(|system| system.system == GnssSystem::Gps)
+            .expect("GPS multipath row");
+        let mp1 = gps.mp1.expect("GPS MP1");
+        let mp2 = gps.mp2.expect("GPS MP2");
+
+        assert_eq!(mp1.n, 23);
+        assert_eq!(mp2.n, 23);
+        assert_close_tolerance(
+            mp1.rms_m,
+            oracle["summary"]["moving_average_mp12_m"].as_f64().unwrap(),
+            1.0e-6,
+            "teqc MP12",
+        );
+        assert_close_tolerance(
+            mp2.rms_m,
+            oracle["summary"]["moving_average_mp21_m"].as_f64().unwrap(),
+            1.0e-6,
+            "teqc MP21",
+        );
+    }
+
+    #[test]
     fn observation_qc_accepts_crinex_v1_decoded_rinex2() {
         let path = fixture_path("tests/fixtures/obs/algo0010_2015001_v1_trim.crx");
         let crx = std::fs::read_to_string(&path)
@@ -1417,6 +1629,20 @@ mod tests {
         ]
     }
 
+    fn dual_frequency_values_with_mp_bias(
+        epoch_index: usize,
+        p_bias_m: f64,
+        lli_slip: bool,
+    ) -> Vec<ObsValue> {
+        let mut values = dual_frequency_values(epoch_index, 8.0, 0.0);
+        values[0].value = values[0].value.map(|value| value + p_bias_m);
+        values[3].value = values[3].value.map(|value| value + p_bias_m);
+        if lli_slip {
+            values[1].lli = Some(1);
+        }
+        values
+    }
+
     fn sat(prn: u8) -> GnssSatelliteId {
         GnssSatelliteId::new(GnssSystem::Gps, prn).expect("valid GPS PRN")
     }
@@ -1433,8 +1659,12 @@ mod tests {
     }
 
     fn assert_close(actual: f64, expected: f64, context: &str) {
+        assert_close_tolerance(actual, expected, 1.0e-9, context);
+    }
+
+    fn assert_close_tolerance(actual: f64, expected: f64, tolerance: f64, context: &str) {
         assert!(
-            (actual - expected).abs() <= 1.0e-9,
+            (actual - expected).abs() <= tolerance,
             "{context}: actual {actual:?}, expected {expected:?}"
         );
     }
