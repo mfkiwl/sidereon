@@ -72,7 +72,7 @@ const OBS_VALUE_WIDTH: usize = 14;
 /// own time scale (no leap-second shifting). This is the natural boundary for
 /// the solver, which derives seconds-of-J2000 / second-of-day / day-of-year
 /// from the civil components.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ObsEpochTime {
     /// Four-digit calendar year.
     pub year: i32,

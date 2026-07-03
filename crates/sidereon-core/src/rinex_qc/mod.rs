@@ -23,7 +23,7 @@ const EARTH_FIXED_RADIUS_MIN_M: f64 = 6_300_000.0;
 const EARTH_FIXED_RADIUS_MAX_M: f64 = 6_400_000.0;
 
 /// Severity assigned to a lint finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Severity {
     /// The file cannot be represented by the existing parsed product.
     Fatal,
