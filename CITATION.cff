@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use sidereon in your work, please cite it."
+title: "sidereon"
+abstract: "A reference-validated GNSS and astrodynamics engine: single- and precise-point positioning (SPP/RTK/PPP), SGP4/SDP4 propagation, conjunction assessment, RINEX/RTCM/SP3/NTRIP data formats, RINEX quality control, and frame/time/atmosphere models, with native Rust, Python, C, WebAssembly, and Elixir interfaces over a single Rust core."
+type: software
+authors:
+  - family-names: "Berkman"
+    given-names: "Neil"
+repository-code: "https://github.com/neilberkman/sidereon"
+url: "https://sidereon.dev"
+license: MIT
+version: "0.11.1"
+date-released: "2026-07-03"
+keywords:
+  - GNSS
+  - astrodynamics
+  - SGP4
+  - RINEX
+  - RTCM
+  - RTK
+  - PPP
+  - orbit-determination
+  - quality-control
