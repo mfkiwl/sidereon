@@ -1,33 +1,39 @@
-//! ARAIM Tier-1 tests from the public MHSS equations: Gaussian tail inversion,
-//! weight-zeroed gain matrices, closed-form fault-free protection levels, and
-//! prior-driven fault-mode enumeration.
-//! Tier-2 checks cite Blanch et al. 2015 and WG-C Milestone 3. The WG-C material
-//! pins the LPV-200 allocation, ISM parameter families, fault-mode enumeration,
-//! and protection-level equations, but it does not provide single-geometry
-//! HPL/VPL table values for the synthetic geometries below. The tests therefore
-//! pin this implementation's fixed GPS-only and GPS+Galileo HPL/VPL values,
-//! monitored fault-mode sets, closed-form fault-free PL, a hand-worked small
-//! S-matrix, and fault-mass conservation.
+//! ARAIM tests from public MHSS equations and published ARAIM references.
+//! External anchors are the LPV-200 allocation from Blanch et al. 2015 and
+//! WG-C Milestone 3, the WG-C Reference ADD v3.0 Appendix D numerical example,
+//! hand-worked S-matrix values, closed-form fault-free PL, and analytic fault
+//! mass. Synthetic geometries below are regression cases for mode handling only.
 
 use super::fault_modes::enumerate_fault_modes;
 use super::ism::{ConstellationIsm, Ism, SatelliteIsm, SatelliteIsmModel};
 use super::protection::{gain_matrix_enu, metric_bias, metric_sigma};
-use super::{araim, AraimGeometry, AraimRow, IntegrityAllocation};
+use super::{araim, AraimError, AraimGeometry, AraimRow, IntegrityAllocation};
 use crate::astro::math::least_squares::Status;
 use crate::astro::math::special::normal_q_inv;
 use crate::dop::{ecef_to_enu_rotation, line_of_sight_from_az_el_deg, LineOfSight};
 use crate::frame::{ItrfPositionM, Wgs84Geodetic};
 use crate::id::{GnssSatelliteId, GnssSystem};
-use crate::quality::{raim_fde_design, RangeFdeOptions, RangeFdeRow};
+use crate::quality::{
+    raim_fde_design, RangeFdeOptions, RangeFdeRow, DEFAULT_VARIANCE_A_M, DEFAULT_VARIANCE_B_M,
+};
 use crate::spp::{EphemerisSource, ReceiverSolution, SolutionMetadata};
 
 const INV_SQRT_3: f64 = 0.577_350_269_189_625_8;
 const WG_C_SIGMA_URA_M: f64 = 0.75;
 const WG_C_SIGMA_URE_M: f64 = 0.5;
 const WG_C_B_NOM_M: f64 = 0.75;
+const WG_C_EXAMPLE_B_NOM_M: f64 = 0.5;
 const WG_C_P_SAT: f64 = 1.0e-5;
 const WG_C_P_CONST_GPS: f64 = 0.0;
 const WG_C_P_CONST_GAL: f64 = 1.0e-4;
+const WG_C_EXAMPLE_P_CONST: f64 = 1.0e-4;
+const WG_C_LPV_200_PHMI_TOTAL: f64 = 1.0e-7;
+const WG_C_LPV_200_PHMI_VERT: f64 = 9.8e-8;
+const WG_C_LPV_200_PHMI_HOR: f64 = 2.0e-9;
+const WG_C_LPV_200_PFA_VERT: f64 = 3.9e-6;
+const WG_C_LPV_200_PFA_HOR: f64 = 9.0e-8;
+const PL_REFERENCE_TOL_M: f64 = 1.0;
+const SIGMA_REFERENCE_TOL_M: f64 = 0.02;
 
 #[test]
 fn fault_free_only_reduces_to_closed_form_pl() {
@@ -42,10 +48,10 @@ fn fault_free_only_reduces_to_closed_form_pl() {
     );
     let allocation = IntegrityAllocation {
         phmi_total: 1.0e-7,
-        phmi_vert: 1.0e-7,
-        phmi_hor: 1.0e-7,
-        pfa_vert: 4.0e-6,
-        pfa_hor: 4.0e-6,
+        phmi_vert: WG_C_LPV_200_PHMI_VERT,
+        phmi_hor: WG_C_LPV_200_PHMI_HOR,
+        pfa_vert: WG_C_LPV_200_PFA_VERT,
+        pfa_hor: WG_C_LPV_200_PFA_HOR,
         p_threshold_unmonitored: 0.0,
         max_fault_order: 0,
     };
@@ -157,10 +163,10 @@ fn fault_modes_are_prior_ordered_and_pinned() {
     );
     let allocation = IntegrityAllocation {
         phmi_total: 1.0e-7,
-        phmi_vert: 1.0e-7,
-        phmi_hor: 1.0e-7,
-        pfa_vert: 4.0e-6,
-        pfa_hor: 4.0e-6,
+        phmi_vert: WG_C_LPV_200_PHMI_VERT,
+        phmi_hor: WG_C_LPV_200_PHMI_HOR,
+        pfa_vert: WG_C_LPV_200_PFA_VERT,
+        pfa_hor: WG_C_LPV_200_PFA_HOR,
         p_threshold_unmonitored: 0.0,
         max_fault_order: 2,
     };
@@ -211,13 +217,50 @@ fn constellation_fault_modes_drop_excluded_clock_and_stay_monitorable() {
 }
 
 #[test]
-fn lpv_200_reference_style_scenarios_are_pinned() {
+fn lpv_200_allocation_matches_wg_c_baseline() {
     let allocation = IntegrityAllocation::lpv_200();
-    assert_abs_diff(allocation.phmi_total, 1.0e-7, 0.0);
-    assert_abs_diff(allocation.phmi_vert, 1.0e-7, 0.0);
-    assert_abs_diff(allocation.phmi_hor, 1.0e-7, 0.0);
-    assert_abs_diff(allocation.pfa_vert, 4.0e-6, 0.0);
-    assert_abs_diff(allocation.pfa_hor, 4.0e-6, 0.0);
+    assert_abs_diff(allocation.phmi_total, WG_C_LPV_200_PHMI_TOTAL, 0.0);
+    assert_abs_diff(allocation.phmi_vert, WG_C_LPV_200_PHMI_VERT, 0.0);
+    assert_abs_diff(allocation.phmi_hor, WG_C_LPV_200_PHMI_HOR, 0.0);
+    assert_abs_diff(allocation.pfa_vert, WG_C_LPV_200_PFA_VERT, 0.0);
+    assert_abs_diff(allocation.pfa_hor, WG_C_LPV_200_PFA_HOR, 0.0);
+    assert!(phmi_split_fits_total(
+        allocation.phmi_vert,
+        allocation.phmi_hor,
+        allocation.phmi_total
+    ));
+}
+
+#[test]
+fn allocation_rejects_phmi_split_above_total() {
+    let mut allocation = IntegrityAllocation::lpv_200();
+    allocation.phmi_vert = 1.0e-7;
+    allocation.phmi_hor = 1.0e-7;
+    let error = araim(&reference_gps_geometry(), &reference_gps_ism(), &allocation)
+        .expect_err("invalid PHMI split");
+    assert_eq!(error, AraimError::InvalidAllocation);
+}
+
+#[test]
+fn wg_c_add_v3_numerical_example_matches_published_pls() {
+    let allocation = IntegrityAllocation::lpv_200();
+    let result = araim(
+        &wg_c_add_v3_numerical_example_geometry(),
+        &wg_c_add_v3_numerical_example_ism(),
+        &allocation,
+    )
+    .expect("WG-C ADD v3.0 Appendix D ARAIM");
+
+    assert!(result.availability);
+    assert_abs_diff(result.vpl_m, 19.2, PL_REFERENCE_TOL_M);
+    assert_abs_diff(result.hpl_m, 14.5, PL_REFERENCE_TOL_M);
+    assert_abs_diff(result.emt_m, 7.8, PL_REFERENCE_TOL_M);
+    assert_abs_diff(result.sigma_acc_v_m, 1.47, SIGMA_REFERENCE_TOL_M);
+}
+
+#[test]
+fn synthetic_lpv_200_modes_are_regression_pinned() {
+    let allocation = IntegrityAllocation::lpv_200();
 
     let gps_result = araim(&reference_gps_geometry(), &reference_gps_ism(), &allocation)
         .expect("GPS-only LPV-200 ARAIM");
@@ -228,8 +271,6 @@ fn lpv_200_reference_style_scenarios_are_pinned() {
             .map(|prn| sat(GnssSystem::Gps, prn).to_string())
             .collect::<Vec<_>>()
     );
-    assert_abs_diff(gps_result.hpl_m, 12.683_570_299_587_462, 1.0e-9);
-    assert_abs_diff(gps_result.vpl_m, 31.458_077_322_350_43, 1.0e-9);
 
     let mixed_result = araim(
         &reference_gps_galileo_geometry(),
@@ -244,8 +285,6 @@ fn lpv_200_reference_style_scenarios_are_pinned() {
     expected_mixed.extend((1..=5).map(|prn| sat(GnssSystem::Galileo, prn).to_string()));
     expected_mixed.push("Galileo*".to_string());
     assert_eq!(monitored_mode_keys(&mixed_result), expected_mixed);
-    assert_abs_diff(mixed_result.hpl_m, 8.837_009_847_530_268, 1.0e-9);
-    assert_abs_diff(mixed_result.vpl_m, 21.443_928_549_396_453, 1.0e-9);
 }
 
 #[test]
@@ -265,13 +304,14 @@ fn hand_worked_s_matrix_and_fault_free_pl_are_pinned() {
     let biases = vec![0.25; geometry.rows.len()];
     let expected_sigma = 2.0 * s;
     let expected_bias = s;
-    let expected_pl = normal_q_inv(0.5e-7).expect("valid PHMI") * expected_sigma + expected_bias;
+    let target = IntegrityAllocation::lpv_200().phmi_vert * 0.5;
+    let expected_pl = normal_q_inv(target).expect("valid PHMI") * expected_sigma + expected_bias;
     let sigma = metric_sigma(&gain.enu_rows[2], &sigmas);
     let bias = metric_bias(&gain.enu_rows[2], &biases);
     assert_abs_diff(sigma, expected_sigma, 2.0e-15);
     assert_abs_diff(bias, expected_bias, 2.0e-15);
     assert_abs_diff(
-        normal_q_inv(0.5e-7).expect("valid PHMI") * sigma + bias,
+        normal_q_inv(target).expect("valid PHMI") * sigma + bias,
         expected_pl,
         2.0e-12,
     );
@@ -291,10 +331,10 @@ fn max_fault_order_one_counts_pair_and_higher_mass_unmonitored() {
     );
     let allocation = IntegrityAllocation {
         phmi_total: 1.0e-7,
-        phmi_vert: 1.0e-7,
-        phmi_hor: 1.0e-7,
-        pfa_vert: 4.0e-6,
-        pfa_hor: 4.0e-6,
+        phmi_vert: WG_C_LPV_200_PHMI_VERT,
+        phmi_hor: WG_C_LPV_200_PHMI_HOR,
+        pfa_vert: WG_C_LPV_200_PFA_VERT,
+        pfa_hor: WG_C_LPV_200_PFA_HOR,
         p_threshold_unmonitored: 0.01,
         max_fault_order: 1,
     };
@@ -409,6 +449,47 @@ fn reference_gps_galileo_geometry() -> AraimGeometry {
     geometry
 }
 
+fn wg_c_add_v3_numerical_example_geometry() -> AraimGeometry {
+    let rows = [
+        (GnssSystem::Gps, 1, [0.0225, 0.9951, -0.0966], 3.5740),
+        (GnssSystem::Gps, 2, [0.6750, -0.6900, -0.2612], 1.1252),
+        (GnssSystem::Gps, 3, [0.0723, -0.6601, -0.7477], 0.5479),
+        (GnssSystem::Gps, 4, [-0.9398, 0.2553, -0.2269], 1.3258),
+        (GnssSystem::Gps, 5, [-0.5907, -0.7539, -0.2877], 1.0104),
+        (GnssSystem::Galileo, 1, [-0.3236, -0.0354, -0.9455], 0.5309),
+        (GnssSystem::Galileo, 2, [-0.6748, 0.4356, -0.5957], 0.5838),
+        (GnssSystem::Galileo, 3, [0.0938, -0.7004, -0.7075], 0.5544),
+        (GnssSystem::Galileo, 4, [0.5571, 0.3088, -0.7709], 0.5448),
+        (GnssSystem::Galileo, 5, [0.6622, 0.6958, -0.2780], 1.0491),
+    ];
+    AraimGeometry {
+        rows: rows
+            .into_iter()
+            .map(|(system, prn, design_enu, c_acc_m2)| {
+                row_from_wg_c_design(system, prn, design_enu, c_acc_m2)
+            })
+            .collect(),
+        receiver: receiver(),
+        clock_systems: vec![GnssSystem::Gps, GnssSystem::Galileo],
+    }
+}
+
+fn wg_c_add_v3_numerical_example_ism() -> Ism {
+    let model = SatelliteIsmModel::new(
+        WG_C_SIGMA_URA_M,
+        WG_C_SIGMA_URE_M,
+        WG_C_EXAMPLE_B_NOM_M,
+        WG_C_P_SAT,
+    );
+    Ism::new(
+        vec![
+            ConstellationIsm::new(GnssSystem::Gps, WG_C_EXAMPLE_P_CONST, model),
+            ConstellationIsm::new(GnssSystem::Galileo, WG_C_EXAMPLE_P_CONST, model),
+        ],
+        Vec::new(),
+    )
+}
+
 fn reference_gps_ism() -> Ism {
     Ism::new(
         vec![ConstellationIsm::new(
@@ -483,6 +564,43 @@ fn monitored_mode_keys(result: &super::AraimResult) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn row_from_wg_c_design(
+    system: GnssSystem,
+    prn: u8,
+    design_enu: [f64; 3],
+    c_acc_m2: f64,
+) -> AraimRow {
+    let receiver = receiver();
+    let r = ecef_to_enu_rotation(receiver.lat_rad, receiver.lon_rad);
+    let east = -design_enu[0];
+    let north = -design_enu[1];
+    let up = -design_enu[2];
+    AraimRow {
+        id: sat(system, prn),
+        line_of_sight: LineOfSight::new(
+            r[0][0] * east + r[1][0] * north + r[2][0] * up,
+            r[0][1] * east + r[1][1] * north + r[2][1] * up,
+            r[0][2] * east + r[1][2] * north + r[2][2] * up,
+        ),
+        system,
+        elevation_rad: elevation_from_wg_c_c_acc(c_acc_m2),
+    }
+}
+
+fn elevation_from_wg_c_c_acc(c_acc_m2: f64) -> f64 {
+    let local_variance_m2 = c_acc_m2 - WG_C_SIGMA_URE_M * WG_C_SIGMA_URE_M;
+    let floor_m2 = DEFAULT_VARIANCE_A_M * DEFAULT_VARIANCE_A_M;
+    let scaled_denominator = local_variance_m2 - floor_m2;
+    assert!(scaled_denominator > 0.0);
+    (DEFAULT_VARIANCE_B_M * DEFAULT_VARIANCE_B_M / scaled_denominator)
+        .sqrt()
+        .asin()
+}
+
+fn phmi_split_fits_total(phmi_vert: f64, phmi_hor: f64, phmi_total: f64) -> bool {
+    phmi_vert + phmi_hor <= phmi_total + phmi_total * 16.0 * f64::EPSILON
 }
 
 fn receiver_solution(

@@ -311,14 +311,15 @@ fn validate_geometry(geometry: &AraimGeometry) -> Result<(), AraimError> {
 }
 
 fn validate_allocation(allocation: &IntegrityAllocation) -> Result<(), AraimError> {
+    let phmi_split = allocation.phmi_vert + allocation.phmi_hor;
+    let phmi_split_tolerance = allocation.phmi_total * 16.0 * f64::EPSILON;
     let valid = validate_probability(allocation.phmi_total, false)
         && validate_probability(allocation.phmi_vert, false)
         && validate_probability(allocation.phmi_hor, false)
         && validate_probability(allocation.pfa_vert, false)
         && validate_probability(allocation.pfa_hor, false)
         && validate_probability(allocation.p_threshold_unmonitored, true)
-        && allocation.phmi_vert <= allocation.phmi_total
-        && allocation.phmi_hor <= allocation.phmi_total;
+        && phmi_split <= allocation.phmi_total + phmi_split_tolerance;
     if valid {
         Ok(())
     } else {

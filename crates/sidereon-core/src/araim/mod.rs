@@ -159,14 +159,14 @@ pub struct IntegrityAllocation {
 }
 
 impl IntegrityAllocation {
-    /// LPV-200 style allocation commonly used by public ARAIM examples.
+    /// LPV-200 allocation from Blanch et al. 2015 and WG-C Milestone 3.
     pub const fn lpv_200() -> Self {
         Self {
             phmi_total: 1.0e-7,
-            phmi_vert: 1.0e-7,
-            phmi_hor: 1.0e-7,
-            pfa_vert: 4.0e-6,
-            pfa_hor: 4.0e-6,
+            phmi_vert: 9.8e-8,
+            phmi_hor: 2.0e-9,
+            pfa_vert: 3.9e-6,
+            pfa_hor: 9.0e-8,
             p_threshold_unmonitored: 1.0e-8,
             max_fault_order: 2,
         }
