@@ -64,45 +64,67 @@ impl DtedTerrain {
         let Some(tile) = self.load_tile(longitude_deg, latitude_deg)? else {
             return Ok(0.0);
         };
-        if options.interpolation == DtedInterpolation::NearestPosting {
-            return tile
-                .get_elevation(longitude_deg, latitude_deg)
-                .map(|v| v as f64)
-                .map_err(Error::Parse);
-        }
+        height_from_tile(tile, longitude_deg, latitude_deg, options)
+    }
 
-        let postings_per_deg_lon = tile.lon_count - 1;
-        let postings_per_deg_lat = tile.lat_count - 1;
+    /// Evaluate `(longitude_deg, latitude_deg)` points in order using one
+    /// mutable borrow of the resident tile cache.
+    ///
+    /// The tuple order is intentionally longitude-first, matching
+    /// [`Self::height_m_with_options`], even though geoid batch helpers use
+    /// latitude-first points.
+    pub fn height_batch(
+        &mut self,
+        points: &[(f64, f64)],
+        options: DtedLookupOptions,
+    ) -> Vec<crate::Result<f64>> {
+        let mut out = Vec::with_capacity(points.len());
+        let mut current = None;
 
-        let lon_idx = (longitude_deg - tile.origin_longitude) * postings_per_deg_lon as f64;
-        let lat_idx = (latitude_deg - tile.origin_latitude) * postings_per_deg_lat as f64;
-        let lon_lo = lon_idx.floor() as i64;
-        let lat_lo = lat_idx.floor() as i64;
-        let fx = lon_idx - lon_lo as f64;
-        let fy = lat_idx - lat_lo as f64;
+        for &(longitude_deg, latitude_deg) in points {
+            if let Err(err) = validate_lookup_coordinates(longitude_deg, latitude_deg) {
+                out.push(Err(err));
+                continue;
+            }
 
-        let mut z = 0.0;
-        for (di, wx) in [(0i64, 1.0 - fx), (1i64, fx)] {
-            for (dj, wy) in [(0i64, 1.0 - fy), (1i64, fy)] {
-                let w = wx * wy;
-                if w == 0.0 {
-                    continue;
+            let primary_grid = terrain_grid(longitude_deg, latitude_deg);
+            if current == Some(primary_grid) {
+                if let Some(tile) = self.tiles.get(&primary_grid) {
+                    if tile.contains(longitude_deg, latitude_deg) {
+                        out.push(height_from_tile(tile, longitude_deg, latitude_deg, options));
+                        continue;
+                    }
                 }
-                let posting_lon =
-                    tile.origin_longitude + (lon_lo + di) as f64 / postings_per_deg_lon as f64;
-                let posting_lat =
-                    tile.origin_latitude + (lat_lo + dj) as f64 / postings_per_deg_lat as f64;
-                z += w * f64::from(
-                    tile.get_elevation(posting_lon, posting_lat)
-                        .map_err(Error::Parse)?,
-                );
+            }
+
+            match self.resolve_grid(longitude_deg, latitude_deg) {
+                Ok(Some(grid_idx)) => {
+                    current = Some(grid_idx);
+                    let tile = self
+                        .tiles
+                        .get(&grid_idx)
+                        .expect("resolved DTED grid must be present in tile cache");
+                    out.push(height_from_tile(tile, longitude_deg, latitude_deg, options));
+                }
+                Ok(None) => {
+                    current = None;
+                    out.push(Ok(0.0));
+                }
+                Err(err) => out.push(Err(err)),
             }
         }
-        Ok(z)
+
+        out
     }
 
     fn load_tile(&mut self, longitude: f64, latitude: f64) -> crate::Result<Option<&DtedTile>> {
-        let mut selected = None;
+        let Some(grid_idx) = self.resolve_grid(longitude, latitude)? else {
+            return Ok(None);
+        };
+        Ok(self.tiles.get(&grid_idx))
+    }
+
+    fn resolve_grid(&mut self, longitude: f64, latitude: f64) -> crate::Result<Option<(i32, i32)>> {
         for grid_idx in terrain_grid_candidates(longitude, latitude) {
             if !self.tiles.contains_key(&grid_idx) {
                 let Some(path) = self.terrain_path_for_grid(grid_idx.0, grid_idx.1) else {
@@ -116,12 +138,11 @@ impl DtedTerrain {
             }
             if let Some(tile) = self.tiles.get(&grid_idx) {
                 if tile.contains(longitude, latitude) {
-                    selected = Some(grid_idx);
-                    break;
+                    return Ok(Some(grid_idx));
                 }
             }
         }
-        Ok(selected.and_then(|grid_idx| self.tiles.get(&grid_idx)))
+        Ok(None)
     }
 
     fn terrain_path_for_grid(&self, latitude_index: i32, longitude_index: i32) -> Option<PathBuf> {
@@ -146,6 +167,49 @@ impl DtedTerrain {
         let sibling = self.root.parent()?.join(&block_dir).join(&tile_name);
         sibling.is_file().then_some(sibling)
     }
+}
+
+fn height_from_tile(
+    tile: &DtedTile,
+    longitude_deg: f64,
+    latitude_deg: f64,
+    options: DtedLookupOptions,
+) -> crate::Result<f64> {
+    if options.interpolation == DtedInterpolation::NearestPosting {
+        return tile
+            .get_elevation(longitude_deg, latitude_deg)
+            .map(|v| v as f64)
+            .map_err(Error::Parse);
+    }
+
+    let postings_per_deg_lon = tile.lon_count - 1;
+    let postings_per_deg_lat = tile.lat_count - 1;
+
+    let lon_idx = (longitude_deg - tile.origin_longitude) * postings_per_deg_lon as f64;
+    let lat_idx = (latitude_deg - tile.origin_latitude) * postings_per_deg_lat as f64;
+    let lon_lo = lon_idx.floor() as i64;
+    let lat_lo = lat_idx.floor() as i64;
+    let fx = lon_idx - lon_lo as f64;
+    let fy = lat_idx - lat_lo as f64;
+
+    let mut z = 0.0;
+    for (di, wx) in [(0i64, 1.0 - fx), (1i64, fx)] {
+        for (dj, wy) in [(0i64, 1.0 - fy), (1i64, fy)] {
+            let w = wx * wy;
+            if w == 0.0 {
+                continue;
+            }
+            let posting_lon =
+                tile.origin_longitude + (lon_lo + di) as f64 / postings_per_deg_lon as f64;
+            let posting_lat =
+                tile.origin_latitude + (lat_lo + dj) as f64 / postings_per_deg_lat as f64;
+            z += w * f64::from(
+                tile.get_elevation(posting_lon, posting_lat)
+                    .map_err(Error::Parse)?,
+            );
+        }
+    }
+    Ok(z)
 }
 
 fn validate_lookup_coordinates(longitude_deg: f64, latitude_deg: f64) -> crate::Result<()> {
@@ -420,6 +484,12 @@ fn convert_signed_magnitude(raw: i16) -> i16 {
 
 #[cfg(all(test, sidereon_repo_tests))]
 mod tests {
+    //! DTED batch fixture provenance: adjacent synthetic tiles under
+    //! `tests/fixtures/dted/tiles` are written by
+    //! `crates/sidereon-core/fixtures-generators/generate_dted_points.py` using
+    //! the public DTED UHL/DSI/ACC/data-record layout. Tests compare
+    //! `f64::to_bits` exactly, never tolerances.
+
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
@@ -493,6 +563,54 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("sidereon-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn scalar_loop(
+        root: &Path,
+        points: &[(f64, f64)],
+        options: DtedLookupOptions,
+    ) -> Vec<crate::Result<f64>> {
+        let mut terrain = DtedTerrain::new(root);
+        points
+            .iter()
+            .map(|&(lon, lat)| terrain.height_m_with_options(lon, lat, options))
+            .collect()
+    }
+
+    fn assert_height_results_match(
+        got: &[crate::Result<f64>],
+        want: &[crate::Result<f64>],
+        context: &str,
+    ) {
+        assert_eq!(got.len(), want.len(), "{context} result length");
+        for (idx, (got, want)) in got.iter().zip(want).enumerate() {
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{context} index {idx} height bits"
+                ),
+                (Err(got), Err(want)) => {
+                    assert_eq!(got, want, "{context} index {idx} error")
+                }
+                (got, want) => panic!("{context} index {idx} mismatch: {got:?} != {want:?}"),
+            }
+        }
+    }
+
+    fn copy_fixture_tile(root: &Path, tile_name: &str) {
+        fs::copy(
+            fixture_path(&format!("tiles/{tile_name}")),
+            root.join(tile_name),
+        )
+        .expect("copy DTED fixture tile");
+    }
+
+    fn copy_primary_fixture_root(name: &str) -> PathBuf {
+        let root = temp_path(name);
+        fs::create_dir_all(&root).expect("create temp DTED dir");
+        copy_fixture_tile(&root, "n36_w107_1arc_v3.dt2");
+        root
     }
 
     fn write_synthetic_dted_tile(
@@ -658,9 +776,9 @@ mod tests {
     // DTED UHL/DSI/ACC/data-record layout (tile id `n36_w107`, elevation formula
     // `z_m = -20 + 7*lon_i - 5*lat_i + lon_i*lat_i`); no external terrain payload is
     // copied. `tests/fixtures/dted/dted_points.json` holds nearest-posting and
-    // bilinear lookup cases generated from that tile. Generated with Python 3.11.15
-    // on macOS-26.5.1-arm64. Floating-point fixture values are serialized as f64
-    // hex-bit strings and must be compared with `f64::to_bits`, never tolerances.
+    // bilinear lookup cases generated from that tile. Floating-point fixture
+    // values are serialized as f64 hex-bit strings and must be compared with
+    // `f64::to_bits`, never tolerances.
     #[test]
     fn dted_lookup_matches_generated_fixture_bits() {
         let raw =
@@ -668,7 +786,8 @@ mod tests {
         let doc: Value = serde_json::from_str(&raw).expect("parse dted fixture");
         assert_eq!(doc["schema"], "gnss-dted-points-v1");
 
-        let mut terrain = DtedTerrain::new(fixture_path("tiles"));
+        let root = copy_primary_fixture_root("dted-fixture-single-scalar");
+        let mut terrain = DtedTerrain::new(&root);
         let nearest = DtedLookupOptions {
             interpolation: DtedInterpolation::NearestPosting,
         };
@@ -711,5 +830,156 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "empty DTED fixture");
+        fs::remove_dir_all(root).expect("remove temp DTED dir");
+    }
+
+    #[test]
+    fn height_batch_matches_scalar_loop_on_fixture_bits() {
+        let raw =
+            std::fs::read_to_string(fixture_path("dted_points.json")).expect("read dted fixture");
+        let doc: Value = serde_json::from_str(&raw).expect("parse dted fixture");
+        assert_eq!(doc["schema"], "gnss-dted-points-v1");
+
+        let points: Vec<(f64, f64)> = ["nearest_cases", "bilinear_cases"]
+            .into_iter()
+            .flat_map(|cases_key| {
+                doc[cases_key]
+                    .as_array()
+                    .expect(cases_key)
+                    .iter()
+                    .map(|case| (bits(&case["longitude_bits"]), bits(&case["latitude_bits"])))
+            })
+            .collect();
+
+        for options in [
+            DtedLookupOptions {
+                interpolation: DtedInterpolation::NearestPosting,
+            },
+            DtedLookupOptions {
+                interpolation: DtedInterpolation::Bilinear,
+            },
+        ] {
+            let root = copy_primary_fixture_root("dted-fixture-single-batch");
+            let want = scalar_loop(&root, &points, options);
+            let mut terrain = DtedTerrain::new(&root);
+            let got = terrain.height_batch(&points, options);
+            assert_height_results_match(&got, &want, "single-tile fixture batch");
+            fs::remove_dir_all(root).expect("remove temp DTED dir");
+        }
+    }
+
+    #[test]
+    fn height_batch_matches_scalar_loop_across_adjacent_tiles_bits() {
+        let root = fixture_path("tiles");
+        let options = DtedLookupOptions {
+            interpolation: DtedInterpolation::Bilinear,
+        };
+        let raw =
+            std::fs::read_to_string(fixture_path("dted_points.json")).expect("read dted fixture");
+        let doc: Value = serde_json::from_str(&raw).expect("parse dted fixture");
+        for case in doc["multi_tile_cases"]
+            .as_array()
+            .expect("multi_tile_cases")
+        {
+            let lon = bits(&case["longitude_bits"]);
+            let lat = bits(&case["latitude_bits"]);
+            let expected = bits(&case["bilinear_bits"]);
+            let mut terrain = DtedTerrain::new(&root);
+            let got = terrain
+                .height_m_with_options(lon, lat, options)
+                .expect("multi-tile generated bilinear height");
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "multi-tile generated case {}",
+                case["case_id"].as_str().expect("case_id")
+            );
+        }
+
+        let sequences = [
+            (
+                "all_in_a_then_all_in_b",
+                vec![
+                    (-106.875, 36.125),
+                    (-106.625, 36.375),
+                    (-105.875, 36.125),
+                    (-105.625, 36.375),
+                ],
+            ),
+            (
+                "interleaved_a_b_a_b",
+                vec![
+                    (-106.875, 36.625),
+                    (-105.875, 36.625),
+                    (-106.625, 36.125),
+                    (-105.625, 36.125),
+                ],
+            ),
+            (
+                "boundary_after_a_then_missing",
+                vec![
+                    (-106.875, 36.5),
+                    (-106.0, 36.5),
+                    (-104.5, 36.5),
+                    (-105.875, 36.5),
+                ],
+            ),
+        ];
+
+        for (name, points) in sequences {
+            let want = scalar_loop(&root, &points, options);
+            let mut terrain = DtedTerrain::new(&root);
+            let got = terrain.height_batch(&points, options);
+            assert_height_results_match(&got, &want, name);
+        }
+
+        let mut terrain = DtedTerrain::new(&root);
+        let missing = terrain.height_batch(&[(-104.5, 36.5)], options);
+        assert_eq!(
+            missing[0].as_ref().map(|v| v.to_bits()),
+            Ok(0.0f64.to_bits())
+        );
+    }
+
+    #[test]
+    fn height_batch_places_errors_at_input_indices() {
+        let root = temp_path("dted-batch-errors");
+        fs::create_dir_all(&root).expect("create temp DTED dir");
+        copy_fixture_tile(&root, "n36_w107_1arc_v3.dt2");
+        copy_fixture_tile(&root, "n36_w106_1arc_v3.dt2");
+        fs::write(root.join("n37_w107_1arc_v3.dt2"), b"not a DTED tile")
+            .expect("write corrupt DTED tile");
+
+        let points = [
+            (-106.875, 36.125),
+            (-106.5, f64::NAN),
+            (-105.875, 36.125),
+            (-106.5, 37.5),
+            (-106.625, 36.375),
+        ];
+        let options = DtedLookupOptions {
+            interpolation: DtedInterpolation::Bilinear,
+        };
+        let want = scalar_loop(&root, &points, options);
+        let mut terrain = DtedTerrain::new(&root);
+        let got = terrain.height_batch(&points, options);
+        assert_height_results_match(&got, &want, "batch error placement");
+
+        assert!(got[0].is_ok(), "index 0 remains valid");
+        assert_eq!(
+            got[1],
+            Err(Error::InvalidInput(
+                "latitude_deg must be finite".to_string()
+            ))
+        );
+        assert!(got[2].is_ok(), "index 2 remains valid");
+        assert!(
+            matches!(&got[3], Err(Error::Parse(msg)) if msg.contains("too short")),
+            "index 3 is the corrupt-tile error: {:?}",
+            got[3]
+        );
+        assert!(got[4].is_ok(), "index 4 remains valid");
+
+        fs::remove_dir_all(root).expect("remove temp DTED dir");
     }
 }

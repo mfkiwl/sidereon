@@ -7,12 +7,47 @@ import json
 import struct
 from pathlib import Path
 
-SYNTHETIC_TILE_ID = "n36_w107"
-SYNTHETIC_TILE_NAME = "n36_w107_1arc_v3.dt2"
 UHL_SIZE = 80
 DSI_SIZE = 648
 ACC_SIZE = 2700
 DATA_OFFSET = UHL_SIZE + DSI_SIZE + ACC_SIZE
+LON_COUNT = 5
+LAT_COUNT = 5
+
+
+class SyntheticTileSpec:
+    def __init__(self, tile_id: str, lon0: float, lat0: float, formula: str, variant: str):
+        self.tile_id = tile_id
+        self.tile_name = f"{tile_id}_1arc_v3.dt2"
+        self.lon0 = lon0
+        self.lat0 = lat0
+        self.formula = formula
+        self.variant = variant
+
+    def elevation(self, lon_i: int, lat_i: int) -> int:
+        if self.variant == "primary":
+            return -20 + 7 * lon_i - 5 * lat_i + lon_i * lat_i
+        if self.variant == "east":
+            return 100 + 3 * lon_i + 11 * lat_i - lon_i * lat_i
+        raise ValueError(f"unknown synthetic DTED variant {self.variant}")
+
+
+SYNTHETIC_TILES = [
+    SyntheticTileSpec(
+        "n36_w107",
+        -107.0,
+        36.0,
+        "z_m = -20 + 7 * lon_i - 5 * lat_i + lon_i * lat_i",
+        "primary",
+    ),
+    SyntheticTileSpec(
+        "n36_w106",
+        -106.0,
+        36.0,
+        "z_m = 100 + 3 * lon_i + 11 * lat_i - lon_i * lat_i",
+        "east",
+    ),
+]
 
 
 def f64_bits(value: float) -> str:
@@ -59,30 +94,24 @@ def signed_magnitude_bytes(value: int) -> bytes:
     return raw.to_bytes(2, byteorder="big", signed=False)
 
 
-def synthetic_elevation(lon_i: int, lat_i: int) -> int:
-    return -20 + 7 * lon_i - 5 * lat_i + lon_i * lat_i
-
-
-def write_synthetic_tile(path: Path) -> None:
+def write_synthetic_tile(path: Path, spec: SyntheticTileSpec) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lon_count = 5
-    lat_count = 5
     uhl = bytearray(b" " * UHL_SIZE)
     uhl[0:4] = b"UHL1"
-    uhl[4:12] = dted_coord(-107.0, is_lon=True)
-    uhl[12:20] = dted_coord(36.0, is_lon=False)
-    uhl[47:51] = f"{lon_count:04}".encode("ascii")
-    uhl[51:55] = f"{lat_count:04}".encode("ascii")
+    uhl[4:12] = dted_coord(spec.lon0, is_lon=True)
+    uhl[12:20] = dted_coord(spec.lat0, is_lon=False)
+    uhl[47:51] = f"{LON_COUNT:04}".encode("ascii")
+    uhl[51:55] = f"{LAT_COUNT:04}".encode("ascii")
 
     data = bytearray()
-    for lon_i in range(lon_count):
-        block = bytearray(12 + 2 * lat_count)
+    for lon_i in range(LON_COUNT):
+        block = bytearray(12 + 2 * LAT_COUNT)
         block[0] = 0xAA
         block[4:6] = lon_i.to_bytes(2, byteorder="big")
-        for lat_i in range(lat_count):
+        for lat_i in range(LAT_COUNT):
             sample = 8 + lat_i * 2
             block[sample : sample + 2] = signed_magnitude_bytes(
-                synthetic_elevation(lon_i, lat_i)
+                spec.elevation(lon_i, lat_i)
             )
         checksum = sum(block[:-4])
         block[-4:] = checksum.to_bytes(4, byteorder="big", signed=True)
@@ -122,18 +151,25 @@ class Tile:
         z = 0.0
         for di, wx in ((0, 1.0 - fx), (1, fx)):
             for dj, wy in ((0, 1.0 - fy), (1, fy)):
+                w = wx * wy
+                if w == 0.0:
+                    continue
                 posting_lon = self.lon0 + (lon_lo + di) / (self.lon_count - 1)
                 posting_lat = self.lat0 + (lat_lo + dj) / (self.lat_count - 1)
-                z += (wx * wy) * self.elevation(posting_lon, posting_lat)
+                z += w * self.elevation(posting_lon, posting_lat)
         return z
 
 
 def main() -> None:
     out_dir = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "dted"
-    tile_path = out_dir / "tiles" / SYNTHETIC_TILE_NAME
-    write_synthetic_tile(tile_path)
+    tile_paths = {}
+    for spec in SYNTHETIC_TILES:
+        tile_path = out_dir / "tiles" / spec.tile_name
+        write_synthetic_tile(tile_path, spec)
+        tile_paths[spec.tile_id] = tile_path
 
-    tile = Tile(tile_path)
+    primary_spec = SYNTHETIC_TILES[0]
+    tile = Tile(tile_paths[primary_spec.tile_id])
     nearest_cases = []
     fractions = [0.0, 0.25, 0.5, 0.75, 1.0]
     for lon_frac in fractions:
@@ -142,7 +178,7 @@ def main() -> None:
             lat = tile.lat0 + lat_frac
             nearest_cases.append(
                 {
-                    "tile_id": SYNTHETIC_TILE_ID,
+                    "tile_id": primary_spec.tile_id,
                     "longitude_bits": f64_bits(lon),
                     "latitude_bits": f64_bits(lat),
                     "elevation_bits": f64_bits(float(tile.elevation(lon, lat))),
@@ -155,23 +191,58 @@ def main() -> None:
         lat = tile.lat0 + lat_frac
         bilinear_cases.append(
             {
-                "tile_id": SYNTHETIC_TILE_ID,
+                "tile_id": primary_spec.tile_id,
                 "longitude_bits": f64_bits(lon),
                 "latitude_bits": f64_bits(lat),
                 "elevation_bits": f64_bits(tile.bilinear(lon, lat)),
             }
         )
 
+    tile_by_id = {
+        spec.tile_id: Tile(tile_paths[spec.tile_id])
+        for spec in SYNTHETIC_TILES
+    }
+    multi_tile_cases = []
+    for case_id, tile_id, lon_frac, lat_frac in (
+        ("a_interior_1", "n36_w107", 0.125, 0.125),
+        ("a_interior_2", "n36_w107", 0.625, 0.375),
+        ("b_interior_1", "n36_w106", 0.125, 0.125),
+        ("b_interior_2", "n36_w106", 0.625, 0.375),
+        ("shared_meridian_from_b", "n36_w106", 0.0, 0.5),
+    ):
+        case_tile = tile_by_id[tile_id]
+        lon = case_tile.lon0 + lon_frac
+        lat = case_tile.lat0 + lat_frac
+        multi_tile_cases.append(
+            {
+                "case_id": case_id,
+                "tile_id": tile_id,
+                "longitude_bits": f64_bits(lon),
+                "latitude_bits": f64_bits(lat),
+                "nearest_bits": f64_bits(float(case_tile.elevation(lon, lat))),
+                "bilinear_bits": f64_bits(case_tile.bilinear(lon, lat)),
+            }
+        )
+
     payload = {
         "schema": "gnss-dted-points-v1",
         "source": {
-            "tile_id": SYNTHETIC_TILE_ID,
-            "tile_path": f"tiles/{SYNTHETIC_TILE_NAME}",
+            "tile_id": primary_spec.tile_id,
+            "tile_path": f"tiles/{primary_spec.tile_name}",
             "format": "DTED UHL/DSI/ACC/data-record byte layout",
-            "elevation_formula": "z_m = -20 + 7 * lon_i - 5 * lat_i + lon_i * lat_i",
+            "elevation_formula": primary_spec.formula,
         },
+        "tiles": [
+            {
+                "tile_id": spec.tile_id,
+                "tile_path": f"tiles/{spec.tile_name}",
+                "elevation_formula": spec.formula,
+            }
+            for spec in SYNTHETIC_TILES
+        ],
         "nearest_cases": nearest_cases,
         "bilinear_cases": bilinear_cases,
+        "multi_tile_cases": multi_tile_cases,
     }
     out = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "dted" / "dted_points.json"
     out.parent.mkdir(parents=True, exist_ok=True)
