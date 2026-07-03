@@ -2,7 +2,7 @@
 
 All notable changes to `sidereon-core` are documented here.
 
-## [Unreleased]
+## [0.11.0]
 
 ### Added
 
@@ -15,6 +15,34 @@ All notable changes to `sidereon-core` are documented here.
   81-day centered average, daily and 3-hourly Ap), format-faithful
   serializers, a CelesTrak data-catalog entry, and a `SpaceWeatherSource`
   hook feeding atmospheric drag and orbital-decay estimation.
+- GNSS observation quality control: per-satellite and per-signal completeness,
+  gap, cycle-slip, multipath, and signal-strength summaries over RINEX
+  observation data, plus a RINEX lint and repair pass with typed finding codes,
+  validated against independent teqc and hand-computed oracles.
+- RTCM MSM carrier-phase lock-time indicator to RINEX loss-of-lock indicator
+  derivation: DF402 and DF407 lock-time bucket tables, conservative
+  decrease detection with same-bucket ambiguity handling, half-cycle ambiguity
+  mapping, and a per-signal lock-time tracker, cross-checked against an
+  independent RTKLIB convbin decode of a real MSM stream. Adds RTCM stream
+  decode diagnostics and typed truncation classification.
+- NTRIP sans-IO protocol: a caster handshake and streaming state machine
+  (request builder, response classification, chunked and sourcetable decoding,
+  GGA position feed policy) with no transport in the core, plus idiomatic
+  streaming clients in the Python and Elixir interfaces.
+- NMEA 0183 support: a forgiving sentence parser, an epoch accumulator, and a
+  GGA writer over a format-agnostic representation.
+- CNAV and RINEX-4 broadcast evaluation: CNAV and CNAV2 clock and orbit
+  parameters, user range accuracy and inter-signal correction accessors,
+  mixed broadcast-store selection, and a lenient navigation parse that reports
+  skipped blocks.
+- TLE mean-element fitting: fit SGP4 elements to a span of states on the
+  shared trust-region least-squares engine, with observability diagnostics,
+  epoch selection, and observation weighting. NDM epochs gain femtosecond
+  precision through a single shared parser.
+- Geoid undulation evaluation matching PROJ on the EGM96 15-arcminute grid:
+  node-registered bilinear interpolation with antimeridian and pole handling,
+  batch lookup, and orthometric to ellipsoidal height conversion, pinned to
+  PROJ-computed reference values.
 
 ### Changed
 
@@ -22,6 +50,8 @@ All notable changes to `sidereon-core` are documented here.
   `NotFactorizable` and `InvalidInterpolationParameter` variants, and
   propagated-covariance TCA option structs now carry `process_noise`.
   Exhaustive matches and struct literals may need source updates.
+- Rust, Python, C, WASM, and Elixir interfaces expose uniform capability parity
+  for the 0.11.0 surface.
 
 ## [0.10.1]
 
