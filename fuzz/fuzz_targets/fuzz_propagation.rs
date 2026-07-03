@@ -132,6 +132,7 @@ fuzz_target!(|data: &[u8]| {
         integrator,
         options: opts,
         drag: None,
+        space_weather: None,
     };
     assert_ok_finite_or_err(
         "StatePropagator::propagate_to",

@@ -56,6 +56,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "rinex_qc_repair_roundtrip"
+path = "fuzz_targets/rinex_qc_repair_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rinex_nav_parse"
 path = "fuzz_targets/rinex_nav_parse.rs"
 test = false
@@ -126,6 +133,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "space_weather_parse"
+path = "fuzz_targets/space_weather_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_math"
 path = "fuzz_targets/fuzz_math.rs"
 test = false
@@ -184,6 +198,13 @@ bench = false
 [[bin]]
 name = "fuzz_signal"
 path = "fuzz_targets/fuzz_signal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "geoid_dac_parse"
+path = "fuzz_targets/geoid_dac_parse.rs"
 test = false
 doc = false
 bench = false
