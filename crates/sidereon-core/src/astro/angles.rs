@@ -111,11 +111,11 @@ pub fn position_angle(
     validate_lon_lat_deg(from_lon_lat_deg, "from")?;
     validate_lon_lat_deg(to_lon_lat_deg, "to")?;
 
-    let lon1 = reduce_lon_deg(from_lon_lat_deg.0).to_radians();
+    let lon1 = reduce_lon_deg(from_lon_lat_deg.0);
     let lat1 = from_lon_lat_deg.1.to_radians();
-    let lon2 = reduce_lon_deg(to_lon_lat_deg.0).to_radians();
+    let lon2 = reduce_lon_deg(to_lon_lat_deg.0);
     let lat2 = to_lon_lat_deg.1.to_radians();
-    let dlon = lon2 - lon1;
+    let dlon = (lon2 - lon1).to_radians();
 
     let numerator = lat2.cos() * dlon.sin();
     let denominator = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
@@ -278,33 +278,51 @@ mod tests {
         a_lon_lat_deg: (f64, f64),
         b_lon_lat_deg: (f64, f64),
         expected_sep_deg: f64,
+        expected_pa_deg: f64,
     }
 
     #[test]
-    fn angular_separation_matches_reference_catalog_cases() {
-        // Reference values frozen from astropy 7.2.0 and skyfield 1.49 on
-        // Python 3.12.13. Coordinates are ICRS, epoch J2000.0. Mizar, Alcor,
-        // Betelgeuse, and Rigel coordinates are SIMBAD ICRS J2000 entries.
-        // Astropy SkyCoord.separation produced expected_sep_deg; Skyfield
-        // separation_from cross-checked each value within 1e-9 deg.
+    fn angular_separation_and_position_angle_match_reference_cases() {
+        // Frozen canonical table generated with astropy.coordinates.
+        // angular_separation and position_angle from astropy 7.2.0 on
+        // Python 3.14.6. Inputs are ICRS/J2000 degrees
+        // (lon1, lat1, lon2, lat2); outputs are degrees. Skyfield 1.49
+        // separation_from cross-checked the star separations within 1e-9 deg.
         let cases = [
             ReferenceCase {
-                name: "Mizar-Alcor",
-                a_lon_lat_deg: (200.98141866666666, 54.925_351_972_222_22),
-                b_lon_lat_deg: (201.306_407_638_75, 54.987_959_661_388_89),
-                expected_sep_deg: 0.19682972435842,
+                name: "sirius->procyon",
+                a_lon_lat_deg: (101.287155333, -16.716115861),
+                b_lon_lat_deg: (114.825493028, 5.224993306),
+                expected_sep_deg: 25.7013646403623,
+                expected_pa_deg: 32.51673660099302,
             },
             ReferenceCase {
-                name: "Betelgeuse-Rigel",
-                a_lon_lat_deg: (88.792_939, 7.407_064),
-                b_lon_lat_deg: (78.634_467_083_333_33, -8.201_638_361_111_11),
-                expected_sep_deg: 18.605960601325172,
+                name: "sirius->canopus",
+                a_lon_lat_deg: (101.287155333, -16.716115861),
+                b_lon_lat_deg: (95.987958333, -52.695661111),
+                expected_sep_deg: 36.22078689550111,
+                expected_pa_deg: 185.43546880831877,
             },
             ReferenceCase {
-                name: "large angle pair",
-                a_lon_lat_deg: (12.3456789012345, -45.678_901_234_567_8),
-                b_lon_lat_deg: (278.765_432_109_876_5, 62.3456789012345),
-                expected_sep_deg: 130.84062807863208,
+                name: "polaris->vega",
+                a_lon_lat_deg: (37.954561667, 89.264108889),
+                b_lon_lat_deg: (279.234734792, 38.783688958),
+                expected_sep_deg: 51.57282525600137,
+                expected_pa_deg: 299.23384966888466,
+            },
+            ReferenceCase {
+                name: "near-coincident",
+                a_lon_lat_deg: (10.0, 20.0),
+                b_lon_lat_deg: (10.0000001, 20.0000001),
+                expected_sep_deg: 1.372232571517946e-07,
+                expected_pa_deg: 43.219178406844925,
+            },
+            ReferenceCase {
+                name: "wrap-crossing",
+                a_lon_lat_deg: (359.9, -5.0),
+                b_lon_lat_deg: (0.1, 5.0),
+                expected_sep_deg: 10.001994721516857,
+                expected_pa_deg: 1.147219154245781,
             },
         ];
 
@@ -319,6 +337,9 @@ mod tests {
             )
             .expect(case.name);
             assert_close_deg(vector_sep, coord_sep, 1.0e-9);
+
+            let pa = position_angle(case.a_lon_lat_deg, case.b_lon_lat_deg).expect(case.name);
+            assert_pa_close(pa, case.expected_pa_deg, 1.0e-9);
         }
     }
 
