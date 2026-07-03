@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ionex_samples_round_trip"
+path = "fuzz_targets/ionex_samples_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rinex_obs_parse"
 path = "fuzz_targets/rinex_obs_parse.rs"
 test = false

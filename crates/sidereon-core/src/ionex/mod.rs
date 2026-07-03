@@ -14,6 +14,7 @@ mod grid;
 mod klobuchar;
 mod nequick_g;
 mod nequick_g_data;
+mod samples;
 mod slant;
 mod tec_grid;
 mod write;
@@ -36,6 +37,7 @@ use crate::GnssSystem;
 
 pub use grid::Ionex;
 pub use nequick_g::{nequick_g_delay_m, nequick_g_stec_tecu, NequickGRayEval};
+pub use samples::{TecGridSamples, TecSample, TecSamplesError};
 pub use tec_grid::{
     iono_delay_xyz as regular_tec_grid_delay_xyz, tec_xyz as regular_tec_xyz, TecGrid,
     TecGridEpoch, TecGridEvalOptions, TecGridShellGeometry,
@@ -418,6 +420,64 @@ pub fn ionex_slant_delay(
     Ok(delay_m)
 }
 
+/// One IONEX slant-delay query for [`ionex_slant_delays`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IonexSlantRequest {
+    /// Receiver geodetic position.
+    pub receiver: Wgs84Geodetic,
+    /// Satellite elevation above the local horizon, radians.
+    pub elevation_rad: f64,
+    /// Satellite azimuth, radians.
+    pub azimuth_rad: f64,
+    /// Query epoch, integer seconds since J2000.
+    pub epoch_j2000_s: i64,
+    /// Carrier frequency on which to report the delay, hertz.
+    pub frequency_hz: f64,
+}
+
+/// Batch IONEX vertical-TEC-grid slant ionospheric group delays.
+///
+/// Evaluates `requests` into `out` one-to-one. The output slice must have the
+/// same length as the request slice. Each request uses the same validation order
+/// and scalar kernel as [`ionex_slant_delay`], while the borrowed grid view is
+/// built once for the batch.
+pub fn ionex_slant_delays(
+    ionex: &Ionex,
+    requests: &[IonexSlantRequest],
+    out: &mut [f64],
+) -> Result<()> {
+    if out.len() != requests.len() {
+        return Err(Error::InvalidInput(format!(
+            "IONEX slant output length {} does not match request length {}",
+            out.len(),
+            requests.len()
+        )));
+    }
+
+    let grid = ionex_vtec_grid_view(ionex);
+    for (request, output) in requests.iter().zip(out.iter_mut()) {
+        validate_receiver(request.receiver)?;
+        validate_finite(request.elevation_rad, "elevation_rad")?;
+        validate_elevation_rad(request.elevation_rad, "elevation_rad")?;
+        validate_finite(request.azimuth_rad, "azimuth_rad")?;
+        validate_frequency(request.frequency_hz)?;
+
+        let delay_m = ionex_slant_delay_unchecked_with_grid(
+            ionex,
+            request.receiver,
+            request.elevation_rad,
+            request.azimuth_rad,
+            request.epoch_j2000_s,
+            request.frequency_hz,
+            grid,
+        );
+        validate_finite(delay_m, "ionosphere_delay_m")?;
+        debug_assert!(delay_m.is_finite());
+        *output = delay_m;
+    }
+    Ok(())
+}
+
 fn ionex_slant_delay_unchecked(
     ionex: &Ionex,
     receiver: Wgs84Geodetic,
@@ -425,6 +485,26 @@ fn ionex_slant_delay_unchecked(
     azimuth_rad: f64,
     epoch_j2000_s: i64,
     frequency_hz: f64,
+) -> f64 {
+    ionex_slant_delay_unchecked_with_grid(
+        ionex,
+        receiver,
+        elevation_rad,
+        azimuth_rad,
+        epoch_j2000_s,
+        frequency_hz,
+        ionex_vtec_grid_view(ionex),
+    )
+}
+
+fn ionex_slant_delay_unchecked_with_grid(
+    ionex: &Ionex,
+    receiver: Wgs84Geodetic,
+    elevation_rad: f64,
+    azimuth_rad: f64,
+    epoch_j2000_s: i64,
+    frequency_hz: f64,
+    grid: slant::VtecGridView<'_>,
 ) -> f64 {
     slant::slant_delay_components(
         slant::PierceLineOfSight {
@@ -437,16 +517,20 @@ fn ionex_slant_delay_unchecked(
         ionex.base_radius_km(),
         ionex.shell_height_km(),
         epoch_j2000_s,
-        slant::VtecGridView {
-            map_epochs: ionex.map_epochs(),
-            maps: ionex.tec_maps(),
-            lat_arr: ionex.lat_nodes_deg(),
-            lon_arr: ionex.lon_nodes_deg(),
-            dlat: ionex.dlat_deg(),
-            dlon: ionex.dlon_deg(),
-        },
+        grid,
     )
     .delay_m
+}
+
+fn ionex_vtec_grid_view(ionex: &Ionex) -> slant::VtecGridView<'_> {
+    slant::VtecGridView {
+        map_epochs: ionex.map_epochs(),
+        maps: ionex.tec_maps(),
+        lat_arr: ionex.lat_nodes_deg(),
+        lon_arr: ionex.lon_nodes_deg(),
+        dlat: ionex.dlat_deg(),
+        dlon: ionex.dlon_deg(),
+    }
 }
 
 fn validate_klobuchar_params(params: &KlobucharParams) -> Result<()> {
@@ -477,7 +561,7 @@ fn validate_galileo_eval(eval: GalileoNequickEval) -> Result<()> {
     validate_frequency(eval.frequency_hz)
 }
 
-fn validate_receiver(receiver: Wgs84Geodetic) -> Result<()> {
+pub(crate) fn validate_receiver(receiver: Wgs84Geodetic) -> Result<()> {
     validate_finite(receiver.lat_rad, "receiver.lat_rad")?;
     validate_finite(receiver.lon_rad, "receiver.lon_rad")?;
     validate_finite(receiver.height_m, "receiver.height_m")?;
@@ -520,7 +604,7 @@ fn validate_lon_deg(value: f64, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn validate_elevation_rad(value: f64, field: &'static str) -> Result<()> {
+pub(crate) fn validate_elevation_rad(value: f64, field: &'static str) -> Result<()> {
     if !(0.0..=core::f64::consts::FRAC_PI_2).contains(&value) {
         return Err(invalid_input(field, "out of range"));
     }
@@ -543,7 +627,7 @@ fn validate_second_of_day(value: f64, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn validate_frequency(frequency_hz: f64) -> Result<()> {
+pub(crate) fn validate_frequency(frequency_hz: f64) -> Result<()> {
     validate_finite(frequency_hz, "frequency_hz")?;
     if frequency_hz <= 0.0 {
         return Err(invalid_input("frequency_hz", "not positive"));

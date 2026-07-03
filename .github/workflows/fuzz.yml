@@ -24,6 +24,7 @@ env:
     fuzz_time
     geoid_dac_parse
     ionex_parse
+    ionex_samples_round_trip
     nmea_accumulate
     nmea_parse
     ntrip_chunk_decode

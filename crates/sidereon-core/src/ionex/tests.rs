@@ -29,7 +29,8 @@ use serde_json::Value;
 use super::grid::Ionex;
 use super::slant::{slant_delay_components, PierceLineOfSight, SlantComponents, VtecGridView};
 use super::{
-    galileo_nequick_g_native, ionosphere_delay, GalileoNequickCoeffs, GalileoNequickEval, IonoModel,
+    galileo_nequick_g_native, ionex_slant_delays, ionosphere_delay, GalileoNequickCoeffs,
+    GalileoNequickEval, IonexSlantRequest, IonoModel, TecGridSamples, TecSamplesError,
 };
 
 /// Parse a C99 / Python `float.hex()` hex-float string into the exact `f64`.
@@ -188,6 +189,12 @@ fn ionex_slant_zero_ulp_full_branch_matrix() {
     let ionex_bytes =
         std::fs::read(&ionex_path).unwrap_or_else(|e| panic!("read {}: {e}", ionex_path.display()));
     let ionex = Ionex::parse(&ionex_bytes).expect("parse synthetic IONEX product");
+    let sample_built =
+        Ionex::from_samples(ionex.tec_grid_samples()).expect("sample-built IONEX product");
+    assert_eq!(
+        sample_built, ionex,
+        "sample-built IONEX must preserve the parsed IR"
+    );
 
     let mut failures: Vec<String> = Vec::new();
 
@@ -272,75 +279,82 @@ fn ionex_slant_zero_ulp_full_branch_matrix() {
         cases.len()
     );
 
-    let lat_arr = ionex.lat_nodes_deg();
-    let lon_arr = ionex.lon_nodes_deg();
-    let dlat = ionex.dlat_deg();
-    let dlon = ionex.dlon_deg();
-    let re = ionex.base_radius_km();
-    let h = ionex.shell_height_km();
-    let epochs = ionex.map_epochs();
-    let maps = ionex.tec_maps();
-
     let mut checks = 0usize;
 
-    for case in cases {
-        let name = case["name"].as_str().unwrap_or("<unnamed>");
-        let inp = &case["inputs"];
-        let exp = &case["expect"];
+    for (source, product) in [("parsed", &ionex), ("sample-built", &sample_built)] {
+        let lat_arr = product.lat_nodes_deg();
+        let lon_arr = product.lon_nodes_deg();
+        let dlat = product.dlat_deg();
+        let dlon = product.dlon_deg();
+        let re = product.base_radius_km();
+        let h = product.shell_height_km();
+        let epochs = product.map_epochs();
+        let maps = product.tec_maps();
 
-        let epoch_s = inp["epoch_s"].as_i64().expect("epoch_s int");
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("<unnamed>");
+            let inp = &case["inputs"];
+            let exp = &case["expect"];
 
-        let got = slant_delay_components(
-            PierceLineOfSight {
-                lat_rad: hexf(inp, "lat_rad"),
-                lon_rad: hexf(inp, "lon_rad"),
-                az_rad: hexf(inp, "az_rad"),
-                el_rad: hexf(inp, "el_rad"),
-            },
-            hexf(inp, "frequency_hz"),
-            re,
-            h,
-            epoch_s,
-            VtecGridView {
-                map_epochs: epochs,
-                maps,
-                lat_arr,
-                lon_arr,
-                dlat,
-                dlon,
-            },
-        );
+            let epoch_s = inp["epoch_s"].as_i64().expect("epoch_s int");
 
-        // The temporal-bracket index is a discrete branch outcome, not a float.
-        assert_eq!(
-            got.map_index as i64,
-            case["map_index"].as_i64().expect("map_index"),
-            "case {name}: temporal bracket index"
-        );
+            let got = slant_delay_components(
+                PierceLineOfSight {
+                    lat_rad: hexf(inp, "lat_rad"),
+                    lon_rad: hexf(inp, "lon_rad"),
+                    az_rad: hexf(inp, "az_rad"),
+                    el_rad: hexf(inp, "el_rad"),
+                },
+                hexf(inp, "frequency_hz"),
+                re,
+                h,
+                epoch_s,
+                VtecGridView {
+                    map_epochs: epochs,
+                    maps,
+                    lat_arr,
+                    lon_arr,
+                    dlat,
+                    dlon,
+                },
+            );
 
-        let components: &[(&str, f64)] = &[
-            ("s", got.s),
-            ("psi", got.psi),
-            ("phi_ipp_deg", got.phi_ipp_deg),
-            ("lambda_ipp_deg_raw", got.lambda_ipp_deg_raw),
-            ("lambda_ipp_deg", got.lambda_ipp_deg),
-            ("w", got.w),
-            ("vtec0", got.vtec0),
-            ("vtec1", got.vtec1),
-            ("p0", got.p0),
-            ("q0", got.q0),
-            ("vtec", got.vtec),
-            ("m", got.m),
-            ("stec", got.stec),
-            ("delay_m", got.delay_m),
-        ];
+            // The temporal-bracket index is a discrete branch outcome, not a float.
+            assert_eq!(
+                got.map_index as i64,
+                case["map_index"].as_i64().expect("map_index"),
+                "case {source}.{name}: temporal bracket index"
+            );
 
-        for &(c, value) in components {
-            let want_hex = exp[c]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {name}: missing expected component {c}"));
-            check(&mut failures, format!("{name}.{c}"), value, want_hex);
-            checks += 1;
+            let components: &[(&str, f64)] = &[
+                ("s", got.s),
+                ("psi", got.psi),
+                ("phi_ipp_deg", got.phi_ipp_deg),
+                ("lambda_ipp_deg_raw", got.lambda_ipp_deg_raw),
+                ("lambda_ipp_deg", got.lambda_ipp_deg),
+                ("w", got.w),
+                ("vtec0", got.vtec0),
+                ("vtec1", got.vtec1),
+                ("p0", got.p0),
+                ("q0", got.q0),
+                ("vtec", got.vtec),
+                ("m", got.m),
+                ("stec", got.stec),
+                ("delay_m", got.delay_m),
+            ];
+
+            for &(c, value) in components {
+                let want_hex = exp[c].as_str().unwrap_or_else(|| {
+                    panic!("case {source}.{name}: missing expected component {c}")
+                });
+                check(
+                    &mut failures,
+                    format!("{source}.{name}.{c}"),
+                    value,
+                    want_hex,
+                );
+                checks += 1;
+            }
         }
     }
 
@@ -373,6 +387,303 @@ fn ionex_map_epochs_are_utc_instants_with_exact_j2000_seconds_view() {
         assert!(
             matches!(epoch.repr, InstantRepr::JulianDate(_)),
             "IONEX epoch should use the split-Julian-date instant representation"
+        );
+    }
+}
+
+fn synthetic_ionex() -> Ionex {
+    let path = fixtures_dir().join("ionex/synthetic_2map_7x7.20i");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    Ionex::parse(&bytes).expect("parse synthetic IONEX product")
+}
+
+fn valid_tec_grid_samples() -> TecGridSamples {
+    TecGridSamples {
+        map_epochs: vec![super::ionex_epoch_from_j2000_seconds(0)],
+        lat_nodes_deg: vec![1.0, 0.0],
+        lon_nodes_deg: vec![0.0, 1.0],
+        dlat_deg: -1.0,
+        dlon_deg: 1.0,
+        shell_height_km: 450.0,
+        base_radius_km: 6371.0,
+        exponent: 0,
+        tec_maps: vec![vec![vec![10.0, 11.0], vec![12.0, 13.0]]],
+        rms_maps: Vec::new(),
+    }
+}
+
+#[test]
+fn ionex_from_samples_rejects_empty() {
+    let err = Ionex::from_samples(TecGridSamples {
+        map_epochs: Vec::new(),
+        lat_nodes_deg: Vec::new(),
+        lon_nodes_deg: Vec::new(),
+        dlat_deg: -1.0,
+        dlon_deg: 1.0,
+        shell_height_km: 450.0,
+        base_radius_km: 6371.0,
+        exponent: 0,
+        tec_maps: Vec::new(),
+        rms_maps: Vec::new(),
+    })
+    .expect_err("empty IONEX samples must fail");
+    assert_eq!(err, TecSamplesError::Empty);
+}
+
+#[test]
+fn ionex_from_samples_rejects_too_few_nodes() {
+    let mut samples = valid_tec_grid_samples();
+    samples.lat_nodes_deg = vec![1.0];
+    samples.tec_maps = vec![vec![vec![10.0, 11.0]]];
+    let err = Ionex::from_samples(samples).expect_err("single latitude node must fail");
+    assert_eq!(err, TecSamplesError::TooFewNodes(1));
+}
+
+#[test]
+fn ionex_from_samples_rejects_non_monotonic_latitudes() {
+    let mut samples = valid_tec_grid_samples();
+    samples.lat_nodes_deg = vec![0.0, 1.0];
+    let err = Ionex::from_samples(samples).expect_err("ascending latitude nodes must fail");
+    assert_eq!(err, TecSamplesError::NonMonotonicLat);
+}
+
+#[test]
+fn ionex_from_samples_rejects_non_monotonic_longitudes() {
+    let mut samples = valid_tec_grid_samples();
+    samples.lon_nodes_deg = vec![1.0, 0.0];
+    let err = Ionex::from_samples(samples).expect_err("descending longitude nodes must fail");
+    assert_eq!(err, TecSamplesError::NonMonotonicLon);
+}
+
+#[test]
+fn ionex_from_samples_rejects_non_monotonic_epochs() {
+    let mut samples = valid_tec_grid_samples();
+    samples.map_epochs = vec![
+        super::ionex_epoch_from_j2000_seconds(10),
+        super::ionex_epoch_from_j2000_seconds(0),
+    ];
+    samples.tec_maps.push(samples.tec_maps[0].clone());
+    let err = Ionex::from_samples(samples).expect_err("descending map epochs must fail");
+    assert_eq!(err, TecSamplesError::NonMonotonicEpochs);
+}
+
+#[test]
+fn ionex_from_samples_rejects_epoch_not_representable() {
+    let mut samples = valid_tec_grid_samples();
+    samples.map_epochs = vec![Instant::from_nanos(TimeScale::Utc, 1)];
+    let err = Ionex::from_samples(samples).expect_err("fractional-second epoch must fail");
+    assert_eq!(err, TecSamplesError::EpochNotRepresentable);
+}
+
+#[test]
+fn ionex_from_samples_rejects_dimension_mismatch() {
+    let mut samples = valid_tec_grid_samples();
+    samples.tec_maps = vec![vec![vec![10.0, 11.0]]];
+    let err = Ionex::from_samples(samples).expect_err("short TEC grid must fail");
+    assert_eq!(err, TecSamplesError::ShapeMismatch);
+}
+
+#[test]
+fn ionex_from_samples_rejects_rms_count_mismatch() {
+    let mut samples = valid_tec_grid_samples();
+    samples.rms_maps = vec![
+        vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+        vec![vec![5.0, 6.0], vec![7.0, 8.0]],
+    ];
+    let err = Ionex::from_samples(samples).expect_err("extra RMS map must fail");
+    assert_eq!(err, TecSamplesError::RmsCountMismatch);
+}
+
+#[test]
+fn ionex_from_samples_rejects_non_finite_values() {
+    let mut samples = valid_tec_grid_samples();
+    samples.tec_maps[0][0][0] = f64::NAN;
+    let err = Ionex::from_samples(samples).expect_err("non-finite TEC value must fail");
+    assert_eq!(err, TecSamplesError::NonFiniteValue);
+}
+
+#[test]
+fn ionex_from_samples_rejects_non_positive_step() {
+    let mut samples = valid_tec_grid_samples();
+    samples.dlon_deg = 0.0;
+    let err = Ionex::from_samples(samples).expect_err("zero longitude step must fail");
+    assert_eq!(err, TecSamplesError::NonPositiveStep);
+}
+
+#[test]
+fn ionex_from_samples_rejects_axis_out_of_range() {
+    let mut samples = valid_tec_grid_samples();
+    samples.lon_nodes_deg = vec![0.0, 361.0];
+    let err = Ionex::from_samples(samples).expect_err("longitude node out of range must fail");
+    assert_eq!(err, TecSamplesError::AxisOutOfRange(361.0));
+}
+
+#[test]
+fn ionex_from_samples_rebuilds_synthetic_ir_byte_identically() {
+    // No real IGS `.YYi` fixture is added in this change. This synthetic
+    // reconstruction plus the golden branch matrix covers the current target;
+    // a future real fixture can add another byte-identical reconstruction guard.
+    let original = synthetic_ionex();
+    let samples = original.tec_grid_samples();
+    assert_eq!(samples.dlat_deg.to_bits(), original.dlat_deg().to_bits());
+    assert_eq!(samples.dlon_deg.to_bits(), original.dlon_deg().to_bits());
+    let rebuilt = Ionex::from_samples(samples).expect("sample-built IONEX");
+    assert_eq!(
+        rebuilt, original,
+        "sample round-trip preserves the IONEX IR"
+    );
+}
+
+#[test]
+fn ionex_from_node_samples_rebuilds_synthetic_ir_byte_identically() {
+    let original = synthetic_ionex();
+    let rebuilt = Ionex::from_node_samples(
+        original.tec_samples(),
+        original.shell_height_km(),
+        original.base_radius_km(),
+        original.exponent(),
+    )
+    .expect("flat node samples rebuild IONEX");
+    assert_eq!(
+        rebuilt, original,
+        "flat node samples preserve the synthetic IONEX IR"
+    );
+}
+
+#[test]
+fn ionex_from_samples_text_round_trip_reparses_to_same_ir() {
+    let original = synthetic_ionex();
+    let sample_built =
+        Ionex::from_samples(original.tec_grid_samples()).expect("sample-built IONEX");
+    let encoded = sample_built.to_ionex_string();
+    let reparsed = Ionex::parse_str(&encoded).expect("serialized sample-built IONEX reparses");
+    assert_eq!(
+        reparsed, sample_built,
+        "serialized sample-built IONEX preserves lattice-aligned VTEC"
+    );
+}
+
+#[test]
+fn ionex_slant_delays_batch_matches_scalar_bits() {
+    let parsed = synthetic_ionex();
+    let sample_built = Ionex::from_samples(parsed.tec_grid_samples()).expect("sample-built IONEX");
+    let f_l1 = crate::frequencies::frequency_hz(
+        crate::GnssSystem::Gps,
+        crate::frequencies::CarrierBand::L1,
+    )
+    .expect("canonical GPS L1 carrier exists");
+    let f_l2 = crate::frequencies::frequency_hz(
+        crate::GnssSystem::Gps,
+        crate::frequencies::CarrierBand::L2,
+    )
+    .expect("canonical GPS L2 carrier exists");
+    let epochs = parsed.map_epochs_s();
+    let requests = vec![
+        IonexSlantRequest {
+            receiver: crate::frame::Wgs84Geodetic::new(
+                30.0_f64.to_radians(),
+                0.0_f64.to_radians(),
+                0.0,
+            )
+            .expect("valid receiver"),
+            elevation_rad: 45.0_f64.to_radians(),
+            azimuth_rad: 90.0_f64.to_radians(),
+            epoch_j2000_s: epochs[0],
+            frequency_hz: f_l1,
+        },
+        IonexSlantRequest {
+            receiver: crate::frame::Wgs84Geodetic::new(
+                -15.0_f64.to_radians(),
+                170.0_f64.to_radians(),
+                250.0,
+            )
+            .expect("valid receiver"),
+            elevation_rad: 20.0_f64.to_radians(),
+            azimuth_rad: 250.0_f64.to_radians(),
+            epoch_j2000_s: (epochs[0] + epochs[1]) / 2,
+            frequency_hz: f_l2,
+        },
+        IonexSlantRequest {
+            receiver: crate::frame::Wgs84Geodetic::new(
+                55.0_f64.to_radians(),
+                -175.0_f64.to_radians(),
+                10.0,
+            )
+            .expect("valid receiver"),
+            elevation_rad: 75.0_f64.to_radians(),
+            azimuth_rad: 15.0_f64.to_radians(),
+            epoch_j2000_s: epochs[1] + 900,
+            frequency_hz: f_l1,
+        },
+    ];
+
+    for product in [&parsed, &sample_built] {
+        let mut out = vec![f64::NAN; requests.len()];
+        ionex_slant_delays(product, &requests, &mut out).expect("valid batch");
+        for (request, got) in requests.iter().zip(out) {
+            let scalar = super::ionex_slant_delay(
+                product,
+                request.receiver,
+                request.elevation_rad,
+                request.azimuth_rad,
+                request.epoch_j2000_s,
+                request.frequency_hz,
+            )
+            .expect("valid scalar");
+            assert_eq!(
+                got.to_bits(),
+                scalar.to_bits(),
+                "batch and scalar IONEX slant delay must match bit-for-bit"
+            );
+        }
+    }
+
+    let mut short = vec![0.0; requests.len() - 1];
+    let err = ionex_slant_delays(&parsed, &requests, &mut short)
+        .expect_err("short output slice must fail");
+    assert!(
+        matches!(err, crate::error::Error::InvalidInput(_)),
+        "length mismatch should be InvalidInput, got {err:?}"
+    );
+
+    for bad_request in [
+        IonexSlantRequest {
+            receiver: crate::frame::Wgs84Geodetic {
+                lat_rad: f64::NAN,
+                lon_rad: 0.0,
+                height_m: 0.0,
+            },
+            ..requests[0]
+        },
+        IonexSlantRequest {
+            elevation_rad: -1.0e-6,
+            ..requests[0]
+        },
+        IonexSlantRequest {
+            azimuth_rad: f64::INFINITY,
+            ..requests[0]
+        },
+        IonexSlantRequest {
+            frequency_hz: 0.0,
+            ..requests[0]
+        },
+    ] {
+        let scalar_err = super::ionex_slant_delay(
+            &parsed,
+            bad_request.receiver,
+            bad_request.elevation_rad,
+            bad_request.azimuth_rad,
+            bad_request.epoch_j2000_s,
+            bad_request.frequency_hz,
+        )
+        .expect_err("bad scalar request must fail");
+        let mut out = [0.0];
+        let batch_err = ionex_slant_delays(&parsed, &[bad_request], &mut out)
+            .expect_err("bad batch request must fail");
+        assert_eq!(
+            format!("{batch_err:?}"),
+            format!("{scalar_err:?}"),
+            "batch validation error must match scalar validation error"
         );
     }
 }

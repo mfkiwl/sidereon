@@ -270,6 +270,7 @@ pub(crate) struct PierceLineOfSight {
 /// instant time axis and the latitude/longitude node arrays with their
 /// signed steps. Bundles the six grid quantities the bilinear/temporal
 /// interpolation reads so the entry point takes one grid argument.
+#[derive(Clone, Copy)]
 pub(crate) struct VtecGridView<'a> {
     pub map_epochs: &'a [Instant],
     pub maps: &'a [Vec<Vec<f64>>],
