@@ -62,6 +62,21 @@ pub struct Ionex {
     skipped_records: usize,
 }
 
+/// Fully materialized IONEX grid fields before invariant checks.
+pub(crate) struct IonexParts {
+    pub(crate) lat_nodes_deg: Vec<f64>,
+    pub(crate) lon_nodes_deg: Vec<f64>,
+    pub(crate) dlat_deg: f64,
+    pub(crate) dlon_deg: f64,
+    pub(crate) shell_height_km: f64,
+    pub(crate) base_radius_km: f64,
+    pub(crate) exponent: i32,
+    pub(crate) map_epochs: Vec<Instant>,
+    pub(crate) tec_maps: Vec<Vec<Vec<f64>>>,
+    pub(crate) rms_maps: Vec<Vec<Vec<f64>>>,
+    pub(crate) skipped_records: usize,
+}
+
 impl Ionex {
     /// Latitude node values in degrees (descending, north-to-south).
     pub fn lat_nodes_deg(&self) -> &[f64] {
@@ -158,6 +173,49 @@ impl Ionex {
             *epoch = ionex_epoch_from_j2000_seconds(target);
         }
         Ok(shifted)
+    }
+
+    /// Build an IONEX product from materialized grid fields.
+    pub(crate) fn from_parts(parts: IonexParts) -> Result<Self> {
+        let IonexParts {
+            lat_nodes_deg,
+            lon_nodes_deg,
+            dlat_deg,
+            dlon_deg,
+            shell_height_km,
+            base_radius_km,
+            exponent,
+            map_epochs,
+            tec_maps,
+            rms_maps,
+            skipped_records,
+        } = parts;
+
+        validate_ionex_parts(
+            &lat_nodes_deg,
+            &lon_nodes_deg,
+            dlat_deg,
+            dlon_deg,
+            shell_height_km,
+            base_radius_km,
+            &map_epochs,
+            &tec_maps,
+            &rms_maps,
+        )?;
+
+        Ok(Self {
+            lat_nodes_deg,
+            lon_nodes_deg,
+            dlat_deg,
+            dlon_deg,
+            shell_height_km,
+            base_radius_km,
+            exponent,
+            map_epochs,
+            tec_maps,
+            rms_maps,
+            skipped_records,
+        })
     }
 
     /// Parse an IONEX product from its bytes.
@@ -338,27 +396,7 @@ impl Ionex {
             )));
         }
 
-        if tec_maps.is_empty() {
-            return Err(Error::Parse("IONEX has no TEC maps".into()));
-        }
-        // Bilinear interpolation brackets a cell with `node[i+1]` / `node[j+1]`,
-        // so each axis needs at least two nodes. Reject a degenerate grid here
-        // rather than letting evaluation index past the end.
-        if lat_nodes_deg.len() < 2 || lon_nodes_deg.len() < 2 {
-            return Err(Error::Parse(format!(
-                "IONEX grid needs >= 2 nodes per axis (got {} lat, {} lon)",
-                lat_nodes_deg.len(),
-                lon_nodes_deg.len()
-            )));
-        }
-        if !rms_maps.is_empty() && rms_maps.len() != tec_maps.len() {
-            return Err(Error::Parse(
-                "IONEX RMS map count does not match TEC map count".into(),
-            ));
-        }
-        validate_map_epochs_strictly_increasing(&map_epochs)?;
-
-        Ok(Self {
+        Self::from_parts(IonexParts {
             lat_nodes_deg,
             lon_nodes_deg,
             dlat_deg: dlat,
@@ -374,7 +412,7 @@ impl Ionex {
     }
 }
 
-fn validate_map_epochs_strictly_increasing(map_epochs: &[Instant]) -> Result<()> {
+pub(crate) fn validate_map_epochs_strictly_increasing(map_epochs: &[Instant]) -> Result<()> {
     let mut previous_s = None;
     for (index, &epoch) in map_epochs.iter().enumerate() {
         let seconds = j2000_seconds_from_instant(epoch).ok_or_else(|| {
@@ -388,6 +426,156 @@ fn validate_map_epochs_strictly_increasing(map_epochs: &[Instant]) -> Result<()>
             ));
         }
         previous_s = Some(seconds);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_ionex_parts(
+    lat_nodes_deg: &[f64],
+    lon_nodes_deg: &[f64],
+    dlat_deg: f64,
+    dlon_deg: f64,
+    shell_height_km: f64,
+    base_radius_km: f64,
+    map_epochs: &[Instant],
+    tec_maps: &[Vec<Vec<f64>>],
+    rms_maps: &[Vec<Vec<f64>>],
+) -> Result<()> {
+    if tec_maps.is_empty() {
+        return Err(Error::Parse("IONEX has no TEC maps".into()));
+    }
+    if map_epochs.len() != tec_maps.len() {
+        return Err(Error::Parse(format!(
+            "IONEX has {} TEC maps but {} map epochs",
+            tec_maps.len(),
+            map_epochs.len()
+        )));
+    }
+    // Bilinear interpolation brackets a cell with `node[i+1]` / `node[j+1]`,
+    // so each axis needs at least two nodes. Reject a degenerate grid here
+    // rather than letting evaluation index past the end.
+    if lat_nodes_deg.len() < 2 || lon_nodes_deg.len() < 2 {
+        return Err(Error::Parse(format!(
+            "IONEX grid needs >= 2 nodes per axis (got {} lat, {} lon)",
+            lat_nodes_deg.len(),
+            lon_nodes_deg.len()
+        )));
+    }
+
+    validate_axis_degree(dlat_deg, "IONEX latitude step")?;
+    validate_axis_degree(dlon_deg, "IONEX longitude step")?;
+    if dlat_deg >= 0.0 {
+        return Err(Error::Parse(
+            "IONEX latitude step must be negative for descending latitude nodes".into(),
+        ));
+    }
+    if dlon_deg <= 0.0 {
+        return Err(Error::Parse(
+            "IONEX longitude step must be positive for ascending longitude nodes".into(),
+        ));
+    }
+    validate::finite(shell_height_km, "IONEX shell height").map_err(map_axis_field_error)?;
+    validate::finite(base_radius_km, "IONEX base radius").map_err(map_axis_field_error)?;
+
+    validate_axis_nodes(lat_nodes_deg, "latitude")?;
+    validate_axis_nodes(lon_nodes_deg, "longitude")?;
+    if lat_nodes_deg.windows(2).any(|w| w[1] >= w[0]) {
+        return Err(Error::Parse(
+            "IONEX latitude nodes must be strictly descending".into(),
+        ));
+    }
+    if lon_nodes_deg.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(Error::Parse(
+            "IONEX longitude nodes must be strictly ascending".into(),
+        ));
+    }
+
+    validate_map_epochs_strictly_increasing(map_epochs)?;
+    validate_map_dimensions(
+        "TEC",
+        tec_maps,
+        map_epochs.len(),
+        lat_nodes_deg.len(),
+        lon_nodes_deg.len(),
+    )?;
+    validate_map_values("TEC", tec_maps)?;
+    if !rms_maps.is_empty() {
+        if rms_maps.len() != tec_maps.len() {
+            return Err(Error::Parse(
+                "IONEX RMS map count does not match TEC map count".into(),
+            ));
+        }
+        validate_map_dimensions(
+            "RMS",
+            rms_maps,
+            map_epochs.len(),
+            lat_nodes_deg.len(),
+            lon_nodes_deg.len(),
+        )?;
+        validate_map_values("RMS", rms_maps)?;
+    }
+    Ok(())
+}
+
+fn validate_axis_nodes(nodes: &[f64], axis: &'static str) -> Result<()> {
+    for (index, &node) in nodes.iter().enumerate() {
+        validate_axis_degree(
+            node,
+            if index == 0 {
+                "IONEX grid axis"
+            } else {
+                "IONEX grid axis[]"
+            },
+        )
+        .map_err(|error| Error::Parse(format!("IONEX {axis} node {index} invalid: {error}")))?;
+    }
+    Ok(())
+}
+
+fn validate_map_dimensions(
+    kind: &'static str,
+    maps: &[Vec<Vec<f64>>],
+    expected_maps: usize,
+    expected_lat: usize,
+    expected_lon: usize,
+) -> Result<()> {
+    if maps.len() != expected_maps {
+        return Err(Error::Parse(format!(
+            "IONEX {kind} map count is {}, expected {expected_maps}",
+            maps.len()
+        )));
+    }
+    for (map_index, map) in maps.iter().enumerate() {
+        if map.len() != expected_lat {
+            return Err(Error::Parse(format!(
+                "IONEX {kind} map {map_index} has {} latitude bands, expected {expected_lat}",
+                map.len()
+            )));
+        }
+        for (lat_index, row) in map.iter().enumerate() {
+            if row.len() != expected_lon {
+                return Err(Error::Parse(format!(
+                    "IONEX {kind} map {map_index} latitude band {lat_index} has {} values, expected {expected_lon}",
+                    row.len()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_map_values(kind: &'static str, maps: &[Vec<Vec<f64>>]) -> Result<()> {
+    for (map_index, map) in maps.iter().enumerate() {
+        for (lat_index, row) in map.iter().enumerate() {
+            for (lon_index, &value) in row.iter().enumerate() {
+                validate::finite(value, "IONEX grid value").map_err(|error| {
+                    Error::Parse(format!(
+                        "IONEX {kind} map {map_index} value [{lat_index}][{lon_index}] invalid: {error}"
+                    ))
+                })?;
+            }
+        }
     }
     Ok(())
 }

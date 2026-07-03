@@ -4,10 +4,11 @@
 pub mod ionosphere {
     pub use crate::ionex::{
         galileo_effective_ionisation_level, galileo_nequick_g_native, ionex_slant_delay,
-        ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m, nequick_g_stec_tecu,
-        regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs, GalileoNequickEval,
-        Ionex, IonoModel, KlobucharParams, NequickGRayEval, TecGrid, TecGridEpoch,
-        TecGridEvalOptions, TecGridShellGeometry,
+        ionex_slant_delays, ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m,
+        nequick_g_stec_tecu, regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs,
+        GalileoNequickEval, Ionex, IonexSlantRequest, IonoModel, KlobucharParams, NequickGRayEval,
+        TecGrid, TecGridEpoch, TecGridEvalOptions, TecGridSamples, TecGridShellGeometry, TecSample,
+        TecSamplesError,
     };
     pub use crate::rinex_nav::{IonoCorrections, KlobucharAlphaBeta};
 
@@ -26,10 +27,11 @@ pub mod troposphere {
 
 pub use ionosphere::{
     galileo_effective_ionisation_level, galileo_nequick_g_native, ionex_slant_delay,
-    ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m, nequick_g_stec_tecu,
-    regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs, GalileoNequickEval, Ionex,
-    IonexGrid, IonoModel, KlobucharParams, NequickGRayEval, TecGrid, TecGridEpoch,
-    TecGridEvalOptions, TecGridShellGeometry,
+    ionex_slant_delays, ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m,
+    nequick_g_stec_tecu, regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs,
+    GalileoNequickEval, Ionex, IonexGrid, IonexSlantRequest, IonoModel, KlobucharParams,
+    NequickGRayEval, TecGrid, TecGridEpoch, TecGridEvalOptions, TecGridSamples,
+    TecGridShellGeometry, TecSample, TecSamplesError,
 };
 pub use troposphere::{
     tropo_mapping, tropo_slant, tropo_zenith, tropo_zwd_delay_xyz, zwd_zenith_wet_delay,
