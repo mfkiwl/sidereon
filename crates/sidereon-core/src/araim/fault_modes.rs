@@ -61,6 +61,7 @@ pub(crate) fn enumerate_fault_modes_checked(
         let model = ism.effective_for(row)?;
         sat_priors.push((row.id, model.p_sat));
     }
+    let satellite_order_mass = satellite_order_masses(&sat_priors);
 
     if allocation.max_fault_order >= 1 {
         for &(id, prior) in &sat_priors {
@@ -101,10 +102,11 @@ pub(crate) fn enumerate_fault_modes_checked(
         }
     }
 
-    if allocation.max_fault_order >= 2 {
+    let max_sat_order = sat_priors.len();
+    let max_enumerated_sat_order = allocation.max_fault_order.min(max_sat_order);
+    if max_enumerated_sat_order >= 2 {
         let mut candidates = Vec::new();
-        let max_order = allocation.max_fault_order.min(sat_priors.len());
-        for order in 2..=max_order {
+        for order in 2..=max_enumerated_sat_order {
             collect_satellite_combinations(
                 &sat_priors,
                 order,
@@ -129,9 +131,23 @@ pub(crate) fn enumerate_fault_modes_checked(
             });
         }
         p_unenumerated += remaining;
+        p_unenumerated += satellite_order_mass
+            .iter()
+            .skip(max_enumerated_sat_order + 1)
+            .sum::<f64>();
+    } else {
+        p_unenumerated += satellite_order_mass.iter().skip(2).sum::<f64>();
     }
 
+    let monitored_fault_mass: f64 = modes.iter().skip(1).map(|mode| mode.prior).sum();
+    let total_fault_mass = monitored_fault_mass + p_unenumerated;
+    if !total_fault_mass.is_finite() || total_fault_mass > 1.0 + 1.0e-12 {
+        return Err(AraimError::InvalidIsm);
+    }
+    modes[0].prior = (1.0 - total_fault_mass).max(0.0);
+
     debug_assert!(p_unenumerated >= 0.0);
+    debug_assert!((monitored_fault_mass + p_unenumerated + modes[0].prior - 1.0).abs() <= 1.0e-10);
     Ok(FaultEnumeration {
         modes,
         p_unenumerated,
@@ -142,6 +158,17 @@ pub(crate) fn enumerate_fault_modes_checked(
 struct Candidate {
     ids: Vec<GnssSatelliteId>,
     prior: f64,
+}
+
+fn satellite_order_masses(sat_priors: &[(GnssSatelliteId, f64)]) -> Vec<f64> {
+    let mut masses = vec![0.0; sat_priors.len() + 1];
+    masses[0] = 1.0;
+    for (seen, &(_, prior)) in sat_priors.iter().enumerate() {
+        for order in (1..=seen + 1).rev() {
+            masses[order] += masses[order - 1] * prior;
+        }
+    }
+    masses
 }
 
 fn collect_satellite_combinations(

@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use super::fault_modes::{enumerate_fault_modes_checked, FaultHypothesis};
 use super::ism::Ism;
 use super::protection::{
-    gain_matrix_enu, k_false_alert, metric_bias, metric_sigma, separation_sigma,
-    solve_protection_level, ProtectionEquationTerm,
+    gain_matrix_enu, gain_matrix_enu_for_clock_systems, k_false_alert, metric_bias, metric_sigma,
+    separation_sigma, solve_protection_level, ProtectionEquationTerm, ProtectionLevelSolution,
 };
-use super::{validate_probability, AraimError, AraimGeometry, IntegrityAllocation};
+use super::{
+    clock_system_for_row, validate_probability, AraimError, AraimGeometry, IntegrityAllocation,
+};
 use crate::id::{GnssSatelliteId, GnssSystem};
 
 /// Per-hypothesis ARAIM monitor data.
@@ -106,9 +108,10 @@ pub fn araim(
         } else {
             let weights_int_k = zeroed_weights(geometry, &weights_int, hypothesis);
             let weights_acc_k = zeroed_weights(geometry, &weights_acc, hypothesis);
+            let clock_systems_k = active_clock_systems(geometry, hypothesis);
             match (
-                gain_matrix_enu(geometry, &weights_int_k),
-                gain_matrix_enu(geometry, &weights_acc_k),
+                gain_matrix_enu_for_clock_systems(geometry, &weights_int_k, &clock_systems_k),
+                gain_matrix_enu_for_clock_systems(geometry, &weights_acc_k, &clock_systems_k),
             ) {
                 (Ok(gain_int), Ok(gain_acc)) => compute_monitorable_mode(
                     hypothesis,
@@ -138,21 +141,28 @@ pub fn araim(
     let pl_e = solve_coord_pl(&fault_modes, 0, allocation.phmi_hor)?;
     let pl_n = solve_coord_pl(&fault_modes, 1, allocation.phmi_hor)?;
     let pl_u = solve_coord_pl(&fault_modes, 2, allocation.phmi_vert)?;
+    let roots_converged = pl_e.converged && pl_n.converged && pl_u.converged;
     let emt_m = fault_modes
         .iter()
         .filter(|mode| mode.monitorable)
         .flat_map(|mode| mode.threshold_enu_m)
         .fold(0.0_f64, f64::max);
+    let fault_free_full_rank = fault_modes
+        .first()
+        .map(|mode| mode.monitorable)
+        .unwrap_or(false);
 
     Ok(AraimResult {
-        hpl_m: (pl_e * pl_e + pl_n * pl_n).sqrt(),
-        vpl_m: pl_u,
+        hpl_m: (pl_e.value_m * pl_e.value_m + pl_n.value_m * pl_n.value_m).sqrt(),
+        vpl_m: pl_u.value_m,
         sigma_acc_h_m: (sigma_acc_e * sigma_acc_e + sigma_acc_n * sigma_acc_n).sqrt(),
         sigma_acc_v_m: sigma_acc_u,
         emt_m,
         fault_modes,
         p_unmonitored,
-        availability: true,
+        availability: fault_free_full_rank
+            && p_unmonitored <= allocation.p_threshold_unmonitored
+            && roots_converged,
     })
 }
 
@@ -223,7 +233,25 @@ fn zeroed_weights(
         .collect()
 }
 
-fn solve_coord_pl(modes: &[FaultMode], coord: usize, phmi: f64) -> Result<f64, AraimError> {
+fn active_clock_systems(geometry: &AraimGeometry, hypothesis: &FaultHypothesis) -> Vec<GnssSystem> {
+    geometry
+        .clock_systems
+        .iter()
+        .copied()
+        .filter(|&clock_system| {
+            geometry.rows.iter().any(|row| {
+                !hypothesis.excludes_satellite(row.id, row.system)
+                    && clock_system_for_row(row.system) == clock_system
+            })
+        })
+        .collect()
+}
+
+fn solve_coord_pl(
+    modes: &[FaultMode],
+    coord: usize,
+    phmi: f64,
+) -> Result<ProtectionLevelSolution, AraimError> {
     let fault_free = modes.first().ok_or(AraimError::NumericalFailure)?;
     if !fault_free.monitorable {
         return Err(AraimError::InsufficientGeometry);

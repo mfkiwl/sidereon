@@ -16,7 +16,8 @@ pub use fault_modes::{enumerate_fault_modes, FaultHypothesis};
 pub use ism::{ConstellationIsm, Ism, SatelliteIsm, SatelliteIsmModel};
 pub use mhss::{araim, AraimResult, FaultMode};
 
-use crate::dop::LineOfSight;
+use crate::astro::frames::transforms::geodetic_from_ecef_proj;
+use crate::dop::{ecef_to_enu_rotation, LineOfSight};
 use crate::frame::Wgs84Geodetic;
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::spp::{EphemerisSource, ReceiverSolution};
@@ -48,18 +49,94 @@ pub struct AraimGeometry {
 impl AraimGeometry {
     /// Build ARAIM geometry from an SPP solution.
     ///
-    /// The current SPP solution type does not retain receive epoch or measured
-    /// pseudoranges, so this adapter cannot reconstruct transmit-time satellite
-    /// positions without adding inputs that are outside this signature. Callers
-    /// should pass explicit [`AraimRow`] values through [`AraimGeometry`] until
-    /// the solve record carries the required epoch data.
+    /// The SPP solution carries the final receiver state and used satellite IDs.
+    /// This adapter queries `eph` at its zero epoch because the solution does not
+    /// retain the original receive epoch. Ephemeris sources used here should make
+    /// that epoch meaningful for the snapshot being converted.
     pub fn from_receiver_solution(
         solution: &ReceiverSolution,
         eph: &dyn EphemerisSource,
     ) -> Result<Self, AraimError> {
-        let _ = (solution, eph);
-        Err(AraimError::InsufficientGeometry)
+        let receiver = match solution.geodetic {
+            Some(receiver) => receiver,
+            None => geodetic_from_position(solution.position.as_array())?,
+        };
+        let clock_systems = receiver_solution_clock_systems(solution)?;
+        if solution.used_sats.len() < 3 + clock_systems.len() {
+            return Err(AraimError::InsufficientGeometry);
+        }
+
+        let rx_ecef_m = solution.position.as_array();
+        let enu = ecef_to_enu_rotation(receiver.lat_rad, receiver.lon_rad);
+        let mut rows = Vec::with_capacity(solution.used_sats.len());
+        for &id in &solution.used_sats {
+            let (sat_ecef_m, _) = eph
+                .position_clock_at_j2000_s(id, 0.0)
+                .ok_or(AraimError::InsufficientGeometry)?;
+            let dx = sat_ecef_m[0] - rx_ecef_m[0];
+            let dy = sat_ecef_m[1] - rx_ecef_m[1];
+            let dz = sat_ecef_m[2] - rx_ecef_m[2];
+            let range_m = (dx * dx + dy * dy + dz * dz).sqrt();
+            if !range_m.is_finite() || range_m <= 0.0 {
+                return Err(AraimError::InsufficientGeometry);
+            }
+
+            let line_of_sight = LineOfSight::new(dx / range_m, dy / range_m, dz / range_m);
+            let up = enu[2][0] * line_of_sight.e_x
+                + enu[2][1] * line_of_sight.e_y
+                + enu[2][2] * line_of_sight.e_z;
+            let elevation_rad = up.clamp(-1.0, 1.0).asin();
+            if !elevation_rad.is_finite() {
+                return Err(AraimError::InsufficientGeometry);
+            }
+
+            rows.push(AraimRow {
+                id,
+                line_of_sight,
+                system: id.system,
+                elevation_rad,
+            });
+        }
+
+        Ok(Self {
+            rows,
+            receiver,
+            clock_systems,
+        })
     }
+}
+
+fn geodetic_from_position(position_m: [f64; 3]) -> Result<Wgs84Geodetic, AraimError> {
+    let [lon_deg, lat_deg, height_m] =
+        geodetic_from_ecef_proj(position_m[0], position_m[1], position_m[2])
+            .map_err(|_| AraimError::InsufficientGeometry)?;
+    Wgs84Geodetic::new(lat_deg.to_radians(), lon_deg.to_radians(), height_m)
+        .map_err(|_| AraimError::InsufficientGeometry)
+}
+
+fn receiver_solution_clock_systems(
+    solution: &ReceiverSolution,
+) -> Result<Vec<GnssSystem>, AraimError> {
+    let clock_systems = if !solution.system_clocks_s.is_empty() {
+        solution
+            .system_clocks_s
+            .iter()
+            .map(|&(system, _)| system)
+            .collect()
+    } else if !solution.metadata.systems.is_empty() {
+        solution.metadata.systems.clone()
+    } else {
+        crate::spp::clock_systems(&solution.used_sats)
+    };
+    if clock_systems.is_empty() {
+        return Err(AraimError::InsufficientGeometry);
+    }
+    for (idx, system) in clock_systems.iter().enumerate() {
+        if clock_systems[..idx].contains(system) {
+            return Err(AraimError::InsufficientGeometry);
+        }
+    }
+    Ok(clock_systems)
 }
 
 /// Integrity and continuity risk allocation for one ARAIM solve.

@@ -1,6 +1,7 @@
 use crate::astro::math::linear::invert_symmetric_pd;
 use crate::astro::math::special::{normal_q, normal_q_inv};
 use crate::dop::ecef_to_enu_rotation;
+use crate::id::GnssSystem;
 
 use super::{clock_system_for_row, validate_probability, AraimError, AraimGeometry};
 
@@ -33,15 +34,29 @@ pub(crate) struct ProtectionEquationTerm {
     pub threshold_m: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ProtectionLevelSolution {
+    pub value_m: f64,
+    pub converged: bool,
+}
+
 pub(crate) fn gain_matrix_enu(
     geometry: &AraimGeometry,
     weights: &[f64],
 ) -> Result<GainMatrix, AraimError> {
-    if weights.len() != geometry.rows.len() || geometry.clock_systems.is_empty() {
+    gain_matrix_enu_for_clock_systems(geometry, weights, &geometry.clock_systems)
+}
+
+pub(crate) fn gain_matrix_enu_for_clock_systems(
+    geometry: &AraimGeometry,
+    weights: &[f64],
+    clock_systems: &[GnssSystem],
+) -> Result<GainMatrix, AraimError> {
+    if weights.len() != geometry.rows.len() || clock_systems.is_empty() {
         return Err(AraimError::InsufficientGeometry);
     }
-    let n_state = 3 + geometry.clock_systems.len();
-    if geometry.rows.len() < n_state {
+    let n_state = 3 + clock_systems.len();
+    if weights.iter().filter(|&&weight| weight > 0.0).count() < n_state {
         return Err(AraimError::InsufficientGeometry);
     }
 
@@ -51,7 +66,11 @@ pub(crate) fn gain_matrix_enu(
         if !weight.is_finite() || weight < 0.0 {
             return Err(AraimError::NumericalFailure);
         }
-        let design = design_row(geometry, row)?;
+        let design = if weight > 0.0 {
+            design_row(clock_systems, row)?
+        } else {
+            vec![0.0; n_state]
+        };
         if weight > 0.0 {
             for i in 0..n_state {
                 for j in 0..n_state {
@@ -146,7 +165,7 @@ pub(crate) fn solve_protection_level(
     fault_free: ProtectionEquationTerm,
     fault_terms: &[ProtectionEquationTerm],
     phmi: f64,
-) -> Result<f64, AraimError> {
+) -> Result<ProtectionLevelSolution, AraimError> {
     if !validate_probability(phmi, false) {
         return Err(AraimError::InvalidAllocation);
     }
@@ -157,15 +176,21 @@ pub(crate) fn solve_protection_level(
 
     let target = phmi * 0.5;
     if fault_terms.is_empty() {
-        return Ok(
-            normal_q_inv(target).ok_or(AraimError::InvalidAllocation)? * fault_free.sigma_m
-                + fault_free.bias_m,
-        );
+        let value_m = normal_q_inv(target).ok_or(AraimError::InvalidAllocation)?
+            * fault_free.sigma_m
+            + fault_free.bias_m;
+        return Ok(ProtectionLevelSolution {
+            value_m,
+            converged: true,
+        });
     }
 
     let mut lo = 0.0;
     if protection_lhs(lo, fault_free, fault_terms) <= target {
-        return Ok(0.0);
+        return Ok(ProtectionLevelSolution {
+            value_m: 0.0,
+            converged: true,
+        });
     }
 
     let mut hi = normal_q_inv(target).ok_or(AraimError::InvalidAllocation)? * fault_free.sigma_m
@@ -182,6 +207,7 @@ pub(crate) fn solve_protection_level(
         }
     }
 
+    let mut converged = false;
     for _ in 0..80 {
         let mid = 0.5 * (lo + hi);
         if protection_lhs(mid, fault_free, fault_terms) > target {
@@ -190,10 +216,14 @@ pub(crate) fn solve_protection_level(
             hi = mid;
         }
         if hi - lo <= 1.0e-4 {
+            converged = true;
             break;
         }
     }
-    Ok(hi)
+    Ok(ProtectionLevelSolution {
+        value_m: hi,
+        converged,
+    })
 }
 
 fn protection_lhs(
@@ -224,8 +254,8 @@ fn validate_term(term: ProtectionEquationTerm) -> Result<(), AraimError> {
     }
 }
 
-fn design_row(geometry: &AraimGeometry, row: &super::AraimRow) -> Result<Vec<f64>, AraimError> {
-    let mut design = vec![0.0_f64; 3 + geometry.clock_systems.len()];
+fn design_row(clock_systems: &[GnssSystem], row: &super::AraimRow) -> Result<Vec<f64>, AraimError> {
+    let mut design = vec![0.0_f64; 3 + clock_systems.len()];
     let los = row.line_of_sight;
     if !los.e_x.is_finite()
         || !los.e_y.is_finite()
@@ -238,8 +268,7 @@ fn design_row(geometry: &AraimGeometry, row: &super::AraimRow) -> Result<Vec<f64
     design[1] = -los.e_y;
     design[2] = -los.e_z;
     let clock_system = clock_system_for_row(row.system);
-    let clock_idx = geometry
-        .clock_systems
+    let clock_idx = clock_systems
         .iter()
         .position(|&system| system == clock_system)
         .ok_or(AraimError::InsufficientGeometry)?;
