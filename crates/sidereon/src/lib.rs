@@ -1578,11 +1578,21 @@ mod tests {
                 <= 1.0e-9
         );
         let sep = astro::angles::angular_separation_coords(
-            (200.98141866666666, 54.925_351_972_222_22),
-            (201.306_407_638_75, 54.987_959_661_388_89),
+            (101.287155333, -16.716115861),
+            (114.825493028, 5.224993306),
         )
         .expect("valid angular separation");
-        assert!((sep - 0.19682972435842).abs() <= 1.0e-9);
+        assert!((sep - 25.7013646403623).abs() <= 1.0e-9);
+        let pa = astro::angles::position_angle(
+            (101.287155333, -16.716115861),
+            (114.825493028, 5.224993306),
+        )
+        .expect("valid position angle");
+        let pa_diff = {
+            let diff = (pa - 32.51673660099302).abs();
+            diff.min(360.0 - diff)
+        };
+        assert!(pa_diff <= 1.0e-9);
         assert!(astro::covariance::symmetric(&[
             [1.0, 0.1, 0.2],
             [0.1, 2.0, 0.3],
