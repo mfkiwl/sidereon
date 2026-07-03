@@ -59,7 +59,20 @@ The Rust interface is the `sidereon` crate above. The other language interfaces 
 
 ## Validation
 
-Numerical routines are tested against committed reference fixtures: SGP4 against the Vallado test vectors, coordinate transforms and ephemerides against pinned Skyfield vectors, the least-squares engine against SciPy, and the GNSS positioning paths against RTKLIB oracle arcs. Many gates are bit-for-bit; the per-crate test suites describe the exact references and tolerances.
+Every numerical routine is cross-checked against the reference implementation or published standard for its domain, not just internal goldens. Each check runs in the test suite against a committed reference fixture whose provenance (tool, version, source) is recorded, and many gates are bit-for-bit.
+
+| Capability | Cross-checked against | Reference |
+|---|---|---|
+| SGP4 / SDP4 propagation | Vallado / CelesTrak verification states | Vallado, Crawford, Hujsak & Kelso, *Revisiting Spacetrack Report #3*, AIAA 2006-6753 |
+| Frames, time, ephemerides (TEME/GCRS/ITRS, IAU 2006/2000A) | Pinned Skyfield vectors (ERFA/SOFA routines under the hood) | IAU SOFA / ERFA |
+| Earth orientation | IERS Earth-orientation parameters | Petit & Luzum (eds.), *IERS Conventions (2010)*, IERS TN 36 |
+| Least-squares engine (TRF) | SciPy `least_squares`, bit-exact | Virtanen et al., *SciPy 1.0*, Nature Methods 17 (2020) |
+| GNSS positioning (SPP / RTK / PPP) | RTKLIB oracle arcs and real IGS precise products | RTKLIB; International GNSS Service (IGS) |
+| Geoid undulation (EGM96 15-arcminute) | PROJ (`us_nga_egm96_15`), to 5 mm | PROJ |
+| RINEX observation QC — multipath (MP1/MP2) | teqc `+qc` on a real captured stream, to sub-micrometer | teqc |
+| RTCM MSM lock-time to RINEX LLI | RTKLIB `convbin` decode of a real MSM stream | RTKLIB |
+
+The per-crate test suites document the exact references, fixtures, and tolerances.
 
 ## License
 
