@@ -2,6 +2,29 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [0.11.1]
+
+### Added
+
+- GNSS observation QC now computes teqc-style multipath (MP1/MP2 RMS) per
+  satellite and per constellation with per-arc moving-average bias removal,
+  matching teqc `+qc` to sub-micrometer on a real captured stream; a
+  receiver clock-jump detector; and an aggregate per-constellation cycle-slip
+  tally over the existing dual-frequency slip detector.
+- QC report renderers: a fixed-width teqc-style text summary, an HTML summary,
+  and JSON serialization of the full `ObservationQcReport`.
+- RINEX 2.x observation-file ingest into the shared canonical observation IR,
+  so RINEX 2 and CRINEX 1.0 archives parse and flow through QC and lint
+  unchanged.
+- Fuzz targets for the space-weather CSV/txt parser, the RINEX QC repair
+  round-trip, and the EGM96 DTED grid parser.
+
+### Changed
+
+- Rust, Python, C, WASM, and Elixir interfaces expose the new QC surface
+  (multipath, clock jumps, cycle-slip tally, and the report renderers)
+  with uniform parity.
+
 ## [0.11.0]
 
 ### Added
@@ -16,9 +39,10 @@ All notable changes to `sidereon-core` are documented here.
   serializers, a CelesTrak data-catalog entry, and a `SpaceWeatherSource`
   hook feeding atmospheric drag and orbital-decay estimation.
 - GNSS observation quality control: per-satellite and per-signal completeness,
-  gap, cycle-slip, multipath, and signal-strength summaries over RINEX
-  observation data, plus a RINEX lint and repair pass with typed finding codes,
-  validated against independent teqc and hand-computed oracles.
+  gap, and signal-strength summaries over RINEX observation data, plus a RINEX
+  lint and repair pass with typed finding codes, cross-checked against an
+  independent extraction oracle on real IGS stations. (Multipath, cycle-slip,
+  and clock-jump metrics land in 0.11.1.)
 - RTCM MSM carrier-phase lock-time indicator to RINEX loss-of-lock indicator
   derivation: DF402 and DF407 lock-time bucket tables, conservative
   decrease detection with same-bucket ambiguity handling, half-cycle ambiguity
