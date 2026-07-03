@@ -16,7 +16,41 @@
 //! byte-aligns a message body before the CRC, so a decode followed by an encode
 //! reproduces the original payload bytes.
 
-use crate::error::{Error, Result};
+use core::fmt;
+
+use crate::error::Error;
+
+/// Internal typed error for exhausting an RTCM message-body bit reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutOfInput {
+    requested_bits: usize,
+    remaining_bits: usize,
+}
+
+impl OutOfInput {
+    fn new(requested_bits: usize, remaining_bits: usize) -> Self {
+        Self {
+            requested_bits,
+            remaining_bits,
+        }
+    }
+}
+
+impl fmt::Display for OutOfInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RTCM body truncated: need {} more bits, {} remain",
+            self.requested_bits, self.remaining_bits
+        )
+    }
+}
+
+impl From<OutOfInput> for Error {
+    fn from(error: OutOfInput) -> Self {
+        Error::Parse(error.to_string())
+    }
+}
 
 /// A forgiving MSB-first reader over a borrowed RTCM message body.
 pub(crate) struct BitReader<'a> {
@@ -36,13 +70,10 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` bits (`n <= 64`) as an unsigned integer, MSB first.
-    pub(crate) fn u(&mut self, n: usize) -> Result<u64> {
+    pub(crate) fn u(&mut self, n: usize) -> std::result::Result<u64, OutOfInput> {
         debug_assert!(n <= 64);
         if self.remaining_bits() < n {
-            return Err(Error::Parse(format!(
-                "RTCM body truncated: need {n} more bits, {} remain",
-                self.remaining_bits()
-            )));
+            return Err(OutOfInput::new(n, self.remaining_bits()));
         }
         let mut acc: u64 = 0;
         for _ in 0..n {
@@ -55,12 +86,12 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a single bit as a boolean flag.
-    pub(crate) fn flag(&mut self) -> Result<bool> {
+    pub(crate) fn flag(&mut self) -> std::result::Result<bool, OutOfInput> {
         Ok(self.u(1)? != 0)
     }
 
     /// Read `n` bits (`n < 64`) as a two's-complement signed integer.
-    pub(crate) fn i(&mut self, n: usize) -> Result<i64> {
+    pub(crate) fn i(&mut self, n: usize) -> std::result::Result<i64, OutOfInput> {
         debug_assert!(n < 64);
         let raw = self.u(n)?;
         let sign_bit = 1u64 << (n - 1);
@@ -74,7 +105,7 @@ impl<'a> BitReader<'a> {
     /// Read `n` bits (`n < 64`) as a sign-and-magnitude signed integer: the
     /// leading bit is the sign (1 = negative), the remaining `n - 1` bits the
     /// magnitude.
-    pub(crate) fn ism(&mut self, n: usize) -> Result<i64> {
+    pub(crate) fn ism(&mut self, n: usize) -> std::result::Result<i64, OutOfInput> {
         debug_assert!((1..64).contains(&n));
         let negative = self.flag()?;
         let magnitude = self.u(n - 1)? as i64;

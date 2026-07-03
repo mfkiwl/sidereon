@@ -152,6 +152,40 @@ pub enum FrameSkipReason {
     Malformed(String),
 }
 
+pub(crate) type DecodeResult<T> = std::result::Result<T, DecodeError>;
+
+#[derive(Debug)]
+pub(crate) enum DecodeError {
+    OutOfInput(bits::OutOfInput),
+    Error(crate::error::Error),
+}
+
+impl From<bits::OutOfInput> for DecodeError {
+    fn from(error: bits::OutOfInput) -> Self {
+        Self::OutOfInput(error)
+    }
+}
+
+impl From<crate::error::Error> for DecodeError {
+    fn from(error: crate::error::Error) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<DecodeError> for crate::error::Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::OutOfInput(error) => error.into(),
+            DecodeError::Error(error) => error,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DecodeFailure {
+    kind: FrameSkipReason,
+}
+
 /// The canonical, format-agnostic RTCM 3 message IR.
 ///
 /// Each variant stores raw transmitted field integers (see the per-type docs),
@@ -182,6 +216,10 @@ pub enum Message {
 ///
 /// Returns [`Error::Parse`] if the body is shorter than 12 bits.
 pub fn message_number(body: &[u8]) -> Result<u16> {
+    message_number_classified(body).map_err(Into::into)
+}
+
+fn message_number_classified(body: &[u8]) -> DecodeResult<u16> {
     let mut r = BitReader::new(body);
     Ok(r.u(12)? as u16)
 }
@@ -194,20 +232,38 @@ impl Message {
     /// to [`Message::Unsupported`]. Errors only on a truncated body of a
     /// recognized type.
     pub fn decode(body: &[u8]) -> Result<Self> {
-        let number = message_number(body)?;
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
+        let number = message_number_classified(body)?;
         let message = match number {
-            1005 | 1006 => Message::StationCoordinates(StationCoordinates::decode(body)?),
-            1007 | 1008 | 1033 => Message::AntennaDescriptor(AntennaDescriptor::decode(body)?),
-            1019 => Message::GpsEphemeris(GpsEphemeris::decode(body)?),
-            1020 => Message::GlonassEphemeris(GlonassEphemeris::decode(body)?),
-            n if msm::is_supported_msm(n) => Message::Msm(MsmMessage::decode(body)?),
-            n if ssr::is_supported_ssr(n) => Message::Ssr(SsrMessage::decode(body)?),
+            1005 | 1006 => Message::StationCoordinates(StationCoordinates::decode_inner(body)?),
+            1007 | 1008 | 1033 => {
+                Message::AntennaDescriptor(AntennaDescriptor::decode_inner(body)?)
+            }
+            1019 => Message::GpsEphemeris(GpsEphemeris::decode_inner(body)?),
+            1020 => Message::GlonassEphemeris(GlonassEphemeris::decode_inner(body)?),
+            n if msm::is_supported_msm(n) => Message::Msm(MsmMessage::decode_inner(body)?),
+            n if ssr::is_supported_ssr(n) => Message::Ssr(SsrMessage::decode_inner(body)?),
             _ => Message::Unsupported(UnsupportedMessage {
                 message_number: number,
                 body: body.to_vec(),
             }),
         };
         Ok(message)
+    }
+
+    fn decode_classified(body: &[u8]) -> std::result::Result<Self, DecodeFailure> {
+        Self::decode_inner(body).map_err(|error| DecodeFailure {
+            kind: match error {
+                DecodeError::OutOfInput(_) => FrameSkipReason::Truncated,
+                DecodeError::Error(crate::error::Error::Parse(message)) => {
+                    FrameSkipReason::Malformed(message)
+                }
+                DecodeError::Error(other) => FrameSkipReason::Malformed(other.to_string()),
+            },
+        })
     }
 
     /// Encode this message back into a body (without the transport frame).
@@ -275,25 +331,27 @@ pub fn decode_stream(bytes: &[u8]) -> RtcmStream {
         pos += rel;
 
         if bytes.len() - pos < FRAME_OVERHEAD {
-            stream.diagnostics.resync_bytes += bytes.len() - pos;
-            break;
+            stream.diagnostics.resync_bytes += 1;
+            pos += 1;
+            continue;
         }
 
         let body_len = ((usize::from(bytes[pos + 1] & 0x03)) << 8) | usize::from(bytes[pos + 2]);
         let frame_len = 3 + body_len + 3;
         if bytes.len() - pos < frame_len {
-            stream.diagnostics.resync_bytes += bytes.len() - pos;
-            break;
+            stream.diagnostics.resync_bytes += 1;
+            pos += 1;
+            continue;
         }
 
         match decode_frame(&bytes[pos..pos + frame_len]) {
             Ok(frame) => {
-                match Message::decode(frame.body) {
+                match Message::decode_classified(frame.body) {
                     Ok(message) => stream.messages.push(message),
-                    Err(error) => stream.diagnostics.skipped_frames.push(FrameSkip {
+                    Err(failure) => stream.diagnostics.skipped_frames.push(FrameSkip {
                         offset: pos,
                         message_number: message_number(frame.body).ok(),
-                        reason: classify_decode_error(error),
+                        reason: failure.kind,
                     }),
                 }
                 pos += frame.frame_len;
@@ -306,19 +364,6 @@ pub fn decode_stream(bytes: &[u8]) -> RtcmStream {
     }
 
     stream
-}
-
-fn classify_decode_error(error: crate::error::Error) -> FrameSkipReason {
-    match error {
-        crate::error::Error::Parse(message)
-            if message.starts_with("RTCM body truncated:")
-                || message.starts_with("RTCM frame truncated:") =>
-        {
-            FrameSkipReason::Truncated
-        }
-        crate::error::Error::Parse(message) => FrameSkipReason::Malformed(message),
-        other => FrameSkipReason::Malformed(other.to_string()),
-    }
 }
 
 /// Owns an RTCM carry buffer for chunked stream decoding.

@@ -887,6 +887,33 @@ fn decode_stream_surfaces_skipped_frames_without_dropping_unsupported_messages()
     assert_eq!(frames.len(), 4);
 }
 
+#[test]
+fn decode_stream_and_frame_scanner_agree_after_overlength_preamble() {
+    let station = Message::StationCoordinates(sample_station(1005, None));
+    let real_frame = station.to_frame().unwrap();
+
+    let mut stream_bytes = vec![PREAMBLE, 0x03, 0xFF, 0xAA, 0xBB];
+    stream_bytes.extend_from_slice(&real_frame);
+
+    let stream = decode_stream(&stream_bytes);
+    assert_eq!(stream.messages, vec![station]);
+
+    let frames: Vec<_> = FrameScanner::new(&stream_bytes).collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].body, decode_frame(&real_frame).unwrap().body);
+    assert_eq!(
+        stream
+            .messages
+            .iter()
+            .map(Message::encode)
+            .collect::<Vec<_>>(),
+        frames
+            .iter()
+            .map(|frame| frame.body.to_vec())
+            .collect::<Vec<_>>()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Public construction + encode path (the binding-facing API)
 //

@@ -16,6 +16,7 @@
 use crate::error::{Error, Result};
 
 use super::bits::{BitReader, BitWriter};
+use super::DecodeResult;
 
 /// A decoded antenna / receiver descriptor message (1007, 1008, or 1033).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,12 +42,17 @@ pub struct AntennaDescriptor {
 impl AntennaDescriptor {
     /// Decode a 1007 / 1008 / 1033 body (without the transport frame).
     pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
         let mut r = BitReader::new(body);
         let message_number = r.u(12)? as u16;
         if !matches!(message_number, 1007 | 1008 | 1033) {
             return Err(Error::Parse(format!(
                 "message {message_number} is not an antenna descriptor 1007/1008/1033"
-            )));
+            ))
+            .into());
         }
         let reference_station_id = r.u(12)? as u16;
         let antenna_descriptor = read_string(&mut r)?;
@@ -98,7 +104,7 @@ impl AntennaDescriptor {
 }
 
 /// Read an 8-bit-counted run of 8-bit characters as a string.
-fn read_string(r: &mut BitReader<'_>) -> Result<String> {
+fn read_string(r: &mut BitReader<'_>) -> DecodeResult<String> {
     let count = r.u(8)? as usize;
     let mut s = String::with_capacity(count);
     for _ in 0..count {

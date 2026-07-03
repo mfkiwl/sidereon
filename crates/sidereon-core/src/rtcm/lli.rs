@@ -393,5 +393,23 @@ mod tests {
             let now = minimum_lock_time_ms(MsmKind::Msm7, indicator).unwrap();
             assert!(now > prev, "DF407 must increase at {indicator}");
         }
+
+        let segment_starts = [
+            64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 480, 512, 544, 576, 608,
+            640, 672, 704,
+        ];
+        for start in segment_starts {
+            let previous_step = if start == 64 {
+                1
+            } else {
+                1u32 << ((start - 64) / 32)
+            };
+            let joined = minimum_lock_time_ms(MsmKind::Msm7, start - 1).unwrap() + previous_step;
+            assert_eq!(
+                minimum_lock_time_ms(MsmKind::Msm7, start).unwrap(),
+                joined,
+                "DF407 segment join at {start}"
+            );
+        }
     }
 }

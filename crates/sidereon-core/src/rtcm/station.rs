@@ -14,6 +14,7 @@
 use crate::error::{Error, Result};
 
 use super::bits::{BitReader, BitWriter};
+use super::DecodeResult;
 
 /// ECEF reference-point scale: each integer step is 0.0001 m.
 const ECEF_SCALE_M: f64 = 0.0001;
@@ -75,12 +76,17 @@ impl StationCoordinates {
 
     /// Decode a 1005 / 1006 body (without the transport frame).
     pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
         let mut r = BitReader::new(body);
         let message_number = r.u(12)? as u16;
         if message_number != 1005 && message_number != 1006 {
             return Err(Error::Parse(format!(
                 "message {message_number} is not station coordinates 1005/1006"
-            )));
+            ))
+            .into());
         }
         let reference_station_id = r.u(12)? as u16;
         let itrf_realization_year = r.u(6)? as u8;
