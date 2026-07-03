@@ -76,7 +76,7 @@ impl FindingRef {
 pub enum Finding {
     /// OBS parse failed before a parsed product existed.
     ObsFatalParse { at: FindingRef, message: String },
-    /// OBS version is not one of the published 3.0x/4.0x versions covered here.
+    /// OBS version is not one of the published versions covered here.
     ObsUnpublishedVersion { at: FindingRef, version: f64 },
     /// A mandatory OBS header retained by the current product is absent.
     ObsMissingHeader { at: FindingRef, label: &'static str },
@@ -875,7 +875,7 @@ pub fn lint_obs_text(text: &str) -> LintReport {
 }
 
 fn classify_obs_parse_error(message: &str) -> Finding {
-    if message.contains("no SYS / # / OBS TYPES") {
+    if message.contains("no SYS / # / OBS TYPES") || message.contains("no # / TYPES OF OBSERV") {
         Finding::ObsMissingObsTypes {
             at: FindingRef::field("SYS / # / OBS TYPES"),
         }
@@ -1956,7 +1956,11 @@ fn repair_nav_order(records: &mut [BroadcastRecord], actions: &mut Vec<RepairAct
 
 fn published_obs_version(version: f64) -> Option<()> {
     let scaled = (version * 100.0).round() as i64;
-    matches!(scaled, 300 | 301 | 302 | 303 | 304 | 305 | 400 | 401 | 402).then_some(())
+    matches!(
+        scaled,
+        200 | 201 | 202 | 210 | 211 | 212 | 300 | 301 | 302 | 303 | 304 | 305 | 400 | 401 | 402
+    )
+    .then_some(())
 }
 
 fn is_valid_obs_code(system: GnssSystem, code: &str, version: f64) -> bool {

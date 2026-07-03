@@ -1,8 +1,8 @@
-//! RINEX 3.0x/4.0x observation-file parser and single-frequency pseudorange
+//! RINEX 2.0x/3.0x/4.0x observation-file parser and single-frequency pseudorange
 //! extraction.
 //!
-//! Parses a RINEX **version 3 or 4** observation file (`OBSERVATION DATA`) into a
-//! typed [`RinexObs`] product: the header (including the surveyed
+//! Parses a RINEX observation file (`OBSERVATION DATA`) into a typed
+//! [`RinexObs`] product: the header (including the surveyed
 //! [`ObsHeader::approx_position_m`] a-priori receiver position and optional
 //! [`ObsHeader::antenna_delta_hen_m`] antenna offset), the per-constellation
 //! observation-code table, and the per-epoch
@@ -24,7 +24,7 @@
 //! # Layout (RINEX 3)
 //!
 //! - Header records are `cols 0..60` content + `cols 60..80` label. The
-//!   load-bearing ones are `RINEX VERSION / TYPE` (must be observation, major 3),
+//!   load-bearing ones are `RINEX VERSION / TYPE` (must be observation),
 //!   `APPROX POSITION XYZ`, `ANTENNA: DELTA H/E/N`, `SYS / # / OBS TYPES` (the
 //!   per-system code list, order-preserving, with continuation lines),
 //!   `SYS / SCALE FACTOR`, `SYS / PHASE SHIFT`, `TIME OF FIRST OBS` (+ time
@@ -34,6 +34,18 @@
 //!   satellite with each observation as a 16-column `F14.3` value + LLI + SSI
 //!   field, in the order the system's `SYS / # / OBS TYPES` list declares. A
 //!   logical satellite record may wrap across 80-column continuation lines.
+//!
+//! # Layout (RINEX 2)
+//!
+//! - The header uses one global `# / TYPES OF OBSERV` list. Legacy two-character
+//!   codes are mapped into the same three-character code strings used by the
+//!   RINEX 3 path as each satellite system is encountered.
+//! - The body is per-epoch: a fixed-column epoch line with a two-digit year,
+//!   event flag, satellite count, and up to twelve inline PRNs. The PRN list
+//!   continues on following lines from column 32 when needed.
+//! - Each satellite then contributes only observation fields, five per physical
+//!   line, with no leading satellite token. Blank value fields are retained as
+//!   `None`.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -179,10 +191,10 @@ pub struct ObsEpoch {
     pub sats: BTreeMap<GnssSatelliteId, Vec<ObsValue>>,
 }
 
-/// Parsed RINEX 3/4 observation header.
+/// Parsed RINEX observation header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObsHeader {
-    /// The full RINEX version (e.g. `3.05`); the major must be 3 or 4.
+    /// The full RINEX version (e.g. `2.11`, `3.05`, or `4.02`).
     pub version: f64,
     /// The surveyed a-priori receiver position (ECEF meters), if the file
     /// carries an `APPROX POSITION XYZ` record.
@@ -237,7 +249,7 @@ pub struct ObsHeader {
     pub unretained_header_labels: Vec<String>,
 }
 
-/// A parsed RINEX 3 observation product.
+/// A parsed RINEX observation product.
 ///
 /// Construct with [`RinexObs::parse`]. Epochs are stored in file order; access
 /// the header via [`RinexObs::header`], the epochs via [`RinexObs::epochs`], and
@@ -259,16 +271,21 @@ pub struct RinexObs {
 }
 
 impl RinexObs {
-    /// Parse RINEX 3/4 observation text into a typed product.
+    /// Parse RINEX observation text into a typed product.
     ///
     /// Returns [`Error::Parse`] if the file is not observation data, is not RINEX
-    /// major version 3 or 4, is missing a required header record, or has a malformed
+    /// major version 2, 3, or 4, is missing a required header record, or has a malformed
     /// epoch record.
     pub fn parse(text: &str) -> Result<Self> {
         let mut parser = Parser::new();
         let mut lines = text.lines();
         parser.parse_header(&mut lines)?;
-        parser.parse_body(&mut lines.peekable())?;
+        let mut body = lines.peekable();
+        if parser.is_rinex2() {
+            parser.parse_body_v2(&mut body)?;
+        } else {
+            parser.parse_body(&mut body)?;
+        }
         parser.finish()
     }
 
@@ -679,6 +696,13 @@ struct Parser {
     current_obs_sys: Option<GnssSystem>,
     /// Number of codes still expected for `current_obs_sys`.
     obs_codes_remaining: usize,
+    /// RINEX 2 default system from the version record when it is not mixed.
+    rinex2_default_system: Option<GnssSystem>,
+    /// Legacy RINEX 2 global observation-code list, before per-system
+    /// canonicalization.
+    rinex2_obs_codes: Vec<String>,
+    /// Number of global RINEX 2 observation codes still expected.
+    rinex2_obs_codes_remaining: usize,
     /// Forgiving-parse diagnostics: a GLONASS-slot or epoch satellite record
     /// whose token does not parse to a representable [`GnssSatelliteId`] is
     /// pushed here as a typed [`Skip`] rather than silently dropped. The public
@@ -725,8 +749,16 @@ impl Parser {
             epochs: Vec::new(),
             current_obs_sys: None,
             obs_codes_remaining: 0,
+            rinex2_default_system: None,
+            rinex2_obs_codes: Vec::new(),
+            rinex2_obs_codes_remaining: 0,
             diagnostics: Diagnostics::new(),
         }
+    }
+
+    fn is_rinex2(&self) -> bool {
+        self.version
+            .is_some_and(|version| version.floor() as i64 == 2)
     }
 
     /// Record a forgiving skip for a record whose satellite token is not a
@@ -750,6 +782,7 @@ impl Parser {
                 "APPROX POSITION XYZ" => self.parse_approx_position(line)?,
                 "ANTENNA: DELTA H/E/N" => self.parse_antenna_delta(line)?,
                 "SYS / # / OBS TYPES" => self.parse_obs_types(line)?,
+                "# / TYPES OF OBSERV" => self.parse_obs_types_v2(line)?,
                 "SYS / SCALE FACTOR" => self.parse_scale_factor(line)?,
                 "SYS / PHASE SHIFT" => self.parse_phase_shift(line)?,
                 "TIME OF FIRST OBS" => self.parse_time_of_first_obs(line)?,
@@ -802,6 +835,7 @@ impl Parser {
                 }
                 "END OF HEADER" => {
                     self.ensure_obs_type_count_complete(line)?;
+                    self.ensure_obs_type_count_complete_v2(line)?;
                     self.ensure_scale_factor_count_complete(line)?;
                     saw_end = true;
                     break;
@@ -833,10 +867,16 @@ impl Parser {
                 "RINEX file is not observation data: {type_field:?}"
             )));
         }
-        if !matches!(version.floor() as i64, 3 | 4) {
+        if !matches!(version.floor() as i64, 2..=4) {
             return Err(Error::Parse(format!(
-                "RINEX OBS parser requires major version 3 or 4, got {version}"
+                "RINEX OBS parser requires major version 2, 3, or 4, got {version}"
             )));
+        }
+        if version.floor() as i64 == 2 {
+            let system_field = field(line, 40, 41).trim();
+            if let Some(letter) = system_field.chars().next().filter(|letter| *letter != 'M') {
+                self.rinex2_default_system = GnssSystem::from_letter(letter);
+            }
         }
         self.version = Some(version);
         Ok(())
@@ -913,6 +953,29 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_obs_types_v2(&mut self, line: &str) -> Result<()> {
+        if field(line, 0, 6).trim().is_empty() {
+            if self.rinex2_obs_codes_remaining == 0 {
+                return Ok(());
+            }
+        } else {
+            self.ensure_obs_type_count_complete_v2(line)?;
+            self.rinex2_obs_codes.clear();
+            self.rinex2_obs_codes_remaining =
+                strict_int_field::<usize>(line, 0, 6, "rinex2.obs_type_count")?;
+        }
+        for code in field(line, 6, 60).split_whitespace() {
+            if self.rinex2_obs_codes_remaining == 0 {
+                return Err(Error::Parse(format!(
+                    "RINEX OBS # / TYPES OF OBSERV lists more codes than declared in {line:?}"
+                )));
+            }
+            self.rinex2_obs_codes.push(code.to_string());
+            self.rinex2_obs_codes_remaining -= 1;
+        }
+        Ok(())
+    }
+
     fn ensure_obs_type_count_complete(&self, line: &str) -> Result<()> {
         if self.obs_codes_remaining == 0 {
             return Ok(());
@@ -924,6 +987,17 @@ impl Parser {
         let declared = supplied + self.obs_codes_remaining;
         Err(Error::Parse(format!(
             "RINEX OBS {system} SYS / # / OBS TYPES declares {declared} codes but supplies {supplied} before {line:?}"
+        )))
+    }
+
+    fn ensure_obs_type_count_complete_v2(&self, line: &str) -> Result<()> {
+        if self.rinex2_obs_codes_remaining == 0 {
+            return Ok(());
+        }
+        let supplied = self.rinex2_obs_codes.len();
+        let declared = supplied + self.rinex2_obs_codes_remaining;
+        Err(Error::Parse(format!(
+            "RINEX OBS # / TYPES OF OBSERV declares {declared} codes but supplies {supplied} before {line:?}"
         )))
     }
 
@@ -1294,6 +1368,124 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_body_v2<'a, I: Iterator<Item = &'a str>>(
+        &mut self,
+        lines: &mut std::iter::Peekable<I>,
+    ) -> Result<()> {
+        while let Some(raw) = lines.next() {
+            let line = raw.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                continue;
+            }
+            let time_scale = self
+                .time_of_first_obs
+                .map_or(TimeScale::Gpst, |(_, scale)| scale);
+            let (epoch_time, flag, numsat, rcv_clock_offset_s) =
+                parse_epoch_line_v2(line, civil_second_policy_for_time_scale(time_scale))?;
+
+            if flag > 1 {
+                for _ in 0..numsat {
+                    lines
+                        .next()
+                        .ok_or_else(|| Error::Parse("RINEX OBS event record truncated".into()))?;
+                }
+                self.epochs.push(ObsEpoch {
+                    epoch: epoch_time,
+                    flag,
+                    rcv_clock_offset_s,
+                    epoch_picoseconds: None,
+                    declared_record_count: numsat,
+                    special_record_count: numsat,
+                    sats: BTreeMap::new(),
+                });
+                continue;
+            }
+
+            let sv_tokens = collect_epoch_sv_tokens_v2(line, numsat, lines)?;
+            let obs_lines_per_sat = self.rinex2_obs_lines_per_sat()?;
+            let mut sats = BTreeMap::new();
+            for token in sv_tokens {
+                let mut obs_lines = Vec::with_capacity(obs_lines_per_sat);
+                for _ in 0..obs_lines_per_sat {
+                    let obs_line = lines.next().ok_or_else(|| {
+                        Error::Parse("RINEX OBS epoch truncated: missing observation line".into())
+                    })?;
+                    obs_lines.push(obs_line.trim_end_matches(['\r', '\n']).to_string());
+                }
+
+                let Some(sat) = self.parse_sv_token_v2(&token) else {
+                    self.push_unrepresentable_satellite_skip(&token);
+                    continue;
+                };
+                self.ensure_rinex2_system_obs_codes(sat.system);
+                let values = self.parse_sat_obs_v2(sat.system, &obs_lines)?;
+                sats.insert(sat, values);
+            }
+            self.epochs.push(ObsEpoch {
+                epoch: epoch_time,
+                flag,
+                rcv_clock_offset_s,
+                epoch_picoseconds: None,
+                declared_record_count: numsat,
+                special_record_count: 0,
+                sats,
+            });
+        }
+        Ok(())
+    }
+
+    fn rinex2_obs_lines_per_sat(&self) -> Result<usize> {
+        if self.rinex2_obs_codes.is_empty() {
+            return Err(Error::Parse(
+                "RINEX OBS header has no # / TYPES OF OBSERV records".into(),
+            ));
+        }
+        Ok(self.rinex2_obs_codes.len().div_ceil(5))
+    }
+
+    fn parse_sv_token_v2(&self, token: &str) -> Option<GnssSatelliteId> {
+        parse_sv_token_v2(token, self.rinex2_default_system.unwrap_or(GnssSystem::Gps))
+    }
+
+    fn ensure_rinex2_system_obs_codes(&mut self, system: GnssSystem) {
+        self.obs_codes.entry(system).or_insert_with(|| {
+            self.rinex2_obs_codes
+                .iter()
+                .map(|code| canonical_rinex2_obs_code(system, code))
+                .collect()
+        });
+    }
+
+    fn parse_sat_obs_v2(&self, system: GnssSystem, obs_lines: &[String]) -> Result<Vec<ObsValue>> {
+        let code_list = self.obs_codes.get(&system).ok_or_else(|| {
+            Error::Parse(format!(
+                "RINEX OBS satellite system {system} has no canonical observation-code table"
+            ))
+        })?;
+        let mut values = Vec::with_capacity(code_list.len());
+        for (i, code) in code_list.iter().enumerate() {
+            let line = obs_lines.get(i / 5).map_or("", String::as_str);
+            let start = (i % 5) * OBS_FIELD_WIDTH;
+            let value_str = field(line, start, start + OBS_VALUE_WIDTH).trim();
+            let value = if value_str.is_empty() {
+                None
+            } else {
+                let scale = self.scale_factor_for(system, code);
+                let parsed = strict_f64_token(value_str, "observation.value", line)? / scale;
+                if format!("{:.3}", parsed * scale).len() > OBS_VALUE_WIDTH {
+                    return Err(Error::Parse(
+                        "RINEX OBS observation value exceeds the F14.3 field width".into(),
+                    ));
+                }
+                Some(parsed)
+            };
+            let lli = digit_at(line, start + OBS_VALUE_WIDTH);
+            let ssi = digit_at(line, start + OBS_VALUE_WIDTH + 1);
+            values.push(ObsValue { value, lli, ssi });
+        }
+        Ok(values)
+    }
+
     fn collect_sat_record<'a, I: Iterator<Item = &'a str>>(
         &self,
         first_line: &str,
@@ -1391,7 +1583,18 @@ impl Parser {
                 )));
             }
         }
-        if self.obs_codes.is_empty() {
+        let mut obs_codes = self.obs_codes;
+        if obs_codes.is_empty() && !self.rinex2_obs_codes.is_empty() {
+            let system = self.rinex2_default_system.unwrap_or(GnssSystem::Gps);
+            obs_codes.insert(
+                system,
+                self.rinex2_obs_codes
+                    .iter()
+                    .map(|code| canonical_rinex2_obs_code(system, code))
+                    .collect(),
+            );
+        }
+        if obs_codes.is_empty() {
             return Err(Error::Parse(
                 "RINEX OBS header has no SYS / # / OBS TYPES records".into(),
             ));
@@ -1400,7 +1603,7 @@ impl Parser {
             version,
             approx_position_m: self.approx_position_m,
             antenna_delta_hen_m: self.antenna_delta_hen_m,
-            obs_codes: self.obs_codes,
+            obs_codes,
             program_run_by_date: self.program_run_by_date,
             comments: self.comments,
             marker_number: self.marker_number,
@@ -1494,6 +1697,215 @@ fn parse_epoch_line(
         .map(|token| strict_f64_token(token, "epoch.rcv_clock_offset_s", line))
         .transpose()?;
     Ok((epoch, flag, numsat, rcv_clock_offset_s, epoch_picoseconds))
+}
+
+type ParsedEpochLineV2 = (ObsEpochTime, u8, usize, Option<f64>);
+
+fn parse_epoch_line_v2(
+    line: &str,
+    second_policy: validate::CivilSecondPolicy,
+) -> Result<ParsedEpochLineV2> {
+    let head = field(line, 0, 32);
+    let tokens: Vec<&str> = head.split_whitespace().collect();
+    if tokens.len() < 8 {
+        return Err(Error::Parse(format!(
+            "RINEX OBS v2 epoch line has too few fields in {line:?}"
+        )));
+    }
+    let year = strict_int_token::<i32>(tokens[0], "epoch.year", line)?;
+    let year = expand_rinex2_year(year);
+    let month = strict_int_token::<i64>(tokens[1], "epoch.month", line)?;
+    let day = strict_int_token::<i64>(tokens[2], "epoch.day", line)?;
+    let hour = strict_int_token::<i64>(tokens[3], "epoch.hour", line)?;
+    let minute = strict_int_token::<i64>(tokens[4], "epoch.minute", line)?;
+    let second = strict_f64_token(tokens[5], "epoch.second", line)?;
+    let civil = validate::civil_datetime_with_second_policy(
+        i64::from(year),
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        second_policy,
+    )
+    .map_err(|error| map_field_error(error, line))?;
+    let flag = strict_int_token::<u8>(tokens[6], "epoch.flag", line)?;
+    let numsat = strict_int_token::<usize>(tokens[7], "epoch.satellite_count", line)?;
+    let clock = field(line, 68, line.len()).trim();
+    let rcv_clock_offset_s = if clock.is_empty() {
+        None
+    } else {
+        Some(strict_f64_token(clock, "epoch.rcv_clock_offset_s", line)?)
+    };
+    Ok((
+        ObsEpochTime {
+            year,
+            month: civil.month as u8,
+            day: civil.day as u8,
+            hour: civil.hour as u8,
+            minute: civil.minute as u8,
+            second: civil.second,
+        },
+        flag,
+        numsat,
+        rcv_clock_offset_s,
+    ))
+}
+
+fn expand_rinex2_year(year: i32) -> i32 {
+    if year >= 100 {
+        year
+    } else if year >= 80 {
+        1900 + year
+    } else {
+        2000 + year
+    }
+}
+
+fn collect_epoch_sv_tokens_v2<'a, I: Iterator<Item = &'a str>>(
+    first_line: &str,
+    count: usize,
+    lines: &mut std::iter::Peekable<I>,
+) -> Result<Vec<String>> {
+    let mut tokens = Vec::with_capacity(count);
+    append_epoch_sv_tokens_v2(first_line, count, &mut tokens);
+    while tokens.len() < count {
+        let continuation = lines.next().ok_or_else(|| {
+            Error::Parse("RINEX OBS v2 epoch truncated: missing satellite-list line".into())
+        })?;
+        append_epoch_sv_tokens_v2(
+            continuation.trim_end_matches(['\r', '\n']),
+            count,
+            &mut tokens,
+        );
+    }
+    tokens.truncate(count);
+    Ok(tokens)
+}
+
+fn append_epoch_sv_tokens_v2(line: &str, count: usize, tokens: &mut Vec<String>) {
+    let remaining = count.saturating_sub(tokens.len());
+    for i in 0..remaining.min(12) {
+        let start = 32 + i * 3;
+        let token = field(line, start, start + 3);
+        if token.trim().is_empty() {
+            break;
+        }
+        tokens.push(token.to_string());
+    }
+}
+
+fn parse_sv_token_v2(token: &str, default_system: GnssSystem) -> Option<GnssSatelliteId> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let mut chars = token.chars();
+    let first = chars.next()?;
+    let (system, prn_text) = if let Some(system) = GnssSystem::from_letter(first) {
+        (system, chars.as_str().trim())
+    } else {
+        (default_system, token)
+    };
+    let prn = prn_text.parse::<u8>().ok()?;
+    GnssSatelliteId::new(system, prn).ok()
+}
+
+fn canonical_rinex2_obs_code(system: GnssSystem, code: &str) -> String {
+    let code = code.trim();
+    if code.len() == 3 {
+        return code.to_string();
+    }
+    let mut chars = code.chars();
+    let Some(kind) = chars.next() else {
+        return code.to_string();
+    };
+    let Some(band) = chars.next() else {
+        return code.to_string();
+    };
+    if chars.next().is_some() || !matches!(kind, 'C' | 'P' | 'L' | 'D' | 'S') {
+        return code.to_string();
+    }
+
+    if let Some(mapped) = canonical_rinex2_code_exact(system, kind, band) {
+        return mapped.to_string();
+    }
+
+    let canonical_kind = if kind == 'P' { 'C' } else { kind };
+    let attr = rinex2_default_tracking_attr(system, kind, band);
+    format!("{canonical_kind}{band}{attr}")
+}
+
+fn canonical_rinex2_code_exact(system: GnssSystem, kind: char, band: char) -> Option<&'static str> {
+    match (system, kind, band) {
+        (GnssSystem::Gps, 'C', '1') => Some("C1C"),
+        (GnssSystem::Gps, 'C', '2') => Some("C2C"),
+        (GnssSystem::Gps, 'P', '1') => Some("C1W"),
+        (GnssSystem::Gps, 'P', '2') => Some("C2W"),
+        (GnssSystem::Glonass, 'C', '1') => Some("C1C"),
+        (GnssSystem::Glonass, 'C', '2') => Some("C2C"),
+        (GnssSystem::Glonass, 'P', '1') => Some("C1P"),
+        (GnssSystem::Glonass, 'P', '2') => Some("C2P"),
+        (GnssSystem::Galileo, 'C', '1') => Some("C1C"),
+        (GnssSystem::Galileo, 'C', '2') => Some("C5Q"),
+        (GnssSystem::Galileo, 'P', '1') => Some("C1X"),
+        (GnssSystem::Galileo, 'P', '2') => Some("C5X"),
+        (GnssSystem::BeiDou, 'C', '1') => Some("C2I"),
+        (GnssSystem::BeiDou, 'C', '2') => Some("C7I"),
+        (GnssSystem::BeiDou, 'P', '1') => Some("C2I"),
+        (GnssSystem::BeiDou, 'P', '2') => Some("C6I"),
+        (GnssSystem::Sbas, 'C', '1') => Some("C1C"),
+        _ => None,
+    }
+}
+
+fn rinex2_default_tracking_attr(system: GnssSystem, kind: char, band: char) -> char {
+    match system {
+        GnssSystem::Gps => match band {
+            '1' => 'C',
+            '2' => {
+                if kind == 'C' {
+                    'C'
+                } else {
+                    'W'
+                }
+            }
+            '5' => 'X',
+            _ => 'X',
+        },
+        GnssSystem::Glonass => match band {
+            '1' => 'C',
+            '2' => 'P',
+            '3' => 'X',
+            _ => 'X',
+        },
+        GnssSystem::Galileo => match band {
+            '1' | '6' => 'C',
+            '5' | '7' | '8' => 'X',
+            _ => 'X',
+        },
+        GnssSystem::BeiDou => match band {
+            '2' | '6' | '7' => 'I',
+            '1' => 'P',
+            '5' | '8' => 'X',
+            _ => 'X',
+        },
+        GnssSystem::Qzss => match band {
+            '1' => 'C',
+            '2' => 'L',
+            '5' | '6' => 'X',
+            _ => 'X',
+        },
+        GnssSystem::Navic => match band {
+            '5' | '9' => 'A',
+            _ => 'X',
+        },
+        GnssSystem::Sbas => match band {
+            '1' => 'C',
+            '5' => 'X',
+            _ => 'X',
+        },
+    }
 }
 
 /// Map a RINEX time-system label onto the core [`TimeScale`]. A blank label

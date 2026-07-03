@@ -32,6 +32,7 @@ env:
     omm_xml_parse
     omm_round_trip
     rinex_obs_parse
+    rinex_obs_v2_parse
     sgp4_tle_3line_parse
     sp3_parse
     sp3_round_trip

@@ -125,14 +125,15 @@ fn committed_obs_fixtures_have_pinned_lint_findings() {
             &[("OBS-H08", 1), ("OBS-H90", 1)][..],
         ),
         (
-            // RINEX 2.11 observation files are outside this parser slice.
+            // RINEX 2.11 mixed OBS has no GLONASS slot table and carries one
+            // retained-header disclosure.
             "algo0010_2015001_v1_trim.crx",
-            &[("OBS-H01", 1)][..],
+            &[("OBS-H12", 8), ("OBS-H90", 1)][..],
         ),
         (
-            // RINEX 2.11 observation files are outside this parser slice.
+            // Same decoded RINEX 2.11 text as the CRINEX twin above.
             "algo0010_2015001_v1_trim.rnx",
-            &[("OBS-H01", 1)][..],
+            &[("OBS-H12", 8), ("OBS-H90", 1)][..],
         ),
     ];
     for (fixture, expected) in fixtures {
