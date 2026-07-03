@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::id::GnssSystem;
 
 use super::bits::{BitReader, BitWriter};
+use super::DecodeResult;
 
 /// The SSR message group derived from the message number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -176,6 +177,10 @@ pub(crate) fn is_supported_ssr(message_number: u16) -> bool {
 impl SsrMessage {
     /// Decode one RTCM SSR body, without the transport frame.
     pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
         let mut r = BitReader::new(body);
         let message_number = r.u(12)? as u16;
         let (system, kind) = ssr_kind(message_number).ok_or_else(|| {
@@ -239,7 +244,8 @@ impl SsrMessage {
             SsrKind::CodeBias | SsrKind::PhaseBias | SsrKind::Vtec => {
                 return Err(Error::Parse(format!(
                     "message {message_number} is not enabled in RTCM SSR Phase A"
-                )));
+                ))
+                .into());
             }
         }
 
@@ -309,7 +315,7 @@ impl SsrMessage {
     }
 }
 
-fn read_header(r: &mut BitReader<'_>, kind: SsrKind) -> Result<SsrHeader> {
+fn read_header(r: &mut BitReader<'_>, kind: SsrKind) -> DecodeResult<SsrHeader> {
     let epoch_time_s = r.u(20)? as u32;
     let update_interval = r.u(4)? as u8;
     let multiple_message = r.flag()?;
@@ -350,7 +356,7 @@ fn write_header(w: &mut BitWriter, header: &SsrHeader, kind: SsrKind) {
     w.push_u(u64::from(header.satellite_count), 6);
 }
 
-fn read_orbit_record(r: &mut BitReader<'_>, system: GnssSystem) -> Result<SsrOrbitRecord> {
+fn read_orbit_record(r: &mut BitReader<'_>, system: GnssSystem) -> DecodeResult<SsrOrbitRecord> {
     Ok(SsrOrbitRecord {
         satellite_id: r.u(satellite_id_bits(system))? as u8,
         iode: r.u(iode_bits(system))? as u32,
@@ -374,7 +380,7 @@ fn write_orbit_record(w: &mut BitWriter, system: GnssSystem, rec: &SsrOrbitRecor
     w.push_i(i64::from(rec.dot_delta_cross), 19);
 }
 
-fn read_clock_record(r: &mut BitReader<'_>) -> Result<SsrClockRecord> {
+fn read_clock_record(r: &mut BitReader<'_>) -> DecodeResult<SsrClockRecord> {
     Ok(SsrClockRecord {
         satellite_id: r.u(6)? as u8,
         c0: r.i(22)? as i32,

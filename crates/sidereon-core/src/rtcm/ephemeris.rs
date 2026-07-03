@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::id::{GnssSatelliteId, GnssSystem};
 
 use super::bits::{BitReader, BitWriter};
+use super::DecodeResult;
 
 /// A decoded GPS broadcast ephemeris (message 1019).
 ///
@@ -95,12 +96,17 @@ impl GpsEphemeris {
 
     /// Decode a message 1019 body (without the transport frame).
     pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
         let mut r = BitReader::new(body);
         let message_number = r.u(12)? as u16;
         if message_number != 1019 {
             return Err(Error::Parse(format!(
                 "message {message_number} is not GPS ephemeris 1019"
-            )));
+            ))
+            .into());
         }
         Ok(Self {
             satellite_id: r.u(6)? as u8,
@@ -268,12 +274,17 @@ impl GlonassEphemeris {
 
     /// Decode a message 1020 body (without the transport frame).
     pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
         let mut r = BitReader::new(body);
         let message_number = r.u(12)? as u16;
         if message_number != 1020 {
             return Err(Error::Parse(format!(
                 "message {message_number} is not GLONASS ephemeris 1020"
-            )));
+            ))
+            .into());
         }
         Ok(Self {
             satellite_id: r.u(6)? as u8,

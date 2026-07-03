@@ -37,7 +37,8 @@
 use crate::error::{Error, Result};
 use crate::id::GnssSystem;
 
-use super::bits::{BitReader, BitWriter};
+use super::bits::{BitReader, BitWriter, OutOfInput};
+use super::DecodeResult;
 
 /// Which MSM variant a message is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +181,10 @@ pub(crate) fn is_supported_msm(message_number: u16) -> bool {
 impl MsmMessage {
     /// Decode an MSM4 / MSM7 message body (without the transport frame).
     pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
         let mut r = BitReader::new(body);
         let message_number = r.u(12)? as u16;
         let (system, kind) = msm_kind(message_number).ok_or_else(|| {
@@ -447,8 +452,8 @@ impl MsmMessage {
 fn read_vec<T>(
     r: &mut BitReader<'_>,
     n: usize,
-    mut f: impl FnMut(&mut BitReader<'_>) -> Result<T>,
-) -> Result<Vec<T>> {
+    mut f: impl FnMut(&mut BitReader<'_>) -> std::result::Result<T, OutOfInput>,
+) -> std::result::Result<Vec<T>, OutOfInput> {
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(f(r)?);
