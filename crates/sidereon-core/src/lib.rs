@@ -80,6 +80,7 @@ pub mod bias; // Bias-SINEX and DCB bias products
 mod broadcast; // broadcast-ephemeris (GPS LNAV / Galileo I/NAV) orbit + clock
 pub mod broadcast_comparison; // broadcast-vs-precise (SISRE orbit/clock) accuracy
 pub mod carrier_phase; // carrier-phase combinations, cycle-slip detection, Hatch smoothing
+pub mod clock_stability; // Allan-family receiver clock stability estimators
 pub mod constants; // shared physical/time constants (used by astro + gnss)
 pub mod constellation; // GNSS constellation identity catalog (CelesTrak/NAVCEN)
 mod crinex; // Hatanaka (CRINEX) observation-file decoder
