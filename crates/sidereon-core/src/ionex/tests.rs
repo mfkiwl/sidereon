@@ -30,7 +30,7 @@ use super::grid::Ionex;
 use super::slant::{slant_delay_components, PierceLineOfSight, SlantComponents, VtecGridView};
 use super::{
     galileo_nequick_g_native, ionex_slant_delays, ionosphere_delay, GalileoNequickCoeffs,
-    GalileoNequickEval, IonexSlantRequest, IonoModel, TecGridSamples, TecSamplesError,
+    GalileoNequickEval, IonexSlantRequest, IonoModel, TecGridSamples, TecSample, TecSamplesError,
 };
 
 /// Parse a C99 / Python `float.hex()` hex-float string into the exact `f64`.
@@ -412,6 +412,32 @@ fn valid_tec_grid_samples() -> TecGridSamples {
     }
 }
 
+fn single_map_ionex_text(epoch: &str) -> String {
+    let mut text = String::new();
+    text.push_str(&ionex_record("1.0", "IONEX VERSION / TYPE"));
+    text.push_str(&ionex_record("1", "# OF MAPS IN FILE"));
+    text.push_str(&ionex_record("1.0 0.0 -1.0", "LAT1 / LAT2 / DLAT"));
+    text.push_str(&ionex_record("0.0 1.0 1.0", "LON1 / LON2 / DLON"));
+    text.push_str(&ionex_record("450.0 450.0 0.0", "HGT1 / HGT2 / DHGT"));
+    text.push_str(&ionex_record("6371.0", "BASE RADIUS"));
+    text.push_str(&ionex_record("0", "EXPONENT"));
+    text.push_str(&ionex_record("", "END OF HEADER"));
+    text.push_str(&ionex_record("1", "START OF TEC MAP"));
+    text.push_str(&ionex_record(epoch, "EPOCH OF CURRENT MAP"));
+    text.push_str(&ionex_record(
+        "1.0 0.0 1.0 1.0 450.0",
+        "LAT/LON1/LON2/DLON/H",
+    ));
+    text.push_str("10 11\n");
+    text.push_str(&ionex_record(
+        "0.0 0.0 1.0 1.0 450.0",
+        "LAT/LON1/LON2/DLON/H",
+    ));
+    text.push_str("12 13\n");
+    text.push_str(&ionex_record("1", "END OF TEC MAP"));
+    text
+}
+
 #[test]
 fn ionex_from_samples_rejects_empty() {
     let err = Ionex::from_samples(TecGridSamples {
@@ -519,6 +545,20 @@ fn ionex_from_samples_rejects_axis_out_of_range() {
 }
 
 #[test]
+fn ionex_from_samples_round_trips_parsed_epoch_eleven_seconds_after_j2000() {
+    let text = single_map_ionex_text("2000 1 1 12 0 11");
+    let parsed = Ionex::parse_str(&text).expect("valid J2000+11s IONEX parses");
+    assert_eq!(parsed.map_epochs_s(), vec![11]);
+
+    let rebuilt = Ionex::from_samples(parsed.tec_grid_samples())
+        .expect("parsed J2000+11s samples rebuild cleanly");
+    assert_eq!(
+        rebuilt, parsed,
+        "sample round-trip preserves a parsed J2000+11s epoch"
+    );
+}
+
+#[test]
 fn ionex_from_samples_rebuilds_synthetic_ir_byte_identically() {
     // No real IGS `.YYi` fixture is added in this change. This synthetic
     // reconstruction plus the golden branch matrix covers the current target;
@@ -531,6 +571,50 @@ fn ionex_from_samples_rebuilds_synthetic_ir_byte_identically() {
     assert_eq!(
         rebuilt, original,
         "sample round-trip preserves the IONEX IR"
+    );
+}
+
+#[test]
+fn ionex_from_node_samples_treats_signed_zero_as_one_axis_node() {
+    let epoch = super::ionex_epoch_from_j2000_seconds(0);
+    let samples = [
+        TecSample {
+            epoch,
+            lat_deg: 1.0,
+            lon_deg: -0.0,
+            vtec_tecu: 10.0,
+            rms_tecu: None,
+        },
+        TecSample {
+            epoch,
+            lat_deg: 1.0,
+            lon_deg: 1.0,
+            vtec_tecu: 11.0,
+            rms_tecu: None,
+        },
+        TecSample {
+            epoch,
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+            vtec_tecu: 12.0,
+            rms_tecu: None,
+        },
+        TecSample {
+            epoch,
+            lat_deg: 0.0,
+            lon_deg: 1.0,
+            vtec_tecu: 13.0,
+            rms_tecu: None,
+        },
+    ];
+
+    let ionex =
+        Ionex::from_node_samples(samples, 450.0, 6371.0, 0).expect("signed-zero nodes rebuild");
+    assert_eq!(ionex.lon_nodes_deg().len(), 2);
+    assert_eq!(ionex.lon_nodes_deg()[0].to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(
+        ionex.tec_maps()[0],
+        vec![vec![10.0, 11.0], vec![12.0, 13.0]]
     );
 }
 

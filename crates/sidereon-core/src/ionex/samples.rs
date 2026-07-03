@@ -22,7 +22,6 @@
 
 use super::grid::{Ionex, IonexParts};
 use super::j2000_seconds_from_instant;
-use crate::astro::time::civil::j2000_seconds_from_split;
 use crate::astro::time::model::{Instant, InstantRepr};
 
 const IONEX_AXIS_DEG_LIMIT: f64 = 360.0;
@@ -146,7 +145,12 @@ impl Ionex {
             rms_maps: samples.rms_maps,
             skipped_records: 0,
         })
-        .map_err(|_| TecSamplesError::ShapeMismatch)
+        .map_err(|_| {
+            // Public sample validation mirrors Ionex::from_parts. This fallback is
+            // only for future private invariants that TecSamplesError cannot yet
+            // classify more precisely.
+            TecSamplesError::ShapeMismatch
+        })
     }
 
     /// Build an IONEX product from a flat stream of node samples.
@@ -189,14 +193,8 @@ impl Ionex {
         map_epochs.sort_by_key(|epoch| {
             exact_j2000_second(*epoch).expect("sample epochs were already validated")
         });
-        lat_nodes_deg.sort_by(|a, b| {
-            b.partial_cmp(a)
-                .expect("sample latitudes were already validated")
-        });
-        lon_nodes_deg.sort_by(|a, b| {
-            a.partial_cmp(b)
-                .expect("sample longitudes were already validated")
-        });
+        lat_nodes_deg.sort_by(|a, b| b.total_cmp(a));
+        lon_nodes_deg.sort_by(f64::total_cmp);
 
         if lat_nodes_deg.len() < 2 {
             return Err(TecSamplesError::TooFewNodes(lat_nodes_deg.len()));
@@ -421,24 +419,15 @@ fn exact_j2000_second(epoch: Instant) -> Option<i64> {
             let seconds = nanos / NANOS_PER_SECOND;
             i64::try_from(seconds).ok()
         }
-        InstantRepr::JulianDate(split) => {
-            let seconds = j2000_seconds_from_instant(epoch)?;
-            let exact = j2000_seconds_from_split(split.jd_whole, split.fraction);
-            if exact.is_finite()
-                && exact >= i64::MIN as f64
-                && exact <= i64::MAX as f64
-                && exact == seconds as f64
-            {
-                Some(seconds)
-            } else {
-                None
-            }
-        }
+        InstantRepr::JulianDate(_) => j2000_seconds_from_instant(epoch),
     }
 }
 
 fn push_unique_bits(values: &mut Vec<f64>, value: f64) {
-    if !values.iter().any(|&existing| same_bits(existing, value)) {
+    if !values
+        .iter()
+        .any(|&existing| same_axis_node(existing, value))
+    {
         values.push(value);
     }
 }
@@ -446,9 +435,9 @@ fn push_unique_bits(values: &mut Vec<f64>, value: f64) {
 fn find_bits(values: &[f64], value: f64) -> Option<usize> {
     values
         .iter()
-        .position(|&existing| same_bits(existing, value))
+        .position(|&existing| same_axis_node(existing, value))
 }
 
-fn same_bits(a: f64, b: f64) -> bool {
-    a.to_bits() == b.to_bits()
+fn same_axis_node(a: f64, b: f64) -> bool {
+    a == b || a.to_bits() == b.to_bits()
 }
