@@ -20,6 +20,22 @@ fn esbc_crx() -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read CRINEX fixture {path}: {e}"))
 }
 
+fn algo_v1_crx() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/obs/algo0010_2015001_v1_trim.crx"
+    );
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read CRINEX v1 fixture {path}: {e}"))
+}
+
+fn algo_v1_rnx() -> String {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/obs/algo0010_2015001_v1_trim.rnx"
+    );
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read RINEX v2 fixture {path}: {e}"))
+}
+
 fn header_line(body: &str, label: &str) -> String {
     format!("{body:<60}{label}")
 }
@@ -65,6 +81,18 @@ fn wrapped_obs_header() -> String {
 
 fn obs_field(value: f64, lli: u8, ssi: u8) -> String {
     format!("{value:14.3}{lli}{ssi}")
+}
+
+fn blank_obs_field() -> String {
+    " ".repeat(OBS_FIELD_WIDTH)
+}
+
+fn v2_epoch_line(epoch: ObsEpochTime, flag: u8, count: usize, sats: &str) -> String {
+    let year = epoch.year % 100;
+    format!(
+        " {year:>2}{:>3}{:>3}{:>3}{:>3}{:11.7}{flag:>3}{count:>3}{sats}",
+        epoch.month, epoch.day, epoch.hour, epoch.minute, epoch.second
+    )
 }
 
 fn obs_fields(base: f64) -> Vec<String> {
@@ -638,6 +666,139 @@ fn parses_crinex_decoded_text_identically() {
 }
 
 #[test]
+fn parses_plain_rinex2_observation_file() {
+    let body = format!(
+        "{}\n{}{}{}{}{}\n{}",
+        v2_epoch_line(
+            ObsEpochTime {
+                year: 2020,
+                month: 1,
+                day: 2,
+                hour: 3,
+                minute: 4,
+                second: 5.0,
+            },
+            0,
+            1,
+            "G 1",
+        ),
+        obs_field(123_456.789, 1, 2),
+        obs_field(234_567.891, 3, 4),
+        blank_obs_field(),
+        obs_field(20_200_000.125, 0, 0),
+        obs_field(45.0, 0, 5),
+        blank_obs_field(),
+    );
+    let text = [
+        header_line(
+            "     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+        ),
+        header_line(
+            "     6    L1    L2    C1    P1    S1    S2",
+            "# / TYPES OF OBSERV",
+        ),
+        header_line(
+            "  2020     1     2     3     4    5.0000000     GPS",
+            "TIME OF FIRST OBS",
+        ),
+        header_line("", "END OF HEADER"),
+        body,
+    ]
+    .join("\n");
+
+    let obs = RinexObs::parse(&text).expect("parse hand-built RINEX 2 OBS");
+    assert!((obs.header().version - 2.11).abs() < 1e-9);
+    assert_eq!(
+        obs.obs_codes(GnssSystem::Gps).expect("GPS code table"),
+        &[
+            "L1C".to_string(),
+            "L2W".to_string(),
+            "C1C".to_string(),
+            "C1W".to_string(),
+            "S1C".to_string(),
+            "S2W".to_string(),
+        ]
+    );
+    assert_eq!(obs.epochs().len(), 1);
+    let epoch = &obs.epochs()[0];
+    assert_eq!(epoch.epoch.year, 2020);
+    assert_eq!(epoch.declared_record_count, 1);
+    let g01 = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
+    let values = epoch.sats.get(&g01).expect("G01 present");
+    assert_eq!(values.len(), 6);
+    assert_eq!(values[0].value, Some(123_456.789));
+    assert_eq!(values[0].lli, Some(1));
+    assert_eq!(values[0].ssi, Some(2));
+    assert_eq!(values[2].value, None);
+    assert_eq!(values[3].value, Some(20_200_000.125));
+    assert_eq!(values[4].value, Some(45.0));
+    assert_eq!(values[4].ssi, Some(5));
+    assert_eq!(values[5].value, None);
+}
+
+#[test]
+fn parses_crinex_v1_decoded_rinex2_into_observations() {
+    let decoded = crinex::decode(&algo_v1_crx()).expect("decode CRINEX v1");
+    let from_crx = RinexObs::parse(&decoded).expect("parse decoded RINEX 2");
+    let from_rnx = RinexObs::parse(&algo_v1_rnx()).expect("parse reference RINEX 2");
+    assert_eq!(from_crx, from_rnx);
+
+    assert!((from_crx.header().version - 2.11).abs() < 1e-9);
+    assert_eq!(from_crx.epochs().len(), 2);
+    assert_eq!(from_crx.epochs()[0].declared_record_count, 20);
+    assert_eq!(from_crx.epochs()[0].sats.len(), 20);
+    assert_eq!(from_crx.epochs()[1].declared_record_count, 19);
+    assert_eq!(from_crx.epochs()[1].sats.len(), 19);
+    assert_eq!(
+        from_crx.obs_codes(GnssSystem::Gps).expect("GPS code table"),
+        &[
+            "L1C".to_string(),
+            "L2W".to_string(),
+            "C1C".to_string(),
+            "C2C".to_string(),
+            "C2W".to_string(),
+            "C1W".to_string(),
+            "S1C".to_string(),
+            "S2W".to_string(),
+        ]
+    );
+    assert_eq!(
+        from_crx
+            .obs_codes(GnssSystem::Glonass)
+            .expect("GLONASS code table"),
+        &[
+            "L1C".to_string(),
+            "L2P".to_string(),
+            "C1C".to_string(),
+            "C2C".to_string(),
+            "C2P".to_string(),
+            "C1P".to_string(),
+            "S1C".to_string(),
+            "S2P".to_string(),
+        ]
+    );
+
+    let g08 = GnssSatelliteId::new(GnssSystem::Gps, 8).expect("valid satellite id");
+    let g08_values = from_crx.epochs()[0].sats.get(&g08).expect("G08 present");
+    assert_eq!(g08_values[0].value, Some(118_504_127.181));
+    assert_eq!(g08_values[0].lli, Some(4));
+    assert_eq!(g08_values[0].ssi, Some(7));
+    assert_eq!(g08_values[3].value, None);
+    assert_eq!(g08_values[4].value, Some(22_550_574.970));
+    assert_eq!(g08_values[5].value, Some(22_550_575.149));
+    assert_eq!(g08_values[6].value, Some(47.250));
+    assert_eq!(g08_values[7].value, Some(37.250));
+
+    let r07 = GnssSatelliteId::new(GnssSystem::Glonass, 7).expect("valid satellite id");
+    let r07_values = from_crx.epochs()[0].sats.get(&r07).expect("R07 present");
+    assert_eq!(r07_values[2].value, Some(21_290_875.138));
+    assert_eq!(r07_values[3].value, Some(21_290_870.931));
+    assert_eq!(r07_values[4].value, Some(21_290_871.206));
+    assert_eq!(r07_values[5].value, Some(21_290_874.848));
+}
+
+#[test]
 fn rejects_malformed_phase_shift_headers() {
     for body in [
         "G L1C bad",
@@ -905,9 +1066,9 @@ fn rejects_non_observation_file() {
 }
 
 #[test]
-fn rejects_non_v3_observation_file() {
-    let v2 = "     2.11           OBSERVATION DATA    M (MIXED)           RINEX VERSION / TYPE\n";
-    assert!(RinexObs::parse(v2).is_err());
+fn rejects_unsupported_observation_file_version() {
+    let v1 = "     1.00           OBSERVATION DATA    G (GPS)             RINEX VERSION / TYPE\n";
+    assert!(RinexObs::parse(v1).is_err());
 }
 
 #[test]

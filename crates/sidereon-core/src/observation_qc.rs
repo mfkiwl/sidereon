@@ -836,6 +836,7 @@ impl SnrAccum {
 mod tests {
     use super::*;
     use crate::constants::{C_M_S, F_L1_HZ, F_L2_HZ};
+    use crate::crinex;
     use crate::rinex::observations::{ObsEpoch, ObsHeader, ObsValue};
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -1181,6 +1182,34 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn observation_qc_accepts_crinex_v1_decoded_rinex2() {
+        let path = fixture_path("tests/fixtures/obs/algo0010_2015001_v1_trim.crx");
+        let crx = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let decoded = crinex::decode(&crx).expect("decode CRINEX v1 fixture");
+        let obs = RinexObs::parse(&decoded).expect("parse decoded RINEX 2 OBS");
+        let report: ObservationQcReport = observation_qc(&obs);
+
+        assert_eq!(report.total_epoch_records, 2);
+        assert_eq!(report.observation_epochs, 2);
+        assert_eq!(report.event_records, 0);
+        assert_eq!(report.skipped_records, 0);
+        assert_eq!(report.interval_s, Some(30.0));
+        assert_eq!(report.interval_source, IntervalSource::Header);
+        assert_eq!(report.missing_epochs, 0);
+        assert_eq!(report.satellites.len(), 20);
+
+        let g08 = GnssSatelliteId::new(GnssSystem::Gps, 8).expect("valid GPS PRN");
+        let g08_report = report
+            .satellites
+            .iter()
+            .find(|sat| sat.satellite == g08)
+            .expect("G08 QC row");
+        assert_eq!(g08_report.epochs_with_observations, 2);
+        assert_eq!(g08_report.value_observations, 14);
     }
 
     #[test]
