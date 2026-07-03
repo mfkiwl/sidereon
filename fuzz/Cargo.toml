@@ -147,6 +147,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sbas_parse"
+path = "fuzz_targets/sbas_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sbas_round_trip"
+path = "fuzz_targets/sbas_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_math"
 path = "fuzz_targets/fuzz_math.rs"
 test = false
