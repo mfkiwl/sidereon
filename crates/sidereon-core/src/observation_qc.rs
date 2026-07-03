@@ -6,9 +6,17 @@
 
 use std::collections::BTreeMap;
 
+use crate::frequencies::rinex_observation_frequency_hz;
 use crate::id::{GnssSatelliteId, GnssSystem};
+use crate::precise_positioning::{
+    detect_cycle_slips as detect_dual_frequency_cycle_slips, CycleSlipConfig, DualFrequencyEpoch,
+    DualFrequencyObservation,
+};
 use crate::rinex::observations::{ObsEpochTime, RinexObs};
 use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
+
+/// Default receiver-clock jump threshold, in seconds.
+pub const DEFAULT_CLOCK_JUMP_THRESHOLD_S: f64 = 0.0005;
 
 /// Options controlling RINEX observation QC aggregation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +25,8 @@ pub struct ObservationQcOptions {
     pub interval_override_s: Option<f64>,
     /// Minimum `delta / interval` ratio that is treated as a data gap.
     pub gap_factor: f64,
+    /// Minimum de-trended receiver-clock step treated as a clock jump.
+    pub clock_jump_threshold_s: f64,
 }
 
 impl Default for ObservationQcOptions {
@@ -24,6 +34,7 @@ impl Default for ObservationQcOptions {
         Self {
             interval_override_s: None,
             gap_factor: 1.5,
+            clock_jump_threshold_s: DEFAULT_CLOCK_JUMP_THRESHOLD_S,
         }
     }
 }
@@ -37,6 +48,9 @@ pub enum ObservationQcError {
     /// The supplied gap factor was not finite and greater than one.
     #[error("invalid observation QC gap factor: must be finite and greater than one")]
     InvalidGapFactor,
+    /// The supplied clock-jump threshold was zero, negative, or non-finite.
+    #[error("invalid observation QC clock-jump threshold: must be finite and positive")]
+    InvalidClockJumpThreshold,
 }
 
 /// Source of the interval used for gap detection.
@@ -83,6 +97,10 @@ pub struct ObservationQcReport {
     pub missing_epochs: usize,
     /// Gaps detected from adjacent observation epochs and the nominal interval.
     pub data_gaps: Vec<ObservationDataGap>,
+    /// Millisecond-scale receiver-clock jumps detected from epoch clock offsets.
+    pub clock_jumps: Vec<ClockJump>,
+    /// Aggregate dual-frequency cycle-slip counts.
+    pub cycle_slips: CycleSlipQc,
     /// Per-satellite observation completeness.
     pub satellites: Vec<SatelliteObservationQc>,
     /// Per-satellite, per-code observation completeness and SSI statistics.
@@ -106,6 +124,43 @@ pub struct ObservationDataGap {
     pub observed_delta_s: f64,
     /// Estimated missing nominal epochs between `start_epoch` and `end_epoch`.
     pub missing_epochs: usize,
+}
+
+/// One detected receiver-clock jump.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockJump {
+    /// Epoch index in the parsed observation stream where the jump appears.
+    pub epoch_index: usize,
+    /// Epoch where the jump appears.
+    pub epoch: ObsEpochTime,
+    /// De-trended receiver-clock step, in seconds.
+    pub delta_s: f64,
+}
+
+/// Aggregate cycle-slip counts from the dual-frequency detector.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CycleSlipQc {
+    /// Total dual-frequency observations passed to the detector.
+    pub observations: usize,
+    /// Total detector-flagged cycle slips.
+    pub total_slips: usize,
+    /// Dual-frequency observations per flagged slip.
+    pub observations_per_slip: Option<f64>,
+    /// Per-constellation detector counts.
+    pub by_system: Vec<SystemCycleSlipQc>,
+}
+
+/// Per-constellation cycle-slip counts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SystemCycleSlipQc {
+    /// GNSS constellation.
+    pub system: GnssSystem,
+    /// Dual-frequency observations passed to the detector for this constellation.
+    pub observations: usize,
+    /// Detector-flagged cycle slips for this constellation.
+    pub slips: usize,
+    /// Dual-frequency observations per flagged slip for this constellation.
+    pub observations_per_slip: Option<f64>,
 }
 
 /// Per-satellite observation counts.
@@ -248,6 +303,8 @@ pub fn observation_qc_with_options(
         resolve_interval(obs, options, &observation_epoch_times, &mut notes)?;
     let data_gaps = detect_gaps(options, &observation_epoch_times, interval_s)?;
     let missing_epochs = data_gaps.iter().map(|gap| gap.missing_epochs).sum();
+    let clock_jumps = detect_clock_jumps(obs, options.clock_jump_threshold_s);
+    let cycle_slips = aggregate_cycle_slips(obs);
 
     Ok(ObservationQcReport {
         total_epoch_records: obs.epochs().len(),
@@ -259,6 +316,8 @@ pub fn observation_qc_with_options(
         interval_source,
         missing_epochs,
         data_gaps,
+        clock_jumps,
+        cycle_slips,
         satellites: satellites
             .into_iter()
             .map(|(satellite, acc)| SatelliteObservationQc {
@@ -295,6 +354,9 @@ fn validate_options(options: ObservationQcOptions) -> Result<(), ObservationQcEr
     if !options.gap_factor.is_finite() || options.gap_factor <= 1.0 {
         return Err(ObservationQcError::InvalidGapFactor);
     }
+    if !positive_finite(options.clock_jump_threshold_s) {
+        return Err(ObservationQcError::InvalidClockJumpThreshold);
+    }
 
     if let Some(interval_s) = options.interval_override_s {
         validate_interval(interval_s)?;
@@ -309,6 +371,10 @@ fn validate_interval(interval_s: f64) -> Result<(), ObservationQcError> {
     } else {
         Err(ObservationQcError::InvalidInterval)
     }
+}
+
+fn positive_finite(value: f64) -> bool {
+    value.is_finite() && value > 0.0
 }
 
 fn resolve_interval(
@@ -373,6 +439,307 @@ fn non_monotonic_notes(observation_epoch_times: &[ObsEpochTime]) -> Vec<Observat
         }
     }
     notes
+}
+
+/// Detect millisecond-scale receiver-clock jumps from RINEX epoch clock offsets.
+pub fn detect_clock_jumps(obs: &RinexObs, threshold_s: f64) -> Vec<ClockJump> {
+    if !positive_finite(threshold_s) {
+        return Vec::new();
+    }
+
+    let deltas = clock_offset_deltas(obs);
+    let nominal_drift_s_per_s = nominal_clock_drift_s_per_s(&deltas, threshold_s);
+
+    deltas
+        .into_iter()
+        .filter_map(|delta| {
+            let expected_delta_s = nominal_drift_s_per_s * delta.time_delta_s;
+            let adjusted_delta_s = delta.raw_delta_s - expected_delta_s;
+            millisecond_clock_step(adjusted_delta_s, threshold_s).then_some(ClockJump {
+                epoch_index: delta.epoch_index,
+                epoch: delta.epoch,
+                delta_s: adjusted_delta_s,
+            })
+        })
+        .collect()
+}
+
+/// Aggregate cycle-slip counts by reusing the dual-frequency detector.
+pub fn aggregate_cycle_slips(obs: &RinexObs) -> CycleSlipQc {
+    let epochs = dual_frequency_epochs(obs);
+    let mut by_system = BTreeMap::<GnssSystem, CycleSlipAccum>::new();
+
+    for epoch in &epochs {
+        for observation in &epoch.observations {
+            if let Some(system) = system_from_satellite_token(&observation.satellite_id) {
+                by_system.entry(system).or_default().observations += 1;
+            }
+        }
+    }
+
+    let Ok(flags) = detect_dual_frequency_cycle_slips(&epochs, CycleSlipConfig::default()) else {
+        return finish_cycle_slip_qc(by_system);
+    };
+
+    for epoch in flags {
+        for observation in epoch.observations {
+            if !observation.slip {
+                continue;
+            }
+            if let Some(system) = system_from_satellite_token(&observation.satellite_id) {
+                by_system.entry(system).or_default().slips += 1;
+            }
+        }
+    }
+
+    finish_cycle_slip_qc(by_system)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClockOffsetSample {
+    epoch_index: usize,
+    epoch: ObsEpochTime,
+    epoch_time_s: f64,
+    offset_s: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClockOffsetDelta {
+    epoch_index: usize,
+    epoch: ObsEpochTime,
+    time_delta_s: f64,
+    raw_delta_s: f64,
+}
+
+fn clock_offset_deltas(obs: &RinexObs) -> Vec<ClockOffsetDelta> {
+    let mut previous: Option<ClockOffsetSample> = None;
+    let mut deltas = Vec::new();
+
+    for (epoch_index, epoch) in obs.epochs().iter().enumerate() {
+        if epoch.flag > 1 {
+            continue;
+        }
+        let Some(offset_s) = epoch.rcv_clock_offset_s else {
+            continue;
+        };
+        if !offset_s.is_finite() {
+            continue;
+        }
+
+        let sample = ClockOffsetSample {
+            epoch_index,
+            epoch: epoch.epoch,
+            epoch_time_s: obs_epoch_seconds(epoch.epoch),
+            offset_s,
+        };
+
+        if let Some(prev) = previous {
+            let time_delta_s = sample.epoch_time_s - prev.epoch_time_s;
+            if time_delta_s > 0.0 {
+                deltas.push(ClockOffsetDelta {
+                    epoch_index: sample.epoch_index,
+                    epoch: sample.epoch,
+                    time_delta_s,
+                    raw_delta_s: sample.offset_s - prev.offset_s,
+                });
+            }
+        }
+
+        previous = Some(sample);
+    }
+
+    deltas
+}
+
+fn nominal_clock_drift_s_per_s(deltas: &[ClockOffsetDelta], threshold_s: f64) -> f64 {
+    let mut slopes = deltas
+        .iter()
+        .filter(|delta| delta.raw_delta_s.abs() < threshold_s)
+        .map(|delta| delta.raw_delta_s / delta.time_delta_s)
+        .filter(|slope| slope.is_finite())
+        .collect::<Vec<_>>();
+    median(&mut slopes).unwrap_or(0.0)
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_by(|a, b| a.total_cmp(b));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
+    }
+}
+
+fn millisecond_clock_step(delta_s: f64, threshold_s: f64) -> bool {
+    if !delta_s.is_finite() || delta_s.abs() < threshold_s {
+        return false;
+    }
+
+    let step_ms = delta_s.abs() * 1000.0;
+    let nearest_ms = step_ms.round();
+    if nearest_ms < 1.0 {
+        return false;
+    }
+
+    let tolerance_ms = (threshold_s * 500.0).min(0.25);
+    (step_ms - nearest_ms).abs() <= tolerance_ms
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CycleSlipAccum {
+    observations: usize,
+    slips: usize,
+}
+
+fn finish_cycle_slip_qc(by_system: BTreeMap<GnssSystem, CycleSlipAccum>) -> CycleSlipQc {
+    let observations = by_system.values().map(|acc| acc.observations).sum();
+    let total_slips = by_system.values().map(|acc| acc.slips).sum();
+    let by_system = by_system
+        .into_iter()
+        .map(|(system, acc)| SystemCycleSlipQc {
+            system,
+            observations: acc.observations,
+            slips: acc.slips,
+            observations_per_slip: observations_per_slip(acc.observations, acc.slips),
+        })
+        .collect();
+
+    CycleSlipQc {
+        observations,
+        total_slips,
+        observations_per_slip: observations_per_slip(observations, total_slips),
+        by_system,
+    }
+}
+
+fn observations_per_slip(observations: usize, slips: usize) -> Option<f64> {
+    (slips > 0).then(|| observations as f64 / slips as f64)
+}
+
+fn dual_frequency_epochs(obs: &RinexObs) -> Vec<DualFrequencyEpoch> {
+    obs.epochs()
+        .iter()
+        .filter(|epoch| epoch.flag <= 1)
+        .map(|epoch| DualFrequencyEpoch {
+            gap_time_s: Some(obs_epoch_seconds(epoch.epoch)),
+            observations: epoch
+                .sats
+                .iter()
+                .filter_map(|(satellite, values)| {
+                    dual_frequency_observation(obs, *satellite, values)
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DualFrequencyBand {
+    first_index: usize,
+    frequency_hz: f64,
+    pseudorange_m: Option<f64>,
+    carrier_phase_cyc: Option<f64>,
+    lli: Option<i64>,
+}
+
+fn dual_frequency_observation(
+    obs: &RinexObs,
+    satellite: GnssSatelliteId,
+    values: &[crate::rinex::observations::ObsValue],
+) -> Option<DualFrequencyObservation> {
+    let codes = obs.header().obs_codes.get(&satellite.system)?;
+    let glonass_channel = obs.header().glonass_slots.get(&satellite.prn).copied();
+    let mut bands = Vec::<DualFrequencyBand>::new();
+
+    for (index, (code, value)) in codes.iter().zip(values.iter()).enumerate() {
+        let kind = code.as_bytes().first().copied();
+        if !matches!(kind, Some(b'C' | b'L')) {
+            continue;
+        }
+        let Some(raw_value) = value.value else {
+            continue;
+        };
+        if !raw_value.is_finite() {
+            continue;
+        }
+        let frequency_hz = rinex_observation_frequency_hz(
+            satellite.system,
+            code,
+            obs.header().version,
+            glonass_channel,
+        )?;
+
+        let band_index = if let Some(existing) = bands
+            .iter()
+            .position(|band| same_frequency_hz(band.frequency_hz, frequency_hz))
+        {
+            existing
+        } else {
+            bands.push(DualFrequencyBand {
+                first_index: index,
+                frequency_hz,
+                pseudorange_m: None,
+                carrier_phase_cyc: None,
+                lli: None,
+            });
+            bands.len() - 1
+        };
+
+        let band = &mut bands[band_index];
+        match kind {
+            Some(b'C') if band.pseudorange_m.is_none() => {
+                band.pseudorange_m = Some(raw_value);
+            }
+            Some(b'L') if band.carrier_phase_cyc.is_none() => {
+                band.carrier_phase_cyc = Some(raw_value);
+                band.lli = value.lli.map(i64::from);
+            }
+            _ => {}
+        }
+    }
+
+    let mut usable = bands
+        .into_iter()
+        .filter(|band| band.pseudorange_m.is_some() && band.carrier_phase_cyc.is_some())
+        .collect::<Vec<_>>();
+    usable.sort_by_key(|band| band.first_index);
+    let band1 = *usable.first()?;
+    let band2 = usable
+        .iter()
+        .copied()
+        .find(|band| !same_frequency_hz(band.frequency_hz, band1.frequency_hz))?;
+
+    Some(DualFrequencyObservation {
+        satellite_id: satellite.to_string(),
+        ambiguity_id: format!(
+            "{}:{:.0}:{:.0}",
+            satellite, band1.frequency_hz, band2.frequency_hz
+        ),
+        p1_m: band1.pseudorange_m?,
+        p2_m: band2.pseudorange_m?,
+        phi1_cyc: band1.carrier_phase_cyc?,
+        phi2_cyc: band2.carrier_phase_cyc?,
+        f1_hz: band1.frequency_hz,
+        f2_hz: band2.frequency_hz,
+        lli1: band1.lli,
+        lli2: band2.lli,
+    })
+}
+
+fn same_frequency_hz(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1.0e-3
+}
+
+fn system_from_satellite_token(satellite_id: &str) -> Option<GnssSystem> {
+    satellite_id
+        .chars()
+        .next()
+        .and_then(GnssSystem::from_letter)
 }
 
 #[derive(Debug, Default)]
@@ -468,6 +835,7 @@ impl SnrAccum {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{C_M_S, F_L1_HZ, F_L2_HZ};
     use crate::rinex::observations::{ObsEpoch, ObsHeader, ObsValue};
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -524,6 +892,8 @@ mod tests {
         assert_eq!(report.event_records, 1);
         assert_eq!(report.power_failure_epochs, 1);
         assert_eq!(report.skipped_records, 0);
+        assert!(report.clock_jumps.is_empty());
+        assert_eq!(report.cycle_slips, CycleSlipQc::default());
         assert_eq!(report.satellites.len(), 2);
         assert_eq!(
             report.satellites[0],
@@ -680,7 +1050,7 @@ mod tests {
             &obs,
             ObservationQcOptions {
                 interval_override_s: Some(0.0),
-                gap_factor: 1.5,
+                ..ObservationQcOptions::default()
             },
         )
         .expect_err("invalid interval");
@@ -691,10 +1061,126 @@ mod tests {
             ObservationQcOptions {
                 interval_override_s: None,
                 gap_factor: 1.0,
+                ..ObservationQcOptions::default()
             },
         )
         .expect_err("invalid gap factor");
         assert_eq!(err, ObservationQcError::InvalidGapFactor);
+
+        let err = observation_qc_with_options(
+            &obs,
+            ObservationQcOptions {
+                clock_jump_threshold_s: 0.0,
+                ..ObservationQcOptions::default()
+            },
+        )
+        .expect_err("invalid clock-jump threshold");
+        assert_eq!(err, ObservationQcError::InvalidClockJumpThreshold);
+    }
+
+    #[test]
+    fn detect_clock_jumps_flags_injected_millisecond_step() {
+        let g01 = sat(1);
+        let mut obs = observation_file(vec![
+            epoch(
+                0,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(1.0), None)])]),
+            ),
+            epoch(
+                0,
+                30.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(2.0), None)])]),
+            ),
+            epoch(
+                1,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(3.0), None)])]),
+            ),
+            epoch(
+                1,
+                30.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(4.0), None)])]),
+            ),
+        ]);
+        let offsets_s = [0.0, 0.000_010, 0.001_020, 0.001_030];
+        for (epoch, offset_s) in obs.epochs.iter_mut().zip(offsets_s) {
+            epoch.rcv_clock_offset_s = Some(offset_s);
+        }
+
+        let jumps = detect_clock_jumps(&obs, DEFAULT_CLOCK_JUMP_THRESHOLD_S);
+
+        assert_eq!(jumps.len(), 1);
+        assert_eq!(jumps[0].epoch_index, 2);
+        assert_close(jumps[0].delta_s, 0.001, "clock jump");
+
+        let report = observation_qc(&obs);
+        assert_eq!(report.clock_jumps, jumps);
+    }
+
+    #[test]
+    fn detect_clock_jumps_ignores_linear_clock_drift() {
+        let g01 = sat(1);
+        let mut obs = observation_file(
+            (0..4)
+                .map(|idx| {
+                    epoch(
+                        idx / 2,
+                        if idx % 2 == 0 { 0.0 } else { 30.0 },
+                        0,
+                        BTreeMap::from([(g01, vec![obs_value(Some(idx as f64), None)])]),
+                    )
+                })
+                .collect(),
+        );
+        for (idx, epoch) in obs.epochs.iter_mut().enumerate() {
+            epoch.rcv_clock_offset_s = Some(idx as f64 * 0.000_010);
+        }
+
+        assert!(detect_clock_jumps(&obs, DEFAULT_CLOCK_JUMP_THRESHOLD_S).is_empty());
+        assert!(observation_qc(&obs).clock_jumps.is_empty());
+    }
+
+    #[test]
+    fn observation_qc_tallies_synthetic_injected_cycle_slip() {
+        let g01 = sat(1);
+        let obs = observation_file(
+            (0usize..5)
+                .map(|epoch_index| {
+                    let wide_lane_cycles = if epoch_index >= 3 { 14.0 } else { 8.0 };
+                    epoch(
+                        (epoch_index / 2) as u8,
+                        if epoch_index % 2 == 0 { 0.0 } else { 30.0 },
+                        0,
+                        BTreeMap::from([(
+                            g01,
+                            dual_frequency_values(epoch_index, wide_lane_cycles, 0.0),
+                        )]),
+                    )
+                })
+                .collect(),
+        );
+
+        let report = observation_qc(&obs);
+
+        assert_eq!(
+            report.cycle_slips,
+            CycleSlipQc {
+                observations: 5,
+                total_slips: 1,
+                observations_per_slip: Some(5.0),
+                by_system: vec![SystemCycleSlipQc {
+                    system: GnssSystem::Gps,
+                    observations: 5,
+                    slips: 1,
+                    observations_per_slip: Some(5.0),
+                }],
+            }
+        );
     }
 
     #[test]
@@ -757,6 +1243,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observation_qc_pins_real_fixture_cycle_slip_tally() {
+        let rel = "tests/fixtures/obs/ESBC00DNK_R_20201770000_01D_30S_MO_120epoch.rnx";
+        let text = std::fs::read_to_string(fixture_path(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let obs = RinexObs::parse(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+        let report = observation_qc(&obs);
+
+        assert_eq!(report.cycle_slips.observations, 4135);
+        assert_eq!(report.cycle_slips.total_slips, 27);
+        assert_close(
+            report
+                .cycle_slips
+                .observations_per_slip
+                .expect("observations per slip"),
+            4135.0 / 27.0,
+            rel,
+        );
+
+        let by_system = report
+            .cycle_slips
+            .by_system
+            .iter()
+            .map(|row| {
+                (
+                    row.system,
+                    (
+                        row.observations,
+                        row.slips,
+                        row.observations_per_slip
+                            .expect("system observations per slip"),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_system[&GnssSystem::Gps].0, 1282);
+        assert_eq!(by_system[&GnssSystem::Gps].1, 4);
+        assert_close(by_system[&GnssSystem::Gps].2, 1282.0 / 4.0, rel);
+        assert_eq!(by_system[&GnssSystem::Glonass].0, 784);
+        assert_eq!(by_system[&GnssSystem::Glonass].1, 10);
+        assert_close(by_system[&GnssSystem::Glonass].2, 784.0 / 10.0, rel);
+        assert_eq!(by_system[&GnssSystem::Galileo].0, 1023);
+        assert_eq!(by_system[&GnssSystem::Galileo].1, 9);
+        assert_close(by_system[&GnssSystem::Galileo].2, 1023.0 / 9.0, rel);
+        assert_eq!(by_system[&GnssSystem::BeiDou].0, 1046);
+        assert_eq!(by_system[&GnssSystem::BeiDou].1, 4);
+        assert_close(by_system[&GnssSystem::BeiDou].2, 1046.0 / 4.0, rel);
+    }
+
     fn observation_file(epochs: Vec<ObsEpoch>) -> RinexObs {
         RinexObs {
             header: ObsHeader {
@@ -765,7 +1300,13 @@ mod tests {
                 antenna_delta_hen_m: None,
                 obs_codes: BTreeMap::from([(
                     GnssSystem::Gps,
-                    vec!["C1C".to_string(), "L1C".to_string(), "S1C".to_string()],
+                    vec![
+                        "C1C".to_string(),
+                        "L1C".to_string(),
+                        "S1C".to_string(),
+                        "C2W".to_string(),
+                        "L2W".to_string(),
+                    ],
                 )]),
                 program_run_by_date: None,
                 comments: Vec::new(),
@@ -824,6 +1365,27 @@ mod tests {
             lli: None,
             ssi,
         }
+    }
+
+    fn dual_frequency_values(
+        epoch_index: usize,
+        melbourne_wubbena_cycles: f64,
+        geometry_free_m: f64,
+    ) -> Vec<ObsValue> {
+        let geometric_m = 23_000_000.0 + epoch_index as f64 * 100.0;
+        let lambda1 = C_M_S / F_L1_HZ;
+        let lambda2 = C_M_S / F_L2_HZ;
+        let lambda_wl = C_M_S / (F_L1_HZ - F_L2_HZ);
+        let l2_m = geometric_m + lambda_wl * (melbourne_wubbena_cycles - geometry_free_m / lambda1);
+        let l1_m = l2_m + geometry_free_m;
+
+        vec![
+            obs_value(Some(geometric_m), None),
+            obs_value(Some(l1_m / lambda1), None),
+            obs_value(None, None),
+            obs_value(Some(geometric_m), None),
+            obs_value(Some(l2_m / lambda2), None),
+        ]
     }
 
     fn sat(prn: u8) -> GnssSatelliteId {
