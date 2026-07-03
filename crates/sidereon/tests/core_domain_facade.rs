@@ -35,4 +35,13 @@ fn core_domain_modules_are_reachable_through_facade() {
         sidereon::terrain::DtedLookupOptions::default().interpolation,
         sidereon::terrain::DtedInterpolation::Bilinear
     );
+
+    let phase = [0.0, 1.0, 2.0];
+    let oadev = sidereon::clock_stability::overlapping_adev(
+        sidereon::clock_stability::AllanSeries::PhaseSeconds(&phase),
+        1.0,
+        &[1],
+    )
+    .expect("facade clock stability");
+    assert_eq!(oadev.deviation[0].to_bits(), 0.0_f64.to_bits());
 }
