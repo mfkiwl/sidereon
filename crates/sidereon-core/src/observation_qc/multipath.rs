@@ -15,7 +15,7 @@ use super::{
 const TEQC_MP_MOVING_AVERAGE_POINTS: usize = 50;
 
 /// MP1/MP2 multipath RMS report.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 pub struct MultipathReport {
     /// Per-satellite MP1/MP2 RMS rows.
     pub satellites: Vec<SatelliteMultipathQc>,
@@ -24,7 +24,7 @@ pub struct MultipathReport {
 }
 
 /// Per-satellite multipath RMS after per-arc teqc moving-average filtering.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SatelliteMultipathQc {
     /// Satellite id.
     pub satellite: GnssSatelliteId,
@@ -35,7 +35,7 @@ pub struct SatelliteMultipathQc {
 }
 
 /// Per-constellation multipath RMS after per-arc teqc moving-average filtering.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SystemMultipathQc {
     /// GNSS constellation.
     pub system: GnssSystem,
@@ -46,7 +46,7 @@ pub struct SystemMultipathQc {
 }
 
 /// RMS statistics for one multipath series.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct MpStats {
     /// Number of multipath samples.
     pub n: usize,

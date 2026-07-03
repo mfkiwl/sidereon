@@ -4,14 +4,18 @@
 //! parse, repair, or resample files; it reports the completeness and signal
 //! indicators a caller needs before choosing solver inputs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod multipath;
+mod report_html;
+mod report_text;
 
 pub use multipath::{
     arc_multipath_rms, mp_combination, multipath_stats, MpStats, MultipathReport,
     SatelliteMultipathQc, SystemMultipathQc,
 };
+pub use report_html::render_html;
+pub use report_text::render_text;
 
 use crate::frequencies::{default_iono_free_pair, frequency_hz, rinex_observation_frequency_hz};
 use crate::id::{GnssSatelliteId, GnssSystem};
@@ -20,7 +24,8 @@ use crate::precise_positioning::{
     DualFrequencyObservation,
 };
 use crate::rinex::observations::{ObsEpochTime, RinexObs};
-use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
+use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds, time_scale_rinex_label};
+use crate::rinex_qc::{lint_obs, Severity};
 
 /// Default receiver-clock jump threshold, in seconds.
 pub const DEFAULT_CLOCK_JUMP_THRESHOLD_S: f64 = 0.0005;
@@ -61,7 +66,7 @@ pub enum ObservationQcError {
 }
 
 /// Source of the interval used for gap detection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntervalSource {
     /// Caller override.
     Override,
@@ -74,7 +79,7 @@ pub enum IntervalSource {
 }
 
 /// Non-fatal QC note.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ObservationQcNote {
     /// Adjacent observation epochs were duplicate or out of order.
     NonMonotonicEpoch { epoch_index: usize },
@@ -83,8 +88,10 @@ pub enum ObservationQcNote {
 }
 
 /// Aggregate QC report for one parsed RINEX observation file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ObservationQcReport {
+    /// Header metadata copied from the source observation product.
+    pub header: ObservationQcHeader,
     /// Total number of epoch records retained by the parser, including events.
     pub total_epoch_records: usize,
     /// Count of normal observation epochs (`flag == 0`) and power-failure
@@ -110,18 +117,87 @@ pub struct ObservationQcReport {
     pub cycle_slips: CycleSlipQc,
     /// MP1/MP2 teqc moving-average multipath RMS.
     pub multipath: MultipathReport,
+    /// Per-constellation observation completeness and gap rollups.
+    pub systems: Vec<SystemObservationQc>,
     /// Per-satellite observation completeness.
     pub satellites: Vec<SatelliteObservationQc>,
     /// Per-satellite, per-code observation completeness and SSI statistics.
     pub satellite_signals: Vec<SatelliteSignalQc>,
     /// Per-system, per-code observation completeness and SSI statistics.
     pub system_signals: Vec<SystemSignalQc>,
+    /// RINEX lint findings summarized for report rendering.
+    pub lint_findings: Vec<ObservationQcFinding>,
     /// Non-fatal QC notes.
     pub notes: Vec<ObservationQcNote>,
 }
 
+/// Source observation header fields rendered in the QC report.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ObservationQcHeader {
+    /// Marker name.
+    pub marker_name: Option<String>,
+    /// Marker number.
+    pub marker_number: Option<String>,
+    /// Marker type.
+    pub marker_type: Option<String>,
+    /// Receiver information.
+    pub receiver: Option<ObservationQcReceiver>,
+    /// Antenna information.
+    pub antenna: Option<ObservationQcAntenna>,
+    /// Approximate receiver ECEF position, meters.
+    pub approx_position_m: Option<[f64; 3]>,
+    /// Antenna height/east/north offset, meters.
+    pub antenna_delta_hen_m: Option<[f64; 3]>,
+    /// Time of first observation.
+    pub time_of_first_obs: Option<ObservationQcTime>,
+    /// Time of last observation.
+    pub time_of_last_obs: Option<ObservationQcTime>,
+    /// Duration covered by retained observation epochs, seconds.
+    pub duration_s: Option<f64>,
+}
+
+/// Receiver identity fields copied from `REC # / TYPE / VERS`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ObservationQcReceiver {
+    /// Receiver serial number.
+    pub number: String,
+    /// Receiver type.
+    pub receiver_type: String,
+    /// Receiver firmware/version.
+    pub version: String,
+}
+
+/// Antenna identity fields copied from `ANT # / TYPE`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ObservationQcAntenna {
+    /// Antenna serial number.
+    pub number: String,
+    /// Antenna type.
+    pub antenna_type: String,
+}
+
+/// Observation epoch with an optional RINEX time-system label.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ObservationQcTime {
+    /// Civil epoch.
+    pub epoch: ObsEpochTime,
+    /// RINEX time-system label, when declared in the source header.
+    pub time_scale: Option<String>,
+}
+
+/// Compact lint finding retained by the QC report.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ObservationQcFinding {
+    /// Stable finding code.
+    pub code: String,
+    /// Finding severity.
+    pub severity: Severity,
+    /// RINEX specification or QC policy reference.
+    pub spec_ref: String,
+}
+
 /// One detected gap between adjacent observation epochs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ObservationDataGap {
     /// Epoch immediately before the gap.
     pub start_epoch: ObsEpochTime,
@@ -136,7 +212,7 @@ pub struct ObservationDataGap {
 }
 
 /// One detected receiver-clock jump.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ClockJump {
     /// Epoch index in the parsed observation stream where the jump appears.
     pub epoch_index: usize,
@@ -147,7 +223,7 @@ pub struct ClockJump {
 }
 
 /// Aggregate cycle-slip counts from the dual-frequency detector.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 pub struct CycleSlipQc {
     /// Total dual-frequency observations passed to the detector.
     pub observations: usize,
@@ -160,7 +236,7 @@ pub struct CycleSlipQc {
 }
 
 /// Per-constellation cycle-slip counts.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct SystemCycleSlipQc {
     /// GNSS constellation.
     pub system: GnssSystem,
@@ -172,8 +248,29 @@ pub struct SystemCycleSlipQc {
     pub observations_per_slip: Option<f64>,
 }
 
+/// Per-constellation observation completeness and gap counts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SystemObservationQc {
+    /// GNSS constellation.
+    pub system: GnssSystem,
+    /// Distinct satellites with at least one non-blank observation.
+    pub satellites_seen: usize,
+    /// Epochs where this constellation has at least one non-blank observation.
+    pub epochs_with_observations: usize,
+    /// Non-blank observation values.
+    pub value_observations: usize,
+    /// Retained observation slots in satellite records for this constellation.
+    pub expected_observations: usize,
+    /// `value_observations / expected_observations`, when defined.
+    pub completeness_ratio: Option<f64>,
+    /// Number of per-constellation data gaps.
+    pub gap_count: usize,
+    /// Missing nominal time across per-constellation gaps, seconds.
+    pub total_gap_s: f64,
+}
+
 /// Per-satellite observation counts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SatelliteObservationQc {
     /// Satellite id.
     pub satellite: GnssSatelliteId,
@@ -184,7 +281,7 @@ pub struct SatelliteObservationQc {
 }
 
 /// Per-satellite, per-observation-code counts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SatelliteSignalQc {
     /// Satellite id.
     pub satellite: GnssSatelliteId,
@@ -200,7 +297,7 @@ pub struct SatelliteSignalQc {
 }
 
 /// Per-system, per-observation-code counts.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SystemSignalQc {
     /// GNSS constellation.
     pub system: GnssSystem,
@@ -216,14 +313,14 @@ pub struct SystemSignalQc {
 }
 
 /// Histogram over RINEX SSI digits. Index 0 is blank/unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SsiHistogram {
     /// Counts indexed by SSI digit.
     pub counts: [u64; 10],
 }
 
 /// Summary statistics over raw numeric `S*` signal-strength observations.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct SnrStats {
     /// Number of samples.
     pub n: usize,
@@ -251,9 +348,11 @@ pub fn observation_qc_with_options(
     validate_options(options)?;
 
     let mut satellites: BTreeMap<GnssSatelliteId, SatelliteAccum> = BTreeMap::new();
+    let mut systems: BTreeMap<GnssSystem, SystemObservationAccum> = BTreeMap::new();
     let mut satellite_signals: BTreeMap<(GnssSatelliteId, String), SignalAccum> = BTreeMap::new();
     let mut system_signals: BTreeMap<(GnssSystem, String), SignalAccum> = BTreeMap::new();
     let mut observation_epoch_times = Vec::new();
+    let mut system_epoch_times: BTreeMap<GnssSystem, Vec<ObsEpochTime>> = BTreeMap::new();
 
     let mut observation_epochs = 0;
     let mut event_records = 0;
@@ -271,11 +370,19 @@ pub fn observation_qc_with_options(
         }
         observation_epoch_times.push(epoch.epoch);
 
+        let mut epoch_systems = BTreeSet::new();
         for (satellite, values) in &epoch.sats {
             let value_observations = values.iter().filter(|value| value.value.is_some()).count();
+            let system_acc = systems.entry(satellite.system).or_default();
+            system_acc.expected_observations += values.len();
+            system_acc.value_observations += value_observations;
+
             if value_observations == 0 {
                 continue;
             }
+
+            system_acc.satellites.insert(*satellite);
+            epoch_systems.insert(satellite.system);
 
             let satellite_acc = satellites.entry(*satellite).or_default();
             satellite_acc.epochs_with_observations += 1;
@@ -305,6 +412,14 @@ pub fn observation_qc_with_options(
                 sys_signal.add(code, value.value, value.ssi);
             }
         }
+
+        for system in epoch_systems {
+            systems.entry(system).or_default().epochs_with_observations += 1;
+            system_epoch_times
+                .entry(system)
+                .or_default()
+                .push(epoch.epoch);
+        }
     }
 
     let mut notes = non_monotonic_notes(&observation_epoch_times);
@@ -315,8 +430,10 @@ pub fn observation_qc_with_options(
     let clock_jumps = detect_clock_jumps(obs, options.clock_jump_threshold_s);
     let cycle_slips = aggregate_cycle_slips(obs);
     let multipath = multipath_stats(obs, &CycleSlipConfig::default());
+    let systems = finish_system_observation_qc(systems, &system_epoch_times, options, interval_s)?;
 
     Ok(ObservationQcReport {
+        header: observation_qc_header(obs, &observation_epoch_times),
         total_epoch_records: obs.epochs().len(),
         observation_epochs,
         event_records,
@@ -329,6 +446,7 @@ pub fn observation_qc_with_options(
         clock_jumps,
         cycle_slips,
         multipath,
+        systems,
         satellites: satellites
             .into_iter()
             .map(|(satellite, acc)| SatelliteObservationQc {
@@ -357,6 +475,7 @@ pub fn observation_qc_with_options(
                 snr: acc.snr.finish(),
             })
             .collect(),
+        lint_findings: observation_qc_findings(obs),
         notes,
     })
 }
@@ -386,6 +505,111 @@ fn validate_interval(interval_s: f64) -> Result<(), ObservationQcError> {
 
 fn positive_finite(value: f64) -> bool {
     value.is_finite() && value > 0.0
+}
+
+fn observation_qc_header(
+    obs: &RinexObs,
+    observation_epoch_times: &[ObsEpochTime],
+) -> ObservationQcHeader {
+    let header = obs.header();
+    let time_of_first_obs = header
+        .time_of_first_obs
+        .map(stamped_declared_time)
+        .or_else(|| observation_epoch_times.first().copied().map(unstamped_time));
+    let time_of_last_obs = header
+        .time_of_last_obs
+        .map(stamped_declared_time)
+        .or_else(|| observation_epoch_times.last().copied().map(unstamped_time));
+    let duration_s = observation_epoch_times
+        .first()
+        .zip(observation_epoch_times.last())
+        .map(|(first, last)| obs_epoch_seconds(*last) - obs_epoch_seconds(*first))
+        .filter(|duration_s| duration_s.is_finite() && *duration_s >= 0.0);
+
+    ObservationQcHeader {
+        marker_name: header.marker_name.clone(),
+        marker_number: header.marker_number.clone(),
+        marker_type: header.marker_type.clone(),
+        receiver: header
+            .receiver
+            .as_ref()
+            .map(|receiver| ObservationQcReceiver {
+                number: receiver.number.clone(),
+                receiver_type: receiver.receiver_type.clone(),
+                version: receiver.version.clone(),
+            }),
+        antenna: header.antenna.as_ref().map(|antenna| ObservationQcAntenna {
+            number: antenna.number.clone(),
+            antenna_type: antenna.antenna_type.clone(),
+        }),
+        approx_position_m: header.approx_position_m,
+        antenna_delta_hen_m: header.antenna_delta_hen_m,
+        time_of_first_obs,
+        time_of_last_obs,
+        duration_s,
+    }
+}
+
+fn stamped_declared_time(
+    (epoch, scale): (ObsEpochTime, crate::astro::time::model::TimeScale),
+) -> ObservationQcTime {
+    ObservationQcTime {
+        epoch,
+        time_scale: Some(time_scale_rinex_label(scale).to_string()),
+    }
+}
+
+fn unstamped_time(epoch: ObsEpochTime) -> ObservationQcTime {
+    ObservationQcTime {
+        epoch,
+        time_scale: None,
+    }
+}
+
+fn finish_system_observation_qc(
+    systems: BTreeMap<GnssSystem, SystemObservationAccum>,
+    system_epoch_times: &BTreeMap<GnssSystem, Vec<ObsEpochTime>>,
+    options: ObservationQcOptions,
+    interval_s: Option<f64>,
+) -> Result<Vec<SystemObservationQc>, ObservationQcError> {
+    systems
+        .into_iter()
+        .map(|(system, acc)| {
+            let times = system_epoch_times
+                .get(&system)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let gaps = detect_gaps(options, times, interval_s)?;
+            let total_gap_s = gaps
+                .iter()
+                .map(|gap| gap.missing_epochs as f64 * gap.nominal_interval_s)
+                .sum::<f64>();
+            let total_gap_s = if total_gap_s == 0.0 { 0.0 } else { total_gap_s };
+            Ok(SystemObservationQc {
+                system,
+                satellites_seen: acc.satellites.len(),
+                epochs_with_observations: acc.epochs_with_observations,
+                value_observations: acc.value_observations,
+                expected_observations: acc.expected_observations,
+                completeness_ratio: (acc.expected_observations > 0)
+                    .then(|| acc.value_observations as f64 / acc.expected_observations as f64),
+                gap_count: gaps.len(),
+                total_gap_s,
+            })
+        })
+        .collect()
+}
+
+fn observation_qc_findings(obs: &RinexObs) -> Vec<ObservationQcFinding> {
+    lint_obs(obs)
+        .findings
+        .into_iter()
+        .map(|finding| ObservationQcFinding {
+            code: finding.code().to_string(),
+            severity: finding.severity(),
+            spec_ref: finding.spec_ref().to_string(),
+        })
+        .collect()
 }
 
 fn resolve_interval(
@@ -835,6 +1059,14 @@ fn system_from_satellite_token(satellite_id: &str) -> Option<GnssSystem> {
         .chars()
         .next()
         .and_then(GnssSystem::from_letter)
+}
+
+#[derive(Debug, Default)]
+struct SystemObservationAccum {
+    satellites: BTreeSet<GnssSatelliteId>,
+    epochs_with_observations: usize,
+    value_observations: usize,
+    expected_observations: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1533,6 +1765,122 @@ mod tests {
         assert_close(by_system[&GnssSystem::BeiDou].2, 1046.0 / 4.0, rel);
     }
 
+    #[test]
+    fn observation_qc_report_text_snapshot_esbc00dnk() {
+        let rel = "tests/fixtures/obs/ESBC00DNK_R_20201770000_01D_30S_MO_120epoch.rnx";
+        let text = std::fs::read_to_string(fixture_path(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let obs = RinexObs::parse(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+        let report = observation_qc(&obs);
+        let rendered = render_text(&report);
+
+        assert_eq!(rendered, ESBC_QC_REPORT_TEXT);
+        assert!(rendered.contains("G   GPS"));
+        assert!(rendered.contains("R   GLONASS"));
+        assert!(rendered.contains("E   Galileo"));
+        assert!(rendered.contains("C   BeiDou"));
+        assert!(rendered.contains("S   SBAS"));
+        assert!(rendered.contains("0.292"));
+        assert!(rendered.contains("1.174"));
+        assert!(rendered.contains("FINDINGS"));
+        assert!(rendered.contains("CODE     SEVERITY SPEC REF"));
+    }
+
+    #[test]
+    fn observation_qc_report_json_contains_expected_fields_esbc00dnk() {
+        let rel = "tests/fixtures/obs/ESBC00DNK_R_20201770000_01D_30S_MO_120epoch.rnx";
+        let text = std::fs::read_to_string(fixture_path(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let obs = RinexObs::parse(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+        let report = observation_qc(&obs);
+
+        let encoded = serde_json::to_string(&report).expect("serialize QC report");
+        let doc: Value = serde_json::from_str(&encoded).expect("parse serialized QC report");
+
+        assert_eq!(doc["header"]["marker_name"], "ESBC00DNK");
+        assert_eq!(doc["header"]["receiver"]["receiver_type"], "SEPT POLARX5");
+        assert_eq!(doc["interval_s"], 30.0);
+
+        let gps = json_system(&doc, "Gps");
+        assert_eq!(gps["satellites_seen"], 13);
+        assert_eq!(gps["epochs_with_observations"], 120);
+        assert_eq!(gps["value_observations"], 18645);
+        assert_close(
+            gps["completeness_ratio"].as_f64().unwrap(),
+            0.800489438433797,
+            "GPS JSON completeness",
+        );
+
+        let gps_mp = json_multipath_system(&doc, "Gps");
+        assert_close(
+            gps_mp["mp1"]["rms_m"].as_f64().unwrap(),
+            0.29240479301672934,
+            "GPS JSON MP1",
+        );
+        let beidou_mp = json_multipath_system(&doc, "BeiDou");
+        assert_close(
+            beidou_mp["mp2"]["rms_m"].as_f64().unwrap(),
+            1.1736185873490712,
+            "BeiDou JSON MP2",
+        );
+
+        let galileo_slips = doc["cycle_slips"]["by_system"]
+            .as_array()
+            .expect("cycle slip systems")
+            .iter()
+            .find(|row| row["system"] == "Galileo")
+            .expect("Galileo cycle slip row");
+        assert_eq!(galileo_slips["slips"], 9);
+        assert_eq!(doc["lint_findings"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn observation_qc_report_html_contains_rows_without_external_assets() {
+        let rel = "tests/fixtures/obs/ESBC00DNK_R_20201770000_01D_30S_MO_120epoch.rnx";
+        let text = std::fs::read_to_string(fixture_path(rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let obs = RinexObs::parse(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+        let report = observation_qc(&obs);
+        let html = render_html(&report);
+
+        assert!(html.contains("<td class=\"text\">G</td>"));
+        assert!(html.contains("<td class=\"text\">GPS</td>"));
+        assert!(html.contains("<td>0.292</td>"));
+        assert!(html.contains("<td>1.174</td>"));
+        assert!(html.contains("<h2>Findings</h2>"));
+        assert!(!html.contains("http"));
+    }
+
+    const ESBC_QC_REPORT_TEXT: &str = r#"RINEX OBSERVATION QC +QC SUMMARY
+
+HEADER
+  MARKER NAME        ESBC00DNK
+  MARKER NUMBER      10118M001
+  MARKER TYPE        GEODETIC
+  RECEIVER           3047937 / SEPT POLARX5 / 5.2.0
+  ANTENNA            CR5200327016 / ASH701945E_M    SCIS
+  POSITION XYZ M     3582105.2910 532589.7313 5232754.8054
+  ANTENNA HEN M      0.2160 0.0000 0.0000
+  TIME FIRST         2020-06-25 00:00:00.0000000 GPS
+  TIME LAST          2020-06-25 00:59:30.0000000 GPS
+  INTERVAL S         30.000 (header)
+  DURATION S         3570.0
+
+PER-CONSTELLATION
+SYS NAME     SATS EPOCHS      OBS   EXPECT     COMP SNR MEAN/MIN BY BAND                                                                              MP1 RMS  MP2 RMS  SLIPS GAPS     GAP S
+--- -------- ---- ------ -------- -------- -------- ------------------------------------------------------------------------------------------------ -------- -------- ------ ---- ---------
+G   GPS        13    120    18645    23292    0.800 1:39.0/5.5 2:37.7/5.5 5:36.0/23.8                                                                   0.292    0.281      4    0       0.0
+R   GLONASS    12    120    16323    22600    0.722 1:42.9/20.5 2:42.0/21.5 3:35.4/25.2                                                                 0.519    0.314     10    0       0.0
+E   Galileo     9    120    19147    20540    0.932 1:42.2/18.8 5:36.5/20.5 6:34.8/24.0 7:45.2/25.5 8:45.2/26.0                                         0.386    0.483      9    0       0.0
+C   BeiDou     12    120    11213    15708    0.714 2:42.6/32.5 6:35.6/26.8 7:41.2/36.0                                                                 1.017    1.174      4    0       0.0
+S   SBAS        5    120     3032     4144    0.732 1:38.2/30.8 5:33.5/31.5                                                                                 -        -      0    0       0.0
+
+FINDINGS
+CODE     SEVERITY SPEC REF
+-------- -------- ------------------------------------------------
+NONE
+"#;
+
     fn observation_file(epochs: Vec<ObsEpoch>) -> RinexObs {
         RinexObs {
             header: ObsHeader {
@@ -1656,6 +2004,24 @@ mod tests {
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    }
+
+    fn json_system<'a>(doc: &'a Value, system: &str) -> &'a Value {
+        doc["systems"]
+            .as_array()
+            .expect("systems")
+            .iter()
+            .find(|row| row["system"] == system)
+            .unwrap_or_else(|| panic!("missing JSON system {system}"))
+    }
+
+    fn json_multipath_system<'a>(doc: &'a Value, system: &str) -> &'a Value {
+        doc["multipath"]["systems"]
+            .as_array()
+            .expect("multipath systems")
+            .iter()
+            .find(|row| row["system"] == system)
+            .unwrap_or_else(|| panic!("missing JSON multipath system {system}"))
     }
 
     fn assert_close(actual: f64, expected: f64, context: &str) {

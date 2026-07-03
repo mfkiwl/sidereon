@@ -22,7 +22,9 @@ use core::fmt;
 /// Note that timekeeping is constellation-tagged separately (`TimeScale`):
 /// GPS/Galileo/BeiDou each run their own system time, and GNSS week numbers are
 /// **not** cross-comparable between systems.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum GnssSystem {
     /// GPS (United States), RINEX letter `G`.
     Gps,
@@ -98,7 +100,9 @@ impl fmt::Display for GnssSystem {
 /// spec (line 112). The `prn` is the within-constellation satellite number as
 /// it appears in the product (e.g. the `01` in the SP3/RINEX token `G01`); it
 /// is only meaningful in combination with [`GnssSatelliteId::system`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct GnssSatelliteId {
     /// The constellation this satellite belongs to.
     pub system: GnssSystem,
