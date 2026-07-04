@@ -110,6 +110,27 @@ pub struct ReliabilityReport {
 /// `(normal_q_inv(alpha / 2) + normal_q_inv(beta))^2`, with `alpha` treated as a
 /// two-sided false-alarm probability and `beta` as missed-detection probability.
 pub fn wtest_noncentrality(alpha: f64, beta: f64) -> Result<f64, QualityError> {
+    Ok(wtest_noncentrality_components(alpha, beta)?.lambda0)
+}
+
+/// Both Baarda w-test noncentrality forms from a single derivation: the
+/// noncentrality parameter `delta0 = normal_q_inv(alpha / 2) + normal_q_inv(beta)`
+/// and its square `lambda0`. Consumers that report both must take them from
+/// here rather than re-deriving one from the other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WtestNoncentralityComponents {
+    /// The noncentrality parameter `delta0`.
+    pub delta0: f64,
+    /// The squared noncentrality `lambda0 = delta0 * delta0`.
+    pub lambda0: f64,
+}
+
+/// Compute [`WtestNoncentralityComponents`] for a two-sided false-alarm
+/// probability `alpha` and a missed-detection probability `beta`.
+pub fn wtest_noncentrality_components(
+    alpha: f64,
+    beta: f64,
+) -> Result<WtestNoncentralityComponents, QualityError> {
     validate_probability(alpha)?;
     if !(0.0..1.0).contains(&beta) || !beta.is_finite() {
         return Err(QualityError::InvalidReliabilityParameter);
@@ -119,7 +140,7 @@ pub fn wtest_noncentrality(alpha: f64, beta: f64) -> Result<f64, QualityError> {
     let delta0 = k_alpha + k_beta;
     let lambda0 = delta0 * delta0;
     if lambda0.is_finite() && lambda0 > 0.0 {
-        Ok(lambda0)
+        Ok(WtestNoncentralityComponents { delta0, lambda0 })
     } else {
         Err(QualityError::InvalidReliabilityParameter)
     }

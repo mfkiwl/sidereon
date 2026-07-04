@@ -172,8 +172,9 @@ pub use crate::estimation::{
     AlphaBetaStep, PrimitiveError, ScalarKalmanGains, MAD_GAUSSIAN_CONSISTENCY,
 };
 pub use crate::quality::{
-    reliability_araim, reliability_design, wtest_noncentrality, ObservationReliability,
-    RangeReliabilityRow, ReliabilityOptions, ReliabilityReport, ReliabilitySummary,
+    reliability_araim, reliability_design, wtest_noncentrality, wtest_noncentrality_components,
+    ObservationReliability, RangeReliabilityRow, ReliabilityOptions, ReliabilityReport,
+    ReliabilitySummary, WtestNoncentralityComponents,
 };
 pub use araim::ProtectionModel;
 pub use error::{Error, Result};

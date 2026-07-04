@@ -8,8 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod normality;
 
 pub use crate::araim::reliability::{
-    reliability_araim, reliability_design, wtest_noncentrality, ObservationReliability,
-    RangeReliabilityRow, ReliabilityOptions, ReliabilityReport, ReliabilitySummary,
+    reliability_araim, reliability_design, wtest_noncentrality, wtest_noncentrality_components,
+    ObservationReliability, RangeReliabilityRow, ReliabilityOptions, ReliabilityReport,
+    ReliabilitySummary, WtestNoncentralityComponents,
 };
 
 use crate::astro::math::linear::{invert_symmetric_pd, normal_equations_weighted};

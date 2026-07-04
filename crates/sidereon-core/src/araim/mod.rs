@@ -21,8 +21,9 @@ pub use ism::{ConstellationIsm, Ism, SatelliteIsm, SatelliteIsmModel};
 pub use mhss::{araim, AraimResult, FaultMode};
 pub use protection::ProtectionModel;
 pub use reliability::{
-    reliability_araim, reliability_design, wtest_noncentrality, ObservationReliability,
-    RangeReliabilityRow, ReliabilityOptions, ReliabilityReport, ReliabilitySummary,
+    reliability_araim, reliability_design, wtest_noncentrality, wtest_noncentrality_components,
+    ObservationReliability, RangeReliabilityRow, ReliabilityOptions, ReliabilityReport,
+    ReliabilitySummary, WtestNoncentralityComponents,
 };
 
 use crate::astro::frames::transforms::geodetic_from_ecef_proj;

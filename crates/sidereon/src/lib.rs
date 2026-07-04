@@ -192,8 +192,8 @@ pub use sidereon_core::geometry_quality::{
 };
 pub use sidereon_core::quality::{
     reliability_araim, reliability_design, spp_robust_fde_driver, wtest_noncentrality,
-    ObservationReliability, RangeReliabilityRow, ReliabilityOptions, ReliabilityReport,
-    ReliabilitySummary,
+    wtest_noncentrality_components, ObservationReliability, RangeReliabilityRow,
+    ReliabilityOptions, ReliabilityReport, ReliabilitySummary, WtestNoncentralityComponents,
 };
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
