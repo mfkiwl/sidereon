@@ -119,6 +119,7 @@ pub mod velocity; // receiver velocity / clock-drift least-squares solve
 
 mod error;
 pub mod frame;
+pub mod frame_catalog;
 mod id;
 
 pub mod atmosphere;
@@ -185,6 +186,11 @@ pub use error::{Error, Result};
 pub use frame::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, ItrfPositionM, ItrfVelocityMS,
     Wgs84Geodetic,
+};
+pub use frame_catalog::{
+    catalog, catalog_entry, propagate_position, transform, transform_from_epoch, FrameCatalogError,
+    HelmertParameters, HelmertRates, HelmertTransform, TerrestrialFrame, TerrestrialPositionM,
+    TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
 pub use geoid::{
     egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
