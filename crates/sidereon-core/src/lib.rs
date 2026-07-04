@@ -123,6 +123,7 @@ pub mod combinations;
 pub mod dgnss;
 pub mod ephemeris;
 pub mod estimation; // Phase-2 estimation substrate: named operation-order recipes
+pub mod geodetic_time_series; // robust station velocity, trajectory, steps, and fields
 pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric heights)
 pub mod geometry;
 pub mod geometry_quality;
