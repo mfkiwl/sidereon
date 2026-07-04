@@ -21,6 +21,7 @@ use super::state::{
     invalid_input, validate_covariance_matrix, FusionError, InsFilterState, ERROR_ATTITUDE_INDEX,
     ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_VELOCITY_INDEX,
 };
+use super::tight::{TightCouplingConfig, TightFusionState};
 use super::timesync::TimeSyncHistory;
 
 const LOOSE_MIN_SATELLITES: usize = 4;
@@ -160,6 +161,8 @@ pub struct InertialFilterConfig {
     pub mechanization: MechanizationConfig,
     /// Loose GNSS update options.
     pub loose: LooseCouplingConfig,
+    /// Tight raw GNSS update options.
+    pub tight: TightCouplingConfig,
 }
 
 impl InertialFilterConfig {
@@ -170,6 +173,7 @@ impl InertialFilterConfig {
             imu_model: ImuErrorModel::default(),
             mechanization: MechanizationConfig::default(),
             loose: LooseCouplingConfig::default(),
+            tight: TightCouplingConfig::default(),
         };
         config.validate()?;
         Ok(config)
@@ -183,7 +187,8 @@ impl InertialFilterConfig {
             .calibration
             .validate()
             .map_err(FusionError::from)?;
-        self.loose.validate()
+        self.loose.validate()?;
+        self.tight.validate()
     }
 }
 
@@ -224,6 +229,7 @@ pub struct InertialFilter {
     pub(super) config: InertialFilterConfig,
     pub(super) last_body_rate_wrt_ecef_rps: [f64; 3],
     pub(super) time_sync: TimeSyncHistory,
+    pub(super) tight: TightFusionState,
 }
 
 impl InertialFilter {
@@ -240,12 +246,14 @@ impl InertialFilter {
     ) -> Result<Self, FusionError> {
         state.validate()?;
         config.validate()?;
-        let time_sync = TimeSyncHistory::from_initial(&state);
+        let tight = TightFusionState::from_filter_state(&state, config.tight)?;
+        let time_sync = TimeSyncHistory::from_initial(&state, &tight);
         Ok(Self {
             state,
             config,
             last_body_rate_wrt_ecef_rps: [0.0; 3],
             time_sync,
+            tight,
         })
     }
 
@@ -282,6 +290,7 @@ impl InertialFilter {
     pub(super) fn propagate_core(&mut self, sample: ImuSample) -> Result<(), FusionError> {
         self.state.validate()?;
         self.config.validate()?;
+        self.tight.align_with_filter_state(&self.state)?;
 
         let previous = self.state.nominal;
         let imu_model = self.effective_imu_model()?;
@@ -311,6 +320,13 @@ impl InertialFilter {
             &linearization.phi,
             &linearization.q_d,
         )?;
+        self.tight.predict_covariance(
+            &linearization.phi,
+            &linearization.q_d,
+            increment.dt_s,
+            self.config.tight,
+        )?;
+        self.tight.copy_base_covariance_to_state(&mut self.state)?;
         self.state.nominal = next_nominal;
         self.state.reset_error_state();
         self.last_body_rate_wrt_ecef_rps = body_rate_wrt_ecef_rps;
@@ -338,7 +354,7 @@ impl InertialFilter {
         let update = self.update_loose_core(measurement)?;
         let snapshot = self.snapshot();
         self.time_sync
-            .push_measurement_and_checkpoint(measurement.clone(), snapshot);
+            .push_loose_measurement_and_checkpoint(measurement.clone(), snapshot);
         Ok(update)
     }
 
@@ -358,6 +374,8 @@ impl InertialFilter {
             &correction,
             self.config.loose.update_options,
         )?;
+        self.tight
+            .replace_base_covariance_and_clear_cross(&self.state.covariance)?;
         Ok(FusionUpdate::from_report(rows, report))
     }
 
