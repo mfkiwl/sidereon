@@ -42,6 +42,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::astro::frames::orientation::EarthOrientation;
+use crate::astro::frames::transforms::FrameTransformError;
+use crate::astro::state::CartesianState;
 use crate::astro::time::model::{Instant, TimeScale};
 use crate::constants::{KM_TO_M, US_TO_S};
 use crate::id::GnssSatelliteId;
@@ -97,6 +100,85 @@ impl PreciseEphemerisSample {
             clock_event: false,
         }
     }
+}
+
+/// One precise-ephemeris state sample with ECEF position and velocity.
+///
+/// This is the state-bearing companion to [`PreciseEphemerisSample`]. It is
+/// emitted only when a source carries a real SP3 velocity record. Positions are
+/// ITRF/IGS ECEF meters and velocities are ITRF/IGS ECEF meters per second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreciseEphemerisStateSample {
+    /// The satellite this sample describes.
+    pub sat: GnssSatelliteId,
+    /// The sample epoch, tagged with its time scale.
+    pub epoch: Instant,
+    /// Satellite position in the ITRF/IGS ECEF frame, meters.
+    pub position_ecef_m: [f64; 3],
+    /// Satellite velocity in the ITRF/IGS ECEF frame, meters per second.
+    pub velocity_ecef_m_s: [f64; 3],
+    /// Satellite clock offset in seconds (`None` when no clock estimate exists).
+    pub clock_s: Option<f64>,
+    /// Satellite clock-rate in seconds per second, when supplied by the source.
+    pub clock_rate_s_s: Option<f64>,
+    /// Whether this epoch carries the SP3 `E` clock-event flag.
+    pub clock_event: bool,
+}
+
+impl PreciseEphemerisStateSample {
+    /// Build a state sample with no clock-event flag.
+    pub fn new(
+        sat: GnssSatelliteId,
+        epoch: Instant,
+        position_ecef_m: [f64; 3],
+        velocity_ecef_m_s: [f64; 3],
+        clock_s: Option<f64>,
+        clock_rate_s_s: Option<f64>,
+    ) -> Self {
+        Self {
+            sat,
+            epoch,
+            position_ecef_m,
+            velocity_ecef_m_s,
+            clock_s,
+            clock_rate_s_s,
+            clock_event: false,
+        }
+    }
+}
+
+/// Convert one SP3 ECEF state sample into the propagator's inertial state.
+///
+/// The supplied [`EarthOrientation`] is the single evaluated frame state for the
+/// sample epoch. The velocity uses the full rotating-frame transport
+/// `v_gcrf = R^T (v_itrf + omega_itrf x r_itrf)`.
+pub fn sp3_ecef_state_to_eci(
+    sample: &PreciseEphemerisStateSample,
+    orientation: &EarthOrientation,
+) -> core::result::Result<CartesianState, FrameTransformError> {
+    validate_state_sample(sample)?;
+    let epoch_j2000_s = instant_to_j2000_seconds(&sample.epoch)
+        .ok_or_else(|| frame_error("epoch", "must be a split Julian date"))?;
+    if !epoch_j2000_s.is_finite() {
+        return Err(frame_error("epoch", "J2000 seconds must be finite"));
+    }
+    let position_itrf_km = [
+        sample.position_ecef_m[0] / KM_TO_M,
+        sample.position_ecef_m[1] / KM_TO_M,
+        sample.position_ecef_m[2] / KM_TO_M,
+    ];
+    let velocity_itrf_km_s = [
+        sample.velocity_ecef_m_s[0] / KM_TO_M,
+        sample.velocity_ecef_m_s[1] / KM_TO_M,
+        sample.velocity_ecef_m_s[2] / KM_TO_M,
+    ];
+    let (position_gcrf_km, velocity_gcrf_km_s) =
+        orientation.itrf_to_gcrf_state_km(position_itrf_km, velocity_itrf_km_s)?;
+    Ok(CartesianState::new(
+        epoch_j2000_s,
+        position_gcrf_km,
+        velocity_gcrf_km_s,
+    ))
 }
 
 /// Validation failure building a [`PreciseEphemerisSamples`] source.
@@ -343,6 +425,65 @@ impl Sp3 {
         }
         out
     }
+
+    /// Extract this product as ECEF position and velocity samples.
+    ///
+    /// Samples are emitted only for epochs where the parsed product carries a
+    /// real velocity record. Position-only SP3 products therefore return an
+    /// empty vector rather than fabricating zero velocity.
+    pub fn precise_ephemeris_state_samples(&self) -> Vec<PreciseEphemerisStateSample> {
+        let mut out = Vec::new();
+        for (idx, &epoch) in self.epochs.iter().enumerate() {
+            if let Ok(states) = self.states_at(idx) {
+                for (&sat, state) in states {
+                    if let Some(velocity) = state.velocity {
+                        out.push(PreciseEphemerisStateSample {
+                            sat,
+                            epoch,
+                            position_ecef_m: state.position.as_array(),
+                            velocity_ecef_m_s: velocity.as_array(),
+                            clock_s: state.clock_s,
+                            clock_rate_s_s: state.clock_rate_s_s,
+                            clock_event: state.flags.clock_event,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+fn validate_state_sample(
+    sample: &PreciseEphemerisStateSample,
+) -> core::result::Result<(), FrameTransformError> {
+    if !sample.position_ecef_m.iter().all(|value| value.is_finite()) {
+        return Err(frame_error("position_ecef_m", "components must be finite"));
+    }
+    if !sample
+        .velocity_ecef_m_s
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Err(frame_error(
+            "velocity_ecef_m_s",
+            "components must be finite",
+        ));
+    }
+    if sample.clock_s.is_some_and(|value| !value.is_finite()) {
+        return Err(frame_error("clock_s", "must be finite"));
+    }
+    if sample
+        .clock_rate_s_s
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err(frame_error("clock_rate_s_s", "must be finite"));
+    }
+    Ok(())
+}
+
+fn frame_error(field: &'static str, reason: &'static str) -> FrameTransformError {
+    FrameTransformError::InvalidInput { field, reason }
 }
 
 #[cfg(test)]

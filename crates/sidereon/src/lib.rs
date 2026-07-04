@@ -180,6 +180,9 @@ pub use sidereon_core::astro::forces::{
     SchwarzschildRelativity, SolarRadiationPressure, ThirdBodyBodies, ThirdBodyGravity,
     ZonalCoefficients, ZonalDegrees, ZonalGravity,
 };
+pub use sidereon_core::astro::frames::{
+    EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider,
+};
 pub use sidereon_core::astro::propagator::{ForceModelComponents, ForceModelKind};
 pub use sidereon_core::geometry_quality::{
     classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
@@ -319,6 +322,10 @@ pub use sidereon_core::astro::space_weather::{
     ObservationClass, SpaceWeatherPolicy, SpaceWeatherSample, SpaceWeatherTable,
 };
 pub use sidereon_core::astro::{passes, propagator, sgp4, space_weather, state, tca, tle};
+pub use sidereon_core::ephemeris::{
+    fit_precise_ephemeris_state_sample_orbit, fit_precise_ephemeris_state_sample_orbits,
+    sp3_ecef_state_to_eci, OrientedPreciseEphemerisStateSample, PreciseEphemerisStateSample,
+};
 
 /// Root-level shortcut for satellite-relative frames and CW propagation.
 ///

@@ -17,7 +17,7 @@
 use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::DragParameters;
-use crate::astro::propagator::api::IntegratorOptions;
+use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
 use crate::astro::propagator::numerical::{ForceModelKind, IntegratorKind, StatePropagator};
 use crate::astro::state::CartesianState;
 
@@ -132,6 +132,21 @@ pub fn propagate_states(
     epochs_tdb_seconds: &[f64],
 ) -> Result<Vec<CartesianState>, PropagationError> {
     config.to_propagator().ephemeris(epochs_tdb_seconds)
+}
+
+/// Run the numerical propagator with an explicit propagation context.
+///
+/// Passing [`PropagationContext::default`] is equivalent to
+/// [`propagate_states`]. This is the high-level opt-in path for future
+/// body-fixed force models that need a shared frame provider.
+pub fn propagate_states_with_context(
+    config: &PropagationConfig,
+    epochs_tdb_seconds: &[f64],
+    ctx: &PropagationContext,
+) -> Result<Vec<CartesianState>, PropagationError> {
+    config
+        .to_propagator()
+        .ephemeris_with_context(epochs_tdb_seconds, ctx)
 }
 
 #[cfg(test)]

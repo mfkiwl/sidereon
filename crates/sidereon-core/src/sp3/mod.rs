@@ -1076,7 +1076,10 @@ pub use combine::{
     EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport,
 };
 pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
-pub use samples::{PreciseEphemerisSample, PreciseEphemerisSamples, PreciseSamplesError};
+pub use samples::{
+    sp3_ecef_state_to_eci, PreciseEphemerisSample, PreciseEphemerisSamples,
+    PreciseEphemerisStateSample, PreciseSamplesError,
+};
 pub use verify::{
     compare_position_series, InterpolationComparison, InterpolationDivergence, ReferenceState,
 };
