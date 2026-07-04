@@ -1299,7 +1299,9 @@ fn validate_calendar_epoch(
         TimeScale::Glonasst
         | TimeScale::Tai
         | TimeScale::Tt
+        | TimeScale::Tcg
         | TimeScale::Tdb
+        | TimeScale::Tcb
         | TimeScale::Gpst
         | TimeScale::Gst
         | TimeScale::Bdt

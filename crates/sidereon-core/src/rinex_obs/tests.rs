@@ -961,6 +961,33 @@ fn accepts_qzss_time_of_first_obs_as_qzsst() {
 }
 
 #[test]
+fn to_rinex_string_omits_unsupported_time_header_labels() {
+    let first = header_line(
+        "  2020     6    25     0     0    0.0000000     GPS",
+        "TIME OF FIRST OBS",
+    );
+    let last = header_line(
+        "  2020     6    25     0    30    0.0000000     GPS",
+        "TIME OF LAST OBS",
+    );
+    let mut obs = RinexObs::parse(&minimal_obs(&[first, last], "")).expect("parse OBS");
+    let first_epoch = obs.header.time_of_first_obs.expect("first stamp").0;
+    let last_epoch = obs.header.time_of_last_obs.expect("last stamp").0;
+    obs.header.time_of_first_obs = Some((first_epoch, TimeScale::Tcg));
+    obs.header.time_of_last_obs = Some((last_epoch, TimeScale::Tcb));
+
+    let serialized = obs.to_rinex_string();
+
+    assert!(!serialized.contains("TCG"));
+    assert!(!serialized.contains("TCB"));
+    assert!(!serialized.contains("TIME OF FIRST OBS"));
+    assert!(!serialized.contains("TIME OF LAST OBS"));
+    let reparsed = RinexObs::parse(&serialized).expect("parse serialized OBS");
+    assert_eq!(reparsed.header.time_of_first_obs, None);
+    assert_eq!(reparsed.header.time_of_last_obs, None);
+}
+
+#[test]
 fn rejects_invalid_civil_epoch_fields() {
     let header = header_line(
         "  2020     2    30     0     0    0.0000000     GPS",

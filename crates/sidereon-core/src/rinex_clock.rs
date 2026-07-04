@@ -93,6 +93,11 @@ pub enum RinexClockError {
         /// Human-readable validation failure.
         reason: &'static str,
     },
+    /// The clock product names a time scale RINEX clock headers cannot represent.
+    UnsupportedTimeScale {
+        /// Unsupported time scale.
+        scale: TimeScale,
+    },
 }
 
 impl fmt::Display for RinexClockError {
@@ -112,6 +117,9 @@ impl fmt::Display for RinexClockError {
             ),
             RinexClockError::InvalidInput { field, reason } => {
                 write!(f, "invalid RINEX clock input {field}: {reason}")
+            }
+            RinexClockError::UnsupportedTimeScale { scale } => {
+                write!(f, "unsupported RINEX clock time scale {}", scale.abbrev())
             }
         }
     }
@@ -290,18 +298,23 @@ impl RinexClock {
     /// series. Epoch components are written on the microsecond civil grid the
     /// parser reads, and bias values use their shortest round-tripping decimal,
     /// so a parsed product re-encodes to the same `f64`s.
-    pub fn to_rinex_string(&self) -> String {
+    pub fn to_rinex_string(&self) -> Result<String, RinexClockError> {
         let mut out = String::new();
-        let label = crate::rinex_common::time_scale_rinex_label(self.time_scale);
+        let label = crate::rinex_common::time_scale_rinex_label(self.time_scale).ok_or(
+            RinexClockError::UnsupportedTimeScale {
+                scale: self.time_scale,
+            },
+        )?;
         let _ = writeln!(out, "{:<60}RINEX VERSION / TYPE", "     3.00           C");
         let _ = writeln!(out, "{label:<60}TIME SYSTEM ID");
         let _ = writeln!(out, "{:<60}END OF HEADER", "");
         for (satellite, points) in &self.series {
             for point in points {
+                validate_serializable_clock_point(self.time_scale, point)?;
                 write_as_record(&mut out, satellite, point);
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -479,6 +492,24 @@ fn gps_seconds_to_instant(gps_seconds: f64) -> Instant {
 fn validate_clock_point(point: ClockPoint) -> Result<(), RinexClockError> {
     validate_instant(point.epoch, "epoch")?;
     validate_finite(point.bias_s, "bias_s")
+}
+
+fn validate_serializable_clock_point(
+    product_scale: TimeScale,
+    point: &ClockPoint,
+) -> Result<(), RinexClockError> {
+    if crate::rinex_common::time_scale_rinex_label(point.epoch.scale).is_none() {
+        return Err(RinexClockError::UnsupportedTimeScale {
+            scale: point.epoch.scale,
+        });
+    }
+    if point.epoch.scale != product_scale {
+        return Err(invalid_input(
+            "epoch",
+            "epoch scale does not match clock time scale",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_instant(epoch: Instant, field: &'static str) -> Result<(), RinexClockError> {
@@ -728,7 +759,9 @@ fn civil_second_policy_for_time_scale(scale: TimeScale) -> validate::CivilSecond
         TimeScale::Glonasst
         | TimeScale::Tai
         | TimeScale::Tt
+        | TimeScale::Tcg
         | TimeScale::Tdb
+        | TimeScale::Tcb
         | TimeScale::Gpst
         | TimeScale::Gst
         | TimeScale::Bdt
@@ -901,12 +934,14 @@ fn time_scale_rank(scale: TimeScale) -> u8 {
         TimeScale::Utc => 0,
         TimeScale::Tai => 1,
         TimeScale::Tt => 2,
-        TimeScale::Tdb => 3,
-        TimeScale::Gpst => 4,
-        TimeScale::Gst => 5,
-        TimeScale::Bdt => 6,
-        TimeScale::Glonasst => 7,
-        TimeScale::Qzsst => 8,
+        TimeScale::Tcg => 3,
+        TimeScale::Tdb => 4,
+        TimeScale::Tcb => 5,
+        TimeScale::Gpst => 6,
+        TimeScale::Gst => 7,
+        TimeScale::Bdt => 8,
+        TimeScale::Glonasst => 9,
+        TimeScale::Qzsst => 10,
     }
 }
 
@@ -1215,10 +1250,16 @@ mod tests {
                     AS G24  2026 05 13 00 01  0.000000  1    5.000000000000e-05\n\
                     AS E11  2026 05 13 00 00  0.000000  1    1.234500000000e-09\n";
         let clock = RinexClock::parse(text).expect("parse GPST RINEX clock");
-        let reparsed = RinexClock::parse(&clock.to_rinex_string()).expect("re-parse serialized");
+        let serialized = clock.to_rinex_string().expect("serialize RINEX clock");
+        let reparsed = RinexClock::parse(&serialized).expect("re-parse serialized");
         assert_eq!(reparsed, clock, "serializer must round-trip through parse");
         // Deterministic output.
-        assert_eq!(reparsed.to_rinex_string(), clock.to_rinex_string());
+        assert_eq!(
+            reparsed
+                .to_rinex_string()
+                .expect("serialize reparsed clock"),
+            serialized
+        );
     }
 
     #[test]
@@ -1232,9 +1273,46 @@ mod tests {
                     AS G05  2017 01 01 00 00 30.000000  1    2.000000000000e-04\n";
         let clock = RinexClock::parse(text).expect("parse UTC RINEX clock");
         assert_eq!(clock.time_scale, TimeScale::Utc);
-        let reparsed = RinexClock::parse(&clock.to_rinex_string()).expect("re-parse serialized");
+        let serialized = clock.to_rinex_string().expect("serialize RINEX clock");
+        let reparsed = RinexClock::parse(&serialized).expect("re-parse serialized");
         assert_eq!(reparsed.time_scale, TimeScale::Utc);
         assert_eq!(reparsed, clock);
+    }
+
+    #[test]
+    fn to_rinex_string_rejects_unsupported_time_scale() {
+        let epoch =
+            civil_to_clock_instant(TimeScale::Tcg, 2026, 5, 13, 0, 0, 0.0).expect("TCG instant");
+        let clock = RinexClock::from_instant_series_rows(
+            TimeScale::Tcg,
+            vec![("G05".to_string(), vec![(epoch, 1.0e-4)])],
+        )
+        .expect("TCG clock builds");
+
+        assert_eq!(
+            clock.to_rinex_string(),
+            Err(RinexClockError::UnsupportedTimeScale {
+                scale: TimeScale::Tcg
+            })
+        );
+    }
+
+    #[test]
+    fn to_rinex_string_rejects_unsupported_row_time_scale() {
+        let epoch =
+            civil_to_clock_instant(TimeScale::Tcg, 2026, 5, 13, 0, 0, 0.0).expect("TCG instant");
+        let clock = RinexClock::from_instant_series_rows(
+            TimeScale::Gpst,
+            vec![("G05".to_string(), vec![(epoch, 1.0e-4)])],
+        )
+        .expect("mixed-scale clock builds");
+
+        assert_eq!(
+            clock.to_rinex_string(),
+            Err(RinexClockError::UnsupportedTimeScale {
+                scale: TimeScale::Tcg
+            })
+        );
     }
 
     #[test]
@@ -1261,14 +1339,18 @@ mod tests {
         )
         .expect("jd clock builds");
 
-        let serialized = nanos_clock.to_rinex_string();
+        let serialized = nanos_clock
+            .to_rinex_string()
+            .expect("serialize nanos RINEX clock");
         assert!(
             serialized.contains("2026 05 13 00 00 30.000000"),
             "Nanos epoch must serialize to its true civil time, got:\n{serialized}"
         );
         assert_eq!(
             serialized,
-            jd_clock.to_rinex_string(),
+            jd_clock
+                .to_rinex_string()
+                .expect("serialize JD RINEX clock"),
             "Nanos- and Julian-date-repr epochs of the same instant must serialize identically"
         );
 
@@ -1289,7 +1371,7 @@ mod tests {
                     AS G05  2016 12 31 23 59 60.000000  1    1.000000000000e-04\n\
                     AS G05  2016 12 31 23 59 60.500000  1    2.000000000000e-04\n";
         let clock = RinexClock::parse(text).expect("parse UTC leap-second RINEX clock");
-        let serialized = clock.to_rinex_string();
+        let serialized = clock.to_rinex_string().expect("serialize RINEX clock");
         assert!(
             serialized.contains("23 59 60.000000"),
             "leap-second label must round-trip, got:\n{serialized}"

@@ -114,12 +114,14 @@ impl RinexObs {
             push_header_line(out, &format!("{interval:10.3}"), "INTERVAL");
         }
         if let Some((epoch, scale)) = h.time_of_first_obs {
-            let label = crate::rinex_common::time_scale_rinex_label(scale);
-            push_header_line(out, &format_first_obs(epoch, label), "TIME OF FIRST OBS");
+            if let Some(label) = crate::rinex_common::time_scale_rinex_label(scale) {
+                push_header_line(out, &format_first_obs(epoch, label), "TIME OF FIRST OBS");
+            }
         }
         if let Some((epoch, scale)) = h.time_of_last_obs {
-            let label = crate::rinex_common::time_scale_rinex_label(scale);
-            push_header_line(out, &format_first_obs(epoch, label), "TIME OF LAST OBS");
+            if let Some(label) = crate::rinex_common::time_scale_rinex_label(scale) {
+                push_header_line(out, &format_first_obs(epoch, label), "TIME OF LAST OBS");
+            }
         }
         for shift in &h.phase_shifts {
             write_phase_shift(out, shift);

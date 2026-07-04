@@ -15,7 +15,7 @@ use crate::astro::constants::time::{
     DAYS_PER_JULIAN_CENTURY, J2000_JD, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
     TT_MINUS_TAI_S,
 };
-use crate::astro::data::iers::UT1_DATA;
+use crate::astro::data::iers::{Ut1Entry, UT1_DATA};
 use crate::astro::time::civil;
 use crate::astro::time::eop::{
     check_ut1_coverage, CoverageError, LeapSecondTable, TimeScaleInputErrorKind, Ut1Provenance,
@@ -31,6 +31,18 @@ const ROUND_1E7: f64 = 10_000_000.0;
 /// 5.1, 2008, sec. 3.3.3). GLONASST still tracks UTC's leap seconds because UTC
 /// does, so any GLONASST<->atomic-scale offset is epoch-dependent.
 pub const GLONASST_MINUS_UTC_S: f64 = 3.0 * SECONDS_PER_HOUR;
+
+/// TT/TCG defining rate constant `L_G` from IAU 2000 Resolution B1.9.
+pub const TT_TCG_RATE_L_G: f64 = 6.969290134e-10;
+
+/// TDB/TCB defining rate constant `L_B` from IAU 2006 Resolution B3.
+pub const TDB_TCB_RATE_L_B: f64 = 1.550519768e-8;
+
+/// TDB offset constant `TDB0`, seconds, from IAU 2006 Resolution B3.
+pub const TDB_TCB_OFFSET_TDB0_S: f64 = -6.55e-5;
+
+/// TT/TCG and TDB/TCB reference epoch Julian Date.
+pub const TCG_TCB_REFERENCE_JD: f64 = 2_443_144.500_372_5;
 
 /// Resolved set of Julian-date split time scales for one UTC instant.
 ///
@@ -56,9 +68,63 @@ pub struct TimeScales {
     pub jd_tdb: f64,
 }
 
-struct LeapSecondEntry {
-    mjd: i32,
-    tai_utc: f64,
+/// One post-1972 TAI-UTC step keyed by UTC Modified Julian Date.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LeapSecondEntry {
+    /// First UTC Modified Julian Date carrying this TAI-UTC value.
+    pub mjd: i32,
+    /// TAI minus UTC, seconds.
+    pub tai_utc: f64,
+}
+
+/// Caller-supplied time tables for UTC, TAI, TT, UT1, TCG, TDB, and TCB.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeTables<'a> {
+    /// Leap-second table entries with the same shape as the embedded table.
+    pub leap_seconds: &'a [LeapSecondEntry],
+    /// UT1-UTC samples with the same shape as the embedded table.
+    pub ut1_utc: &'a [Ut1Entry],
+}
+
+impl<'a> TimeTables<'a> {
+    /// Construct time tables from caller-owned slices.
+    pub fn new(
+        leap_seconds: &'a [LeapSecondEntry],
+        ut1_utc: &'a [Ut1Entry],
+    ) -> Result<Self, CoverageError> {
+        validate_time_tables(leap_seconds, ut1_utc)?;
+        Ok(Self {
+            leap_seconds,
+            ut1_utc,
+        })
+    }
+
+    /// Provenance and coverage for this leap-second table.
+    #[must_use]
+    pub fn leap_second_table(&self) -> LeapSecondTable {
+        leap_second_table_for(self.leap_seconds, "caller-supplied leap-second table")
+    }
+
+    /// Coverage for this UT1-UTC table, expressed on the TT axis.
+    #[must_use]
+    pub fn ut1_coverage(&self) -> Ut1Provenance {
+        ut1_coverage_for(
+            self.ut1_utc,
+            self.leap_seconds,
+            "caller-supplied UT1-UTC table",
+        )
+    }
+}
+
+impl TimeTables<'static> {
+    /// Embedded time tables bundled with the crate.
+    #[must_use]
+    pub fn embedded() -> Self {
+        Self {
+            leap_seconds: LEAP_SECONDS,
+            ut1_utc: &UT1_DATA,
+        }
+    }
 }
 
 static LEAP_SECONDS: &[LeapSecondEntry] = &[
@@ -288,26 +354,30 @@ impl TimeScales {
         minute: i32,
         second: f64,
     ) -> Result<Self, CoverageError> {
-        validate::finite(second, "second").map_err(map_time_scale_field_error)?;
-        validate::civil_datetime_with_second_policy(
-            i64::from(year),
-            i64::from(month),
-            i64::from(day),
-            i64::from(hour),
-            i64::from(minute),
-            second,
-            validate::CivilSecondPolicy::UtcLike,
-        )
-        .map_err(map_time_scale_field_error)?;
-        if second >= 60.0 && !is_positive_leap_second_label(year, month, day, hour, minute) {
-            return Err(CoverageError::InvalidInput {
-                field: "civil datetime",
-                kind: TimeScaleInputErrorKind::InvalidCivilTime,
-            });
-        }
+        validate_utc_input_embedded(year, month, day, hour, minute, second)?;
         Ok(Self::from_utc_unchecked(
             year, month, day, hour, minute, second,
         ))
+    }
+
+    /// Resolve time scales for a UTC calendar instant using caller-supplied
+    /// leap-second and UT1-UTC tables.
+    pub fn from_utc_with_tables(
+        year: i32,
+        month: i32,
+        day: i32,
+        hour: i32,
+        minute: i32,
+        second: f64,
+        tables: TimeTables<'_>,
+    ) -> Result<Self, CoverageError> {
+        validate_time_tables(tables.leap_seconds, tables.ut1_utc)?;
+        validate_utc_input_with_table(year, month, day, hour, minute, second, tables.leap_seconds)?;
+        let scales =
+            Self::from_utc_with_tables_unchecked(year, month, day, hour, minute, second, tables)?;
+        let prov = tables.ut1_coverage();
+        check_ut1_coverage(&prov, scales.jd_tt, ValidityMode::Strict)?;
+        Ok(scales)
     }
 
     /// Exact Skyfield `_utc()` path. The arithmetic order below is load-bearing
@@ -374,6 +444,69 @@ impl TimeScales {
         }
     }
 
+    /// Exact UTC conversion path using caller-supplied tables.
+    fn from_utc_with_tables_unchecked(
+        year: i32,
+        month: i32,
+        day: i32,
+        hour: i32,
+        minute: i32,
+        second: f64,
+        tables: TimeTables<'_>,
+    ) -> Result<Self, CoverageError> {
+        let jd_day = julian_day_number(year, month, day);
+        let jd1 = jd_day as f64 - 0.5;
+        let utc_seconds_of_day =
+            hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + second;
+        let leap_lookup_second = if second >= 60.0 { 59.0 } else { second };
+        let jd2 = (leap_lookup_second
+            + minute as f64 * SECONDS_PER_MINUTE
+            + hour as f64 * SECONDS_PER_HOUR)
+            / SECONDS_PER_DAY;
+        let jd_utc_total = jd1 + jd2;
+
+        let leap_seconds = find_leap_seconds_in_table_checked(jd_utc_total, tables.leap_seconds)?;
+        let utc_seconds_at_midnight = jd1 * SECONDS_PER_DAY;
+
+        let utc_whole_seconds = utc_seconds_of_day.trunc();
+        let utc_subsecond = utc_seconds_of_day.fract();
+
+        let tai_seconds = utc_seconds_at_midnight + leap_seconds + utc_whole_seconds;
+        let jd_whole = (tai_seconds / SECONDS_PER_DAY).floor();
+        let tai_fraction =
+            (tai_seconds - jd_whole * SECONDS_PER_DAY + utc_subsecond) / SECONDS_PER_DAY;
+        let tt_offset_days = TT_MINUS_TAI_S / SECONDS_PER_DAY;
+
+        let tt_fraction = tai_fraction + tt_offset_days;
+        let jd_tt = jd_whole + tt_fraction;
+
+        let delta_t = interpolate_delta_t_with_table(jd_tt, tables.ut1_utc, tables.leap_seconds)?;
+        let ut1_fraction = tt_fraction - delta_t / SECONDS_PER_DAY;
+        let jd_ut1 = jd_whole + ut1_fraction;
+
+        let t = (jd_whole - J2000_JD + tt_fraction) / DAYS_PER_JULIAN_CENTURY;
+        let tdb_minus_tt_seconds = 0.001657 * (628.3076 * t + 6.2401).sin()
+            + 0.000022 * (575.3385 * t + 4.2970).sin()
+            + 0.000014 * (1256.6152 * t + 6.1969).sin()
+            + 0.000005 * (606.9777 * t + 4.0212).sin()
+            + 0.000005 * (52.9691 * t + 0.4444).sin()
+            + 0.000002 * (21.3299 * t + 5.5431).sin()
+            + 0.000010 * t * (628.3076 * t + 4.2490).sin();
+
+        let tdb_fraction = tt_fraction + tdb_minus_tt_seconds / SECONDS_PER_DAY;
+        let jd_tdb = jd_whole + tdb_fraction;
+
+        Ok(Self {
+            jd_whole,
+            ut1_fraction,
+            tt_fraction,
+            tdb_fraction,
+            jd_ut1,
+            jd_tt,
+            jd_tdb,
+        })
+    }
+
     /// Coverage-policy-enforced variant of [`TimeScales::from_utc`].
     ///
     /// The numerics are produced by [`TimeScales::from_utc`] **unchanged** (the
@@ -414,6 +547,30 @@ impl TimeScales {
         })
     }
 
+    /// Coverage-policy-enforced variant of [`TimeScales::from_utc_with_tables`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_utc_validated_with_tables(
+        year: i32,
+        month: i32,
+        day: i32,
+        hour: i32,
+        minute: i32,
+        second: f64,
+        mode: ValidityMode,
+        tables: TimeTables<'_>,
+    ) -> Result<Validated<Self>, CoverageError> {
+        validate_time_tables(tables.leap_seconds, tables.ut1_utc)?;
+        validate_utc_input_with_table(year, month, day, hour, minute, second, tables.leap_seconds)?;
+        let scales =
+            Self::from_utc_with_tables_unchecked(year, month, day, hour, minute, second, tables)?;
+        let prov = tables.ut1_coverage();
+        let degraded = check_ut1_coverage(&prov, scales.jd_tt, mode)?;
+        Ok(Validated {
+            value: scales,
+            degraded,
+        })
+    }
+
     /// Build [`TimeScales`] for a calendar instant labelled in `scale`.
     ///
     /// Non-UTC scales (GPST/GST/BDT/QZSST/TAI/TT/TDB and GLONASST) are converted
@@ -431,20 +588,72 @@ impl TimeScales {
         minute: i32,
         second: f64,
     ) -> Result<Self, CoverageError> {
-        let utc = scale_calendar_to_utc(
-            scale,
-            ScaleCal {
-                year,
-                month,
-                day,
-                hour,
-                minute,
-                second,
-            },
-        );
+        let cal = ScaleCal {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        };
+        validate_scale_input_embedded(scale, cal)?;
+        let utc = scale_calendar_to_utc(scale, cal, LEAP_SECONDS);
         Self::from_utc(
             utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
         )
+    }
+
+    /// Build [`TimeScales`] for a calendar instant labelled in `scale` using
+    /// caller-supplied leap-second and UT1-UTC tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_scale_with_tables(
+        scale: TimeScale,
+        year: i32,
+        month: i32,
+        day: i32,
+        hour: i32,
+        minute: i32,
+        second: f64,
+        tables: TimeTables<'_>,
+    ) -> Result<Self, CoverageError> {
+        validate_time_tables(tables.leap_seconds, tables.ut1_utc)?;
+        let cal = ScaleCal {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        };
+        validate_scale_input_with_table(scale, cal, tables.leap_seconds)?;
+        let utc = scale_calendar_to_utc_with_table(scale, cal, tables.leap_seconds)?;
+        Self::from_utc_with_tables(
+            utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second, tables,
+        )
+    }
+
+    /// Full TCG Julian Date from this instant's TT coordinate.
+    #[must_use]
+    pub fn jd_tcg(&self) -> f64 {
+        tt_to_tcg_jd(self.jd_tt)
+    }
+
+    /// TCG day fraction relative to [`TimeScales::jd_whole`].
+    #[must_use]
+    pub fn tcg_fraction(&self) -> f64 {
+        tcg_fraction_from_tt_split(self.jd_whole, self.tt_fraction)
+    }
+
+    /// Full TCB Julian Date from this instant's TDB coordinate.
+    #[must_use]
+    pub fn jd_tcb(&self) -> f64 {
+        tdb_to_tcb_jd(self.jd_tdb)
+    }
+
+    /// TCB day fraction relative to [`TimeScales::jd_whole`].
+    #[must_use]
+    pub fn tcb_fraction(&self) -> f64 {
+        tcb_fraction_from_tdb_split(self.jd_whole, self.tdb_fraction)
     }
 }
 
@@ -466,39 +675,146 @@ struct ScaleCal {
 /// recovering UTC is a plain -3 h shift that preserves UTC's leap labels. The
 /// atomic-aligned scales are shifted to TAI and then resolved to UTC through the
 /// leap-second table.
-fn scale_calendar_to_utc(scale: TimeScale, cal: ScaleCal) -> ScaleCal {
+fn scale_calendar_to_utc(
+    scale: TimeScale,
+    cal: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> ScaleCal {
     match scale {
         TimeScale::Utc => cal,
         TimeScale::Glonasst => normalize_calendar_seconds(cal, cal.second - GLONASST_MINUS_UTC_S),
+        TimeScale::Tcg => {
+            let tcg_jd = continuous_calendar_jd(cal);
+            coordinate_calendar_to_utc(
+                cal,
+                tcg_to_tt_jd(tcg_jd) - tcg_jd,
+                TimeScale::Tt,
+                leap_seconds,
+            )
+        }
+        TimeScale::Tdb => {
+            let tdb_jd = continuous_calendar_jd(cal);
+            coordinate_calendar_to_utc(
+                cal,
+                tdb_to_tt_jd_for_tdb_input(tdb_jd) - tdb_jd,
+                TimeScale::Tt,
+                leap_seconds,
+            )
+        }
+        TimeScale::Tcb => {
+            let tcb_jd = continuous_calendar_jd(cal);
+            let tdb_jd = tcb_to_tdb_jd(tcb_jd);
+            let tt_jd = tdb_to_tt_jd_for_tdb_input(tdb_jd);
+            coordinate_calendar_to_utc(cal, tt_jd - tcb_jd, TimeScale::Tt, leap_seconds)
+        }
         _ => {
             let tai = normalize_calendar_seconds(cal, cal.second + tai_minus_scale_seconds(scale));
-            tai_calendar_to_utc(tai)
+            tai_calendar_to_utc(tai, leap_seconds)
         }
     }
 }
 
+fn scale_calendar_to_utc_with_table(
+    scale: TimeScale,
+    cal: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<ScaleCal, CoverageError> {
+    match scale {
+        TimeScale::Utc => Ok(cal),
+        TimeScale::Glonasst => Ok(normalize_calendar_seconds(
+            cal,
+            cal.second - GLONASST_MINUS_UTC_S,
+        )),
+        TimeScale::Tcg => {
+            let tcg_jd = continuous_calendar_jd(cal);
+            coordinate_calendar_to_utc_with_table(
+                cal,
+                tcg_to_tt_jd(tcg_jd) - tcg_jd,
+                TimeScale::Tt,
+                leap_seconds,
+            )
+        }
+        TimeScale::Tdb => {
+            let tdb_jd = continuous_calendar_jd(cal);
+            coordinate_calendar_to_utc_with_table(
+                cal,
+                tdb_to_tt_jd_for_tdb_input(tdb_jd) - tdb_jd,
+                TimeScale::Tt,
+                leap_seconds,
+            )
+        }
+        TimeScale::Tcb => {
+            let tcb_jd = continuous_calendar_jd(cal);
+            let tdb_jd = tcb_to_tdb_jd(tcb_jd);
+            let tt_jd = tdb_to_tt_jd_for_tdb_input(tdb_jd);
+            coordinate_calendar_to_utc_with_table(cal, tt_jd - tcb_jd, TimeScale::Tt, leap_seconds)
+        }
+        _ => {
+            let tai = normalize_calendar_seconds(cal, cal.second + tai_minus_scale_seconds(scale));
+            tai_calendar_to_utc_with_table(tai, leap_seconds)
+        }
+    }
+}
+
+fn coordinate_calendar_to_utc(
+    cal: ScaleCal,
+    target_minus_source_days: f64,
+    target_scale: TimeScale,
+    leap_seconds: &[LeapSecondEntry],
+) -> ScaleCal {
+    let target =
+        normalize_calendar_seconds(cal, cal.second + target_minus_source_days * SECONDS_PER_DAY);
+    let tai = normalize_calendar_seconds(
+        target,
+        target.second + tai_minus_scale_seconds(target_scale),
+    );
+    tai_calendar_to_utc(tai, leap_seconds)
+}
+
+fn coordinate_calendar_to_utc_with_table(
+    cal: ScaleCal,
+    target_minus_source_days: f64,
+    target_scale: TimeScale,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<ScaleCal, CoverageError> {
+    let target =
+        normalize_calendar_seconds(cal, cal.second + target_minus_source_days * SECONDS_PER_DAY);
+    let tai = normalize_calendar_seconds(
+        target,
+        target.second + tai_minus_scale_seconds(target_scale),
+    );
+    tai_calendar_to_utc_with_table(tai, leap_seconds)
+}
+
+fn continuous_calendar_jd(cal: ScaleCal) -> f64 {
+    let jd1 = julian_day_number(cal.year, cal.month, cal.day) as f64 - 0.5;
+    jd1 + seconds_of_day(cal) / SECONDS_PER_DAY
+}
+
 fn tai_minus_scale_seconds(scale: TimeScale) -> f64 {
     match scale {
-        // Utc/Glonasst are handled before reaching here; 0.0 keeps the match
-        // total without affecting the atomic path.
-        TimeScale::Utc | TimeScale::Glonasst => 0.0,
+        // Utc/Glonasst/TCG/TDB/TCB are handled before reaching here; 0.0 keeps
+        // the match total without affecting the atomic path.
+        TimeScale::Utc | TimeScale::Glonasst | TimeScale::Tcg | TimeScale::Tdb | TimeScale::Tcb => {
+            0.0
+        }
         TimeScale::Tai => 0.0,
-        TimeScale::Tt | TimeScale::Tdb => -TT_MINUS_TAI_S,
+        TimeScale::Tt => -TT_MINUS_TAI_S,
         // QZSST is steered synchronous with GPST, so it shares GPST's TAI offset.
         TimeScale::Gpst | TimeScale::Gst | TimeScale::Qzsst => GPST_MINUS_TAI_S,
         TimeScale::Bdt => BDT_MINUS_TAI_S,
     }
 }
 
-fn tai_calendar_to_utc(tai: ScaleCal) -> ScaleCal {
-    if let Some(utc) = positive_leap_second_utc_label(tai) {
+fn tai_calendar_to_utc(tai: ScaleCal, leap_seconds: &[LeapSecondEntry]) -> ScaleCal {
+    if let Some(utc) = positive_leap_second_utc_label(tai, leap_seconds) {
         return utc;
     }
 
-    let mut leap = leap_seconds_at_utc_label(tai);
+    let mut leap = leap_seconds_at_utc_label(tai, leap_seconds);
     let mut utc = normalize_calendar_seconds(tai, tai.second - leap);
     for _ in 0..3 {
-        let next_leap = leap_seconds_at_utc_label(utc);
+        let next_leap = leap_seconds_at_utc_label(utc, leap_seconds);
         if next_leap == leap {
             return utc;
         }
@@ -508,7 +824,31 @@ fn tai_calendar_to_utc(tai: ScaleCal) -> ScaleCal {
     utc
 }
 
-fn positive_leap_second_utc_label(tai: ScaleCal) -> Option<ScaleCal> {
+fn tai_calendar_to_utc_with_table(
+    tai: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<ScaleCal, CoverageError> {
+    if let Some(utc) = positive_leap_second_utc_label_with_table(tai, leap_seconds)? {
+        return Ok(utc);
+    }
+
+    let mut leap = leap_seconds_at_utc_label_checked(tai, leap_seconds)?;
+    let mut utc = normalize_calendar_seconds(tai, tai.second - leap);
+    for _ in 0..3 {
+        let next_leap = leap_seconds_at_utc_label_checked(utc, leap_seconds)?;
+        if next_leap == leap {
+            return Ok(utc);
+        }
+        leap = next_leap;
+        utc = normalize_calendar_seconds(tai, tai.second - leap);
+    }
+    Ok(utc)
+}
+
+fn positive_leap_second_utc_label(
+    tai: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> Option<ScaleCal> {
     let tai_sod = seconds_of_day(tai);
     let utc_midnight = ScaleCal {
         year: tai.year,
@@ -519,8 +859,8 @@ fn positive_leap_second_utc_label(tai: ScaleCal) -> Option<ScaleCal> {
         second: 0.0,
     };
     let previous_second = normalize_calendar_seconds(utc_midnight, -1.0);
-    let old_leap = leap_seconds_at_utc_label(previous_second);
-    let new_leap = leap_seconds_at_utc_label(utc_midnight);
+    let old_leap = leap_seconds_at_utc_label(previous_second, leap_seconds);
+    let new_leap = leap_seconds_at_utc_label(utc_midnight, leap_seconds);
     if new_leap <= old_leap || !(old_leap..new_leap).contains(&tai_sod) {
         return None;
     }
@@ -530,18 +870,77 @@ fn positive_leap_second_utc_label(tai: ScaleCal) -> Option<ScaleCal> {
     Some(utc)
 }
 
-fn leap_seconds_at_utc_label(cal: ScaleCal) -> f64 {
+fn positive_leap_second_utc_label_with_table(
+    tai: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<Option<ScaleCal>, CoverageError> {
+    let tai_sod = seconds_of_day(tai);
+    let utc_midnight = ScaleCal {
+        year: tai.year,
+        month: tai.month,
+        day: tai.day,
+        hour: 0,
+        minute: 0,
+        second: 0.0,
+    };
+    let previous_second = normalize_calendar_seconds(utc_midnight, -1.0);
+    let Ok(old_leap) = leap_seconds_at_utc_label_checked(previous_second, leap_seconds) else {
+        return Ok(None);
+    };
+    let new_leap = leap_seconds_at_utc_label_checked(utc_midnight, leap_seconds)?;
+    if new_leap <= old_leap || !(old_leap..new_leap).contains(&tai_sod) {
+        return Ok(None);
+    }
+
+    let mut utc = previous_second;
+    utc.second = 60.0 + (tai_sod - old_leap);
+    Ok(Some(utc))
+}
+
+fn leap_seconds_at_utc_label(cal: ScaleCal, leap_seconds: &[LeapSecondEntry]) -> f64 {
     let jd1 = julian_day_number(cal.year, cal.month, cal.day) as f64 - 0.5;
     let lookup_second = if cal.second >= 60.0 { 59.0 } else { cal.second };
     let jd2 = (cal.hour as f64 * SECONDS_PER_HOUR
         + cal.minute as f64 * SECONDS_PER_MINUTE
         + lookup_second)
         / SECONDS_PER_DAY;
-    find_leap_seconds(jd1 + jd2)
+    find_leap_seconds_in_table(jd1 + jd2, leap_seconds)
+}
+
+fn leap_seconds_at_utc_label_checked(
+    cal: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<f64, CoverageError> {
+    let jd1 = julian_day_number(cal.year, cal.month, cal.day) as f64 - 0.5;
+    let lookup_second = if cal.second >= 60.0 { 59.0 } else { cal.second };
+    let jd2 = (cal.hour as f64 * SECONDS_PER_HOUR
+        + cal.minute as f64 * SECONDS_PER_MINUTE
+        + lookup_second)
+        / SECONDS_PER_DAY;
+    find_leap_seconds_in_table_checked(jd1 + jd2, leap_seconds)
 }
 
 fn seconds_of_day(cal: ScaleCal) -> f64 {
     cal.hour as f64 * SECONDS_PER_HOUR + cal.minute as f64 * SECONDS_PER_MINUTE + cal.second
+}
+
+fn tdb_to_tt_jd_for_tdb_input(jd_tdb: f64) -> f64 {
+    let mut jd_tt = jd_tdb;
+    for _ in 0..4 {
+        jd_tt = jd_tdb - tdb_minus_tt_seconds_at_tt_jd(jd_tt) / SECONDS_PER_DAY;
+    }
+    jd_tt
+}
+
+fn tdb_minus_tt_seconds_at_tt_jd(jd_tt: f64) -> f64 {
+    let t = (jd_tt - J2000_JD) / DAYS_PER_JULIAN_CENTURY;
+    0.001657 * (628.3076 * t + 6.2401).sin()
+        + 0.000022 * (575.3385 * t + 4.2970).sin()
+        + 0.000014 * (1256.6152 * t + 6.1969).sin()
+        + 0.000005 * (606.9777 * t + 4.0212).sin()
+        + 0.000005 * (52.9691 * t + 0.4444).sin()
+        + 0.000002 * (21.3299 * t + 5.5431).sin()
+        + 0.000010 * t * (628.3076 * t + 4.2490).sin()
 }
 
 fn normalize_calendar_seconds(mut cal: ScaleCal, second: f64) -> ScaleCal {
@@ -607,11 +1006,39 @@ pub(crate) fn is_positive_leap_second_label(
     hour: i32,
     minute: i32,
 ) -> bool {
+    is_positive_leap_second_label_with_table(year, month, day, hour, minute, LEAP_SECONDS)
+}
+
+fn is_positive_leap_second_label_with_table(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    leap_seconds: &[LeapSecondEntry],
+) -> bool {
     if hour != 23 || minute != 59 {
         return false;
     }
     let jd1 = julian_day_number(year, month, day) as f64 - 0.5;
-    find_leap_seconds(jd1 + 1.0) > find_leap_seconds(jd1)
+    find_leap_seconds_in_table(jd1 + 1.0, leap_seconds)
+        > find_leap_seconds_in_table(jd1, leap_seconds)
+}
+
+fn is_positive_leap_second_label_with_table_checked(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<bool, CoverageError> {
+    if hour != 23 || minute != 59 {
+        return Ok(false);
+    }
+    let jd1 = julian_day_number(year, month, day) as f64 - 0.5;
+    Ok(find_leap_seconds_in_table_checked(jd1 + 1.0, leap_seconds)?
+        > find_leap_seconds_in_table_checked(jd1, leap_seconds)?)
 }
 
 impl From<&FieldError> for TimeScaleInputErrorKind {
@@ -635,6 +1062,272 @@ fn map_time_scale_field_error(error: FieldError) -> CoverageError {
         field: error.field(),
         kind: TimeScaleInputErrorKind::from(&error),
     }
+}
+
+fn validate_utc_input_embedded(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: f64,
+) -> Result<(), CoverageError> {
+    validate_utc_civil_input(year, month, day, hour, minute, second)?;
+    if second >= 60.0
+        && !is_positive_leap_second_label_with_table(year, month, day, hour, minute, LEAP_SECONDS)
+    {
+        return Err(CoverageError::InvalidInput {
+            field: "civil datetime",
+            kind: TimeScaleInputErrorKind::InvalidCivilTime,
+        });
+    }
+    Ok(())
+}
+
+fn validate_utc_input_with_table(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: f64,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<(), CoverageError> {
+    validate_utc_civil_input(year, month, day, hour, minute, second)?;
+    ensure_leap_table_covers_calendar(year, month, day, hour, minute, second, leap_seconds)?;
+    if second >= 60.0
+        && !is_positive_leap_second_label_with_table_checked(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            leap_seconds,
+        )?
+    {
+        return Err(CoverageError::InvalidInput {
+            field: "civil datetime",
+            kind: TimeScaleInputErrorKind::InvalidCivilTime,
+        });
+    }
+    Ok(())
+}
+
+fn validate_utc_civil_input(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: f64,
+) -> Result<(), CoverageError> {
+    validate::finite(second, "second").map_err(map_time_scale_field_error)?;
+    validate::civil_datetime_with_second_policy(
+        i64::from(year),
+        i64::from(month),
+        i64::from(day),
+        i64::from(hour),
+        i64::from(minute),
+        second,
+        validate::CivilSecondPolicy::UtcLike,
+    )
+    .map_err(map_time_scale_field_error)?;
+    Ok(())
+}
+
+fn ensure_leap_table_covers_calendar(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: f64,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<(), CoverageError> {
+    let jd1 = julian_day_number(year, month, day) as f64 - 0.5;
+    let lookup_second = if second >= 60.0 { 59.0 } else { second };
+    let jd2 = (hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + lookup_second)
+        / SECONDS_PER_DAY;
+    find_leap_seconds_in_table_checked(jd1 + jd2, leap_seconds).map(|_| ())
+}
+
+fn validate_time_tables(
+    leap_seconds: &[LeapSecondEntry],
+    ut1_utc: &[Ut1Entry],
+) -> Result<(), CoverageError> {
+    validate_leap_seconds_table(leap_seconds)?;
+    validate_ut1_table(ut1_utc)?;
+    if effective_ut1_utc_rows(ut1_utc, leap_seconds).len() < 2 {
+        return Err(table_error("ut1_utc", TimeScaleInputErrorKind::Missing));
+    }
+    Ok(())
+}
+
+fn validate_leap_seconds_table(leap_seconds: &[LeapSecondEntry]) -> Result<(), CoverageError> {
+    if leap_seconds.is_empty() {
+        return Err(table_error(
+            "leap_seconds",
+            TimeScaleInputErrorKind::Missing,
+        ));
+    }
+    let mut previous_mjd = leap_seconds[0].mjd;
+    if !leap_seconds[0].tai_utc.is_finite() {
+        return Err(table_error(
+            "leap_seconds",
+            TimeScaleInputErrorKind::NonFinite,
+        ));
+    }
+    for entry in &leap_seconds[1..] {
+        if entry.mjd <= previous_mjd {
+            return Err(table_error(
+                "leap_seconds",
+                TimeScaleInputErrorKind::OutOfRange,
+            ));
+        }
+        if !entry.tai_utc.is_finite() {
+            return Err(table_error(
+                "leap_seconds",
+                TimeScaleInputErrorKind::NonFinite,
+            ));
+        }
+        previous_mjd = entry.mjd;
+    }
+    Ok(())
+}
+
+fn validate_ut1_table(ut1_utc: &[Ut1Entry]) -> Result<(), CoverageError> {
+    if ut1_utc.len() < 2 {
+        return Err(table_error("ut1_utc", TimeScaleInputErrorKind::Missing));
+    }
+    let mut previous_mjd = ut1_utc[0].mjd;
+    if !ut1_utc[0].ut1_utc.is_finite() {
+        return Err(table_error("ut1_utc", TimeScaleInputErrorKind::NonFinite));
+    }
+    for entry in &ut1_utc[1..] {
+        if entry.mjd <= previous_mjd {
+            return Err(table_error("ut1_utc", TimeScaleInputErrorKind::OutOfRange));
+        }
+        if !entry.ut1_utc.is_finite() {
+            return Err(table_error("ut1_utc", TimeScaleInputErrorKind::NonFinite));
+        }
+        previous_mjd = entry.mjd;
+    }
+    Ok(())
+}
+
+fn effective_ut1_utc_rows<'a>(
+    ut1_utc: &'a [Ut1Entry],
+    leap_seconds: &[LeapSecondEntry],
+) -> &'a [Ut1Entry] {
+    debug_assert!(!leap_seconds.is_empty());
+    let first_covered_mjd = leap_seconds[0].mjd;
+    let first = ut1_utc
+        .iter()
+        .position(|entry| entry.mjd >= first_covered_mjd)
+        .unwrap_or(ut1_utc.len());
+    &ut1_utc[first..]
+}
+
+fn table_error(field: &'static str, kind: TimeScaleInputErrorKind) -> CoverageError {
+    CoverageError::InvalidInput { field, kind }
+}
+
+fn validate_scale_input_embedded(scale: TimeScale, cal: ScaleCal) -> Result<(), CoverageError> {
+    if scale == TimeScale::Utc {
+        return validate_utc_input_embedded(
+            cal.year, cal.month, cal.day, cal.hour, cal.minute, cal.second,
+        );
+    }
+    validate_continuous_scale_input(cal)
+}
+
+fn validate_scale_input_with_table(
+    scale: TimeScale,
+    cal: ScaleCal,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<(), CoverageError> {
+    if scale == TimeScale::Utc {
+        return validate_utc_input_with_table(
+            cal.year,
+            cal.month,
+            cal.day,
+            cal.hour,
+            cal.minute,
+            cal.second,
+            leap_seconds,
+        );
+    }
+    validate_continuous_scale_input(cal)?;
+    if is_utc_based(scale) {
+        let utc = scale_calendar_to_utc_with_table(scale, cal, leap_seconds)?;
+        ensure_leap_table_covers_calendar(
+            utc.year,
+            utc.month,
+            utc.day,
+            utc.hour,
+            utc.minute,
+            utc.second,
+            leap_seconds,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_continuous_scale_input(cal: ScaleCal) -> Result<(), CoverageError> {
+    validate::finite(cal.second, "second").map_err(map_time_scale_field_error)?;
+    validate::civil_datetime_with_second_policy(
+        i64::from(cal.year),
+        i64::from(cal.month),
+        i64::from(cal.day),
+        i64::from(cal.hour),
+        i64::from(cal.minute),
+        cal.second,
+        validate::CivilSecondPolicy::Continuous,
+    )
+    .map_err(map_time_scale_field_error)
+    .map(|_| ())
+}
+
+/// Convert a TT Julian Date to TCG using IAU 2000 Resolution B1.9.
+#[must_use]
+pub fn tt_to_tcg_jd(jd_tt: f64) -> f64 {
+    TCG_TCB_REFERENCE_JD + (jd_tt - TCG_TCB_REFERENCE_JD) / (1.0 - TT_TCG_RATE_L_G)
+}
+
+/// Convert a TCG Julian Date to TT using IAU 2000 Resolution B1.9.
+#[must_use]
+pub fn tcg_to_tt_jd(jd_tcg: f64) -> f64 {
+    TCG_TCB_REFERENCE_JD + (jd_tcg - TCG_TCB_REFERENCE_JD) * (1.0 - TT_TCG_RATE_L_G)
+}
+
+/// Convert a TDB Julian Date to TCB using IAU 2006 Resolution B3.
+#[must_use]
+pub fn tdb_to_tcb_jd(jd_tdb: f64) -> f64 {
+    TCG_TCB_REFERENCE_JD
+        + (((jd_tdb - TCG_TCB_REFERENCE_JD) * SECONDS_PER_DAY - TDB_TCB_OFFSET_TDB0_S)
+            / (1.0 - TDB_TCB_RATE_L_B))
+            / SECONDS_PER_DAY
+}
+
+/// Convert a TCB Julian Date to TDB using IAU 2006 Resolution B3.
+#[must_use]
+pub fn tcb_to_tdb_jd(jd_tcb: f64) -> f64 {
+    TCG_TCB_REFERENCE_JD
+        + (((jd_tcb - TCG_TCB_REFERENCE_JD) * SECONDS_PER_DAY) * (1.0 - TDB_TCB_RATE_L_B)
+            + TDB_TCB_OFFSET_TDB0_S)
+            / SECONDS_PER_DAY
+}
+
+fn tcg_fraction_from_tt_split(jd_whole: f64, tt_fraction: f64) -> f64 {
+    let elapsed_tt_days = (jd_whole - TCG_TCB_REFERENCE_JD) + tt_fraction;
+    tt_fraction + elapsed_tt_days * TT_TCG_RATE_L_G / (1.0 - TT_TCG_RATE_L_G)
+}
+
+fn tcb_fraction_from_tdb_split(jd_whole: f64, tdb_fraction: f64) -> f64 {
+    let elapsed_tdb_days = (jd_whole - TCG_TCB_REFERENCE_JD) + tdb_fraction;
+    tdb_fraction
+        + (elapsed_tdb_days * TDB_TCB_RATE_L_B - TDB_TCB_OFFSET_TDB0_S / SECONDS_PER_DAY)
+            / (1.0 - TDB_TCB_RATE_L_B)
 }
 
 /// Civil calendar -> Julian day number (Fliegel-style, integer arithmetic).
@@ -661,9 +1354,9 @@ pub fn julian_day_number(year: i32, month: i32, day: i32) -> i64 {
 /// the published piecewise-linear IERS/USNO model
 /// `TAI-UTC = base + (MJD - ref_mjd) * rate` (see [`RUBBER_SECONDS`]) using the
 /// fractional UTC MJD, so the offset is continuous within each segment as the
-/// historical definition requires. Before 1961 (and for a non-finite input) it
-/// clamps to the first rubber-second segment's value rather than extrapolating
-/// into undefined territory.
+/// historical definition requires. Before 1961 it clamps to the first
+/// rubber-second segment's value rather than extrapolating into undefined
+/// territory. Non-finite inputs return `NaN`.
 ///
 /// Boundary semantics (post-1972): the date is the integer MJD (`(jd_utc -
 /// 2400000.5) as i32`), so the count steps at UTC midnight (the table's
@@ -676,6 +1369,9 @@ pub fn julian_day_number(year: i32, month: i32, day: i32) -> i64 {
 /// distinctly have to carry the civil second out-of-band rather than rely on
 /// this function.
 pub fn find_leap_seconds(jd_utc: f64) -> f64 {
+    if !jd_utc.is_finite() {
+        return f64::NAN;
+    }
     let mjd = (jd_utc - 2400000.5) as i32;
     if mjd >= LEAP_SECONDS[0].mjd {
         // Post-1972 integer leap-second table (unchanged, bit-identical).
@@ -690,6 +1386,56 @@ pub fn find_leap_seconds(jd_utc: f64) -> f64 {
         return ls;
     }
     rubber_tai_minus_utc(jd_utc)
+}
+
+fn find_leap_seconds_in_table(jd_utc: f64, leap_seconds: &[LeapSecondEntry]) -> f64 {
+    debug_assert!(!leap_seconds.is_empty());
+    if !jd_utc.is_finite() {
+        return f64::NAN;
+    }
+    let mjd = (jd_utc - 2400000.5) as i32;
+    if mjd >= leap_seconds[0].mjd {
+        let mut ls = leap_seconds[0].tai_utc;
+        for entry in leap_seconds {
+            if mjd >= entry.mjd {
+                ls = entry.tai_utc;
+            } else {
+                break;
+            }
+        }
+        return ls;
+    }
+    rubber_tai_minus_utc(jd_utc)
+}
+
+fn find_leap_seconds_in_table_checked(
+    jd_utc: f64,
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<f64, CoverageError> {
+    debug_assert!(!leap_seconds.is_empty());
+    if !jd_utc.is_finite() {
+        return Err(table_error(
+            "leap_seconds",
+            TimeScaleInputErrorKind::NonFinite,
+        ));
+    }
+    let mjd = (jd_utc - 2400000.5) as i32;
+    if mjd < leap_seconds[0].mjd {
+        return Err(table_error(
+            "leap_seconds",
+            TimeScaleInputErrorKind::OutOfRange,
+        ));
+    }
+
+    let mut ls = leap_seconds[0].tai_utc;
+    for entry in leap_seconds {
+        if mjd >= entry.mjd {
+            ls = entry.tai_utc;
+        } else {
+            break;
+        }
+    }
+    Ok(ls)
 }
 
 /// TAI - UTC (the full accumulated leap-second count) at a UTC Julian date.
@@ -730,13 +1476,16 @@ pub fn gps_utc_offset_s(jd_utc: f64) -> f64 {
 ///
 /// Selects the latest [`RUBBER_SECONDS`] segment whose `start_mjd` precedes the
 /// instant's fractional MJD and applies `base + (MJD - ref_mjd) * rate`. Inputs
-/// before the first segment (pre-1961) and non-finite inputs clamp to the first
-/// segment's constant term.
+/// before the first segment (pre-1961) clamp to the first segment's constant
+/// term. Non-finite inputs return `NaN`.
 fn rubber_tai_minus_utc(jd_utc: f64) -> f64 {
     let mjd = jd_utc - 2400000.5;
     let first = &RUBBER_SECONDS[0];
-    // Pre-1961 or non-finite input clamps to the first segment's constant.
-    if mjd.is_nan() || mjd < first.start_mjd as f64 {
+    if !mjd.is_finite() {
+        return f64::NAN;
+    }
+    // Pre-1961 input clamps to the first segment's constant.
+    if mjd < first.start_mjd as f64 {
         return first.base;
     }
     let mut selected = first;
@@ -760,8 +1509,8 @@ pub enum TimeOffsetError {
         "time-scale {0} is UTC-based; its offset is epoch-dependent, use timescale_offset_at_s"
     )]
     EpochRequired(&'static str),
-    /// TDB differs from TT by an epoch-dependent periodic relativistic term, not
-    /// a fixed offset; resolve TDB through [`TimeScales::from_utc`] instead.
+    /// The named coordinate scale has no fixed offset; resolve it through
+    /// [`TimeScales`] or the scale-specific conversion helpers.
     #[error("time-scale {0} has no fixed/constant offset; resolve it through TimeScales")]
     Unsupported(&'static str),
     /// A leap-aware query received a non-finite UTC Julian date.
@@ -841,7 +1590,9 @@ fn scale_minus_tai_s(scale: TimeScale, utc_jd: f64) -> Result<f64, TimeOffsetErr
         TimeScale::Utc => -leap(scale)?,
         // GLONASST = UTC + 3 h = TAI - (TAI-UTC) + 3 h.
         TimeScale::Glonasst => -leap(scale)? + GLONASST_MINUS_UTC_S,
-        TimeScale::Tdb => return Err(TimeOffsetError::Unsupported("TDB")),
+        TimeScale::Tcg | TimeScale::Tdb | TimeScale::Tcb => {
+            return Err(TimeOffsetError::Unsupported(scale.abbrev()));
+        }
     })
 }
 
@@ -899,11 +1650,21 @@ pub fn timescale_offset_at_s(
 /// Exposed so a precision pipeline can interrogate table coverage and apply
 /// strict-vs-permissive policy (see [`crate::astro::time::eop`]).
 pub fn leap_second_table() -> LeapSecondTable {
+    leap_second_table_for(
+        LEAP_SECONDS,
+        "IERS Bulletin C (TAI-UTC), bundled in sidereon-core",
+    )
+}
+
+fn leap_second_table_for(
+    leap_seconds: &[LeapSecondEntry],
+    source: &'static str,
+) -> LeapSecondTable {
     LeapSecondTable {
-        source: "IERS Bulletin C (TAI-UTC), bundled in sidereon-core",
-        first_mjd: LEAP_SECONDS.first().map(|e| e.mjd).unwrap_or(0),
-        last_mjd: LEAP_SECONDS.last().map(|e| e.mjd).unwrap_or(0),
-        entries: LEAP_SECONDS.len(),
+        source,
+        first_mjd: leap_seconds.first().map(|e| e.mjd).unwrap_or(0),
+        last_mjd: leap_seconds.last().map(|e| e.mjd).unwrap_or(0),
+        entries: leap_seconds.len(),
     }
 }
 
@@ -945,6 +1706,43 @@ fn interpolate_delta_t(jd_tt: f64) -> f64 {
     }
 }
 
+fn interpolate_delta_t_with_table(
+    jd_tt: f64,
+    ut1_utc: &[Ut1Entry],
+    leap_seconds: &[LeapSecondEntry],
+) -> Result<f64, CoverageError> {
+    struct DeltaTRow {
+        jd_tt: f64,
+        delta_t: f64,
+    }
+
+    let table: Vec<DeltaTRow> = effective_ut1_utc_rows(ut1_utc, leap_seconds)
+        .iter()
+        .map(|entry| {
+            let jd_utc = entry.mjd as f64 + 2400000.5;
+            let leap_seconds = find_leap_seconds_in_table_checked(jd_utc, leap_seconds)?;
+            let tt_minus_utc = leap_seconds + TT_MINUS_TAI_S;
+            let delta_t = ((tt_minus_utc - entry.ut1_utc) * ROUND_1E7).round() / ROUND_1E7;
+            Ok(DeltaTRow {
+                jd_tt: jd_utc + tt_minus_utc / SECONDS_PER_DAY,
+                delta_t,
+            })
+        })
+        .collect::<Result<_, CoverageError>>()?;
+
+    let delta_t = match table.binary_search_by(|row| row.jd_tt.partial_cmp(&jd_tt).unwrap()) {
+        Ok(i) => table[i].delta_t,
+        Err(0) => table[0].delta_t,
+        Err(i) if i >= table.len() => table.last().unwrap().delta_t,
+        Err(i) => {
+            let p1 = &table[i - 1];
+            let p2 = &table[i];
+            p1.delta_t + (jd_tt - p1.jd_tt) * (p2.delta_t - p1.delta_t) / (p2.jd_tt - p1.jd_tt)
+        }
+    };
+    Ok(delta_t)
+}
+
 /// UT1 coverage interval for the embedded EOP table, in TT Julian dates.
 ///
 /// Outside this interval the delta-T interpolation clamps to the nearest table
@@ -952,20 +1750,35 @@ fn interpolate_delta_t(jd_tt: f64) -> f64 {
 /// instants outside `[first_jd_tt, last_jd_tt]` as degraded; see
 /// [`crate::astro::time::eop`].
 pub fn ut1_coverage() -> Ut1Provenance {
-    let first = UT1_DATA.first();
-    let last = UT1_DATA.last();
+    ut1_coverage_for(
+        &UT1_DATA,
+        LEAP_SECONDS,
+        "IERS Earth Orientation Parameters (UT1-UTC), bundled",
+    )
+}
+
+fn ut1_coverage_for(
+    ut1_utc: &[Ut1Entry],
+    leap_seconds: &[LeapSecondEntry],
+    source: &'static str,
+) -> Ut1Provenance {
+    let ut1_utc = effective_ut1_utc_rows(ut1_utc, leap_seconds);
+    let first = ut1_utc.first();
+    let last = ut1_utc.last();
     let to_jd_tt = |mjd: i32| -> f64 {
         let jd_utc = mjd as f64 + 2400000.5;
-        let tt_minus_utc = find_leap_seconds(jd_utc) + TT_MINUS_TAI_S;
+        let tt_minus_utc = find_leap_seconds_in_table_checked(jd_utc, leap_seconds)
+            .expect("effective UT1 rows are covered by leap table")
+            + TT_MINUS_TAI_S;
         jd_utc + tt_minus_utc / SECONDS_PER_DAY
     };
     Ut1Provenance {
-        source: "IERS Earth Orientation Parameters (UT1-UTC), bundled",
+        source,
         first_mjd: first.map(|e| e.mjd).unwrap_or(0),
         last_mjd: last.map(|e| e.mjd).unwrap_or(0),
         first_jd_tt: first.map(|e| to_jd_tt(e.mjd)).unwrap_or(0.0),
         last_jd_tt: last.map(|e| to_jd_tt(e.mjd)).unwrap_or(0.0),
-        entries: UT1_DATA.len(),
+        entries: ut1_utc.len(),
     }
 }
 
@@ -986,6 +1799,336 @@ mod tests {
         let jd1 = julian_day_number(year, month, day) as f64 - 0.5;
         let sod = hour as f64 * SECONDS_PER_HOUR + minute as f64 * SECONDS_PER_MINUTE + second;
         jd1 + sod / SECONDS_PER_DAY
+    }
+
+    fn positive_ulp_distance(a: f64, b: f64) -> u64 {
+        debug_assert!(a.is_sign_positive());
+        debug_assert!(b.is_sign_positive());
+        a.to_bits().abs_diff(b.to_bits())
+    }
+
+    // --- IAU TCG/TCB linear definitions. -------------------------------------
+
+    #[test]
+    fn iau_tcg_tcb_constants_are_exact_f64_bits() {
+        assert_eq!(TT_TCG_RATE_L_G.to_bits(), 0x3e07_f240_9f5d_dc8f);
+        assert_eq!(TDB_TCB_RATE_L_B.to_bits(), 0x3e50_a609_49f9_cf0c);
+        assert_eq!(TDB_TCB_OFFSET_TDB0_S.to_bits(), 0xbf11_2ba1_6e7a_311f);
+        assert_eq!(TCG_TCB_REFERENCE_JD.to_bits(), 0x4142_a3c4_400c_34c2);
+        assert_eq!(TT_TCG_RATE_L_G, 6.969290134e-10);
+        assert_eq!(TDB_TCB_RATE_L_B, 1.550519768e-8);
+        assert_eq!(TDB_TCB_OFFSET_TDB0_S, -6.55e-5);
+        assert_eq!(TCG_TCB_REFERENCE_JD, 2_443_144.500_372_5);
+    }
+
+    #[test]
+    fn tcg_tcb_linear_conversions_round_trip_to_one_ulp() {
+        let cases = [
+            TCG_TCB_REFERENCE_JD,
+            J2000_JD,
+            2_460_000.5,
+            2_443_145.5,
+            2_443_144.500_372_5 + 1_000.0,
+            2_460_123.456_789,
+            2_400_014.327_160_368,
+            2_400_015.561_728_258,
+        ];
+        for jd in cases {
+            let tcg = tt_to_tcg_jd(jd);
+            let tt_back = tcg_to_tt_jd(tcg);
+            assert!(
+                positive_ulp_distance(tt_back, jd) <= 1,
+                "TT->TCG->TT round trip at JD {jd}: got {tt_back}"
+            );
+
+            let tcb = tdb_to_tcb_jd(jd);
+            let tdb_back = tcb_to_tdb_jd(tcb);
+            assert!(
+                positive_ulp_distance(tdb_back, jd) <= 1,
+                "TDB->TCB->TDB round trip at JD {jd}: got {tdb_back}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcg_reference_epoch_is_synchronized_and_tcb_carries_tdb0_before_jd_rounding() {
+        assert_eq!(
+            tt_to_tcg_jd(TCG_TCB_REFERENCE_JD).to_bits(),
+            TCG_TCB_REFERENCE_JD.to_bits()
+        );
+        assert_eq!(
+            tcg_to_tt_jd(TCG_TCB_REFERENCE_JD).to_bits(),
+            TCG_TCB_REFERENCE_JD.to_bits()
+        );
+
+        let tdb_offset_at_reference_s = (TCG_TCB_REFERENCE_JD - TCG_TCB_REFERENCE_JD)
+            * SECONDS_PER_DAY
+            * (1.0 - TDB_TCB_RATE_L_B)
+            + TDB_TCB_OFFSET_TDB0_S;
+        assert_eq!(
+            tdb_offset_at_reference_s.to_bits(),
+            TDB_TCB_OFFSET_TDB0_S.to_bits()
+        );
+
+        let tdb_at_tcb_reference = tcb_to_tdb_jd(TCG_TCB_REFERENCE_JD);
+        let rounded_full_jd = TCG_TCB_REFERENCE_JD + TDB_TCB_OFFSET_TDB0_S / SECONDS_PER_DAY;
+        assert_eq!(tdb_at_tcb_reference.to_bits(), rounded_full_jd.to_bits());
+        assert_eq!(tdb_at_tcb_reference.to_bits(), 0x4142_a3c4_400c_34c0);
+        assert_eq!(
+            tdb_to_tcb_jd(tdb_at_tcb_reference).to_bits(),
+            TCG_TCB_REFERENCE_JD.to_bits()
+        );
+    }
+
+    #[test]
+    fn tai_defining_epoch_maps_tt_and_tcg_to_reference_jd() {
+        let scales = TimeScales::from_scale(TimeScale::Tai, 1977, 1, 1, 0, 0, 0.0)
+            .expect("valid TAI reference instant");
+        assert_eq!(scales.jd_tt.to_bits(), TCG_TCB_REFERENCE_JD.to_bits());
+        assert_eq!(scales.jd_tcg().to_bits(), TCG_TCB_REFERENCE_JD.to_bits());
+    }
+
+    #[test]
+    fn tcb_calendar_reference_input_resolves_to_tt_reference_jd() {
+        let scales = TimeScales::from_scale(TimeScale::Tcb, 1977, 1, 1, 0, 0, 32.184)
+            .expect("valid TCB reference instant");
+        assert_eq!(scales.jd_tt.to_bits(), TCG_TCB_REFERENCE_JD.to_bits());
+        assert_eq!(scales.jd_tcg().to_bits(), TCG_TCB_REFERENCE_JD.to_bits());
+    }
+
+    #[test]
+    fn tdb_calendar_input_uses_periodic_tdb_tt_inverse() {
+        let tdb_jd = J2000_JD;
+        let tt_jd = tdb_to_tt_jd_for_tdb_input(tdb_jd);
+        let reconstructed_tdb = tt_jd + tdb_minus_tt_seconds_at_tt_jd(tt_jd) / SECONDS_PER_DAY;
+        assert_eq!(reconstructed_tdb.to_bits(), tdb_jd.to_bits());
+
+        let scales = TimeScales::from_scale(TimeScale::Tdb, 2000, 1, 1, 12, 0, 0.0)
+            .expect("valid TDB input");
+        assert_eq!(scales.jd_tdb.to_bits(), tdb_jd.to_bits());
+    }
+
+    #[test]
+    fn tcg_tcb_fractions_use_split_affine_relations() {
+        let scales = TimeScales::from_utc(2000, 1, 1, 12, 0, 0.0).expect("valid UTC instant");
+
+        assert_eq!(scales.tcg_fraction().to_bits(), 0x3f48_88c2_8751_43f2);
+        assert_ne!(
+            scales.tcg_fraction().to_bits(),
+            (scales.jd_tcg() - scales.jd_whole).to_bits()
+        );
+
+        assert_eq!(scales.tcb_fraction().to_bits(), 0x3f4c_9c46_0494_33ba);
+        assert_ne!(
+            scales.tcb_fraction().to_bits(),
+            (scales.jd_tcb() - scales.jd_whole).to_bits()
+        );
+    }
+
+    #[test]
+    fn from_scale_rejects_continuous_scale_leap_second_labels_before_normalizing() {
+        let expected = Err(CoverageError::InvalidInput {
+            field: "civil datetime",
+            kind: TimeScaleInputErrorKind::InvalidCivilTime,
+        });
+        for scale in [
+            TimeScale::Tai,
+            TimeScale::Tt,
+            TimeScale::Tcg,
+            TimeScale::Tdb,
+            TimeScale::Tcb,
+            TimeScale::Gpst,
+            TimeScale::Gst,
+            TimeScale::Bdt,
+            TimeScale::Qzsst,
+        ] {
+            assert_eq!(
+                TimeScales::from_scale(scale, 2017, 1, 1, 0, 0, 60.0),
+                expected
+            );
+        }
+        assert!(TimeScales::from_scale(TimeScale::Utc, 2016, 12, 31, 23, 59, 60.0).is_ok());
+
+        let tables = TimeTables::embedded();
+        assert_eq!(
+            TimeScales::from_scale_with_tables(TimeScale::Tcb, 2017, 1, 1, 0, 0, 60.0, tables),
+            expected
+        );
+    }
+
+    #[test]
+    fn embedded_tables_path_is_bit_identical() {
+        let tables = TimeTables::embedded();
+        for (year, month, day, hour, minute, second) in [
+            (1973, 1, 2, 0, 0, 0.0),
+            (2000, 1, 1, 12, 0, 0.0),
+            (2016, 12, 31, 23, 59, 60.0),
+            (2026, 6, 1, 0, 0, 0.0),
+        ] {
+            let embedded = TimeScales::from_utc(year, month, day, hour, minute, second)
+                .expect("embedded UTC conversion");
+            let via_tables =
+                TimeScales::from_utc_with_tables(year, month, day, hour, minute, second, tables)
+                    .expect("table UTC conversion");
+            assert_eq!(via_tables, embedded);
+        }
+    }
+
+    #[test]
+    fn caller_leap_table_future_step_shifts_tt_by_exactly_one_second() {
+        let mut leap_seconds = LEAP_SECONDS.to_vec();
+        let last = leap_seconds.last().expect("embedded leap table");
+        leap_seconds.push(LeapSecondEntry {
+            mjd: 61041,
+            tai_utc: last.tai_utc + 1.0,
+        });
+        let tables = TimeTables::new(&leap_seconds, &UT1_DATA).expect("valid override tables");
+
+        let embedded =
+            TimeScales::from_utc(2026, 1, 2, 0, 0, 0.0).expect("embedded UTC conversion");
+        let override_scales = TimeScales::from_utc_with_tables(2026, 1, 2, 0, 0, 0.0, tables)
+            .expect("override UTC conversion");
+        assert_eq!(
+            override_scales.jd_whole.to_bits(),
+            embedded.jd_whole.to_bits()
+        );
+        assert_eq!(
+            override_scales.tt_fraction.to_bits(),
+            (embedded.tt_fraction + 1.0 / SECONDS_PER_DAY).to_bits()
+        );
+
+        let before_embedded =
+            TimeScales::from_utc(2025, 12, 1, 0, 0, 0.0).expect("embedded UTC conversion");
+        let before_override = TimeScales::from_utc_with_tables(2025, 12, 1, 0, 0, 0.0, tables)
+            .expect("override UTC conversion");
+        assert_eq!(before_override, before_embedded);
+    }
+
+    #[test]
+    fn caller_leap_table_must_cover_queried_epoch() {
+        let leap_seconds = [LeapSecondEntry {
+            mjd: 61041,
+            tai_utc: 38.0,
+        }];
+        let tables = TimeTables::new(&leap_seconds, &UT1_DATA).expect("valid future tables");
+
+        let err = TimeScales::from_utc_with_tables(2025, 12, 31, 0, 0, 0.0, tables)
+            .expect_err("caller leap table must cover the query epoch");
+        assert_eq!(
+            err,
+            CoverageError::InvalidInput {
+                field: "leap_seconds",
+                kind: TimeScaleInputErrorKind::OutOfRange
+            }
+        );
+
+        let err = TimeScales::from_utc_validated_with_tables(
+            2025,
+            12,
+            31,
+            0,
+            0,
+            0.0,
+            ValidityMode::Permissive,
+            tables,
+        )
+        .expect_err("permissive mode still requires leap table coverage");
+        assert_eq!(
+            err,
+            CoverageError::InvalidInput {
+                field: "leap_seconds",
+                kind: TimeScaleInputErrorKind::OutOfRange
+            }
+        );
+    }
+
+    #[test]
+    fn caller_ut1_table_uses_validated_coverage_modes() {
+        let ut1_utc = [
+            Ut1Entry {
+                mjd: 61041,
+                ut1_utc: 0.0,
+            },
+            Ut1Entry {
+                mjd: 61042,
+                ut1_utc: 0.0,
+            },
+        ];
+        let tables = TimeTables::new(LEAP_SECONDS, &ut1_utc).expect("valid short UT1 table");
+
+        let strict = TimeScales::from_utc_with_tables(2025, 12, 31, 0, 0, 0.0, tables)
+            .expect_err("strict caller-table path must reject before UT1 coverage");
+        assert_eq!(
+            strict,
+            CoverageError::OutsideCoverage(crate::astro::time::eop::DegradeReason::BeforeCoverage)
+        );
+
+        let permissive = TimeScales::from_utc_validated_with_tables(
+            2025,
+            12,
+            31,
+            0,
+            0,
+            0.0,
+            ValidityMode::Permissive,
+            tables,
+        )
+        .expect("permissive caller-table path returns degraded value");
+        assert_eq!(
+            permissive.degraded,
+            Some(crate::astro::time::eop::DegradeReason::BeforeCoverage)
+        );
+
+        let strict_after = TimeScales::from_utc_validated_with_tables(
+            2026,
+            1,
+            3,
+            0,
+            0,
+            0.0,
+            ValidityMode::Strict,
+            tables,
+        )
+        .expect_err("strict caller-table path must reject after UT1 coverage");
+        assert_eq!(
+            strict_after,
+            CoverageError::OutsideCoverage(crate::astro::time::eop::DegradeReason::AfterCoverage)
+        );
+    }
+
+    #[test]
+    fn caller_tables_reject_short_or_malformed_inputs() {
+        assert_eq!(
+            TimeTables::new(&[], &UT1_DATA).expect_err("empty leap table"),
+            CoverageError::InvalidInput {
+                field: "leap_seconds",
+                kind: TimeScaleInputErrorKind::Missing
+            }
+        );
+        let unsorted = [
+            LeapSecondEntry {
+                mjd: 41317,
+                tai_utc: 10.0,
+            },
+            LeapSecondEntry {
+                mjd: 41317,
+                tai_utc: 11.0,
+            },
+        ];
+        assert_eq!(
+            TimeTables::new(&unsorted, &UT1_DATA).expect_err("unsorted leap table"),
+            CoverageError::InvalidInput {
+                field: "leap_seconds",
+                kind: TimeScaleInputErrorKind::OutOfRange
+            }
+        );
+        assert_eq!(
+            TimeTables::new(LEAP_SECONDS, &[]).expect_err("short UT1 table"),
+            CoverageError::InvalidInput {
+                field: "ut1_utc",
+                kind: TimeScaleInputErrorKind::Missing
+            }
+        );
     }
 
     // --- Pre-1972 rubber-second UTC-TAI model. --------------------------------
@@ -1065,10 +2208,11 @@ mod tests {
     }
 
     #[test]
-    fn tai_minus_utc_pre_1961_clamps_to_first_segment() {
-        // Before the table and for a non-finite input, clamp to the 1961 value.
+    fn tai_minus_utc_pre_1961_clamps_to_first_segment_and_nonfinite_is_nan() {
+        // Before the table, clamp to the first defined 1961 value.
         assert_eq!(find_leap_seconds(utc_jd(1958, 1, 1, 0, 0, 0.0)), 1.4228180);
-        assert_eq!(find_leap_seconds(f64::NAN), 1.4228180);
+        assert!(find_leap_seconds(f64::NAN).is_nan());
+        assert!(find_leap_seconds(f64::INFINITY).is_nan());
     }
 
     // --- Fixed atomic-scale offsets (hex-float goldens). ----------------------

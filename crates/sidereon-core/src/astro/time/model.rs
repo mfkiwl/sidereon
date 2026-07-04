@@ -41,8 +41,12 @@ pub enum TimeScale {
     Tai,
     /// Terrestrial Time.
     Tt,
+    /// Geocentric Coordinate Time.
+    Tcg,
     /// Barycentric Dynamical Time.
     Tdb,
+    /// Barycentric Coordinate Time.
+    Tcb,
     /// GPS time.
     Gpst,
     /// Galileo System Time.
@@ -65,7 +69,9 @@ impl TimeScale {
             TimeScale::Utc => "UTC",
             TimeScale::Tai => "TAI",
             TimeScale::Tt => "TT",
+            TimeScale::Tcg => "TCG",
             TimeScale::Tdb => "TDB",
+            TimeScale::Tcb => "TCB",
             TimeScale::Gpst => "GPST",
             TimeScale::Gst => "GST",
             TimeScale::Bdt => "BDT",

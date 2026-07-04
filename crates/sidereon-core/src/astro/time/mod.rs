@@ -23,6 +23,7 @@ pub mod gnss;
 pub mod model;
 pub mod scales;
 
+pub use crate::astro::data::iers::Ut1Entry;
 pub use civil::{
     civil_from_j2000_seconds, civil_from_julian_day_number, civil_from_split_julian_date,
     day_of_year, day_of_year_int, days_in_month, fractional_day_of_year_from_instant, is_leap_year,
@@ -39,9 +40,11 @@ pub use model::{
     SECONDS_PER_WEEK,
 };
 pub use scales::{
-    find_leap_seconds, gps_utc_offset_s, leap_second_table, tai_utc_offset_s,
-    timescale_offset_at_s, timescale_offset_s, TimeOffsetError, TimeOffsetErrorCode, TimeScales,
-    GLONASST_MINUS_UTC_S,
+    find_leap_seconds, gps_utc_offset_s, leap_second_table, tai_utc_offset_s, tcb_to_tdb_jd,
+    tcg_to_tt_jd, tdb_to_tcb_jd, timescale_offset_at_s, timescale_offset_s, tt_to_tcg_jd,
+    LeapSecondEntry, TimeOffsetError, TimeOffsetErrorCode, TimeScales, TimeTables,
+    GLONASST_MINUS_UTC_S, TCG_TCB_REFERENCE_JD, TDB_TCB_OFFSET_TDB0_S, TDB_TCB_RATE_L_B,
+    TT_TCG_RATE_L_G,
 };
 
 /// Legacy lightweight epoch: seconds since the J2000 TDB epoch.

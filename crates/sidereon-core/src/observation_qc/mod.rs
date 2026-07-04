@@ -555,7 +555,7 @@ fn stamped_declared_time(
 ) -> ObservationQcTime {
     ObservationQcTime {
         epoch,
-        time_scale: Some(time_scale_rinex_label(scale).to_string()),
+        time_scale: time_scale_rinex_label(scale).map(str::to_string),
     }
 }
 

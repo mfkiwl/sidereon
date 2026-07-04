@@ -38,17 +38,17 @@ pub(crate) fn time_scale_label(label: &str) -> Option<TimeScale> {
 /// used by the serializers so a parsed product round-trips its time system.
 /// `GLO` is intentionally not emitted: a `GLO` label decodes to [`TimeScale::Utc`]
 /// (the two are indistinguishable after parsing), so `Utc` serializes as `UTC`.
-pub(crate) fn time_scale_rinex_label(scale: TimeScale) -> &'static str {
+pub(crate) fn time_scale_rinex_label(scale: TimeScale) -> Option<&'static str> {
     match scale {
-        TimeScale::Gpst => "GPS",
-        TimeScale::Qzsst => "QZS",
-        TimeScale::Gst => "GAL",
-        TimeScale::Bdt => "BDT",
-        TimeScale::Utc => "UTC",
-        TimeScale::Tai => "TAI",
-        // No RINEX header label maps to these scales; GPST is the RINEX default
-        // time system and keeps a serialized header parseable.
-        TimeScale::Tt | TimeScale::Tdb | TimeScale::Glonasst => "GPS",
+        TimeScale::Gpst => Some("GPS"),
+        TimeScale::Qzsst => Some("QZS"),
+        TimeScale::Gst => Some("GAL"),
+        TimeScale::Bdt => Some("BDT"),
+        TimeScale::Utc => Some("UTC"),
+        TimeScale::Tai => Some("TAI"),
+        TimeScale::Tt | TimeScale::Tcg | TimeScale::Tdb | TimeScale::Tcb | TimeScale::Glonasst => {
+            None
+        }
     }
 }
 
@@ -86,7 +86,7 @@ mod tests {
     fn known_labels_round_trip() {
         for label in ["GPS", "QZS", "GAL", "BDT", "UTC", "TAI"] {
             let scale = time_scale_label(label).expect("known label");
-            assert_eq!(time_scale_rinex_label(scale), label);
+            assert_eq!(time_scale_rinex_label(scale), Some(label));
         }
     }
 
@@ -94,7 +94,20 @@ mod tests {
     fn glonass_label_is_utc() {
         assert_eq!(time_scale_label("GLO"), Some(TimeScale::Utc));
         // UTC serializes back as UTC (GLO and UTC are indistinguishable).
-        assert_eq!(time_scale_rinex_label(TimeScale::Utc), "UTC");
+        assert_eq!(time_scale_rinex_label(TimeScale::Utc), Some("UTC"));
+    }
+
+    #[test]
+    fn unsupported_labels_are_none() {
+        for scale in [
+            TimeScale::Tt,
+            TimeScale::Tcg,
+            TimeScale::Tdb,
+            TimeScale::Tcb,
+            TimeScale::Glonasst,
+        ] {
+            assert_eq!(time_scale_rinex_label(scale), None);
+        }
     }
 
     #[test]

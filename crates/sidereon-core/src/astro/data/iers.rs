@@ -1,8 +1,12 @@
 //! Embedded IERS UT1-UTC data table.
 //! Source: IERS Earth Orientation Parameters (finals2000A.all, refreshed).
 
+/// One UT1-UTC sample keyed by UTC Modified Julian Date.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ut1Entry {
+    /// UTC Modified Julian Date of the sample.
     pub mjd: i32,
+    /// UT1 minus UTC, seconds.
     pub ut1_utc: f64,
 }
 
