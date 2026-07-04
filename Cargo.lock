@@ -703,6 +703,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sidereon-scoreboard"
+version = "0.15.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "sidereon-core",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "simba"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
