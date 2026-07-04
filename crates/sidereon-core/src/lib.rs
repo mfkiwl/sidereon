@@ -137,6 +137,7 @@ pub mod qc_obs {
     pub use crate::observation_qc::*;
 }
 pub mod orbit;
+pub mod orbit_determination;
 pub mod positioning;
 pub mod prelude;
 pub mod quality; // measurement weighting, RAIM, and FDE integrity checks
