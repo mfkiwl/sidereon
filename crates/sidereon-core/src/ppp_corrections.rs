@@ -1,9 +1,9 @@
 //! Static-arc PPP correction precomputation.
 //!
-//! This module owns the language-independent correction algebra that used to sit
-//! in Sidereon' `PPPCorrections` wrapper: per-epoch Sun/Moon and solid-earth tide
-//! evaluation, per-satellite carrier-phase wind-up continuity, and satellite
-//! antenna PCO/PCV projection in the satellite body frame.
+//! This module owns the language-independent correction algebra for per-epoch
+//! Sun/Moon and solid-earth tide evaluation, per-satellite carrier-phase wind-up
+//! continuity, and satellite antenna PCO/PCV projection in the satellite body
+//! frame.
 
 use crate::astro::angles::beta_angle_from_cos_rad;
 use crate::astro::bodies::{sun_moon_ecef, SunMoon};
@@ -38,11 +38,11 @@ use crate::tides::{ocean_tide_loading, solid_earth_pole_tide, solid_earth_tide, 
 pub use crate::tides::{OceanLoadingBlq, NUM_OCEAN_CONSTITUENTS};
 use crate::tolerances::{
     FREQUENCY_DENOMINATOR_EPS_HZ, PPP_FREQUENCY_ABS_EPS_HZ, PPP_FREQUENCY_REL_EPS,
-    YAW_SINGULARITY_EPS_RAD,
+    VECTOR_NORM_ZERO_EPS, YAW_SINGULARITY_EPS_RAD,
 };
 use crate::{GnssSatelliteId, GnssSystem};
 
-/// Civil date/time fields used by Sidereon PPP correction tables.
+/// Civil date/time fields used by PPP correction tables.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CivilDateTime {
     pub year: i32,
@@ -858,10 +858,7 @@ fn satellite_antenna_correction(
     let rs = pred.sat_pos_ecef_m;
     let ant = options.antenna_for(sat, epoch)?;
 
-    let ez = unit3(neg3(rs))?;
-    let es = unit3(sub3(sun_ecef_m, rs))?;
-    let ey = unit3(cross3(ez, es))?;
-    let ex = cross3(ey, ez);
+    let (ex, ey, ez) = satellite_sun_fixed_axes(rs, sun_ecef_m)?;
 
     let off1 = ant.pco(&options.freq1_label)?;
     let off2 = ant.pco(&options.freq2_label)?;
@@ -873,6 +870,43 @@ fn satellite_antenna_correction(
     let pcv_m = nadir_pcv_if(ant, pred, options, gamma)?;
 
     Some((dant_ecef, pcv_m))
+}
+
+/// Convert a satellite body-frame PCO to ECEF using satellite-Sun-fixed axes.
+pub(crate) fn satellite_body_pco_to_ecef(
+    pco_body_m: [f64; 3],
+    sat_position_ecef_m: [f64; 3],
+    sun_ecef_m: [f64; 3],
+) -> Option<[f64; 3]> {
+    let (ex, ey, ez) = satellite_sun_fixed_axes(sat_position_ecef_m, sun_ecef_m)?;
+    Some(body_to_ecef(pco_body_m, ex, ey, ez))
+}
+
+fn satellite_sun_fixed_axes(
+    sat_position_ecef_m: [f64; 3],
+    sun_ecef_m: [f64; 3],
+) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
+    let sat_norm_m = norm3(sat_position_ecef_m);
+    if !sat_norm_m.is_finite() || sat_norm_m <= VECTOR_NORM_ZERO_EPS {
+        return None;
+    }
+    let ez = scale3(neg3(sat_position_ecef_m), 1.0 / sat_norm_m);
+
+    let sun_delta_m = sub3(sun_ecef_m, sat_position_ecef_m);
+    let sun_delta_norm_m = norm3(sun_delta_m);
+    if !sun_delta_norm_m.is_finite() || sun_delta_norm_m <= VECTOR_NORM_ZERO_EPS {
+        return None;
+    }
+    let es = scale3(sun_delta_m, 1.0 / sun_delta_norm_m);
+
+    let normal = cross3(ez, es);
+    let normal_norm = norm3(normal);
+    if !normal_norm.is_finite() || normal_norm <= VECTOR_NORM_ZERO_EPS {
+        return None;
+    }
+    let ey = scale3(normal, 1.0 / normal_norm);
+    let ex = cross3(ey, ez);
+    Some((ex, ey, ez))
 }
 
 fn body_to_ecef(pco_body_m: [f64; 3], ex: [f64; 3], ey: [f64; 3], ez: [f64; 3]) -> [f64; 3] {
