@@ -130,6 +130,7 @@ pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric he
 pub mod geometry;
 pub mod geometry_quality;
 pub mod ils; // integer least squares ambiguity-resolution kernels
+pub mod inertial; // ECEF strapdown INS frames, mechanization, and IMU error model
 pub mod integrity; // shared protection and covariance primitives
 pub mod observation_qc; // RINEX observation completeness and signal rollups
 pub mod qc_obs {
@@ -147,6 +148,15 @@ pub mod terrain;
 pub mod terrain_store;
 pub mod tides;
 pub mod tolerances;
+
+/// GNSS/INS fusion staging surface.
+///
+/// This pass exposes the inertial frame, mechanization, and IMU error-model
+/// primitives only. Measurement updates and filter state are added in later
+/// passes.
+pub mod fusion {
+    pub use crate::inertial::*;
+}
 
 pub use crate::error_metrics::{
     error_ellipse_from_enu_m2, horizontal_radius_at, metrics_from_ecef_covariance_m2,
@@ -177,6 +187,13 @@ pub use geoid::{
     geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, GeoidError, GeoidGrid,
 };
 pub use id::{GnssSatelliteId, GnssSystem, SatelliteIdError};
+pub use inertial::{
+    gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
+    mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, AttitudeQuaternion, ConingCorrection,
+    CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuGrade, ImuSample,
+    ImuSampleKind, ImuSpec, InertialError, MechanizationConfig, NavState, StrapdownMechanizer,
+    WGS84_NORMAL_GRAVITY_EQUATOR_MPS2, WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
+};
 pub use sidereal::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
     repeat_period, sidereal_filter, solar_day_period, SiderealFilterError, SiderealFilterOptions,
