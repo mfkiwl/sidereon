@@ -7,13 +7,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::antex::{Antex, AntexDateTime};
+use crate::astro::bodies::sun_moon_ecef;
+use crate::astro::math::vec3::add3;
+use crate::astro::time::civil::civil_from_j2000_seconds;
 use crate::astro::time::model::{GnssWeekTow, TimeScale};
+use crate::astro::time::scales::TimeScales;
 use crate::broadcast::satellite_state_unchecked;
 use crate::constants::{C_M_S, GPS_EPOCH_TO_J2000_S, SECONDS_PER_HOUR, SECONDS_PER_WEEK};
 use crate::ephemeris::{BroadcastEphemeris, BroadcastIssue, NavMessage};
 use crate::error::{Error, Result};
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::observables::{ObservableEphemerisSource, ObservableState, ObservablesError};
+use crate::ppp_corrections::satellite_body_pco_to_ecef;
 use crate::rinex_nav::is_beidou_geo;
 use crate::rtcm::{Message, SsrKind, SsrMessage};
 use crate::spp::EphemerisSource;
@@ -49,12 +55,71 @@ pub enum OrbitBasis {
 }
 
 /// Reference point of the corrected orbit.
+///
+/// `rtcm_ssr_default` preserves the RTCM SSR convention used by the current
+/// correction path: no satellite PCO is applied because the corrected state is
+/// already treated as an antenna-phase-center state. BKG Ntrip Client provider
+/// documentation states that broadcast corrections default to APC unless a CoM
+/// stream is selected: https://software.rtcm-ntrip.org/export/7020/ntrip/trunk/BNC/src/bnchelp.html
+///
+/// `igs_ssr_default` selects CoM for IGS SSR CoM streams. IGS SSR v1.00 defines
+/// CoM/APC as the satellite reference point choices and IGS RTS product
+/// documentation identifies CoM streams separately from antenna-reference
+/// streams:
+/// https://files.igs.org/pub/data/format/igs_ssr_v1.pdf
+/// https://igs.org/rts/products/
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum OrbitReferencePoint {
+pub enum SsrReferencePoint {
     /// Satellite antenna phase center.
     AntennaPhaseCenter,
     /// Satellite center of mass.
     CenterOfMass,
+}
+
+impl SsrReferencePoint {
+    /// Default reference point for decoded RTCM SSR streams.
+    pub const fn rtcm_ssr_default() -> Self {
+        Self::AntennaPhaseCenter
+    }
+
+    /// Default reference point for IGS SSR CoM streams.
+    pub const fn igs_ssr_default() -> Self {
+        Self::CenterOfMass
+    }
+
+    /// Stable compact tag for storing this reference-point choice.
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::AntennaPhaseCenter => 0,
+            Self::CenterOfMass => 1,
+        }
+    }
+
+    /// Decode a compact tag produced by [`SsrReferencePoint::tag`].
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::AntennaPhaseCenter),
+            1 => Some(Self::CenterOfMass),
+            _ => None,
+        }
+    }
+}
+
+/// Backward-compatible name for an SSR orbit reference point.
+pub type OrbitReferencePoint = SsrReferencePoint;
+
+/// Satellite attitude model used for SSR CoM-to-APC conversion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SsrSatelliteAttitude {
+    /// No satellite attitude model is available; CoM-to-APC conversion is declined.
+    #[default]
+    Unavailable,
+    /// Nominal satellite-Sun-fixed axes used by the PPP antenna PCO path.
+    ///
+    /// This does not cover yaw maneuvers, eclipse turns, or provider-specific
+    /// attitude laws. Use it only when that nominal model is the intended SSR
+    /// convention for the correction stream.
+    NominalSunFixed,
 }
 
 /// Provider and solution identity.
@@ -82,7 +147,7 @@ pub struct SsrOrbitCorrection {
     /// True when the RTCM reference datum bit marks a regional CRS.
     pub crs_regional: bool,
     /// Orbit reference point policy.
-    pub reference_point: OrbitReferencePoint,
+    pub reference_point: SsrReferencePoint,
     /// Radial delta to add, meters.
     pub radial_m: f64,
     /// Along-track delta to add, meters.
@@ -163,7 +228,7 @@ struct SatCorrections {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SsrCorrectionStore {
     corrections: BTreeMap<GnssSatelliteId, SatCorrections>,
-    reference_point: OrbitReferencePoint,
+    reference_point: SsrReferencePoint,
     staleness: StalenessPolicy,
 }
 
@@ -178,15 +243,20 @@ impl SsrCorrectionStore {
     pub fn new() -> Self {
         Self {
             corrections: BTreeMap::new(),
-            reference_point: OrbitReferencePoint::CenterOfMass,
+            reference_point: SsrReferencePoint::rtcm_ssr_default(),
             staleness: StalenessPolicy::seconds(DEFAULT_SSR_STALENESS_S),
         }
     }
 
     /// Set the orbit reference point policy for later ingests.
-    pub fn with_reference_point(mut self, reference_point: OrbitReferencePoint) -> Self {
+    pub fn with_reference_point(mut self, reference_point: SsrReferencePoint) -> Self {
         self.reference_point = reference_point;
         self
+    }
+
+    /// Orbit reference point policy used for later ingests.
+    pub fn reference_point(&self) -> SsrReferencePoint {
+        self.reference_point
     }
 
     /// Set the store staleness policy.
@@ -215,6 +285,7 @@ impl SsrCorrectionStore {
             message.system,
             week,
             message.header.epoch_time_s,
+            message.header.update_interval,
             update_interval_s,
         )?;
         let solution = SsrSolution {
@@ -353,7 +424,7 @@ impl SsrCorrectionStore {
 }
 
 fn orbit_from_rtcm(
-    reference_point: OrbitReferencePoint,
+    reference_point: SsrReferencePoint,
     message: &SsrMessage,
     solution: SsrSolution,
     record: &crate::rtcm::SsrOrbitRecord,
@@ -419,6 +490,8 @@ impl Default for SsrFallbackPolicy {
 pub struct SsrCorrectedEphemeris<'a> {
     broadcast: &'a BroadcastEphemeris,
     store: &'a SsrCorrectionStore,
+    antex: Option<&'a Antex>,
+    attitude: SsrSatelliteAttitude,
     staleness: StalenessPolicy,
     fallback: SsrFallbackPolicy,
 }
@@ -429,9 +502,23 @@ impl<'a> SsrCorrectedEphemeris<'a> {
         Self {
             broadcast,
             store,
+            antex: None,
+            attitude: SsrSatelliteAttitude::Unavailable,
             staleness: store.staleness(),
             fallback: SsrFallbackPolicy::default(),
         }
+    }
+
+    /// Attach satellite ANTEX calibrations for CoM-to-APC orbit conversion.
+    pub fn with_satellite_antennas(mut self, antex: &'a Antex) -> Self {
+        self.antex = Some(antex);
+        self
+    }
+
+    /// Set the satellite attitude model for CoM-to-APC conversion.
+    pub fn with_satellite_attitude(mut self, attitude: SsrSatelliteAttitude) -> Self {
+        self.attitude = attitude;
+        self
     }
 
     /// Set the staleness policy.
@@ -464,7 +551,7 @@ impl<'a> SsrCorrectedEphemeris<'a> {
     /// Corrected ECEF position and satellite clock at a J2000 epoch.
     pub fn corrected_state(&self, sat: GnssSatelliteId, t_j2000_s: f64) -> Option<([f64; 3], f64)> {
         self.corrected_state_inner(sat, t_j2000_s)
-            .or_else(|| self.broadcast_fallback(sat, t_j2000_s))
+            .or_else(|| self.broadcast_fallback_after_failure(sat, t_j2000_s))
     }
 
     fn corrected_state_inner(
@@ -512,11 +599,15 @@ impl<'a> SsrCorrectedEphemeris<'a> {
         let radial = orbit.radial_m + orbit.radial_rate_m_s * dt_orbit;
         let along = orbit.along_m + orbit.along_rate_m_s * dt_orbit;
         let cross = orbit.cross_m + orbit.cross_rate_m_s * dt_orbit;
-        let corrected_position = [
+        let mut corrected_position = [
             r[0] + radial * er[0] + along * ea[0] + cross * ec[0],
             r[1] + radial * er[1] + along * ea[1] + cross * ec[1],
             r[2] + radial * er[2] + along * ea[2] + cross * ec[2],
         ];
+        if orbit.reference_point == SsrReferencePoint::CenterOfMass {
+            let pco_ecef_m = self.satellite_pco_to_apc(sat, t_j2000_s, corrected_position)?;
+            corrected_position = add3(corrected_position, pco_ecef_m);
+        }
 
         let dt_clock = t_j2000_s - clock.ref_epoch_j2000_s;
         let mut dclock_m =
@@ -544,12 +635,42 @@ impl<'a> SsrCorrectedEphemeris<'a> {
         }
     }
 
-    fn broadcast_fallback(&self, sat: GnssSatelliteId, t_j2000_s: f64) -> Option<([f64; 3], f64)> {
+    fn broadcast_fallback_after_failure(
+        &self,
+        sat: GnssSatelliteId,
+        t_j2000_s: f64,
+    ) -> Option<([f64; 3], f64)> {
+        if self
+            .store
+            .orbit(sat)
+            .is_some_and(|orbit| orbit.reference_point == SsrReferencePoint::CenterOfMass)
+        {
+            return None;
+        }
         if self.fallback.on_missing_correction == MissingCorrectionAction::FallBackToBroadcast {
             self.broadcast.position_clock_at_j2000_s(sat, t_j2000_s)
         } else {
             None
         }
+    }
+
+    fn satellite_pco_to_apc(
+        &self,
+        sat: GnssSatelliteId,
+        t_j2000_s: f64,
+        sat_position_ecef_m: [f64; 3],
+    ) -> Option<[f64; 3]> {
+        if self.attitude != SsrSatelliteAttitude::NominalSunFixed {
+            return None;
+        }
+        let antex = self.antex?;
+        let epoch = antex_epoch_from_j2000_gpst(t_j2000_s)?;
+        let antenna = antex.satellite_antenna(&sat.to_string(), epoch)?;
+        let frequency = ssr_apc_frequency(sat.system)?;
+        let pco_body_m = antenna.pco(frequency).ok()?;
+        let ts = time_scales_from_j2000_gpst(t_j2000_s)?;
+        let sun_ecef_m = sun_moon_ecef(&ts).ok()?.sun;
+        satellite_body_pco_to_ecef(pco_body_m, sat_position_ecef_m, sun_ecef_m)
     }
 }
 
@@ -584,6 +705,8 @@ impl ObservableEphemerisSource for SsrCorrectedEphemeris<'_> {
 pub struct SsrCorrectedEphemerisOwned {
     broadcast: Arc<BroadcastEphemeris>,
     store: Arc<SsrCorrectionStore>,
+    antex: Option<Arc<Antex>>,
+    attitude: SsrSatelliteAttitude,
     staleness: StalenessPolicy,
     fallback: SsrFallbackPolicy,
 }
@@ -595,9 +718,23 @@ impl SsrCorrectedEphemerisOwned {
         Self {
             broadcast,
             store,
+            antex: None,
+            attitude: SsrSatelliteAttitude::Unavailable,
             staleness,
             fallback: SsrFallbackPolicy::default(),
         }
+    }
+
+    /// Attach satellite ANTEX calibrations for CoM-to-APC orbit conversion.
+    pub fn with_satellite_antennas(mut self, antex: Arc<Antex>) -> Self {
+        self.antex = Some(antex);
+        self
+    }
+
+    /// Set the satellite attitude model for CoM-to-APC conversion.
+    pub fn with_satellite_attitude(mut self, attitude: SsrSatelliteAttitude) -> Self {
+        self.attitude = attitude;
+        self
     }
 
     /// Set the staleness policy.
@@ -628,9 +765,15 @@ impl SsrCorrectedEphemerisOwned {
     }
 
     fn borrowed(&self) -> SsrCorrectedEphemeris<'_> {
-        SsrCorrectedEphemeris::new(&self.broadcast, &self.store)
+        let source = SsrCorrectedEphemeris::new(&self.broadcast, &self.store)
             .with_staleness(self.staleness)
             .with_fallback(self.fallback.clone())
+            .with_satellite_attitude(self.attitude);
+        if let Some(antex) = &self.antex {
+            source.with_satellite_antennas(antex)
+        } else {
+            source
+        }
     }
 }
 
@@ -680,6 +823,7 @@ fn ssr_epoch_j2000_s(
     system: GnssSystem,
     week: GnssWeekTow,
     epoch_time_s: u32,
+    update_interval: u8,
     update_interval_s: f64,
 ) -> Result<f64> {
     let scale = match system {
@@ -687,13 +831,14 @@ fn ssr_epoch_j2000_s(
         GnssSystem::BeiDou => TimeScale::Bdt,
         _ => TimeScale::Gpst,
     };
-    let normalized = GnssWeekTow::new(
-        scale,
-        week.week,
-        f64::from(epoch_time_s) + update_interval_s / 2.0,
-    )
-    .and_then(GnssWeekTow::normalized)
-    .map_err(|_| Error::Parse("SSR epoch is out of range".to_string()))?;
+    let epoch_offset_s = if update_interval == 0 {
+        0.0
+    } else {
+        update_interval_s / 2.0
+    };
+    let normalized = GnssWeekTow::new(scale, week.week, f64::from(epoch_time_s) + epoch_offset_s)
+        .and_then(GnssWeekTow::normalized)
+        .map_err(|_| Error::Parse("SSR epoch is out of range".to_string()))?;
     let continuous = f64::from(normalized.week) * SECONDS_PER_WEEK + normalized.tow_s;
     Ok(match system {
         GnssSystem::BeiDou => {
@@ -722,6 +867,57 @@ fn default_nav_message(system: GnssSystem) -> Option<NavMessage> {
         GnssSystem::BeiDou => Some(NavMessage::BeidouD1),
         _ => None,
     }
+}
+
+fn ssr_apc_frequency(system: GnssSystem) -> Option<&'static str> {
+    match system {
+        GnssSystem::Gps => Some("G01"),
+        GnssSystem::Glonass => Some("R01"),
+        GnssSystem::Galileo => Some("E01"),
+        GnssSystem::BeiDou => Some("C02"),
+        GnssSystem::Qzss => Some("J01"),
+        GnssSystem::Navic => Some("I05"),
+        GnssSystem::Sbas => Some("S01"),
+    }
+}
+
+fn antex_epoch_from_j2000_gpst(t_j2000_s: f64) -> Option<AntexDateTime> {
+    let (year, month, day, hour, minute, second) = civil_fields_from_j2000_gpst(t_j2000_s)?;
+    AntexDateTime::new(year, month, day, hour, minute, second.trunc() as u8).ok()
+}
+
+fn time_scales_from_j2000_gpst(t_j2000_s: f64) -> Option<TimeScales> {
+    let (year, month, day, hour, minute, second) = civil_fields_from_j2000_gpst(t_j2000_s)?;
+    TimeScales::from_scale(
+        TimeScale::Gpst,
+        year,
+        i32::from(month),
+        i32::from(day),
+        i32::from(hour),
+        i32::from(minute),
+        second,
+    )
+    .ok()
+}
+
+fn civil_fields_from_j2000_gpst(t_j2000_s: f64) -> Option<(i32, u8, u8, u8, u8, f64)> {
+    if !t_j2000_s.is_finite() {
+        return None;
+    }
+    let whole = t_j2000_s.floor();
+    if whole < i64::MIN as f64 || whole > i64::MAX as f64 {
+        return None;
+    }
+    let fraction = t_j2000_s - whole;
+    let (year, month, day, hour, minute, second) = civil_from_j2000_seconds(whole as i64);
+    Some((
+        i32::try_from(year).ok()?,
+        u8::try_from(month).ok()?,
+        u8::try_from(day).ok()?,
+        u8::try_from(hour).ok()?,
+        u8::try_from(minute).ok()?,
+        second as f64 + fraction,
+    ))
 }
 
 fn continuous_time_for_sat(sat: GnssSatelliteId, t_j2000_s: f64) -> Option<(f64, bool)> {
@@ -810,6 +1006,7 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astro::math::vec3::dot3;
     use crate::rtcm::{
         SsrClockRecord, SsrHeader, SsrOrbitRecord, SsrPhaseBiasRecord, SsrPhaseBiasSignal,
         SsrStreamAssembler,
@@ -822,6 +1019,10 @@ mod tests {
     ));
     const REAL_SSR_WEEK: u32 = 2425;
     const REAL_SSR_EPOCH_TOW_S: f64 = 344_970.0;
+    const GPS_ANTEX_TEXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/antex/igs20_wettzell_trim.atx"
+    ));
 
     fn header(kind: SsrKind) -> SsrHeader {
         SsrHeader {
@@ -873,6 +1074,7 @@ mod tests {
         let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).unwrap();
         let orbit = store.orbit(sat).unwrap();
         assert_eq!(orbit.iode, 42);
+        assert_eq!(orbit.reference_point, SsrReferencePoint::rtcm_ssr_default());
         assert_eq!(orbit.radial_m.to_bits(), (-1.0_f64).to_bits());
         assert_eq!(orbit.along_m.to_bits(), 8.0_f64.to_bits());
         assert_eq!(orbit.cross_m.to_bits(), (-12.0_f64).to_bits());
@@ -881,6 +1083,87 @@ mod tests {
         assert_eq!(clock.c0_m.to_bits(), 1.0_f64.to_bits());
         assert!((clock.c1_m_s + 0.002).abs() < 1.0e-18);
         assert!((clock.c2_m_s2 - 6.0e-6).abs() < 1.0e-18);
+    }
+
+    #[test]
+    fn reference_point_tag_round_trips_through_store_ingest() {
+        let message = SsrMessage {
+            message_number: 1057,
+            system: GnssSystem::Gps,
+            kind: SsrKind::Orbit,
+            header: header(SsrKind::Orbit),
+            orbit: vec![SsrOrbitRecord {
+                satellite_id: 1,
+                iode: 42,
+                delta_radial: 0,
+                delta_along: 0,
+                delta_cross: 0,
+                dot_delta_radial: 0,
+                dot_delta_along: 0,
+                dot_delta_cross: 0,
+            }],
+            clock: Vec::new(),
+            code_bias: Vec::new(),
+            phase_bias: Vec::<SsrPhaseBiasRecord>::new(),
+            ura: Vec::new(),
+            padding_bits: Vec::new(),
+        };
+        let mut store =
+            SsrCorrectionStore::new().with_reference_point(SsrReferencePoint::igs_ssr_default());
+        let week = GnssWeekTow::new(TimeScale::Gpst, 2_400, 100_000.0).unwrap();
+        store.ingest_ssr(&message, week).unwrap();
+        let tag = store.reference_point().tag();
+        assert_eq!(
+            SsrReferencePoint::from_tag(tag),
+            Some(SsrReferencePoint::CenterOfMass)
+        );
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).unwrap();
+        assert_eq!(
+            store.clone().orbit(sat).unwrap().reference_point,
+            SsrReferencePoint::CenterOfMass
+        );
+    }
+
+    #[test]
+    fn interval_zero_epoch_uses_transmitted_time_not_midpoint() {
+        let week = GnssWeekTow::new(TimeScale::Gpst, 2_400, 0.0).unwrap();
+        let got_zero =
+            ssr_epoch_j2000_s(GnssSystem::Gps, week, 100_000, 0, update_interval_s(0)).unwrap();
+        let expected = f64::from(week.week) * SECONDS_PER_WEEK + 100_000.0 - GPS_EPOCH_TO_J2000_S;
+        assert_eq!(got_zero.to_bits(), expected.to_bits());
+
+        let got_nonzero =
+            ssr_epoch_j2000_s(GnssSystem::Gps, week, 100_000, 1, update_interval_s(1)).unwrap();
+        assert_eq!(got_nonzero.to_bits(), (expected + 1.0).to_bits());
+    }
+
+    #[test]
+    fn satellite_pco_projection_matches_hand_geometry() {
+        let sat_position_ecef_m = [1.0, 0.0, 0.0];
+        let sun_ecef_m = [1.0, 1.0, 0.0];
+        let pco_body_m = [0.25, 0.5, 0.75];
+        let shift = satellite_body_pco_to_ecef(pco_body_m, sat_position_ecef_m, sun_ecef_m)
+            .expect("non-degenerate satellite-Sun axes");
+        assert_eq!(
+            shift.map(f64::to_bits),
+            [
+                (-0.75_f64).to_bits(),
+                0.25_f64.to_bits(),
+                (-0.5_f64).to_bits()
+            ]
+        );
+        let los_unit = [0.0, 0.0, 1.0];
+        assert_eq!(dot3(shift, los_unit).to_bits(), (-0.5_f64).to_bits());
+    }
+
+    #[test]
+    fn satellite_pco_projection_declines_near_degenerate_axes() {
+        assert!(satellite_body_pco_to_ecef(
+            [0.25, 0.5, 0.75],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0e-15, 0.0],
+        )
+        .is_none());
     }
 
     #[test]
@@ -1005,9 +1288,18 @@ mod tests {
         let source = SsrCorrectedEphemeris::new(&broadcast, &store)
             .with_staleness(StalenessPolicy::seconds(60.0));
         let sat = GnssSatelliteId::new(GnssSystem::Gps, 30).unwrap();
-        let (position, _clock) = source
+        let (position, clock) = source
             .corrected_state(sat, ssr_j2000(REAL_SSR_EPOCH_TOW_S))
             .expect("corrected state");
+        assert_eq!(
+            position.map(f64::to_bits),
+            [
+                13_931_924_021_901_094_572,
+                4_714_745_314_434_008_008,
+                13_939_538_677_975_909_636,
+            ]
+        );
+        assert_eq!(clock.to_bits(), 4_553_802_230_946_855_152);
         let rtklib_position = [
             -6_327_381.424_159_626,
             15_802_129.789_888_298,
@@ -1021,9 +1313,85 @@ mod tests {
         assert!(position_error_m < 1.0e-6, "{position_error_m}");
     }
 
+    #[test]
+    fn com_reference_point_requires_explicit_attitude_model() {
+        let nav_text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ssr/BRDC00WRD_S_20261820000_G30_G31.rnx"
+        ))
+        .expect("read NAV fixture");
+        let broadcast = BroadcastEphemeris::from_nav(&nav_text).expect("parse NAV fixture");
+        let antex = Antex::parse(GPS_ANTEX_TEXT).expect("parse ANTEX fixture");
+        let store = real_gps_ssr_store_with_reference_point(SsrReferencePoint::CenterOfMass);
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 30).unwrap();
+        let t = ssr_j2000(REAL_SSR_EPOCH_TOW_S);
+
+        let no_attitude = SsrCorrectedEphemeris::new(&broadcast, &store)
+            .with_staleness(StalenessPolicy::seconds(60.0))
+            .with_satellite_antennas(&antex);
+        assert!(no_attitude.corrected_state(sat, t).is_none());
+
+        let fallback = SsrCorrectedEphemeris::new(&broadcast, &store)
+            .with_staleness(StalenessPolicy::seconds(60.0))
+            .with_satellite_antennas(&antex)
+            .with_fallback(SsrFallbackPolicy {
+                on_missing_correction: MissingCorrectionAction::FallBackToBroadcast,
+                regional: RegionalPolicy::DeclineRegional,
+            });
+        assert!(fallback.corrected_state(sat, t).is_none());
+
+        let nominal = SsrCorrectedEphemeris::new(&broadcast, &store)
+            .with_staleness(StalenessPolicy::seconds(60.0))
+            .with_satellite_antennas(&antex)
+            .with_satellite_attitude(SsrSatelliteAttitude::NominalSunFixed);
+        assert!(nominal.corrected_state(sat, t).is_some());
+    }
+
+    #[test]
+    fn com_orbit_tag_blocks_fallback_after_store_default_changes_to_apc() {
+        let nav_text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ssr/BRDC00WRD_S_20261820000_G30_G31.rnx"
+        ))
+        .expect("read NAV fixture");
+        let broadcast = BroadcastEphemeris::from_nav(&nav_text).expect("parse NAV fixture");
+        let antex = Antex::parse(GPS_ANTEX_TEXT).expect("parse ANTEX fixture");
+        let mut store = real_gps_ssr_store_with_reference_point(SsrReferencePoint::CenterOfMass);
+        store = store.with_reference_point(SsrReferencePoint::AntennaPhaseCenter);
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 30).unwrap();
+        let t = ssr_j2000(REAL_SSR_EPOCH_TOW_S);
+        assert_eq!(
+            store.reference_point(),
+            SsrReferencePoint::AntennaPhaseCenter
+        );
+        assert_eq!(
+            store.orbit(sat).unwrap().reference_point,
+            SsrReferencePoint::CenterOfMass
+        );
+
+        let source = SsrCorrectedEphemeris::new(&broadcast, &store)
+            .with_staleness(StalenessPolicy::seconds(60.0))
+            .with_satellite_antennas(&antex)
+            .with_fallback(SsrFallbackPolicy {
+                on_missing_correction: MissingCorrectionAction::FallBackToBroadcast,
+                regional: RegionalPolicy::DeclineRegional,
+            });
+
+        assert_eq!(
+            source.observable_state_at_j2000_s(sat, t),
+            Err(ObservablesError::NoEphemeris)
+        );
+    }
+
     fn real_gps_ssr_store() -> SsrCorrectionStore {
+        real_gps_ssr_store_with_reference_point(SsrReferencePoint::rtcm_ssr_default())
+    }
+
+    fn real_gps_ssr_store_with_reference_point(
+        reference_point: SsrReferencePoint,
+    ) -> SsrCorrectionStore {
         let mut assembler = SsrStreamAssembler::new();
-        let mut store = SsrCorrectionStore::new();
+        let mut store = SsrCorrectionStore::new().with_reference_point(reference_point);
         let week = GnssWeekTow::new(TimeScale::Gpst, REAL_SSR_WEEK, REAL_SSR_EPOCH_TOW_S)
             .expect("valid SSR week");
         for decoded in assembler.push(&hex_bytes(REAL_SSRA02IGS0_1060_FRAME_HEX)) {
