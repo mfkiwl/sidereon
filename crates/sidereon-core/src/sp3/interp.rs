@@ -69,6 +69,33 @@ use crate::sp3::{Sp3, Sp3State};
 use crate::validate;
 use crate::{Error, Result};
 
+/// Per-satellite precise node series in native fit units.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PreciseSatSeries {
+    /// Floored J2000-second node axis.
+    pub(super) x: Vec<f64>,
+    /// X position nodes in SP3-native kilometers.
+    pub(super) kx: Vec<f64>,
+    /// Y position nodes in SP3-native kilometers.
+    pub(super) ky: Vec<f64>,
+    /// Z position nodes in SP3-native kilometers.
+    pub(super) kz: Vec<f64>,
+    /// Clock nodes as `(x_seconds, clock_us, clock_event)`.
+    pub(super) clk: Vec<(f64, f64, bool)>,
+}
+
+impl PreciseSatSeries {
+    pub(super) fn new() -> Self {
+        Self {
+            x: Vec::new(),
+            kx: Vec::new(),
+            ky: Vec::new(),
+            kz: Vec::new(),
+            clk: Vec::new(),
+        }
+    }
+}
+
 impl Sp3 {
     /// The product's parsed epochs as seconds since J2000, in the file's own time
     /// scale, ascending.
@@ -134,44 +161,46 @@ impl Sp3 {
     /// Errors:
     /// - [`Error::InvalidInput`] if `query` is NaN or infinite.
     pub fn position_at_j2000_seconds(&self, sat: GnssSatelliteId, query: f64) -> Result<Sp3State> {
-        // Gather this satellite's position nodes (x = J2000 seconds, y = km),
-        // in ascending epoch order, skipping epochs where the satellite has no
-        // record. Track clock nodes and clock-event epochs alongside.
-        let mut pos_x: Vec<f64> = Vec::new();
-        let mut pos_kx: Vec<f64> = Vec::new();
-        let mut pos_ky: Vec<f64> = Vec::new();
-        let mut pos_kz: Vec<f64> = Vec::new();
-        // Clock nodes: (x_seconds, clock_us, is_clock_event_epoch).
-        let mut clk_nodes: Vec<(f64, f64, bool)> = Vec::new();
-
-        for (idx, ep) in self.epochs.iter().enumerate() {
-            // Node axis: floored to whole seconds to match gnssanalysis
-            // datetime2j2000 (the query, below, is NOT floored).
-            let xi = match instant_to_j2000_seconds(ep) {
-                Some(v) => v.floor(),
-                None => continue,
-            };
-            // Use the parser's NATIVE km/us node values (exact ASCII->f64, as
-            // gnssanalysis read_sp3 carries them). Reconstructing km from the
-            // public meters (km->m->km) drifts up to 1 ULP and breaks parity;
-            // the *1000 / *1e-6 happens once, AFTER eval. interp_raw is
-            // populated only from real position records, so a velocity-only
-            // (fabricated) state never enters the spline.
-            let Some(raw) = self.interp_raw[idx].get(&sat) else {
-                continue;
-            };
-            pos_x.push(xi);
-            pos_kx.push(raw.km[0]);
-            pos_ky.push(raw.km[1]);
-            pos_kz.push(raw.km[2]);
-
-            if let Some(clk_us) = raw.clock_us {
-                clk_nodes.push((xi, clk_us, raw.clock_event));
-            }
-        }
-
-        interpolate_precise_state(sat, &pos_x, &pos_kx, &pos_ky, &pos_kz, &clk_nodes, query)
+        let series = gather_sp3_precise_series(self, sat);
+        interpolate_precise_state(
+            sat,
+            &series.x,
+            &series.kx,
+            &series.ky,
+            &series.kz,
+            &series.clk,
+            query,
+        )
     }
+}
+
+/// Gather one satellite's SP3-native node series in ascending epoch order.
+pub(super) fn gather_sp3_precise_series(source: &Sp3, sat: GnssSatelliteId) -> PreciseSatSeries {
+    let mut series = PreciseSatSeries::new();
+
+    for (idx, ep) in source.epochs.iter().enumerate() {
+        // Node axis: floored to whole seconds to match gnssanalysis
+        // datetime2j2000. The query is never floored.
+        let xi = match instant_to_j2000_seconds(ep) {
+            Some(v) => v.floor(),
+            None => continue,
+        };
+        // Use the parser's native km/us node values. Reconstructing km from the
+        // public meters can drift by 1 ULP; unit conversion stays after eval.
+        let Some(raw) = source.interp_raw[idx].get(&sat) else {
+            continue;
+        };
+        series.x.push(xi);
+        series.kx.push(raw.km[0]);
+        series.ky.push(raw.km[1]);
+        series.kz.push(raw.km[2]);
+
+        if let Some(clk_us) = raw.clock_us {
+            series.clk.push((xi, clk_us, raw.clock_event));
+        }
+    }
+
+    series
 }
 
 /// Interpolate a satellite state from already-gathered native-unit nodes.
