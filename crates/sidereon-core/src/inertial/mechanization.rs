@@ -131,7 +131,7 @@ pub fn rodrigues_delta_dcm(delta_theta_rad: [f64; 3]) -> Result<Mat3, InertialEr
     ))
 }
 
-fn validate_increment(increment: &CorrectedImuIncrement) -> Result<(), InertialError> {
+pub(crate) fn validate_increment(increment: &CorrectedImuIncrement) -> Result<(), InertialError> {
     validate_finite(increment.t_j2000_s, "increment.t_j2000_s")?;
     validate_vec3(increment.delta_velocity_mps, "increment.delta_velocity_mps")?;
     validate_vec3(increment.delta_theta_rad, "increment.delta_theta_rad")?;
@@ -143,7 +143,7 @@ fn validate_increment(increment: &CorrectedImuIncrement) -> Result<(), InertialE
     }
 }
 
-fn mid_interval_dcm(
+pub(crate) fn mid_interval_dcm(
     attitude_body_to_ecef: &Mat3,
     delta_theta_rad: [f64; 3],
     dt_s: f64,
@@ -156,7 +156,7 @@ fn mid_interval_dcm(
     ))
 }
 
-fn earth_rotation_first_order(dt_s: f64) -> Mat3 {
+pub(crate) fn earth_rotation_first_order(dt_s: f64) -> Mat3 {
     [
         [1.0, OMEGA_E_DOT_RAD_S * dt_s, 0.0],
         [-OMEGA_E_DOT_RAD_S * dt_s, 1.0, 0.0],
@@ -164,7 +164,7 @@ fn earth_rotation_first_order(dt_s: f64) -> Mat3 {
     ]
 }
 
-fn earth_rate_cross(v: [f64; 3]) -> [f64; 3] {
+pub(crate) fn earth_rate_cross(v: [f64; 3]) -> [f64; 3] {
     [-OMEGA_E_DOT_RAD_S * v[1], OMEGA_E_DOT_RAD_S * v[0], 0.0]
 }
 

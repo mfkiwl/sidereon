@@ -8,6 +8,7 @@ pub mod config;
 pub mod frames;
 pub mod imu;
 pub mod mechanization;
+pub mod sim;
 pub mod state;
 
 pub use config::{
@@ -22,6 +23,11 @@ pub use imu::{
     CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuSample, ImuSampleKind,
 };
 pub use mechanization::{mechanize_ecef, rodrigues_delta_dcm, StrapdownMechanizer};
+pub use sim::{
+    simulate_imu_samples, simulate_imu_samples_from_increments, true_imu_increment_between,
+    ImuRateRandomWalk, ImuSimulationOptions, ImuSimulationOutput, ImuSimulator,
+    SimulatedImuSequence, DEFAULT_IMU_SIM_SEED,
+};
 pub use state::{
     attitude_yaw_pitch_roll_rad, dcm_to_quaternion, quaternion_to_dcm, reorthonormalize_dcm,
     AttitudeQuaternion, NavState,

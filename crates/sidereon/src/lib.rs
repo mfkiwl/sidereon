@@ -210,10 +210,13 @@ pub use sidereon_core::{
 };
 pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
-    mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, AttitudeQuaternion, ConingCorrection,
-    CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuGrade, ImuSample,
-    ImuSampleKind, ImuSpec, InertialError, MechanizationConfig, NavState, StrapdownMechanizer,
-    WGS84_NORMAL_GRAVITY_EQUATOR_MPS2, WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
+    mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, simulate_imu_samples,
+    simulate_imu_samples_from_increments, true_imu_increment_between, AttitudeQuaternion,
+    ConingCorrection, CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuGrade,
+    ImuRateRandomWalk, ImuSample, ImuSampleKind, ImuSimulationOptions, ImuSimulationOutput,
+    ImuSimulator, ImuSpec, InertialError, MechanizationConfig, NavState, SimulatedImuSequence,
+    StrapdownMechanizer, DEFAULT_IMU_SIM_SEED, WGS84_NORMAL_GRAVITY_EQUATOR_MPS2,
+    WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
 };
 pub use sidereon_core::{
     geodesic_direct, geodesic_inverse, geodetic_to_itrf, itrf_to_geodetic, FrameValueError,
