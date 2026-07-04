@@ -160,6 +160,21 @@ impl BroadcastStore {
         &self.records
     }
 
+    /// Select the broadcast record used for `sat` at `t_j2000_s`.
+    ///
+    /// The selection uses the same message preference, native-system time
+    /// mapping, and validity-window checks as
+    /// [`EphemerisSource::position_clock_at_j2000_s`]. Non-Keplerian systems
+    /// return `None`.
+    pub fn select_record_at(
+        &self,
+        sat: GnssSatelliteId,
+        t_j2000_s: f64,
+    ) -> Option<&BroadcastRecord> {
+        let (t_continuous_s, _) = query_continuous_time(sat, t_j2000_s)?;
+        self.select(sat, t_continuous_s)
+    }
+
     /// Select the valid record for `sat` with a matching GPS issue byte at `t`.
     pub fn select_by_iode_at(
         &self,

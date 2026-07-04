@@ -189,12 +189,17 @@ pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies, geometry,
     geometry_quality, ils, navigation, nmea, observables, orbit, positioning, ppp_corrections,
-    qc_obs, quality, rinex, rtcm, rtk, sbas, signal, source_localization, ssr, staleness, terrain,
-    tides, velocity,
+    qc_obs, quality, rinex, rtcm, rtk, sbas, sidereal, signal, source_localization, ssr, staleness,
+    terrain, tides, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
     ItrfPositionM, ItrfVelocityMS, SatelliteIdError, Wgs84Geodetic,
+};
+pub use sidereon_core::{
+    orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
+    repeat_period, sidereal_filter, solar_day_period, SiderealFilterError, SiderealFilterOptions,
+    SiderealFilterOutput, SiderealTemplateMethod, SIDEREAL_DAY_NANOS, SIDEREAL_DAY_SECONDS,
 };
 
 /// Stable RTK input, result, option, status, and error types used by the
