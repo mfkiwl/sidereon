@@ -31,6 +31,28 @@ const GEO_AF1_SCALE_S_S: f64 = 1.0 / 1_099_511_627_776.0;
 const GEO_DISABLED_TIMEOUT_S: f64 = 60.0;
 const SBAS_SHELL_HEIGHT_KM: f64 = 350.0;
 
+/// DO-229 UDRE variance table, in square meters, for UDREI values 0 through 13.
+pub const SBAS_UDRE_VARIANCE_M2: [f64; 14] = [
+    0.0520, 0.0924, 0.1444, 0.2830, 0.4678, 0.8315, 1.2992, 1.8709, 2.5465, 3.3260, 5.1968,
+    20.7870, 230.9661, 2078.695,
+];
+
+/// DO-229 GIVE variance table, in square meters, for GIVEI values 0 through 14.
+pub const SBAS_GIVE_VARIANCE_M2: [f64; 15] = [
+    0.0084, 0.0333, 0.0749, 0.1331, 0.2079, 0.2994, 0.4075, 0.5322, 0.6735, 0.8315, 1.1974, 1.8709,
+    3.3260, 20.7870, 187.0826,
+];
+
+/// Return the DO-229 UDRE variance for one UDREI value.
+pub fn udre_variance_m2_for_udrei(udrei: u8) -> Option<f64> {
+    SBAS_UDRE_VARIANCE_M2.get(usize::from(udrei)).copied()
+}
+
+/// Return the DO-229 GIVE variance for one GIVEI value.
+pub fn give_variance_m2_for_givei(givei: u8) -> Option<f64> {
+    SBAS_GIVE_VARIANCE_M2.get(usize::from(givei)).copied()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SbasFastCorrection {
     pub prc_m: f64,
@@ -38,6 +60,13 @@ pub struct SbasFastCorrection {
     pub udrei: u8,
     pub t_of_j2000_s: f64,
     pub iodf: u8,
+}
+
+impl SbasFastCorrection {
+    /// DO-229 UDRE variance, in square meters, for this fast correction.
+    pub fn udre_variance_m2(&self) -> Option<f64> {
+        udre_variance_m2_for_udrei(self.udrei)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,14 +94,17 @@ pub struct SbasIonoGrid {
 }
 
 impl SbasIonoGrid {
+    /// Construct an ionospheric grid from IGP records and the IODI value.
     pub fn new(igps: Vec<SbasIgp>, iodi: u8) -> Self {
         Self { igps, iodi }
     }
 
+    /// Ionospheric grid points in storage order.
     pub fn igps(&self) -> &[SbasIgp] {
         &self.igps
     }
 
+    /// Interpolate the L1 slant ionospheric delay at a receiver look direction.
     pub fn slant_delay_m(
         &self,
         receiver: Wgs84Geodetic,
@@ -98,7 +130,20 @@ impl SbasIonoGrid {
         Some(vertical_delay_m * mapping * frequency_scale)
     }
 
+    /// Interpolate the vertical GIVE variance at an ionospheric pierce point.
+    pub fn variance_at_ipp(&self, lat_deg: f64, lon_deg: f64) -> Option<f64> {
+        let variance_m2 = self
+            .delay_variance_at_ipp(lat_deg, lon_deg)?
+            .give_variance_m2?;
+        (variance_m2.is_finite() && variance_m2 >= 0.0).then_some(variance_m2)
+    }
+
     fn vertical_delay_at_ipp(&self, lat_deg: f64, lon_deg: f64) -> Option<f64> {
+        self.delay_variance_at_ipp(lat_deg, lon_deg)
+            .map(|value| value.vertical_delay_m)
+    }
+
+    fn delay_variance_at_ipp(&self, lat_deg: f64, lon_deg: f64) -> Option<IgpInterpolation> {
         let mut lats: Vec<f64> = self.igps.iter().map(|p| p.lat_deg).collect();
         lats.sort_by(f64_total_cmp);
         lats.dedup_by(|a, b| (*a - *b).abs() < SBAS_IGP_COORD_EPS_DEG);
@@ -126,14 +171,26 @@ impl SbasIonoGrid {
                 let e01 = active_point(&active, lat0, lon1)?.vertical_delay_m;
                 let e10 = active_point(&active, lat1, lon0)?.vertical_delay_m;
                 let e11 = active_point(&active, lat1, lon1)?.vertical_delay_m;
-                Some(
-                    (1.0 - p) * (1.0 - q) * e00
-                        + p * (1.0 - q) * e01
-                        + (1.0 - p) * q * e10
-                        + p * q * e11,
-                )
+                let vertical_delay_m = (1.0 - p) * (1.0 - q) * e00
+                    + p * (1.0 - q) * e01
+                    + (1.0 - p) * q * e10
+                    + p * q * e11;
+                let give_variance_m2 = bilinear_give_variance_m2(&active, lat0, lat1, lon0, lon1)
+                    .map(|(v00, v01, v10, v11)| {
+                        (1.0 - p) * (1.0 - q) * v00
+                            + p * (1.0 - q) * v01
+                            + (1.0 - p) * q * v10
+                            + p * q * v11
+                    });
+                Some(IgpInterpolation {
+                    vertical_delay_m,
+                    give_variance_m2,
+                })
             }
-            3 => plane_interpolate(&active, lat_deg, lon_deg),
+            3 => Some(IgpInterpolation {
+                vertical_delay_m: plane_interpolate(&active, lat_deg, lon_deg)?,
+                give_variance_m2: plane_interpolate_give_variance(&active, lat_deg, lon_deg),
+            }),
             _ => None,
         }
     }
@@ -349,6 +406,17 @@ impl SbasCorrectionStore {
         let p = self.partitions.get(&geo)?;
         let timed = p.long_term.get(&sat)?;
         self.fresh(timed.epoch_j2000_s, t_j2000_s)
+            .then_some(&timed.value)
+    }
+
+    pub(crate) fn fresh_iono_grid(
+        &self,
+        geo: GnssSatelliteId,
+        t_j2000_s: f64,
+    ) -> Option<&SbasIonoGrid> {
+        let p = self.partitions.get(&geo)?;
+        let timed = p.iono_grid.as_ref()?;
+        (!p.is_disabled(t_j2000_s) && self.fresh(timed.epoch_j2000_s, t_j2000_s))
             .then_some(&timed.value)
     }
 
@@ -589,7 +657,7 @@ fn ingest_iono(partition: &mut GeoPartition, delays: &SbasIonoDelays, epoch_j200
             lat_deg,
             lon_deg,
             vertical_delay_m: f64::from(entry.vertical_delay) * IONO_DELAY_SCALE_M,
-            give_variance_m2: None,
+            give_variance_m2: give_variance_m2_for_givei(entry.givei),
         };
         if let Some(existing) = igps.iter_mut().find(|p| {
             (p.lat_deg - lat_deg).abs() < SBAS_IGP_COORD_EPS_DEG
@@ -1302,19 +1370,56 @@ fn active_point(points: &[SbasIgp], lat_deg: f64, lon_deg: f64) -> Option<&SbasI
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IgpInterpolation {
+    vertical_delay_m: f64,
+    give_variance_m2: Option<f64>,
+}
+
+fn bilinear_give_variance_m2(
+    points: &[SbasIgp],
+    lat0: f64,
+    lat1: f64,
+    lon0: f64,
+    lon1: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    let v00 = active_point(points, lat0, lon0)?.give_variance_m2?;
+    let v01 = active_point(points, lat0, lon1)?.give_variance_m2?;
+    let v10 = active_point(points, lat1, lon0)?.give_variance_m2?;
+    let v11 = active_point(points, lat1, lon1)?.give_variance_m2?;
+    Some((v00, v01, v10, v11))
+}
+
 fn plane_interpolate(points: &[SbasIgp], lat_deg: f64, lon_deg: f64) -> Option<f64> {
+    plane_interpolate_value(points, lat_deg, lon_deg, |point| {
+        Some(point.vertical_delay_m)
+    })
+}
+
+fn plane_interpolate_give_variance(points: &[SbasIgp], lat_deg: f64, lon_deg: f64) -> Option<f64> {
+    let variance_m2 =
+        plane_interpolate_value(points, lat_deg, lon_deg, |point| point.give_variance_m2)?;
+    (variance_m2.is_finite() && variance_m2 >= 0.0).then_some(variance_m2)
+}
+
+fn plane_interpolate_value(
+    points: &[SbasIgp],
+    lat_deg: f64,
+    lon_deg: f64,
+    value: impl Fn(&SbasIgp) -> Option<f64>,
+) -> Option<f64> {
     let [p0, p1, p2] = points else {
         return None;
     };
     let x0 = p0.lon_deg;
     let y0 = p0.lat_deg;
-    let z0 = p0.vertical_delay_m;
+    let z0 = value(p0)?;
     let x1 = p1.lon_deg;
     let y1 = p1.lat_deg;
-    let z1 = p1.vertical_delay_m;
+    let z1 = value(p1)?;
     let x2 = p2.lon_deg;
     let y2 = p2.lat_deg;
-    let z2 = p2.vertical_delay_m;
+    let z2 = value(p2)?;
     let det = x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1);
     if det.abs() < 1.0e-12 {
         return None;

@@ -15,6 +15,7 @@ pub use source::{
     IssueAwareBroadcast, SbasCorrectedEphemeris, SbasCorrectedEphemerisOwned, SbasSolveMode,
 };
 pub use store::{
-    sat_to_sbas_prn, sbas_prn_to_sat, SbasCorrectionStore, SbasFastCorrection, SbasGeoState,
-    SbasIgp, SbasIonoGrid, SbasLongTermCorrection,
+    give_variance_m2_for_givei, sat_to_sbas_prn, sbas_prn_to_sat, udre_variance_m2_for_udrei,
+    SbasCorrectionStore, SbasFastCorrection, SbasGeoState, SbasIgp, SbasIonoGrid,
+    SbasLongTermCorrection, SBAS_GIVE_VARIANCE_M2, SBAS_UDRE_VARIANCE_M2,
 };
