@@ -19,5 +19,7 @@ pub use decay::{
 };
 pub use driver::{propagate_states, PropagationConfig, PropagationForceModel};
 pub use dynamics::OrbitalDynamics;
-pub use numerical::{ForceModelKind, IntegratorKind, StatePropagator, StateTransitionMatrix};
+pub use numerical::{
+    ForceModelComponents, ForceModelKind, IntegratorKind, StatePropagator, StateTransitionMatrix,
+};
 pub use result::{PropagationPoint, PropagationResult, PropagationStats};

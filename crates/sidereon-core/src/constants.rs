@@ -4,10 +4,12 @@
 //! target may still keep a local alias or comment when the operation order of a
 //! formula matters, but the source value lives here so modules do not drift.
 
-pub use crate::astro::constants::astro::{AU_KM, AU_M};
+pub use crate::astro::constants::astro::{
+    AU_KM, AU_M, GM_MOON_KM3_S2, GM_SUN_KM3_S2, SOLAR_RADIATION_PRESSURE_N_M2,
+};
 pub use crate::astro::constants::earth::{
-    MEAN_EARTH_RADIUS_KM, MEAN_EARTH_RADIUS_M, OMEGA_E_DOT_RAD_S, WGS84_A_KM, WGS84_A_M, WGS84_E2,
-    WGS84_F,
+    J2_EARTH, J3_EARTH, J4_EARTH, J5_EARTH, J6_EARTH, MEAN_EARTH_RADIUS_KM, MEAN_EARTH_RADIUS_M,
+    OMEGA_E_DOT_RAD_S, WGS84_A_KM, WGS84_A_M, WGS84_E2, WGS84_F,
 };
 pub use crate::astro::constants::geometry::AZIMUTH_ZENITH_EPS;
 pub use crate::astro::constants::time::{
@@ -25,6 +27,9 @@ pub const HALF_WEEK_S: f64 = SECONDS_PER_WEEK / 2.0;
 /// Speed of light in vacuum (m/s), IS-GPS-200. Re-exported from the canonical
 /// core home so the value is defined once for the whole workspace.
 pub const C_M_S: f64 = crate::astro::constants::physics::SPEED_OF_LIGHT_M_S;
+
+/// Speed of light in vacuum (km/s), exact SI value converted to kilometers.
+pub const C_KM_S: f64 = crate::astro::constants::physics::SPEED_OF_LIGHT_KM_S;
 
 /// GPS L1 carrier frequency (Hz). Galileo E1 shares this frequency.
 pub const F_L1_HZ: f64 = 1_575.42e6;

@@ -3,7 +3,8 @@
 //! Builds a propagatable object from a raw epoch plus an ECI Cartesian state
 //! (position + velocity) and propagates it forward (or backward) with the
 //! existing integrators ([`RK4`], [`DP54`]) and the existing force models
-//! (two-body, two-body + J2). This is a thin orchestration layer over
+//! (two-body, two-body + J2, and additive perturbation sets). This is a thin
+//! orchestration layer over
 //! [`crate::astro::integrators`] and [`crate::astro::forces`]: it constructs the
 //! force model, wraps it in [`OrbitalDynamics`], and drives the chosen
 //! integrator. It adds no integration math of its own, so a single-shot
@@ -16,8 +17,9 @@ use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::covariance::{Covariance6, Covariance6Error};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{
-    CompositeForceModel, DragParameters, ForceModel, J2Gravity, SourcedDragForce,
-    SpaceWeatherSource, TwoBodyGravity,
+    CompositeForceModel, DragParameters, ForceModel, J2Gravity, SchwarzschildRelativity,
+    SolarRadiationPressure, SourcedDragForce, SpaceWeatherSource, ThirdBodyGravity, TwoBodyGravity,
+    ZonalGravity,
 };
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
@@ -50,10 +52,12 @@ pub enum IntegratorKind {
 
 /// Which force model supplies the acceleration during propagation.
 ///
-/// Each variant carries its own physical parameters so a caller can propagate a
-/// non-Earth central body by supplying a different gravitational parameter. The
-/// [`Self::two_body`] / [`Self::two_body_j2`] constructors fill in the canonical
-/// Earth values from [`crate::astro::constants`].
+/// The legacy variants carry their own physical parameters so a caller can
+/// propagate a non-Earth central body by supplying a different gravitational
+/// parameter. The [`Self::two_body`] / [`Self::two_body_j2`] constructors fill
+/// in the canonical Earth values from [`crate::astro::constants`]. The
+/// [`Self::Composite`] variant adds optional force components without changing
+/// those legacy branches.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ForceModelKind {
     /// Pure two-body (Keplerian) gravity.
@@ -70,6 +74,92 @@ pub enum ForceModelKind {
         /// J2 zonal harmonic coefficient (dimensionless).
         j2: f64,
     },
+    /// Additive composition of central gravity and optional perturbations.
+    Composite {
+        /// Force components to add.
+        components: ForceModelComponents,
+    },
+}
+
+/// Additive force components for [`ForceModelKind::Composite`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForceModelComponents {
+    /// Optional central two-body gravitational parameter, km^3/s^2.
+    pub two_body_mu_km3_s2: Option<f64>,
+    /// Optional zonal gravity perturbation.
+    pub zonal: Option<ZonalGravity>,
+    /// Optional Sun and Moon third-body perturbation.
+    pub third_body: Option<ThirdBodyGravity>,
+    /// Optional cannonball solar radiation pressure perturbation.
+    pub solar_radiation_pressure: Option<SolarRadiationPressure>,
+    /// Optional geocentric Schwarzschild relativistic correction.
+    pub relativity: Option<SchwarzschildRelativity>,
+}
+
+impl Default for ForceModelComponents {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl ForceModelComponents {
+    /// No force components.
+    pub const EMPTY: Self = Self {
+        two_body_mu_km3_s2: None,
+        zonal: None,
+        third_body: None,
+        solar_radiation_pressure: None,
+        relativity: None,
+    };
+
+    /// Canonical Earth two-body central gravity.
+    pub fn earth_two_body() -> Self {
+        Self {
+            two_body_mu_km3_s2: Some(MU_EARTH),
+            ..Self::EMPTY
+        }
+    }
+
+    /// Canonical Earth Phase A force set, with optional spacecraft SRP parameters.
+    pub fn earth_phase_a(solar_radiation_pressure: Option<SolarRadiationPressure>) -> Self {
+        Self {
+            two_body_mu_km3_s2: Some(MU_EARTH),
+            zonal: Some(ZonalGravity::earth_j2_through_j6()),
+            third_body: Some(ThirdBodyGravity::default()),
+            solar_radiation_pressure,
+            relativity: Some(SchwarzschildRelativity::default()),
+        }
+    }
+
+    /// Set or replace central two-body gravity.
+    pub fn with_two_body_mu(mut self, mu_km3_s2: f64) -> Self {
+        self.two_body_mu_km3_s2 = Some(mu_km3_s2);
+        self
+    }
+
+    /// Set or replace zonal gravity.
+    pub fn with_zonal(mut self, zonal: ZonalGravity) -> Self {
+        self.zonal = Some(zonal);
+        self
+    }
+
+    /// Set or replace third-body gravity.
+    pub fn with_third_body(mut self, third_body: ThirdBodyGravity) -> Self {
+        self.third_body = Some(third_body);
+        self
+    }
+
+    /// Set or replace solar radiation pressure.
+    pub fn with_solar_radiation_pressure(mut self, srp: SolarRadiationPressure) -> Self {
+        self.solar_radiation_pressure = Some(srp);
+        self
+    }
+
+    /// Set or replace relativity.
+    pub fn with_relativity(mut self, relativity: SchwarzschildRelativity) -> Self {
+        self.relativity = Some(relativity);
+        self
+    }
 }
 
 impl ForceModelKind {
@@ -90,9 +180,20 @@ impl ForceModelKind {
         }
     }
 
-    /// Build the boxed [`ForceModel`] this variant describes. Reuses the
-    /// existing [`TwoBodyGravity`] / [`J2Gravity`] / [`CompositeForceModel`]
-    /// implementations; no acceleration math is duplicated here.
+    /// Build an additive force model from components.
+    pub fn composite(components: ForceModelComponents) -> Self {
+        Self::Composite { components }
+    }
+
+    /// Earth two-body plus Phase A perturbations.
+    pub fn earth_phase_a(solar_radiation_pressure: Option<SolarRadiationPressure>) -> Self {
+        Self::Composite {
+            components: ForceModelComponents::earth_phase_a(solar_radiation_pressure),
+        }
+    }
+
+    /// Build the boxed [`ForceModel`] this variant describes. Reuses the force
+    /// model implementations; no acceleration math is duplicated here.
     fn build(self) -> Box<dyn ForceModel> {
         match self {
             ForceModelKind::TwoBody { mu_km3_s2 } => Box::new(TwoBodyGravity { mu: mu_km3_s2 }),
@@ -108,6 +209,25 @@ impl ForceModelKind {
                     re: re_km,
                     j2,
                 }));
+                Box::new(composite)
+            }
+            ForceModelKind::Composite { components } => {
+                let mut composite = CompositeForceModel::new();
+                if let Some(mu_km3_s2) = components.two_body_mu_km3_s2 {
+                    composite.add(Box::new(TwoBodyGravity { mu: mu_km3_s2 }));
+                }
+                if let Some(zonal) = components.zonal {
+                    composite.add(Box::new(zonal));
+                }
+                if let Some(third_body) = components.third_body {
+                    composite.add(Box::new(third_body));
+                }
+                if let Some(srp) = components.solar_radiation_pressure {
+                    composite.add(Box::new(srp));
+                }
+                if let Some(relativity) = components.relativity {
+                    composite.add(Box::new(relativity));
+                }
                 Box::new(composite)
             }
         }
@@ -644,6 +764,74 @@ mod tests {
                 4_599_620_700_962_266_984,
             ]
         );
+    }
+
+    #[test]
+    fn composite_with_phase_a_terms_off_matches_two_body_bit_for_bit() {
+        let state = CartesianState::new(0.0, [7000.0, -1210.0, 1300.0], [1.0, 7.2, 0.5]);
+        let options = IntegratorOptions {
+            initial_step: 10.0,
+            ..IntegratorOptions::default()
+        };
+        let legacy = StatePropagator {
+            initial: state,
+            force_model: ForceModelKind::two_body(),
+            integrator: IntegratorKind::Rk4,
+            options,
+            drag: None,
+            space_weather: None,
+        }
+        .ephemeris(&[0.0, 60.0, 120.0])
+        .expect("legacy two-body ephemeris");
+        let composite = StatePropagator {
+            initial: state,
+            force_model: ForceModelKind::composite(ForceModelComponents::earth_two_body()),
+            integrator: IntegratorKind::Rk4,
+            options,
+            drag: None,
+            space_weather: None,
+        }
+        .ephemeris(&[0.0, 60.0, 120.0])
+        .expect("composite two-body ephemeris");
+
+        assert_states_bit_for_bit(&legacy, &composite);
+    }
+
+    #[test]
+    fn phase_a_all_forces_leo_smoke_stays_bounded() {
+        let initial = leo_state(500.0);
+        let srp = SolarRadiationPressure::new(1.3, 0.02).expect("valid SRP");
+        let propagator = StatePropagator::new(
+            initial.epoch_tdb_seconds,
+            initial.position_array(),
+            initial.velocity_array(),
+            ForceModelKind::earth_phase_a(Some(srp)),
+            IntegratorKind::Dp54,
+        )
+        .with_options(IntegratorOptions {
+            abs_tol: 1.0e-10,
+            rel_tol: 1.0e-12,
+            initial_step: 30.0,
+            max_step: 120.0,
+            ..IntegratorOptions::default()
+        })
+        .with_drag(test_drag_parameters(0.02));
+
+        let result = propagator
+            .propagate_to(initial.epoch_tdb_seconds + 1800.0)
+            .expect("Phase A propagation");
+        let final_state = result.final_state;
+
+        assert!(final_state
+            .position_km
+            .iter()
+            .all(|value| value.is_finite()));
+        assert!(final_state
+            .velocity_km_s
+            .iter()
+            .all(|value| value.is_finite()));
+        assert!((6500.0..8000.0).contains(&final_state.position_km.norm()));
+        assert!((6.0..9.0).contains(&final_state.velocity_km_s.norm()));
     }
 
     #[test]
