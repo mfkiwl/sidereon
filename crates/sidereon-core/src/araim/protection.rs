@@ -5,22 +5,6 @@ use crate::id::GnssSystem;
 
 use super::{clock_system_for_row, validate_probability, AraimError, AraimGeometry};
 
-/// Satellite error model consumed by protection-level solvers.
-pub trait ProtectionModel {
-    /// Number of satellite rows.
-    fn len(&self) -> usize;
-    /// Integrity sigma for row `index`, meters.
-    fn sigma_int_m(&self, index: usize) -> f64;
-    /// Accuracy sigma for row `index`, meters.
-    fn sigma_acc_m(&self, index: usize) -> f64;
-    /// Nominal bias bound for row `index`, meters.
-    fn b_nom_m(&self, index: usize) -> f64;
-    /// Returns true when there are no satellite rows.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GainMatrix {
     pub enu_rows: [Vec<f64>; 3],
@@ -38,6 +22,12 @@ pub(crate) struct ProtectionEquationTerm {
 pub(crate) struct ProtectionLevelSolution {
     pub value_m: f64,
     pub converged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FalseAlertAxis {
+    Horizontal,
+    Vertical,
 }
 
 pub(crate) fn gain_matrix_enu(
@@ -151,22 +141,37 @@ pub(crate) fn separation_sigma(
         .sqrt()
 }
 
-pub(crate) fn k_false_alert(pfa: f64, n_fault_modes: usize) -> Result<f64, AraimError> {
+pub(crate) fn k_false_alert(
+    pfa: f64,
+    n_fault_modes: usize,
+    axis: FalseAlertAxis,
+) -> Result<f64, AraimError> {
     if n_fault_modes == 0 {
         return Ok(0.0);
     }
     if !validate_probability(pfa, false) {
         return Err(AraimError::InvalidAllocation);
     }
-    normal_q_inv(pfa / (2.0 * n_fault_modes as f64)).ok_or(AraimError::InvalidAllocation)
+    let denominator_per_mode = match axis {
+        // WG-C Reference ADD v3.0 Eq. (26).
+        FalseAlertAxis::Horizontal => 4.0,
+        // WG-C Reference ADD v3.0 Eq. (27).
+        FalseAlertAxis::Vertical => 2.0,
+    };
+    normal_q_inv(pfa / (denominator_per_mode * n_fault_modes as f64))
+        .ok_or(AraimError::InvalidAllocation)
 }
 
 pub(crate) fn solve_protection_level(
     fault_free: ProtectionEquationTerm,
     fault_terms: &[ProtectionEquationTerm],
-    phmi: f64,
+    integrity_target: f64,
+    tolerance_m: f64,
 ) -> Result<ProtectionLevelSolution, AraimError> {
-    if !validate_probability(phmi, false) {
+    if !validate_probability(integrity_target, false)
+        || tolerance_m <= 0.0
+        || !tolerance_m.is_finite()
+    {
         return Err(AraimError::InvalidAllocation);
     }
     validate_term(fault_free)?;
@@ -174,9 +179,8 @@ pub(crate) fn solve_protection_level(
         validate_term(*term)?;
     }
 
-    let target = phmi * 0.5;
     if fault_terms.is_empty() {
-        let value_m = normal_q_inv(target).ok_or(AraimError::InvalidAllocation)?
+        let value_m = normal_q_inv(integrity_target * 0.5).ok_or(AraimError::InvalidAllocation)?
             * fault_free.sigma_m
             + fault_free.bias_m;
         return Ok(ProtectionLevelSolution {
@@ -186,20 +190,21 @@ pub(crate) fn solve_protection_level(
     }
 
     let mut lo = 0.0;
-    if protection_lhs(lo, fault_free, fault_terms) <= target {
+    if protection_lhs(lo, fault_free, fault_terms) <= integrity_target {
         return Ok(ProtectionLevelSolution {
             value_m: 0.0,
             converged: true,
         });
     }
 
-    let mut hi = normal_q_inv(target).ok_or(AraimError::InvalidAllocation)? * fault_free.sigma_m
+    let mut hi = normal_q_inv(integrity_target * 0.5).ok_or(AraimError::InvalidAllocation)?
+        * fault_free.sigma_m
         + fault_free.bias_m;
     if hi <= lo || !hi.is_finite() {
         hi = 1.0;
     }
     let mut expanded = 0usize;
-    while protection_lhs(hi, fault_free, fault_terms) > target {
+    while protection_lhs(hi, fault_free, fault_terms) > integrity_target {
         hi *= 2.0;
         expanded += 1;
         if !hi.is_finite() || expanded > 100 {
@@ -210,20 +215,25 @@ pub(crate) fn solve_protection_level(
     let mut converged = false;
     for _ in 0..80 {
         let mid = 0.5 * (lo + hi);
-        if protection_lhs(mid, fault_free, fault_terms) > target {
+        if protection_lhs(mid, fault_free, fault_terms) > integrity_target {
             lo = mid;
         } else {
             hi = mid;
         }
-        if hi - lo <= 1.0e-4 {
+        if hi - lo <= tolerance_m {
             converged = true;
             break;
         }
     }
-    Ok(ProtectionLevelSolution {
-        value_m: hi,
-        converged,
-    })
+    let value_m = if converged {
+        // Return a conservative PL that is still within the configured root
+        // tolerance. This follows the ADD requirement to output an upper PL
+        // within TOLPL of the equation solution.
+        lo + tolerance_m
+    } else {
+        hi
+    };
+    Ok(ProtectionLevelSolution { value_m, converged })
 }
 
 fn protection_lhs(
@@ -231,11 +241,21 @@ fn protection_lhs(
     fault_free: ProtectionEquationTerm,
     fault_terms: &[ProtectionEquationTerm],
 ) -> f64 {
-    let mut value = normal_q((y_m - fault_free.bias_m) / fault_free.sigma_m);
+    // WG-C Reference ADD v3.0 Eqs. (31)-(32): the fault-free term is two-sided,
+    // and monitored fault terms use the modified Q of Eqs. (7)-(8).
+    let mut value = 2.0 * normal_q((y_m - fault_free.bias_m) / fault_free.sigma_m);
     for term in fault_terms {
-        value += term.prior * normal_q((y_m - term.threshold_m - term.bias_m) / term.sigma_m);
+        value += term.prior * modified_q((y_m - term.threshold_m - term.bias_m) / term.sigma_m);
     }
     value
+}
+
+fn modified_q(argument: f64) -> f64 {
+    if argument <= 0.0 {
+        1.0
+    } else {
+        normal_q(argument)
+    }
 }
 
 fn validate_term(term: ProtectionEquationTerm) -> Result<(), AraimError> {

@@ -41,10 +41,8 @@ pub fn enumerate_fault_modes(
     geometry: &AraimGeometry,
     ism: &Ism,
     allocation: &IntegrityAllocation,
-) -> Vec<FaultHypothesis> {
-    enumerate_fault_modes_checked(geometry, ism, allocation)
-        .map(|enumeration| enumeration.modes)
-        .unwrap_or_default()
+) -> Result<Vec<FaultHypothesis>, AraimError> {
+    enumerate_fault_modes_checked(geometry, ism, allocation).map(|enumeration| enumeration.modes)
 }
 
 pub(crate) fn enumerate_fault_modes_checked(
@@ -62,6 +60,9 @@ pub(crate) fn enumerate_fault_modes_checked(
         sat_priors.push((row.id, model.p_sat));
     }
     let satellite_order_mass = satellite_order_masses(&sat_priors);
+    let constellation_priors = constellation_priors(geometry, ism)?;
+    let constellation_involving_order_mass =
+        constellation_involving_order_masses(&satellite_order_mass, &constellation_priors);
 
     if allocation.max_fault_order >= 1 {
         for &(id, prior) in &sat_priors {
@@ -74,16 +75,12 @@ pub(crate) fn enumerate_fault_modes_checked(
             }
         }
 
-        let mut systems: Vec<GnssSystem> = geometry.rows.iter().map(|row| row.system).collect();
-        systems.sort_unstable();
-        systems.dedup();
-        for system in systems {
-            let constellation = ism.constellation(system).ok_or(AraimError::InvalidIsm)?;
-            if constellation.p_const > 0.0 {
+        for &(system, prior) in &constellation_priors {
+            if prior > 0.0 {
                 modes.push(FaultHypothesis {
                     excluded: Vec::new(),
                     excluded_constellation: Some(system),
-                    prior: constellation.p_const,
+                    prior,
                 });
             }
         }
@@ -91,14 +88,8 @@ pub(crate) fn enumerate_fault_modes_checked(
         for &(_, prior) in &sat_priors {
             p_unenumerated += prior;
         }
-        let mut systems: Vec<GnssSystem> = geometry.rows.iter().map(|row| row.system).collect();
-        systems.sort_unstable();
-        systems.dedup();
-        for system in systems {
-            p_unenumerated += ism
-                .constellation(system)
-                .ok_or(AraimError::InvalidIsm)?
-                .p_const;
+        for &(_, prior) in &constellation_priors {
+            p_unenumerated += prior;
         }
     }
 
@@ -138,6 +129,13 @@ pub(crate) fn enumerate_fault_modes_checked(
     } else {
         p_unenumerated += satellite_order_mass.iter().skip(2).sum::<f64>();
     }
+    // WG-C Reference ADD v3.0 Section 4.6 treats constellation faults as
+    // independent primary events, so multi-event tail mass must include any
+    // combination that contains at least one constellation event.
+    p_unenumerated += constellation_involving_order_mass
+        .iter()
+        .skip(2)
+        .sum::<f64>();
 
     let monitored_fault_mass: f64 = modes.iter().skip(1).map(|mode| mode.prior).sum();
     let total_fault_mass = monitored_fault_mass + p_unenumerated;
@@ -165,6 +163,49 @@ fn satellite_order_masses(sat_priors: &[(GnssSatelliteId, f64)]) -> Vec<f64> {
     masses[0] = 1.0;
     for (seen, &(_, prior)) in sat_priors.iter().enumerate() {
         for order in (1..=seen + 1).rev() {
+            masses[order] += masses[order - 1] * prior;
+        }
+    }
+    masses
+}
+
+fn constellation_priors(
+    geometry: &AraimGeometry,
+    ism: &Ism,
+) -> Result<Vec<(GnssSystem, f64)>, AraimError> {
+    let mut systems: Vec<GnssSystem> = geometry.rows.iter().map(|row| row.system).collect();
+    systems.sort_unstable();
+    systems.dedup();
+    systems
+        .into_iter()
+        .map(|system| {
+            ism.constellation(system)
+                .map(|constellation| (system, constellation.p_const))
+                .ok_or(AraimError::InvalidIsm)
+        })
+        .collect()
+}
+
+fn constellation_involving_order_masses(
+    satellite_order_mass: &[f64],
+    constellation_priors: &[(GnssSystem, f64)],
+) -> Vec<f64> {
+    let constellation_order_mass =
+        order_masses(constellation_priors.iter().map(|&(_, prior)| prior));
+    let mut masses = vec![0.0; satellite_order_mass.len() + constellation_order_mass.len() - 1];
+    for (sat_order, &sat_mass) in satellite_order_mass.iter().enumerate() {
+        for (const_order, &const_mass) in constellation_order_mass.iter().enumerate().skip(1) {
+            masses[sat_order + const_order] += sat_mass * const_mass;
+        }
+    }
+    masses
+}
+
+fn order_masses(priors: impl IntoIterator<Item = f64>) -> Vec<f64> {
+    let mut masses = vec![1.0];
+    for prior in priors {
+        masses.push(0.0);
+        for order in (1..masses.len()).rev() {
             masses[order] += masses[order - 1] * prior;
         }
     }

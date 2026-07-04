@@ -3,6 +3,9 @@
 //! This module is sans-IO: callers provide line-of-sight geometry plus an
 //! externally supplied integrity support message, and the solver returns
 //! protection levels without reading products, global state, or residuals.
+//! ISM records can use the default local pseudorange variance model or direct
+//! per-satellite effective sigmas for reference cases that publish `Cint` and
+//! `Cacc` diagonals.
 
 pub mod fault_modes;
 pub mod ism;
@@ -50,13 +53,15 @@ impl AraimGeometry {
     /// Build ARAIM geometry from an SPP solution.
     ///
     /// The SPP solution carries the final receiver state and used satellite IDs.
-    /// This adapter queries `eph` at its zero epoch because the solution does not
-    /// retain the original receive epoch. Ephemeris sources used here should make
-    /// that epoch meaningful for the snapshot being converted.
+    /// `t_j2000_s` is the receive epoch used to query the ephemeris source.
     pub fn from_receiver_solution(
         solution: &ReceiverSolution,
         eph: &dyn EphemerisSource,
+        t_j2000_s: f64,
     ) -> Result<Self, AraimError> {
+        if !t_j2000_s.is_finite() {
+            return Err(AraimError::InsufficientGeometry);
+        }
         let receiver = match solution.geodetic {
             Some(receiver) => receiver,
             None => geodetic_from_position(solution.position.as_array())?,
@@ -71,7 +76,7 @@ impl AraimGeometry {
         let mut rows = Vec::with_capacity(solution.used_sats.len());
         for &id in &solution.used_sats {
             let (sat_ecef_m, _) = eph
-                .position_clock_at_j2000_s(id, 0.0)
+                .position_clock_at_j2000_s(id, t_j2000_s)
                 .ok_or(AraimError::InsufficientGeometry)?;
             let dx = sat_ecef_m[0] - rx_ecef_m[0];
             let dy = sat_ecef_m[1] - rx_ecef_m[1];
@@ -154,6 +159,8 @@ pub struct IntegrityAllocation {
     pub pfa_hor: f64,
     /// Maximum acceptable unmonitored fault probability mass.
     pub p_threshold_unmonitored: f64,
+    /// Fault-prior threshold used for the effective monitor threshold.
+    pub p_emt: f64,
     /// Maximum enumerated satellite-fault order. Zero keeps only fault-free.
     pub max_fault_order: usize,
 }
@@ -167,7 +174,10 @@ impl IntegrityAllocation {
             phmi_hor: 2.0e-9,
             pfa_vert: 3.9e-6,
             pfa_hor: 9.0e-8,
-            p_threshold_unmonitored: 1.0e-8,
+            // WG-C Reference ADD v3.0 Table 3, LPV-200 PTHRES.
+            p_threshold_unmonitored: 8.0e-8,
+            // WG-C Reference ADD v3.0 Table 2, LPV-200 PEMT.
+            p_emt: 1.0e-5,
             max_fault_order: 2,
         }
     }

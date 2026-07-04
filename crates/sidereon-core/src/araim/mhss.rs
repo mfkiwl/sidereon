@@ -4,12 +4,17 @@ use super::fault_modes::{enumerate_fault_modes_checked, FaultHypothesis};
 use super::ism::Ism;
 use super::protection::{
     gain_matrix_enu, gain_matrix_enu_for_clock_systems, k_false_alert, metric_bias, metric_sigma,
-    separation_sigma, solve_protection_level, ProtectionEquationTerm, ProtectionLevelSolution,
+    separation_sigma, solve_protection_level, FalseAlertAxis, ProtectionEquationTerm,
+    ProtectionLevelSolution,
 };
 use super::{
     clock_system_for_row, validate_probability, AraimError, AraimGeometry, IntegrityAllocation,
 };
 use crate::id::{GnssSatelliteId, GnssSystem};
+
+// WG-C Reference ADD v3.0 Table 3 and Appendix B, Eq. (68): TOLPL is 5e-2 m.
+const HORIZONTAL_PL_TOL_M: f64 = 5.0e-2;
+const VERTICAL_PL_TOL_M: f64 = 1.0e-4;
 
 /// Per-hypothesis ARAIM monitor data.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,21 +78,20 @@ pub fn araim(
         .iter()
         .map(|sigma| 1.0 / (sigma * sigma))
         .collect();
-    let weights_acc: Vec<f64> = sigma_acc_m
-        .iter()
-        .map(|sigma| 1.0 / (sigma * sigma))
-        .collect();
 
     let enumeration = enumerate_fault_modes_checked(geometry, ism, allocation)?;
     let n_fault_modes = enumeration.modes.len().saturating_sub(1);
-    let k_h = k_false_alert(allocation.pfa_hor, n_fault_modes)?;
-    let k_v = k_false_alert(allocation.pfa_vert, n_fault_modes)?;
+    let k_h = k_false_alert(
+        allocation.pfa_hor,
+        n_fault_modes,
+        FalseAlertAxis::Horizontal,
+    )?;
+    let k_v = k_false_alert(allocation.pfa_vert, n_fault_modes, FalseAlertAxis::Vertical)?;
 
     let fault_free_int = gain_matrix_enu(geometry, &weights_int)?;
-    let fault_free_acc = gain_matrix_enu(geometry, &weights_acc)?;
-    let sigma_acc_e = metric_sigma(&fault_free_acc.enu_rows[0], &sigma_acc_m);
-    let sigma_acc_n = metric_sigma(&fault_free_acc.enu_rows[1], &sigma_acc_m);
-    let sigma_acc_u = metric_sigma(&fault_free_acc.enu_rows[2], &sigma_acc_m);
+    let sigma_acc_e = metric_sigma(&fault_free_int.enu_rows[0], &sigma_acc_m);
+    let sigma_acc_n = metric_sigma(&fault_free_int.enu_rows[1], &sigma_acc_m);
+    let sigma_acc_u = metric_sigma(&fault_free_int.enu_rows[2], &sigma_acc_m);
 
     let mut p_unmonitored = enumeration.p_unenumerated;
     let mut fault_modes = Vec::with_capacity(enumeration.modes.len());
@@ -97,8 +101,7 @@ pub fn araim(
                 hypothesis,
                 MonitorInputs {
                     gain_int: &fault_free_int,
-                    gain_acc: &fault_free_acc,
-                    fault_free_acc: &fault_free_acc,
+                    fault_free_int: &fault_free_int,
                     sigma_int_m: &sigma_int_m,
                     sigma_acc_m: &sigma_acc_m,
                     bias_m: &bias_m,
@@ -107,18 +110,13 @@ pub fn araim(
             )
         } else {
             let weights_int_k = zeroed_weights(geometry, &weights_int, hypothesis);
-            let weights_acc_k = zeroed_weights(geometry, &weights_acc, hypothesis);
             let clock_systems_k = active_clock_systems(geometry, hypothesis);
-            match (
-                gain_matrix_enu_for_clock_systems(geometry, &weights_int_k, &clock_systems_k),
-                gain_matrix_enu_for_clock_systems(geometry, &weights_acc_k, &clock_systems_k),
-            ) {
-                (Ok(gain_int), Ok(gain_acc)) => compute_monitorable_mode(
+            match gain_matrix_enu_for_clock_systems(geometry, &weights_int_k, &clock_systems_k) {
+                Ok(gain_int) => compute_monitorable_mode(
                     hypothesis,
                     MonitorInputs {
                         gain_int: &gain_int,
-                        gain_acc: &gain_acc,
-                        fault_free_acc: &fault_free_acc,
+                        fault_free_int: &fault_free_int,
                         sigma_int_m: &sigma_int_m,
                         sigma_acc_m: &sigma_acc_m,
                         bias_m: &bias_m,
@@ -138,14 +136,31 @@ pub fn araim(
         return Err(AraimError::UnmonitorableFaultMass);
     }
 
-    let pl_e = solve_coord_pl(&fault_modes, 0, allocation.phmi_hor)?;
-    let pl_n = solve_coord_pl(&fault_modes, 1, allocation.phmi_hor)?;
-    let pl_u = solve_coord_pl(&fault_modes, 2, allocation.phmi_vert)?;
+    let budget_scale = integrity_budget_scale(allocation, p_unmonitored)?;
+    let pl_e = solve_coord_pl(
+        &fault_modes,
+        0,
+        0.5 * allocation.phmi_hor * budget_scale,
+        HORIZONTAL_PL_TOL_M,
+    )?;
+    let pl_n = solve_coord_pl(
+        &fault_modes,
+        1,
+        0.5 * allocation.phmi_hor * budget_scale,
+        HORIZONTAL_PL_TOL_M,
+    )?;
+    let pl_u = solve_coord_pl(
+        &fault_modes,
+        2,
+        allocation.phmi_vert * budget_scale,
+        VERTICAL_PL_TOL_M,
+    )?;
     let roots_converged = pl_e.converged && pl_n.converged && pl_u.converged;
     let emt_m = fault_modes
         .iter()
         .filter(|mode| mode.monitorable)
-        .flat_map(|mode| mode.threshold_enu_m)
+        .filter(|mode| mode.prior >= allocation.p_emt)
+        .map(|mode| mode.threshold_enu_m[2])
         .fold(0.0_f64, f64::max);
     let fault_free_full_rank = fault_modes
         .first()
@@ -160,16 +175,13 @@ pub fn araim(
         emt_m,
         fault_modes,
         p_unmonitored,
-        availability: fault_free_full_rank
-            && p_unmonitored <= allocation.p_threshold_unmonitored
-            && roots_converged,
+        availability: fault_free_full_rank && roots_converged,
     })
 }
 
 struct MonitorInputs<'a> {
     gain_int: &'a super::protection::GainMatrix,
-    gain_acc: &'a super::protection::GainMatrix,
-    fault_free_acc: &'a super::protection::GainMatrix,
+    fault_free_int: &'a super::protection::GainMatrix,
     sigma_int_m: &'a [f64],
     sigma_acc_m: &'a [f64],
     bias_m: &'a [f64],
@@ -185,8 +197,8 @@ fn compute_monitorable_mode(hypothesis: &FaultHypothesis, inputs: MonitorInputs<
         bias_enu_m[coord] = metric_bias(&inputs.gain_int.enu_rows[coord], inputs.bias_m);
         threshold_enu_m[coord] = inputs.k[coord]
             * separation_sigma(
-                &inputs.gain_acc.enu_rows[coord],
-                &inputs.fault_free_acc.enu_rows[coord],
+                &inputs.gain_int.enu_rows[coord],
+                &inputs.fault_free_int.enu_rows[coord],
                 inputs.sigma_acc_m,
             );
     }
@@ -250,7 +262,8 @@ fn active_clock_systems(geometry: &AraimGeometry, hypothesis: &FaultHypothesis) 
 fn solve_coord_pl(
     modes: &[FaultMode],
     coord: usize,
-    phmi: f64,
+    integrity_target: f64,
+    tolerance_m: f64,
 ) -> Result<ProtectionLevelSolution, AraimError> {
     let fault_free = modes.first().ok_or(AraimError::NumericalFailure)?;
     if !fault_free.monitorable {
@@ -273,7 +286,20 @@ fn solve_coord_pl(
             threshold_m: mode.threshold_enu_m[coord],
         })
         .collect();
-    solve_protection_level(fault_free_term, &fault_terms, phmi)
+    solve_protection_level(fault_free_term, &fault_terms, integrity_target, tolerance_m)
+}
+
+fn integrity_budget_scale(
+    allocation: &IntegrityAllocation,
+    p_unmonitored: f64,
+) -> Result<f64, AraimError> {
+    let phmi_split = allocation.phmi_vert + allocation.phmi_hor;
+    let scale = 1.0 - p_unmonitored / phmi_split;
+    if scale > 0.0 && scale.is_finite() {
+        Ok(scale)
+    } else {
+        Err(AraimError::UnmonitorableFaultMass)
+    }
 }
 
 fn validate_geometry(geometry: &AraimGeometry) -> Result<(), AraimError> {
@@ -319,6 +345,7 @@ fn validate_allocation(allocation: &IntegrityAllocation) -> Result<(), AraimErro
         && validate_probability(allocation.pfa_vert, false)
         && validate_probability(allocation.pfa_hor, false)
         && validate_probability(allocation.p_threshold_unmonitored, true)
+        && validate_probability(allocation.p_emt, false)
         && phmi_split <= allocation.phmi_total + phmi_split_tolerance;
     if valid {
         Ok(())
