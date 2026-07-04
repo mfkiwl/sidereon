@@ -105,6 +105,7 @@ mod rinex_qc; // RINEX observation/navigation lint and mechanical repair
 pub mod rtcm; // RTCM 3 differential-GNSS stream decode/encode (MSM, station, ephemeris)
 pub mod rtk; // RTK double-difference construction
 pub mod sbas;
+pub mod sidereal; // repeating-geometry residual filtering and period diagnostics
 pub mod signal; // GPS C/A code, coherent correlation, and acquisition
 pub mod source_localization; // ToA/TDOA source localization from arrival times
 mod sp3; // SP3-c / SP3-d parser + arbitrary-epoch interpolation
@@ -161,3 +162,8 @@ pub use geoid::{
     geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, GeoidError, GeoidGrid,
 };
 pub use id::{GnssSatelliteId, GnssSystem, SatelliteIdError};
+pub use sidereal::{
+    orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
+    repeat_period, sidereal_filter, solar_day_period, SiderealFilterError, SiderealFilterOptions,
+    SiderealFilterOutput, SiderealTemplateMethod, SIDEREAL_DAY_NANOS, SIDEREAL_DAY_SECONDS,
+};
