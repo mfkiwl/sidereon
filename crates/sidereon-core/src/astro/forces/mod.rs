@@ -1,3 +1,4 @@
+pub mod albedo;
 pub mod composite;
 pub mod drag;
 pub mod geopotential;
@@ -9,6 +10,7 @@ pub mod r#trait;
 pub mod two_body;
 pub mod zonal;
 
+pub use albedo::EarthRadiationPressure;
 pub use composite::CompositeForceModel;
 pub use drag::{DragForce, DragParameters, SourcedDragForce, SpaceWeather, SpaceWeatherSource};
 pub use geopotential::{
