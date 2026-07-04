@@ -256,7 +256,8 @@ pub mod geoid {
     pub use sidereon_core::geoid::{
         egm96_ellipsoidal_height_m, egm96_grid, egm96_orthometric_height_m, egm96_undulation,
         egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
-        geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, GeoidError, GeoidGrid,
+        geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, Egm2008GridSpacing,
+        Egm2008RasterWindow, GeoidError, GeoidGrid,
     };
 }
 
