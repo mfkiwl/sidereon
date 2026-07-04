@@ -10,15 +10,22 @@ sidereon is one engine: a Rust core for satellite orbit propagation, GNSS positi
 
 ## Capabilities
 
-- **Orbit propagation:** SGP4/SDP4 from TLE/OMM, numerical propagation with atmospheric drag and decay/reentry prediction, Kepler propagation and anomaly conversion, batch/constellation propagation, ground tracks, passes, visibility, and coverage.
-- **GNSS positioning:** single-point (SPP), RTK float and fixed (LAMBDA), PPP float and fixed, DGNSS, across GPS/GLONASS/Galileo/BeiDou/QZSS, with robust solves, RAIM fault detection and exclusion, and DOP (G/P/H/V/T).
-- **GNSS corrections:** SBAS message decode and correction application, RTCM SSR and Galileo HAS orbit/clock/bias correction stores, and differential code biases (DCB/OSB) from Bias-SINEX and CODE products.
-- **Ephemeris and time:** broadcast and precise (SP3) ephemeris, JPL SPK kernels, source-agnostic satellite state sampling across all three, scale-aware time (UTC/TT/UT1/TDB/GNSS), leap seconds, Earth orientation (EOP).
-- **Geometry and events:** TEME/GCRS/ITRS/geodetic/topocentric transforms (IAU/IERS), look angles, eclipse, relative motion in RIC/RTN/LVLH frames with Clohessy-Wiltshire propagation, conjunction screening with collision probability (TCA/Pc), initial orbit determination, and classical and equinoctial element conversion.
+- **Orbit propagation:** SGP4/SDP4 from TLE/OMM, numerical propagation with a composable force model (zonal harmonics through J6, Sun/Moon third-body, solar radiation pressure with conical shadow, relativistic correction, NRLMSISE-00 drag), decay/reentry prediction, Kepler propagation and anomaly conversion, batch/constellation propagation, ground tracks, passes, visibility, and coverage.
+- **Orbit determination:** initial orbit determination (Gibbs, Herrick-Gibbs, Gauss angles-only), batch least-squares fit of the numerical propagator to precise ephemerides with a per-satellite RTN residual ledger, and covariance propagation.
+- **GNSS positioning:** single-point (SPP), RTK float and fixed (LAMBDA), PPP float and fixed, DGNSS, across GPS/GLONASS/Galileo/BeiDou/QZSS, with robust solves and DOP (G/P/H/V/T).
+- **Integrity and error bounds:** RAIM fault detection and exclusion, multi-constellation ARAIM (MHSS protection levels), SBAS protection levels (DO-229), classical reliability (per-observation minimal detectable bias, internal/external reliability), observability classification of every solve (rank, redundancy, conditioning), and covariance-derived error metrics (CEP, R95, drms, SEP, error ellipse) that report wide or flagged bounds for weak geometry rather than fabricated confidence.
+- **GNSS corrections:** SBAS message decode and correction application, RTCM SSR and Galileo HAS orbit/clock/bias correction stores, NTRIP client stream handling, and differential code biases (DCB/OSB) from Bias-SINEX and CODE products.
+- **Ephemeris and time:** broadcast and precise (SP3) ephemeris, JPL SPK kernels, source-agnostic satellite state sampling across all three, batched multi-satellite interpolation, scale-aware time (UTC/TAI/TT/UT1/TDB and the GNSS system times) with leap-second handling, and Earth orientation (EOP).
+- **Timing and clocks:** Allan-family stability analysis (ADEV/MDEV/HDEV/TDEV), power-law clock-noise identification with a five-coefficient fit (IEEE 1139), and clock comparison across products.
+- **Estimation and detection:** scalar Kalman and alpha-beta trackers, innovation gating (NIS), robust statistics (MAD), CFAR detection thresholds, and source localization (ToA/TDOA) from arrival times at known sensors.
+- **Geodesy and monitoring:** robust station velocity (MIDAS), trajectory fitting with seasonal terms and offsets, step detection, network motion fields with common-mode removal, and repeating-geometry (sidereal) filtering with coverage-aware templates.
+- **Inertial foundation:** ECEF strapdown mechanization with rigorous attitude integration, WGS84 gravity, and IMU error modeling parameterized by Allan variance.
+- **Geometry and events:** TEME/GCRS/ITRS/geodetic/topocentric transforms (IAU/IERS), a precise Earth-orientation rotation provider, look angles, eclipse, relative motion in RIC/RTN/LVLH frames with Clohessy-Wiltshire propagation, conjunction screening with collision probability (TCA/Pc), and classical and equinoctial element conversion.
 - **Observation and almanac:** apparent places (geocentric and topocentric RA/Dec) for the Sun, Moon, and planets, Sun and Moon rise/set, seasons, moon phases, planetary transits, lunar and solar eclipses, sub-solar/sub-observer and terminator geometry, angular separation and position/phase/beta angles, and satellite visual magnitude.
-- **Atmosphere and terrain:** Klobuchar and full Galileo NeQuick-G ionosphere, IONEX grids (vertical TEC and slant delay), tropospheric delay, NRLMSISE-00 density, and DTED terrain elevation lookup.
+- **Observation quality:** RINEX observation QC (completeness, multipath, cycle slips) validated against the standard toolchain, carrier-phase combinations, and Hatch smoothing.
+- **Atmosphere and terrain:** Klobuchar and full Galileo NeQuick-G ionosphere, IONEX grids (vertical TEC and slant delay), tropospheric delay, NRLMSISE-00 density, DTED terrain elevation lookup with batch probes, and a memory-mappable terrain store.
 - **RF link:** free-space path loss, EIRP, carrier-to-noise (C/N0), and link margin.
-- **Formats:** TLE/OMM, CCSDS OEM/OPM/CDM, RINEX observation/navigation/clock, CRINEX (Hatanaka), SP3, IONEX, ANTEX, Bias-SINEX, CODE DCB, RTCM 3.x, with forgiving parsers and round-trippable serializers for the formats that support it.
+- **Formats:** TLE/OMM, CCSDS OEM/OPM/CDM, RINEX observation/navigation/clock, CRINEX (Hatanaka), SP3, IONEX, ANTEX, Bias-SINEX, CODE DCB, RTCM 3.x, NMEA 0183, with forgiving parsers and round-trippable serializers for the formats that support it.
 
 ## Install
 
