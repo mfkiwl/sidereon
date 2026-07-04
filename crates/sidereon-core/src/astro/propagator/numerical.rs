@@ -17,9 +17,9 @@ use crate::astro::constants::{J2_EARTH, MU_EARTH, RE_EARTH};
 use crate::astro::covariance::{Covariance6, Covariance6Error};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{
-    CompositeForceModel, DragParameters, ForceModel, J2Gravity, SchwarzschildRelativity,
-    SolarRadiationPressure, SourcedDragForce, SpaceWeatherSource, SphericalHarmonicGravityConfig,
-    ThirdBodyGravity, TwoBodyGravity, ZonalGravity,
+    CompositeForceModel, DragParameters, EarthRadiationPressure, ForceModel, J2Gravity,
+    SchwarzschildRelativity, SolarRadiationPressure, SourcedDragForce, SpaceWeatherSource,
+    SphericalHarmonicGravityConfig, ThirdBodyGravity, TwoBodyGravity, ZonalGravity,
 };
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
@@ -94,6 +94,8 @@ pub struct ForceModelComponents {
     pub third_body: Option<ThirdBodyGravity>,
     /// Optional cannonball solar radiation pressure perturbation.
     pub solar_radiation_pressure: Option<SolarRadiationPressure>,
+    /// Optional cannonball Earth albedo and infrared radiation pressure perturbation.
+    pub earth_radiation_pressure: Option<EarthRadiationPressure>,
     /// Optional geocentric Schwarzschild relativistic correction.
     pub relativity: Option<SchwarzschildRelativity>,
 }
@@ -112,6 +114,7 @@ impl ForceModelComponents {
         spherical_harmonic: None,
         third_body: None,
         solar_radiation_pressure: None,
+        earth_radiation_pressure: None,
         relativity: None,
     };
 
@@ -131,6 +134,7 @@ impl ForceModelComponents {
             spherical_harmonic: None,
             third_body: Some(ThirdBodyGravity::default()),
             solar_radiation_pressure,
+            earth_radiation_pressure: None,
             relativity: Some(SchwarzschildRelativity::default()),
         }
     }
@@ -149,6 +153,7 @@ impl ForceModelComponents {
             )?),
             third_body: Some(ThirdBodyGravity::default()),
             solar_radiation_pressure,
+            earth_radiation_pressure: None,
             relativity: Some(SchwarzschildRelativity::default()),
         })
     }
@@ -180,6 +185,12 @@ impl ForceModelComponents {
     /// Set or replace solar radiation pressure.
     pub fn with_solar_radiation_pressure(mut self, srp: SolarRadiationPressure) -> Self {
         self.solar_radiation_pressure = Some(srp);
+        self
+    }
+
+    /// Set or replace Earth albedo and infrared radiation pressure.
+    pub fn with_earth_radiation_pressure(mut self, pressure: EarthRadiationPressure) -> Self {
+        self.earth_radiation_pressure = Some(pressure);
         self
     }
 
@@ -275,6 +286,9 @@ impl ForceModelKind {
                 }
                 if let Some(srp) = components.solar_radiation_pressure {
                     composite.add(Box::new(srp));
+                }
+                if let Some(pressure) = components.earth_radiation_pressure {
+                    composite.add(Box::new(pressure));
                 }
                 if let Some(relativity) = components.relativity {
                     composite.add(Box::new(relativity));
@@ -884,6 +898,17 @@ mod tests {
         .expect("composite two-body ephemeris");
 
         assert_states_bit_for_bit(&legacy, &composite);
+    }
+
+    #[test]
+    fn earth_radiation_pressure_component_is_opt_in() {
+        let components = ForceModelComponents::earth_phase_a(None);
+        assert_eq!(components.earth_radiation_pressure, None);
+
+        let pressure = EarthRadiationPressure::new(1.2, 0.011).expect("valid model");
+        let with_pressure = components.with_earth_radiation_pressure(pressure);
+        assert_eq!(components.earth_radiation_pressure, None);
+        assert_eq!(with_pressure.earth_radiation_pressure, Some(pressure));
     }
 
     #[test]
