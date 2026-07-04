@@ -125,6 +125,7 @@ pub mod ephemeris;
 pub mod estimation; // Phase-2 estimation substrate: named operation-order recipes
 pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric heights)
 pub mod geometry;
+pub mod geometry_quality;
 pub mod ils; // integer least squares ambiguity-resolution kernels
 pub mod observation_qc; // RINEX observation completeness and signal rollups
 pub mod qc_obs {

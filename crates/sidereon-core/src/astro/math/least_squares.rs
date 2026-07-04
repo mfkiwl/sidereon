@@ -355,14 +355,11 @@ pub fn normal_covariance(
     // covariance is unbounded, i.e. the Jacobian is rank-deficient. This is the
     // SVD analogue of the previous Cholesky-failure check, but it also catches
     // the near-collinear case that squaring into J^T J would have masked.
-    let smax = singular.iter().cloned().fold(0.0_f64, f64::max);
-    if smax == 0.0 {
+    let diagnostics = singular_value_diagnostics(singular.as_slice(), m, n);
+    if diagnostics.rank < n {
         return Err(SolveError::SingularJacobian);
     }
-    let threshold = smax * (m.max(n) as f64) * f64::EPSILON;
-    if singular.iter().any(|&s| s <= threshold) {
-        return Err(SolveError::SingularJacobian);
-    }
+    debug_assert!(diagnostics.condition_number.is_finite());
 
     // cov[i][j] = variance_scale * sum_k V[i,k] (1/sigma_k^2) V[j,k].
     // v_t is n x n with row k = the k-th right singular vector, so V[i,k] = v_t[(k, i)].
@@ -400,6 +397,43 @@ pub fn hessian_trace(jacobian: &DMatrix<f64>) -> f64 {
         trace += col;
     }
     trace
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SingularValueDiagnostics {
+    pub(crate) rank: usize,
+    pub(crate) condition_number: f64,
+}
+
+pub(crate) fn singular_value_diagnostics(
+    singular_values: &[f64],
+    rows: usize,
+    cols: usize,
+) -> SingularValueDiagnostics {
+    let smax = singular_values.iter().copied().fold(0.0_f64, f64::max);
+    if smax == 0.0 {
+        return SingularValueDiagnostics {
+            rank: 0,
+            condition_number: f64::INFINITY,
+        };
+    }
+
+    let threshold = smax * (rows.max(cols) as f64) * f64::EPSILON;
+    let rank = singular_values.iter().filter(|&&s| s > threshold).count();
+    let condition_number = if rank < cols {
+        f64::INFINITY
+    } else {
+        let smin = singular_values
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        smax / smin
+    };
+
+    SingularValueDiagnostics {
+        rank,
+        condition_number,
+    }
 }
 
 /// Fitted parameter covariance directly from a design (Jacobian) matrix and the
