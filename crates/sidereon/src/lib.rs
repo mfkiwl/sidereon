@@ -195,9 +195,9 @@ pub use sidereon_core::quality::{
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies, fusion,
-    geodetic_time_series, geometry, geometry_quality, ils, inertial, navigation, nmea, observables,
-    orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas, sbas_pl,
-    sidereal, signal, source_localization, ssr, staleness, terrain, tides, velocity,
+    geodesic, geodetic_time_series, geometry, geometry_quality, ils, inertial, navigation, nmea,
+    observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas,
+    sbas_pl, sidereal, signal, source_localization, ssr, staleness, terrain, tides, velocity,
 };
 pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
@@ -207,8 +207,9 @@ pub use sidereon_core::{
     WGS84_NORMAL_GRAVITY_EQUATOR_MPS2, WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
 };
 pub use sidereon_core::{
-    geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
-    ItrfPositionM, ItrfVelocityMS, ProtectionModel, SatelliteIdError, Wgs84Geodetic,
+    geodesic_direct, geodesic_inverse, geodetic_to_itrf, itrf_to_geodetic, FrameValueError,
+    GeodesicError, GnssSatelliteId, GnssSystem, ItrfPositionM, ItrfVelocityMS, ProtectionModel,
+    SatelliteIdError, Wgs84Geodetic,
 };
 pub use sidereon_core::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
