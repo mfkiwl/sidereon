@@ -232,7 +232,7 @@ pub fn apply_closed_loop_error(
     apply_closed_loop_navigation_error(state, dx)
 }
 
-fn apply_closed_loop_navigation_error(
+pub(super) fn apply_closed_loop_navigation_error(
     state: &mut crate::inertial::NavState,
     dx: &[f64],
 ) -> Result<(), FusionError> {
@@ -264,7 +264,7 @@ fn apply_closed_loop_navigation_error(
     Ok(())
 }
 
-fn apply_closed_loop_scale_error(state: &mut InsFilterState, dx: &[f64]) {
+pub(super) fn apply_closed_loop_scale_error(state: &mut InsFilterState, dx: &[f64]) {
     if state.layout().includes_scale_factors() {
         for axis in 0..3 {
             state.accel_scale_factor[axis] += dx[ERROR_ACCEL_SCALE_INDEX + axis];
@@ -313,7 +313,7 @@ fn apply_correction(
     })
 }
 
-fn innovation_covariance(
+pub(super) fn innovation_covariance(
     covariance: &[Vec<f64>],
     correction: &EkfCorrection,
 ) -> Result<Vec<Vec<f64>>, FusionError> {
@@ -341,7 +341,7 @@ fn validate_measurement_covariance(
     }
 }
 
-fn normalized_innovation_squared(
+pub(super) fn normalized_innovation_squared(
     innovation_covariance: &[Vec<f64>],
     innovation: &[f64],
 ) -> Result<f64, FusionError> {
@@ -360,7 +360,7 @@ fn normalized_innovation_squared(
         .sum())
 }
 
-fn screen_correction(
+pub(super) fn screen_correction(
     correction: &EkfCorrection,
     innovation_covariance: &[Vec<f64>],
     gate: InnovationGate,

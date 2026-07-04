@@ -12,6 +12,7 @@ use crate::inertial::{ImuSample, ImuSampleKind};
 
 use super::loose::{FusionUpdate, GnssFixMeasurement, InertialFilter};
 use super::state::{invalid_input, validate_positive, FusionError, InsFilterState};
+use super::tight::{TightFilterSnapshot, TightFusionState, TightGnssEpoch};
 
 /// Default number of retained IMU samples for time-sync replay.
 pub const DEFAULT_TIME_SYNC_IMU_CAPACITY: usize = 256;
@@ -59,6 +60,8 @@ pub struct InertialFilterSnapshot {
     pub state: InsFilterState,
     /// Last propagated body angular rate relative to ECEF, resolved in body axes.
     pub last_body_rate_wrt_ecef_rps: [f64; 3],
+    /// Tight receiver-clock augmentation and full augmented covariance.
+    pub tight: TightFilterSnapshot,
 }
 
 /// Current retained-history occupancy for time synchronization.
@@ -102,11 +105,11 @@ pub(super) struct TimeSyncHistory {
     config: TimeSyncHistoryConfig,
     imu_samples: VecDeque<StoredImuSample>,
     checkpoints: VecDeque<StoredCheckpoint>,
-    measurements: VecDeque<GnssFixMeasurement>,
+    measurements: VecDeque<StoredGnssMeasurement>,
 }
 
 impl TimeSyncHistory {
-    pub(super) fn from_initial(state: &InsFilterState) -> Self {
+    pub(super) fn from_initial(state: &InsFilterState, tight: &TightFusionState) -> Self {
         let mut history = Self {
             config: TimeSyncHistoryConfig::default(),
             imu_samples: VecDeque::new(),
@@ -116,6 +119,7 @@ impl TimeSyncHistory {
         history.push_checkpoint(InertialFilterSnapshot {
             state: state.clone(),
             last_body_rate_wrt_ecef_rps: [0.0; 3],
+            tight: tight.snapshot(),
         });
         history
     }
@@ -165,10 +169,10 @@ impl TimeSyncHistory {
 
     /// Epoch of the most recently accepted GNSS measurement, if any.
     pub(super) fn last_measurement_t_j2000_s(&self) -> Option<f64> {
-        self.measurements.back().map(|m| m.t_j2000_s)
+        self.measurements.back().map(StoredGnssMeasurement::epoch)
     }
 
-    pub(super) fn push_measurement_and_checkpoint(
+    pub(super) fn push_loose_measurement_and_checkpoint(
         &mut self,
         measurement: GnssFixMeasurement,
         snapshot: InertialFilterSnapshot,
@@ -176,7 +180,20 @@ impl TimeSyncHistory {
         bounded_push(
             &mut self.measurements,
             self.config.checkpoint_capacity,
-            measurement,
+            StoredGnssMeasurement::Loose(measurement),
+        );
+        self.push_checkpoint(snapshot);
+    }
+
+    pub(super) fn push_tight_measurement_and_checkpoint(
+        &mut self,
+        measurement: TightGnssEpoch,
+        snapshot: InertialFilterSnapshot,
+    ) {
+        bounded_push(
+            &mut self.measurements,
+            self.config.checkpoint_capacity,
+            StoredGnssMeasurement::Tight(measurement),
         );
         self.push_checkpoint(snapshot);
     }
@@ -190,6 +207,19 @@ impl TimeSyncHistory {
                 snapshot,
             },
         );
+    }
+
+    fn push_stored_measurement_and_checkpoint(
+        &mut self,
+        measurement: StoredGnssMeasurement,
+        snapshot: InertialFilterSnapshot,
+    ) {
+        bounded_push(
+            &mut self.measurements,
+            self.config.checkpoint_capacity,
+            measurement,
+        );
+        self.push_checkpoint(snapshot);
     }
 
     pub(super) fn restore_to_snapshot(&mut self, snapshot: InertialFilterSnapshot) {
@@ -211,7 +241,7 @@ impl TimeSyncHistory {
         while self
             .measurements
             .back()
-            .is_some_and(|measurement| measurement.t_j2000_s > restored_epoch_j2000_s)
+            .is_some_and(|measurement| measurement.epoch() > restored_epoch_j2000_s)
         {
             self.measurements.pop_back();
         }
@@ -237,7 +267,7 @@ impl TimeSyncHistory {
             }
         }
         for measurement in &self.measurements {
-            if measurement.t_j2000_s <= checkpoint_epoch_j2000_s {
+            if measurement.epoch() <= checkpoint_epoch_j2000_s {
                 history.measurements.push_back(measurement.clone());
             }
         }
@@ -255,7 +285,7 @@ impl TimeSyncHistory {
         self.measurements
             .iter()
             .enumerate()
-            .filter(|(_, measurement)| measurement.t_j2000_s > t_j2000_s)
+            .filter(|(_, measurement)| measurement.epoch() > t_j2000_s)
             .map(|(order, measurement)| ReplayMeasurement {
                 measurement: measurement.clone(),
                 order,
@@ -347,6 +377,7 @@ impl InertialFilter {
         InertialFilterSnapshot {
             state: self.state.clone(),
             last_body_rate_wrt_ecef_rps: self.last_body_rate_wrt_ecef_rps,
+            tight: self.tight.snapshot(),
         }
     }
 
@@ -363,6 +394,8 @@ impl InertialFilter {
         let restored = snapshot.clone();
         self.state = restored.state.clone();
         self.last_body_rate_wrt_ecef_rps = restored.last_body_rate_wrt_ecef_rps;
+        self.tight
+            .restore(&restored.tight, restored.state.dimension())?;
         self.time_sync.restore_to_snapshot(restored);
         Ok(())
     }
@@ -411,6 +444,36 @@ impl InertialFilter {
         self.apply_late_loose_update(measurement, current_t_j2000_s)
     }
 
+    /// Apply a tight raw GNSS update at the measurement epoch, replaying history if needed.
+    pub fn update_tight_time_sync(
+        &mut self,
+        source: &dyn crate::observables::ObservableEphemerisSource,
+        epoch: &TightGnssEpoch,
+    ) -> Result<TimeSyncUpdate, FusionError> {
+        epoch.validate()?;
+        let target_t_j2000_s = epoch.t_j2000_s;
+        let current_t_j2000_s = self.state.nominal.t_j2000_s;
+        if target_t_j2000_s > current_t_j2000_s {
+            return Err(invalid_input(
+                "t_j2000_s",
+                "must not exceed current inertial epoch",
+            ));
+        }
+
+        if target_t_j2000_s == current_t_j2000_s {
+            let update = self.update_tight(source, epoch)?;
+            return Ok(TimeSyncUpdate {
+                update,
+                late_measurement: false,
+                replayed_imu_segments: 0,
+                restored_checkpoint_epoch_j2000_s: current_t_j2000_s,
+                current_epoch_j2000_s: self.state.nominal.t_j2000_s,
+            });
+        }
+
+        self.apply_late_tight_update(source, epoch, current_t_j2000_s)
+    }
+
     fn apply_late_loose_update(
         &mut self,
         measurement: &GnssFixMeasurement,
@@ -424,7 +487,7 @@ impl InertialFilter {
         let mut replay_measurements = original_history.measurements_after(checkpoint.t_j2000_s);
         if replay_measurements
             .iter()
-            .any(|r| r.measurement.t_j2000_s == measurement.t_j2000_s)
+            .any(|r| r.measurement.epoch() == measurement.t_j2000_s)
         {
             return Err(invalid_input(
                 "t_j2000_s",
@@ -433,14 +496,14 @@ impl InertialFilter {
         }
         let new_order = replay_measurements.len();
         replay_measurements.push(ReplayMeasurement {
-            measurement: measurement.clone(),
+            measurement: StoredGnssMeasurement::Loose(measurement.clone()),
             order: new_order,
             is_new: true,
         });
         replay_measurements.sort_by(|a, b| {
             a.measurement
-                .t_j2000_s
-                .total_cmp(&b.measurement.t_j2000_s)
+                .epoch()
+                .total_cmp(&b.measurement.epoch())
                 .then_with(|| a.order.cmp(&b.order))
                 .then_with(|| a.is_new.cmp(&b.is_new))
         });
@@ -453,12 +516,99 @@ impl InertialFilter {
         let mut supplied_update = None;
         for replay in replay_measurements {
             replayed_imu_segments +=
-                working.replay_imu_to_epoch(replay.measurement.t_j2000_s, &original_history)?;
-            let update = working.update_loose_core(&replay.measurement)?;
+                working.replay_imu_to_epoch(replay.measurement.epoch(), &original_history)?;
+            let update = match &replay.measurement {
+                StoredGnssMeasurement::Loose(measurement) => {
+                    working.update_loose_core(measurement)?
+                }
+                StoredGnssMeasurement::Tight(_) => {
+                    return Err(invalid_input(
+                        "gnss_measurements",
+                        "tight replay needs update_tight_time_sync",
+                    ));
+                }
+            };
             let snapshot = working.snapshot();
             working
                 .time_sync
-                .push_measurement_and_checkpoint(replay.measurement.clone(), snapshot);
+                .push_stored_measurement_and_checkpoint(replay.measurement.clone(), snapshot);
+            if replay.is_new {
+                supplied_update = Some(update);
+            }
+        }
+        replayed_imu_segments +=
+            working.replay_imu_to_epoch(original_current_t_j2000_s, &original_history)?;
+        let update = supplied_update.ok_or_else(|| {
+            invalid_input("gnss_measurements", "supplied measurement was not replayed")
+        })?;
+        let restored_checkpoint_epoch_j2000_s = checkpoint.t_j2000_s;
+        let current_epoch_j2000_s = working.state.nominal.t_j2000_s;
+        *self = working;
+        Ok(TimeSyncUpdate {
+            update,
+            late_measurement: true,
+            replayed_imu_segments,
+            restored_checkpoint_epoch_j2000_s,
+            current_epoch_j2000_s,
+        })
+    }
+
+    fn apply_late_tight_update(
+        &mut self,
+        source: &dyn crate::observables::ObservableEphemerisSource,
+        epoch: &TightGnssEpoch,
+        original_current_t_j2000_s: f64,
+    ) -> Result<TimeSyncUpdate, FusionError> {
+        let original_history = self.time_sync.clone();
+        let checkpoint = original_history
+            .checkpoint_at_or_before(epoch.t_j2000_s)
+            .ok_or_else(|| invalid_input("t_j2000_s", "outside retained checkpoint history"))?
+            .clone();
+        let mut replay_measurements = original_history.measurements_after(checkpoint.t_j2000_s);
+        if replay_measurements
+            .iter()
+            .any(|r| r.measurement.epoch() == epoch.t_j2000_s)
+        {
+            return Err(invalid_input(
+                "t_j2000_s",
+                "duplicate GNSS measurement epoch in late replay",
+            ));
+        }
+        let new_order = replay_measurements.len();
+        replay_measurements.push(ReplayMeasurement {
+            measurement: StoredGnssMeasurement::Tight(epoch.clone()),
+            order: new_order,
+            is_new: true,
+        });
+        replay_measurements.sort_by(|a, b| {
+            a.measurement
+                .epoch()
+                .total_cmp(&b.measurement.epoch())
+                .then_with(|| a.order.cmp(&b.order))
+                .then_with(|| a.is_new.cmp(&b.is_new))
+        });
+
+        let mut working = self.clone();
+        working.restore_snapshot(&checkpoint.snapshot)?;
+        working.time_sync = original_history.rebase_through_checkpoint(checkpoint.t_j2000_s);
+
+        let mut replayed_imu_segments = 0usize;
+        let mut supplied_update = None;
+        for replay in replay_measurements {
+            replayed_imu_segments +=
+                working.replay_imu_to_epoch(replay.measurement.epoch(), &original_history)?;
+            let update = match &replay.measurement {
+                StoredGnssMeasurement::Loose(measurement) => {
+                    working.update_loose_core(measurement)?
+                }
+                StoredGnssMeasurement::Tight(measurement) => {
+                    working.update_tight_core(source, measurement)?
+                }
+            };
+            let snapshot = working.snapshot();
+            working
+                .time_sync
+                .push_stored_measurement_and_checkpoint(replay.measurement.clone(), snapshot);
             if replay.is_new {
                 supplied_update = Some(update);
             }
@@ -596,8 +746,23 @@ struct StoredCheckpoint {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+enum StoredGnssMeasurement {
+    Loose(GnssFixMeasurement),
+    Tight(TightGnssEpoch),
+}
+
+impl StoredGnssMeasurement {
+    fn epoch(&self) -> f64 {
+        match self {
+            Self::Loose(measurement) => measurement.t_j2000_s,
+            Self::Tight(epoch) => epoch.t_j2000_s,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ReplayMeasurement {
-    measurement: GnssFixMeasurement,
+    measurement: StoredGnssMeasurement,
     order: usize,
     is_new: bool,
 }
