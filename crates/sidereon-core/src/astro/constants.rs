@@ -107,6 +107,14 @@ pub mod earth {
     pub const OMEGA_E_DOT_RAD_S: f64 = 7.292_115_146_7e-5;
     /// Earth's J2 coefficient used by the core force models.
     pub const J2_EARTH: f64 = 1.082_626_68e-3;
+    /// Earth's J3 unnormalized zonal coefficient from EGM96.
+    pub const J3_EARTH: f64 = -2.532_656_485_332_235_5e-6;
+    /// Earth's J4 unnormalized zonal coefficient from EGM96.
+    pub const J4_EARTH: f64 = -1.619_621_591_367e-6;
+    /// Earth's J5 unnormalized zonal coefficient from EGM96.
+    pub const J5_EARTH: f64 = -2.272_960_828_686_982e-7;
+    /// Earth's J6 unnormalized zonal coefficient from EGM96.
+    pub const J6_EARTH: f64 = 5.406_812_391_070_848e-7;
 }
 
 /// Universal physical constants.
@@ -114,6 +122,8 @@ pub mod physics {
     /// Speed of light in vacuum (m/s), exact by SI definition (and the value
     /// IS-GPS-200 fixes for GNSS ranging).
     pub const SPEED_OF_LIGHT_M_S: f64 = 299_792_458.0;
+    /// Speed of light in vacuum (km/s), exact SI value converted to kilometers.
+    pub const SPEED_OF_LIGHT_KM_S: f64 = SPEED_OF_LIGHT_M_S / 1_000.0;
 }
 
 /// Astronomical constants.
@@ -124,6 +134,10 @@ pub mod astro {
     pub const AU_M: f64 = AU_KM * 1_000.0;
     /// Solar gravitational parameter (km^3/s^2), IAU 2015 Resolution B3.
     pub const GM_SUN_KM3_S2: f64 = 132_712_440_041.939_38;
+    /// Lunar gravitational parameter (km^3/s^2), DE/IAU conventional value.
+    pub const GM_MOON_KM3_S2: f64 = 4_902.800_066;
+    /// Solar radiation pressure at 1 AU (N/m^2), the cannonball SRP convention.
+    pub const SOLAR_RADIATION_PRESSURE_N_M2: f64 = 4.56e-6;
     /// AU value used by the Montenbruck-Gill analytic Sun/Moon series.
     pub const MONTENBRUCK_AU_M: f64 = 149_597_870_691.0;
     /// Solar photosphere radius (km), used by conical eclipse-shadow geometry.
@@ -191,3 +205,11 @@ pub const MU_EARTH: f64 = earth::GM_EARTH_KM3_S2;
 pub const RE_EARTH: f64 = earth::WGS84_A_KM;
 /// Earth J2 zonal harmonic for the gravity model.
 pub const J2_EARTH: f64 = earth::J2_EARTH;
+/// Earth J3 zonal harmonic for the gravity model.
+pub const J3_EARTH: f64 = earth::J3_EARTH;
+/// Earth J4 zonal harmonic for the gravity model.
+pub const J4_EARTH: f64 = earth::J4_EARTH;
+/// Earth J5 zonal harmonic for the gravity model.
+pub const J5_EARTH: f64 = earth::J5_EARTH;
+/// Earth J6 zonal harmonic for the gravity model.
+pub const J6_EARTH: f64 = earth::J6_EARTH;

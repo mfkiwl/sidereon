@@ -176,6 +176,11 @@ use std::path::Path;
 
 // Re-export core domain modules whose public helpers are intentionally part of
 // the ergonomic crate surface.
+pub use sidereon_core::astro::forces::{
+    SchwarzschildRelativity, SolarRadiationPressure, ThirdBodyBodies, ThirdBodyGravity,
+    ZonalCoefficients, ZonalDegrees, ZonalGravity,
+};
+pub use sidereon_core::astro::propagator::{ForceModelComponents, ForceModelKind};
 pub use sidereon_core::geometry_quality::{
     classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
 };
