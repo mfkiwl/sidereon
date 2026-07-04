@@ -255,6 +255,13 @@ fn correct_rate_vector(
     Ok(mul_vec3(&inverse, sub3(measured, bias)))
 }
 
+pub(crate) fn apply_calibration_error_vector(
+    value: [f64; 3],
+    scale_misalignment: &Mat3,
+) -> [f64; 3] {
+    mul_vec3(&identity_plus(scale_misalignment), value)
+}
+
 fn identity_plus(m: &Mat3) -> Mat3 {
     [
         [1.0 + m[0][0], m[0][1], m[0][2]],

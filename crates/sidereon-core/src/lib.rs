@@ -196,10 +196,13 @@ pub use geoid::{
 pub use id::{GnssSatelliteId, GnssSystem, SatelliteIdError};
 pub use inertial::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
-    mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, AttitudeQuaternion, ConingCorrection,
-    CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuGrade, ImuSample,
-    ImuSampleKind, ImuSpec, InertialError, MechanizationConfig, NavState, StrapdownMechanizer,
-    WGS84_NORMAL_GRAVITY_EQUATOR_MPS2, WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
+    mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, simulate_imu_samples,
+    simulate_imu_samples_from_increments, true_imu_increment_between, AttitudeQuaternion,
+    ConingCorrection, CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuGrade,
+    ImuRateRandomWalk, ImuSample, ImuSampleKind, ImuSimulationOptions, ImuSimulationOutput,
+    ImuSimulator, ImuSpec, InertialError, MechanizationConfig, NavState, SimulatedImuSequence,
+    StrapdownMechanizer, DEFAULT_IMU_SIM_SEED, WGS84_NORMAL_GRAVITY_EQUATOR_MPS2,
+    WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
 };
 pub use observables::{
     observable_media_corrections, predict_batch_with_media, predict_batch_with_media_parallel,
