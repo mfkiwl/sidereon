@@ -29,11 +29,11 @@ pub use crate::rinex_nav::{
     NavMessagePreference,
 };
 pub use crate::sp3::{
-    align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
-    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport,
-    PreciseEphemerisInterpolant, PreciseEphemerisSample, PreciseEphemerisSamples,
-    PreciseInterpolantError, PreciseSamplesError, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State,
-    Sp3TimeSystem, Sp3Version,
+    align_clock_reference, clock_reference_offset, compare_position_series, merge, AgreementMetric,
+    ClockReferenceOffset, EpochAgreement, InterpolationComparison, InterpolationDivergence,
+    MergeCombine, MergeFlag, MergeOptions, MergeReport, PreciseEphemerisInterpolant,
+    PreciseEphemerisSample, PreciseEphemerisSamples, PreciseInterpolantError, PreciseSamplesError,
+    ReferenceState, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State, Sp3TimeSystem, Sp3Version,
 };
 pub use crate::spp::EphemerisSource;
 use crate::{validate, GnssSatelliteId, GnssSystem};

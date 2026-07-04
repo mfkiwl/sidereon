@@ -616,12 +616,21 @@ pub struct RangePrediction {
 /// Predict geometric ranges for many `(satellite, receiver, epoch)` requests in
 /// one call, writing into a caller-provided `out` slice.
 ///
-/// `out[i]` is filled from `requests[i]` using the same per-request
-/// [`transmit_time_satellite_state`] machinery (light-time iteration + Sagnac
-/// transport), so the batch is bit-identical to calling that predictor in a loop
-/// and projecting the geometry fields; this is amortization of the call boundary
-/// only, not a different algorithm. `options.carrier_hz` is unused (ranges carry
-/// no Doppler); `options.light_time` / `options.sagnac` are honored.
+/// `out[i]` is filled from `requests[i]` by the range-only transmit-time kernel
+/// [`range_prediction_at_rx`]: the same light-time iteration and Sagnac transport
+/// as [`transmit_time_satellite_state`], projected to the range geometry. It is
+/// therefore bit-identical to calling that predictor in a loop and reading its
+/// geometry fields, and the whole batch is one native call over the array (no
+/// per-request host-language dispatch).
+///
+/// Internally this is the vectorized hot path: it drops the finite-difference
+/// **velocity** evaluation that [`transmit_time_satellite_state`] performs and
+/// that a range consumer never uses, cutting the per-request ephemeris
+/// evaluations by a third (from 6 to 4), and writes each result in a single pass
+/// over `out`. The range values are unchanged to the bit, because the velocity
+/// term never entered a [`RangePrediction`]; only the discarded work is removed.
+/// `options.carrier_hz` is unused (ranges carry no Doppler);
+/// `options.light_time` / `options.sagnac` are honored.
 ///
 /// Errors:
 /// - [`ObservablesError::InvalidInput`] with field `out` if `out.len()` differs
@@ -640,26 +649,45 @@ pub fn predict_ranges(
             kind: ObservablesInputErrorKind::OutOfRange,
         });
     }
-    let tt_options = TransmitTimeOptions {
-        light_time: options.light_time,
-        sagnac: options.sagnac,
-    };
     for (request, slot) in requests.iter().zip(out.iter_mut()) {
-        let state = transmit_time_satellite_state(
+        *slot = range_prediction_at_rx(
             source,
             request.sat,
             request.receiver_ecef_m,
             request.t_rx_j2000_s,
-            tt_options,
+            options,
         )?;
-        *slot = RangePrediction {
-            geometric_range_m: state.geometric_range_m,
-            sat_clock_s: state.clock_s,
-            transmit_time_j2000_s: state.transmit_time_j2000_s,
-            sat_pos_ecef_m: state.position_ecef_m,
-        };
     }
     Ok(())
+}
+
+/// Range-only transmit-time kernel: iterate light time / Sagnac to the geometric
+/// range at receive epoch `t_rx_j2000_s` and project just the [`RangePrediction`]
+/// geometry.
+///
+/// This is [`transmit_time_satellite_state`] with the finite-difference velocity
+/// (and its two extra ephemeris evaluations) removed, since a range prediction
+/// never carries velocity. Every returned field is bit-identical to the
+/// corresponding field of `transmit_time_satellite_state` for the same inputs.
+fn range_prediction_at_rx(
+    source: &dyn ObservableEphemerisSource,
+    sat: GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    options: PredictOptions,
+) -> Result<RangePrediction, ObservablesError> {
+    validate_transmit_time_inputs(receiver_ecef_m, t_rx_j2000_s)?;
+    let solved = solve_transmit_time(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
+    let dx = solved.sat_rot_ecef_m[0] - receiver_ecef_m[0];
+    let dy = solved.sat_rot_ecef_m[1] - receiver_ecef_m[1];
+    let dz = solved.sat_rot_ecef_m[2] - receiver_ecef_m[2];
+    let range = geometric_range_m([dx, dy, dz])?;
+    Ok(RangePrediction {
+        geometric_range_m: range,
+        sat_clock_s: solved.state.clock_s,
+        transmit_time_j2000_s: solved.transmit_time_j2000_s,
+        sat_pos_ecef_m: solved.sat_rot_ecef_m,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -963,6 +991,69 @@ mod public_api_tests {
             assert_eq!(
                 got.sat_pos_ecef_m.map(f64::to_bits),
                 single.position_ecef_m.map(f64::to_bits)
+            );
+        }
+    }
+
+    #[test]
+    fn predict_ranges_batch_matches_scalar_calls_bitwise() {
+        // Item 3: the vectorized batch kernel must be byte-identical to solving
+        // each request in its own one-element call (no cross-request state).
+        let source = StaticSource {
+            state: ObservableState {
+                position_ecef_m: [20_200_000.0, 14_000_000.0, 21_700_000.0],
+                clock_s: Some(1.25e-6),
+            },
+        };
+        let options = PredictOptions::default();
+        let sat1 = GnssSatelliteId::new(GnssSystem::Gps, 21).expect("valid satellite id");
+        let sat2 = GnssSatelliteId::new(GnssSystem::Gps, 7).expect("valid satellite id");
+        let requests = [
+            RangePredictionRequest {
+                sat: sat1,
+                receiver_ecef_m: [4_027_894.0, 307_046.0, 4_919_474.0],
+                t_rx_j2000_s: 646_272_000.0,
+            },
+            RangePredictionRequest {
+                sat: sat2,
+                receiver_ecef_m: [1_130_000.0, -4_830_000.0, 3_994_000.0],
+                t_rx_j2000_s: 646_272_060.0,
+            },
+            RangePredictionRequest {
+                sat: sat1,
+                receiver_ecef_m: [-2_700_000.0, -4_290_000.0, 3_855_000.0],
+                t_rx_j2000_s: 646_272_120.0,
+            },
+        ];
+        let zero = RangePrediction {
+            geometric_range_m: 0.0,
+            sat_clock_s: None,
+            transmit_time_j2000_s: 0.0,
+            sat_pos_ecef_m: [0.0; 3],
+        };
+
+        let mut batch = [zero; 3];
+        predict_ranges(&source, &requests, options, &mut batch).expect("batch ranges");
+
+        for (i, request) in requests.iter().enumerate() {
+            let mut single = [zero; 1];
+            predict_ranges(&source, std::slice::from_ref(request), options, &mut single)
+                .expect("single range");
+            assert_eq!(
+                batch[i].geometric_range_m.to_bits(),
+                single[0].geometric_range_m.to_bits()
+            );
+            assert_eq!(
+                batch[i].transmit_time_j2000_s.to_bits(),
+                single[0].transmit_time_j2000_s.to_bits()
+            );
+            assert_eq!(
+                batch[i].sat_clock_s.map(f64::to_bits),
+                single[0].sat_clock_s.map(f64::to_bits)
+            );
+            assert_eq!(
+                batch[i].sat_pos_ecef_m.map(f64::to_bits),
+                single[0].sat_pos_ecef_m.map(f64::to_bits)
             );
         }
     }
