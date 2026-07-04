@@ -307,7 +307,7 @@ pub use sidereon_core::astro::sgp4::{Loss, XScale};
 pub use sidereon_core::astro::space_weather::{
     ObservationClass, SpaceWeatherPolicy, SpaceWeatherSample, SpaceWeatherTable,
 };
-pub use sidereon_core::astro::{passes, propagator, sgp4, space_weather, state, tca, tle};
+pub use sidereon_core::astro::{omm, passes, propagator, sgp4, space_weather, state, tca, tle};
 
 /// Root-level shortcut for satellite-relative frames and CW propagation.
 ///

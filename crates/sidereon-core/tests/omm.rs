@@ -46,6 +46,9 @@ const FIXTURES: &[Fixture] = &[
     },
 ];
 
+const ISS_CSV: &str = "OBJECT_NAME,OBJECT_ID,EPOCH,MEAN_MOTION,ECCENTRICITY,INCLINATION,RA_OF_ASC_NODE,ARG_OF_PERICENTER,MEAN_ANOMALY,EPHEMERIS_TYPE,CLASSIFICATION_TYPE,NORAD_CAT_ID,ELEMENT_SET_NO,REV_AT_EPOCH,BSTAR,MEAN_MOTION_DOT,MEAN_MOTION_DDOT\n\
+ISS (ZARYA),1998-067A,2026-06-17T04:32:52.099296,15.49273435,0.0004737,51.6332,300.0813,195.1146,164.9702,0,U,25544,999,57175,0.00017172,9.113e-5,0";
+
 /// Pull the two element lines out of a CelesTrak `.tle` file (a name line plus
 /// the two element lines, with CRLF endings).
 fn tle_lines(body: &str) -> (String, String) {
@@ -169,4 +172,49 @@ fn omm_json_matches_other_encodings_and_drives_sgp4_to_0_ulp() {
             Satellite::from_omm(&json).unwrap_or_else(|e| panic!("{} JSON: {e}", fix.name));
         assert_bit_identical(&format!("{} [JSON]", fix.name), &from_omm, &from_tle);
     }
+}
+
+#[test]
+fn gp_csv_matches_json_and_drives_sgp4_to_0_ulp() {
+    let fix = &FIXTURES[0];
+    let csv = omm::parse_csv(ISS_CSV).expect("ISS GP CSV parses");
+    let json = omm::parse_json(fix.json).expect("ISS GP JSON parses");
+    assert_eq!(
+        canonical(&csv),
+        canonical(&json),
+        "CSV and JSON disagree on orbital content",
+    );
+
+    let (l1, l2) = tle_lines(fix.tle);
+    let from_tle = Satellite::from_tle(&l1, &l2).expect("ISS TLE initializes");
+    let from_csv = Satellite::from_omm(&csv).expect("ISS GP CSV initializes");
+    assert_bit_identical("ISS (ZARYA) [CSV]", &from_csv, &from_tle);
+
+    let elements = csv.to_element_set().expect("CSV converts to element set");
+    let tle_elements = sidereon_core::astro::tle::parse(&l1, &l2)
+        .expect("ISS TLE parses")
+        .elements
+        .to_element_set()
+        .expect("ISS TLE converts to element set");
+    assert_eq!(elements.catalog_number, tle_elements.catalog_number);
+    assert_eq!(
+        elements.mean_motion_rev_per_day,
+        tle_elements.mean_motion_rev_per_day
+    );
+    assert_eq!(elements.eccentricity, tle_elements.eccentricity);
+    assert_eq!(elements.inclination_deg, tle_elements.inclination_deg);
+    assert_eq!(
+        elements.right_ascension_deg,
+        tle_elements.right_ascension_deg
+    );
+    assert_eq!(
+        elements.argument_of_perigee_deg,
+        tle_elements.argument_of_perigee_deg
+    );
+    assert_eq!(elements.mean_anomaly_deg, tle_elements.mean_anomaly_deg);
+    assert_eq!(elements.bstar.to_bits(), tle_elements.bstar.to_bits());
+    assert_eq!(
+        elements.mean_motion_double_dot.to_bits(),
+        tle_elements.mean_motion_double_dot.to_bits()
+    );
 }

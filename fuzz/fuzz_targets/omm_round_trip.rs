@@ -26,4 +26,11 @@ fuzz_target!(|data: &[u8]| {
             omm::parse_json(&omm::encode_json(&original)).expect("encoded OMM JSON must reparse");
         assert_eq!(reparsed, original);
     }
+
+    if let Ok(original) = omm::parse_csv_array(&text) {
+        let reparsed = omm::parse_csv_array(&omm::encode_csv(&original.omms))
+            .expect("encoded OMM CSV must reparse");
+        assert_eq!(reparsed.omms, original.omms);
+        assert_eq!(reparsed.skipped, 0);
+    }
 });

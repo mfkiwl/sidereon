@@ -26,7 +26,7 @@ const ISS_L1_BAD_CHECKSUM: &str =
 #[test]
 fn iss_round_trip_fixture_self_validates() {
     let parsed = parse(ISS_L1, ISS_L2).expect("committed ISS TLE parses");
-    let (l1, l2) = encode(&parsed.elements);
+    let (l1, l2) = encode(&parsed.elements).expect("committed ISS TLE encodes");
 
     // Character-exact round-trip regression lock.
     assert_eq!(l1, ISS_L1);
@@ -53,7 +53,7 @@ fn dump_fixture() {
 
     let parsed = parse(ISS_L1, ISS_L2).expect("dump: ISS TLE parses");
     let el = &parsed.elements;
-    let (l1, l2) = encode(el);
+    let (l1, l2) = encode(el).expect("dump: ISS TLE encodes");
     let bad = parse(ISS_L1_BAD_CHECKSUM, ISS_L2).expect("dump: bad-checksum TLE parses");
 
     let warnings: Vec<_> = bad

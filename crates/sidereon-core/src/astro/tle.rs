@@ -72,6 +72,14 @@ const CATALOG_WIDTH: usize = 5;
 const INTL_DESIGNATOR_WIDTH: usize = 8;
 /// Width of the two-digit epoch year field.
 const EPOCH_YEAR_WIDTH: usize = 2;
+/// Highest catalog number that can be represented in a legacy TLE field.
+pub const MAX_TLE_CATALOG_NUMBER: u32 = 339_999;
+/// Highest catalog number that remains a five-digit numeric TLE field.
+pub const MAX_NUMERIC_TLE_CATALOG_NUMBER: u32 = 99_999;
+/// Alpha-5 leading letters, in their published numeric order.
+const ALPHA5_LETTERS: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+/// Number of numeric suffix slots under each Alpha-5 leading letter.
+const ALPHA5_SUFFIX_MODULUS: u32 = 10_000;
 
 /// Parsed TLE orbital elements in canonical astrodynamic units.
 ///
@@ -80,6 +88,12 @@ const EPOCH_YEAR_WIDTH: usize = 2;
 /// calendar `epoch_year` plus the one-based fractional `epoch_day_of_year`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TleElements {
+    /// Catalog number as it appeared at the format boundary.
+    ///
+    /// Numeric TLE fields keep their five-character representation (for
+    /// example, `"00005"`), and Alpha-5 fields keep their letter-plus-four-digit
+    /// representation (for example, `"A0000"`). Use
+    /// [`decode_catalog_number`] to obtain the numeric catalog id.
     pub catalog_number: String,
     pub classification: String,
     pub international_designator: String,
@@ -116,9 +130,9 @@ impl TleElements {
     /// precisely so they equal the `mantissa * 10^exp` product the element-set
     /// initializer expects; they too pass through unchanged.
     ///
-    /// The catalog number is parsed to the numeric form `ElementSet` carries; it
-    /// is used only for SGP4 diagnostics and does not affect propagation, so a
-    /// non-numeric (Alpha-5) catalog falls back to `0`.
+    /// The catalog number is decoded to the numeric form `ElementSet` carries.
+    /// It is used only for SGP4 diagnostics and does not affect propagation, but
+    /// it must still survive the TLE bridge without silent loss.
     pub fn to_element_set(&self) -> Result<ElementSet, TleError> {
         validate_tle_bridge(self)?;
         Ok(ElementSet {
@@ -132,7 +146,7 @@ impl TleElements {
             mean_anomaly_deg: self.mean_anomaly_deg,
             mean_motion_rev_per_day: self.mean_motion,
             right_ascension_deg: self.raan_deg,
-            catalog_number: self.catalog_number.trim().parse().unwrap_or(0),
+            catalog_number: decode_catalog_number(&self.catalog_number)?,
         })
     }
 }
@@ -159,13 +173,32 @@ pub struct ParsedTle {
 /// Failure modes of [`parse`]. Messages mirror the historical reference strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TleError {
+    /// A TLE line contained a non-ASCII character.
     NonAscii,
+    /// A line failed fixed-width TLE grammar validation.
     Format,
+    /// The catalog-number fields in line 1 and line 2 differed.
     SatelliteMismatch,
-    InvalidField {
-        field: &'static str,
+    /// The five-character catalog field was neither numeric nor valid Alpha-5.
+    InvalidCatalogNumber {
+        /// The rejected catalog field.
+        value: String,
+        /// The validation reason.
         reason: &'static str,
     },
+    /// The catalog id is outside the range representable by TLE or Alpha-5.
+    CatalogNumberOutOfRange {
+        /// The rejected numeric catalog id.
+        catalog_number: u32,
+    },
+    /// A decoded scalar field failed boundary validation.
+    InvalidField {
+        /// Field name.
+        field: &'static str,
+        /// Validation reason.
+        reason: &'static str,
+    },
+    /// A scalar field could not be parsed.
     Field(String),
 }
 
@@ -180,6 +213,13 @@ impl fmt::Display for TleError {
             TleError::SatelliteMismatch => {
                 write!(f, "Satellite numbers in lines 1 and 2 do not match")
             }
+            TleError::InvalidCatalogNumber { value, reason } => {
+                write!(f, "TLE invalid catalog number {value:?}: {reason}")
+            }
+            TleError::CatalogNumberOutOfRange { catalog_number } => write!(
+                f,
+                "TLE catalog number {catalog_number} cannot be encoded in a five-character field"
+            ),
             TleError::InvalidField { field, reason } => {
                 write!(f, "TLE invalid field {field}: {reason}")
             }
@@ -236,13 +276,92 @@ pub fn parse(line1: &str, line2: &str) -> Result<ParsedTle, TleError> {
     })
 }
 
+/// Encode a numeric catalog id into its five-character TLE catalog field.
+///
+/// Values `0..=99999` encode as five decimal digits. Values
+/// `100000..=339999` encode with Alpha-5, where the first character carries the
+/// ten-thousands digit group and the four trailing characters carry the
+/// remainder. Larger values return [`TleError::CatalogNumberOutOfRange`] because
+/// the TLE field has no representation for them.
+pub fn encode_catalog_number(catalog_number: u32) -> Result<String, TleError> {
+    if catalog_number <= MAX_NUMERIC_TLE_CATALOG_NUMBER {
+        return Ok(format!("{catalog_number:05}"));
+    }
+    if catalog_number > MAX_TLE_CATALOG_NUMBER {
+        return Err(TleError::CatalogNumberOutOfRange { catalog_number });
+    }
+
+    let prefix = catalog_number / ALPHA5_SUFFIX_MODULUS;
+    let suffix = catalog_number % ALPHA5_SUFFIX_MODULUS;
+    let letter = alpha5_letter_for_value(prefix)
+        .ok_or(TleError::CatalogNumberOutOfRange { catalog_number })?;
+    Ok(format!("{letter}{suffix:04}"))
+}
+
+/// Decode a five-character TLE catalog field into its numeric catalog id.
+///
+/// Plain numeric fields decode directly. Alpha-5 fields decode by the published
+/// `letter_value * 10000 + suffix` rule, with letters `I` and `O` rejected.
+pub fn decode_catalog_number(field: &str) -> Result<u32, TleError> {
+    let field = field.trim();
+    if field.is_empty() {
+        return Err(TleError::InvalidCatalogNumber {
+            value: field.to_string(),
+            reason: "empty field",
+        });
+    }
+
+    if field.bytes().all(|b| b.is_ascii_digit()) {
+        if field.len() > CATALOG_WIDTH {
+            return Err(TleError::InvalidCatalogNumber {
+                value: field.to_string(),
+                reason: "numeric TLE field is wider than five digits",
+            });
+        }
+        return field
+            .parse::<u32>()
+            .map_err(|_| TleError::InvalidCatalogNumber {
+                value: field.to_string(),
+                reason: "invalid numeric field",
+            });
+    }
+
+    if field.len() != CATALOG_WIDTH {
+        return Err(TleError::InvalidCatalogNumber {
+            value: field.to_string(),
+            reason: "Alpha-5 field must be one letter followed by four digits",
+        });
+    }
+
+    let mut chars = field.chars();
+    let letter = chars.next().expect("non-empty field");
+    let prefix = alpha5_value_for_letter(letter).ok_or_else(|| TleError::InvalidCatalogNumber {
+        value: field.to_string(),
+        reason: "invalid Alpha-5 leading letter",
+    })?;
+    let suffix = chars.as_str();
+    if !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(TleError::InvalidCatalogNumber {
+            value: field.to_string(),
+            reason: "Alpha-5 suffix must be four digits",
+        });
+    }
+    let suffix = suffix
+        .parse::<u32>()
+        .map_err(|_| TleError::InvalidCatalogNumber {
+            value: field.to_string(),
+            reason: "invalid Alpha-5 suffix",
+        })?;
+    Ok(prefix * ALPHA5_SUFFIX_MODULUS + suffix)
+}
+
 /// Encode [`TleElements`] as the two 69-character TLE lines (with checksums).
 ///
 /// The caller is responsible for supplying normalized field values (defaults
 /// applied, widths validated); this function performs the fixed-width formatting,
 /// assumed-decimal encoding, and checksum generation.
-pub fn encode(el: &TleElements) -> (String, String) {
-    let cat = pad_leading(el.catalog_number.trim(), CATALOG_WIDTH);
+pub fn encode(el: &TleElements) -> Result<(String, String), TleError> {
+    let cat = encode_catalog_number_text(&el.catalog_number)?;
     let cls = &el.classification;
     let intl = pad_trailing(&el.international_designator, INTL_DESIGNATOR_WIDTH);
 
@@ -271,7 +390,7 @@ pub fn encode(el: &TleElements) -> (String, String) {
     );
     let line2 = pad_and_checksum(&l2_body);
 
-    (line1, line2)
+    Ok((line1, line2))
 }
 
 // -- Parsing internals --
@@ -351,6 +470,9 @@ const LINE2_POSITIONS: [(usize, char); 10] = [
 ];
 
 fn extract_fields(line1: &str, line2: &str) -> Result<TleElements, TleError> {
+    let catalog_number = slice_inclusive(line1, 2, 6).trim().to_string();
+    decode_catalog_number(&catalog_number)?;
+
     let two_digit_year = parse_int(slice_inclusive(line1, 18, 19).trim())?;
     let epoch_year = if two_digit_year < YEAR_PIVOT {
         2000 + two_digit_year
@@ -359,7 +481,7 @@ fn extract_fields(line1: &str, line2: &str) -> Result<TleElements, TleError> {
     };
 
     Ok(TleElements {
-        catalog_number: slice_inclusive(line1, 2, 6).trim().to_string(),
+        catalog_number,
         classification: char_at(line1, 7).unwrap_or('U').to_string(),
         international_designator: slice_inclusive(line1, 9, 16).trim_end().to_string(),
         epoch_year,
@@ -520,6 +642,37 @@ fn char_at(s: &str, index: usize) -> Option<char> {
     s.as_bytes().get(index).map(|&b| b as char)
 }
 
+fn alpha5_value_for_letter(letter: char) -> Option<u32> {
+    ALPHA5_LETTERS
+        .chars()
+        .position(|candidate| candidate == letter)
+        .map(|index| 10 + index as u32)
+}
+
+fn alpha5_letter_for_value(value: u32) -> Option<char> {
+    if value < 10 {
+        return None;
+    }
+    ALPHA5_LETTERS.chars().nth((value - 10) as usize)
+}
+
+fn encode_catalog_number_text(text: &str) -> Result<String, TleError> {
+    let trimmed = text.trim();
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let catalog_number =
+            trimmed
+                .parse::<u32>()
+                .map_err(|_| TleError::InvalidCatalogNumber {
+                    value: trimmed.to_string(),
+                    reason: "invalid numeric field",
+                })?;
+        encode_catalog_number(catalog_number)
+    } else {
+        let catalog_number = decode_catalog_number(trimmed)?;
+        encode_catalog_number(catalog_number)
+    }
+}
+
 /// Quantize a value onto the TLE "assumed decimal" grid (five significant
 /// mantissa digits and a power-of-ten exponent) and decode it back, yielding the
 /// exact `f64` SGP4 receives when the same quantity is carried through a TLE.
@@ -677,9 +830,70 @@ mod tests {
     #[test]
     fn round_trips_iss_character_exact() {
         let parsed = parse(ISS_L1, ISS_L2).unwrap();
-        let (l1, l2) = encode(&parsed.elements);
+        let (l1, l2) = encode(&parsed.elements).unwrap();
         assert_eq!(l1, ISS_L1);
         assert_eq!(l2, ISS_L2);
+    }
+
+    #[test]
+    fn alpha5_catalog_examples_match_published_table() {
+        for (field, value) in [
+            ("A0000", 100_000),
+            ("E8493", 148_493),
+            ("H6932", 176_932),
+            ("J2931", 182_931),
+            ("P4018", 234_018),
+            ("W1928", 301_928),
+            ("Z9999", 339_999),
+        ] {
+            assert_eq!(decode_catalog_number(field), Ok(value));
+            assert_eq!(encode_catalog_number(value), Ok(field.to_string()));
+        }
+    }
+
+    #[test]
+    fn alpha5_catalog_round_trips_exhaustive_letter_alphabet() {
+        for letter in ALPHA5_LETTERS.chars() {
+            for suffix in [0, 1, 9998, 9999] {
+                let field = format!("{letter}{suffix:04}");
+                let value = decode_catalog_number(&field).unwrap();
+                assert_eq!(encode_catalog_number(value).unwrap(), field);
+            }
+        }
+        assert!(decode_catalog_number("I0000").is_err());
+        assert!(decode_catalog_number("O0000").is_err());
+        assert!(decode_catalog_number("a0000").is_err());
+    }
+
+    #[test]
+    fn alpha5_tle_bridge_preserves_numeric_catalog_id() {
+        let parsed = parse(ISS_L1, ISS_L2).unwrap();
+        let mut el = parsed.elements;
+        el.catalog_number = "A0000".to_string();
+
+        let (line1, line2) = encode(&el).unwrap();
+        assert_eq!(slice_inclusive(&line1, 2, 6), "A0000");
+        assert_eq!(slice_inclusive(&line2, 2, 6), "A0000");
+
+        let parsed = parse(&line1, &line2).unwrap();
+        assert_eq!(parsed.elements.catalog_number, "A0000");
+        assert_eq!(
+            parsed.elements.to_element_set().unwrap().catalog_number,
+            100_000
+        );
+    }
+
+    #[test]
+    fn tle_encode_rejects_catalog_numbers_outside_alpha5_range() {
+        let parsed = parse(ISS_L1, ISS_L2).unwrap();
+        let mut el = parsed.elements;
+        el.catalog_number = "340000".to_string();
+        assert_eq!(
+            encode(&el),
+            Err(TleError::CatalogNumberOutOfRange {
+                catalog_number: 340_000
+            })
+        );
     }
 
     #[test]
@@ -761,7 +975,7 @@ mod tests {
         el.mean_motion_double_dot = 9.999996e-5;
         el.bstar = 9.999996e-5;
 
-        let (line1, line2) = encode(&el);
+        let (line1, line2) = encode(&el).unwrap();
         assert_eq!(slice_inclusive(&line1, 44, 51), " 10000-3");
         assert_eq!(slice_inclusive(&line1, 53, 60), " 10000-3");
 
@@ -769,7 +983,7 @@ mod tests {
         assert_eq!(parsed.mean_motion_double_dot, 1.0e-4);
         assert_eq!(parsed.bstar, 1.0e-4);
 
-        let (round_trip_line1, round_trip_line2) = encode(&parsed);
+        let (round_trip_line1, round_trip_line2) = encode(&parsed).unwrap();
         assert_eq!(round_trip_line1, line1);
         assert_eq!(round_trip_line2, line2);
     }

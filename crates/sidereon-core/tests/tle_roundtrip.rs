@@ -35,7 +35,7 @@ fn iss_round_trips_character_exact() {
     let l1 = "1 25544U 98067A   18184.80969102  .00001614  00000-0  31745-4 0  9993";
     let l2 = "2 25544  51.6414 295.8524 0003435 262.6267 204.2868 15.54005638121106";
     let parsed = tle::parse(l1, l2).unwrap();
-    let (gen_l1, gen_l2) = tle::encode(&parsed.elements);
+    let (gen_l1, gen_l2) = tle::encode(&parsed.elements).unwrap();
     assert_eq!(gen_l1, l1);
     assert_eq!(gen_l2, l2);
 }
@@ -51,7 +51,7 @@ fn all_stations_round_trip() {
 
     for (l1, l2) in pairs {
         let parsed = tle::parse(&l1, &l2).unwrap();
-        let (gen_l1, gen_l2) = tle::encode(&parsed.elements);
+        let (gen_l1, gen_l2) = tle::encode(&parsed.elements).unwrap();
 
         assert_eq!(
             gen_l2, l2,

@@ -65,6 +65,27 @@ const FIELD_TAGS: &[&str] = &[
     "MEAN_MOTION_DDOT",
 ];
 
+/// CSV columns emitted by the compact GP CSV writer.
+const GP_CSV_FIELDS: &[&str] = &[
+    "OBJECT_NAME",
+    "OBJECT_ID",
+    "EPOCH",
+    "MEAN_MOTION",
+    "ECCENTRICITY",
+    "INCLINATION",
+    "RA_OF_ASC_NODE",
+    "ARG_OF_PERICENTER",
+    "MEAN_ANOMALY",
+    "EPHEMERIS_TYPE",
+    "CLASSIFICATION_TYPE",
+    "NORAD_CAT_ID",
+    "ELEMENT_SET_NO",
+    "REV_AT_EPOCH",
+    "BSTAR",
+    "MEAN_MOTION_DOT",
+    "MEAN_MOTION_DDOT",
+];
+
 /// UTC calendar epoch as carried by an OMM, split into the components a KVN/XML
 /// `EPOCH` (or JSON `EPOCH`) string spells out. Stored as integers so the epoch
 /// re-encodes losslessly and converts directly to the SGP4 epoch.
@@ -551,6 +572,20 @@ pub fn encode_json(omm: &Omm) -> String {
     Value::Object(map).to_string()
 }
 
+/// Encode a slice of [`Omm`] records as a GP JSON array.
+///
+/// Each array member is the same object produced by [`encode_json`], preserving
+/// all scalar fields and optional metadata carried by [`Omm`].
+pub fn encode_json_array(omms: &[Omm]) -> String {
+    use serde_json::Value;
+
+    let values: Vec<Value> = omms
+        .iter()
+        .map(|omm| serde_json::from_str(&encode_json(omm)).expect("encoded OMM JSON object"))
+        .collect();
+    Value::Array(values).to_string()
+}
+
 /// Render a JSON scalar as the string the shared field mapping consumes. Numbers
 /// use their canonical decimal form; strings pass through; null becomes empty.
 fn json_scalar_to_string(value: &serde_json::Value) -> String {
@@ -564,16 +599,207 @@ fn json_scalar_to_string(value: &serde_json::Value) -> String {
     }
 }
 
+// ── CSV ──────────────────────────────────────────────────────────────
+
+/// Parse the first valid GP CSV record into an [`Omm`].
+///
+/// The input must begin with a header row of OMM keyword columns. Additional
+/// rows are accepted; malformed records are skipped by [`parse_csv_array`], and
+/// this function returns the first record that survives field validation.
+pub fn parse_csv(text: &str) -> Result<Omm, OmmError> {
+    let parsed = parse_csv_array(text)?;
+    parsed
+        .omms
+        .into_iter()
+        .next()
+        .ok_or_else(|| OmmError::Field("empty GP CSV".to_string()))
+}
+
+/// Parse all valid GP CSV records into [`Omm`] values.
+///
+/// Header names are the OMM keyword names used by GP CSV and JSON. Each record
+/// is mapped onto the same `(key, value)` field set used by KVN, XML, and JSON,
+/// so all encodings share one [`Omm`] intermediate representation. A bad data
+/// row increments [`OmmArray::skipped`] rather than aborting the whole file.
+pub fn parse_csv_array(text: &str) -> Result<OmmArray, OmmError> {
+    let records = parse_csv_records(text)?;
+    let Some((header, rows)) = records.split_first() else {
+        return Err(OmmError::Field("missing GP CSV header".to_string()));
+    };
+    let header: Vec<String> = header.iter().map(|key| key.trim().to_string()).collect();
+    if header.is_empty() || header.iter().all(String::is_empty) {
+        return Err(OmmError::Field("missing GP CSV header".to_string()));
+    }
+
+    let mut omms = Vec::with_capacity(rows.len());
+    let mut skipped = 0usize;
+    for row in rows {
+        if row.len() != header.len() {
+            skipped += 1;
+            continue;
+        }
+        let fields = header
+            .iter()
+            .zip(row.iter())
+            .map(|(key, value)| (key.clone(), value.trim().to_string()))
+            .collect();
+        let map = crate::format::kvn::FieldMap::from_pairs(fields);
+        match Omm::from_field_map(&map) {
+            Ok(omm) => omms.push(omm),
+            Err(_) => skipped += 1,
+        }
+    }
+
+    Ok(OmmArray { omms, skipped })
+}
+
+/// Encode [`Omm`] records as compact GP CSV.
+///
+/// The emitted header matches the common GP CSV/JSON keyword set. Numeric values
+/// use their shortest round-tripping decimal form, and fields containing CSV
+/// delimiters are quoted with standard double-quote escaping.
+pub fn encode_csv(omms: &[Omm]) -> String {
+    let mut out = String::new();
+    write_csv_record(&mut out, GP_CSV_FIELDS.iter().copied());
+    for omm in omms {
+        out.push('\n');
+        write_csv_record(
+            &mut out,
+            GP_CSV_FIELDS
+                .iter()
+                .map(|key| omm_csv_field_value(omm, key)),
+        );
+    }
+    out
+}
+
+fn parse_csv_records(text: &str) -> Result<Vec<Vec<String>>, OmmError> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut chars = text.chars().peekable();
+    let mut in_quotes = false;
+    let mut quoted_field = false;
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    field.push('"');
+                    chars.next();
+                }
+                '"' => in_quotes = false,
+                _ => field.push(ch),
+            }
+            continue;
+        }
+
+        match ch {
+            '"' if field.is_empty() && !quoted_field => {
+                in_quotes = true;
+                quoted_field = true;
+            }
+            ',' => {
+                record.push(std::mem::take(&mut field));
+                quoted_field = false;
+            }
+            '\n' => {
+                record.push(std::mem::take(&mut field));
+                push_csv_record(&mut records, &mut record);
+                quoted_field = false;
+            }
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' => {
+                record.push(std::mem::take(&mut field));
+                push_csv_record(&mut records, &mut record);
+                quoted_field = false;
+            }
+            _ => field.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(OmmError::Field(
+            "malformed GP CSV: unclosed quoted field".to_string(),
+        ));
+    }
+    if !field.is_empty() || !record.is_empty() || quoted_field {
+        record.push(field);
+        push_csv_record(&mut records, &mut record);
+    }
+
+    Ok(records)
+}
+
+fn push_csv_record(records: &mut Vec<Vec<String>>, record: &mut Vec<String>) {
+    if record.len() == 1 && record[0].is_empty() {
+        record.clear();
+        return;
+    }
+    records.push(std::mem::take(record));
+}
+
+fn write_csv_record<I, S>(out: &mut String, fields: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for (index, field) in fields.into_iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_csv_field(out, field.as_ref());
+    }
+}
+
+fn write_csv_field(out: &mut String, field: &str) {
+    if field.contains([',', '"', '\n', '\r']) {
+        out.push('"');
+        for ch in field.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    } else {
+        out.push_str(field);
+    }
+}
+
+fn omm_csv_field_value(omm: &Omm, key: &str) -> String {
+    match key {
+        "OBJECT_NAME" => omm.object_name.clone().unwrap_or_default(),
+        "OBJECT_ID" => omm.object_id.clone().unwrap_or_default(),
+        "EPOCH" => omm.epoch.to_iso8601(),
+        "MEAN_MOTION" => fmt_num(omm.mean_motion),
+        "ECCENTRICITY" => fmt_num(omm.eccentricity),
+        "INCLINATION" => fmt_num(omm.inclination_deg),
+        "RA_OF_ASC_NODE" => fmt_num(omm.ra_of_asc_node_deg),
+        "ARG_OF_PERICENTER" => fmt_num(omm.arg_of_pericenter_deg),
+        "MEAN_ANOMALY" => fmt_num(omm.mean_anomaly_deg),
+        "EPHEMERIS_TYPE" => omm.ephemeris_type.to_string(),
+        "CLASSIFICATION_TYPE" => omm.classification_type.clone(),
+        "NORAD_CAT_ID" => omm.norad_cat_id.to_string(),
+        "ELEMENT_SET_NO" => omm.element_set_no.to_string(),
+        "REV_AT_EPOCH" => omm.rev_at_epoch.to_string(),
+        "BSTAR" => fmt_num(omm.bstar),
+        "MEAN_MOTION_DOT" => fmt_num(omm.mean_motion_dot),
+        "MEAN_MOTION_DDOT" => fmt_num(omm.mean_motion_ddot),
+        _ => String::new(),
+    }
+}
+
 // ── Encoding auto-detect ─────────────────────────────────────────────
 
 /// Parse an OMM in any supported encoding, detecting it from the leading
-/// non-whitespace character: `<` is XML, `{` or `[` is JSON, anything else is
-/// KVN. JSON requires the `json` feature; without it a JSON document returns an
-/// error rather than being misread.
+/// non-whitespace character and first content line: `<` is XML, `{` or `[` is
+/// JSON, a comma-separated header is CSV, and anything else is KVN.
 pub fn parse(text: &str) -> Result<Omm, OmmError> {
     match text.trim_start().chars().next() {
         Some('<') => parse_xml(text),
         Some('{') | Some('[') => parse_json_detected(text),
+        _ if looks_like_csv(text) => parse_csv(text),
         _ => parse_kvn(text),
     }
 }
@@ -594,6 +820,13 @@ pub fn parse_epoch(text: &str) -> Result<OmmEpoch, OmmError> {
 
 fn parse_json_detected(text: &str) -> Result<Omm, OmmError> {
     parse_json(text)
+}
+
+fn looks_like_csv(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.contains(',') && !line.contains('='))
 }
 
 // ── Field mapping (shared by every encoding) ─────────────────────────
@@ -942,6 +1175,8 @@ mod tests {
 
     const ISS_KVN: &str = include_str!("../../tests/fixtures/omm/25544.kvn");
     const ISS_XML: &str = include_str!("../../tests/fixtures/omm/25544.xml");
+    const ISS_CSV: &str = "OBJECT_NAME,OBJECT_ID,EPOCH,MEAN_MOTION,ECCENTRICITY,INCLINATION,RA_OF_ASC_NODE,ARG_OF_PERICENTER,MEAN_ANOMALY,EPHEMERIS_TYPE,CLASSIFICATION_TYPE,NORAD_CAT_ID,ELEMENT_SET_NO,REV_AT_EPOCH,BSTAR,MEAN_MOTION_DOT,MEAN_MOTION_DDOT\n\
+ISS (ZARYA),1998-067A,2026-06-17T04:32:52.099296,15.49273435,0.0004737,51.6332,300.0813,195.1146,164.9702,0,U,25544,999,57175,0.00017172,9.113e-5,0";
 
     /// Reduce an OMM to its canonical orbital + catalog content (the fields the
     /// Elixir `Sidereon.Elements` struct carries), blanking the free-text header
@@ -1344,6 +1579,71 @@ mod tests {
     }
 
     #[test]
+    fn json_array_round_trips_through_struct() {
+        const ISS_JSON: &str = include_str!("../../tests/fixtures/omm/25544.json");
+        let omm = parse_json(ISS_JSON).unwrap();
+        let encoded = encode_json_array(std::slice::from_ref(&omm));
+        let reparsed = parse_json_array(&encoded).unwrap();
+        assert_eq!(reparsed.skipped, 0);
+        assert_eq!(reparsed.omms, vec![omm]);
+    }
+
+    #[test]
+    fn csv_matches_json_orbital_content() {
+        const ISS_JSON: &str = include_str!("../../tests/fixtures/omm/25544.json");
+        let csv = parse_csv(ISS_CSV).unwrap();
+        let json = parse_json(ISS_JSON).unwrap();
+        assert_eq!(canonical(&csv), canonical(&json));
+    }
+
+    #[test]
+    fn csv_round_trips_through_struct() {
+        let omm = parse_csv(ISS_CSV).unwrap();
+        let reparsed = parse_csv(&encode_csv(std::slice::from_ref(&omm))).unwrap();
+        assert_eq!(omm, reparsed);
+    }
+
+    #[test]
+    fn csv_preserves_sub_microsecond_epoch() {
+        let text = ISS_CSV.replace(
+            "2026-06-17T04:32:52.099296",
+            "2026-06-17T04:32:52.099296123456789",
+        );
+        let omm = parse_csv(&text).expect("high-precision CSV epoch");
+        assert_eq!(omm.epoch.microsecond, 99_296);
+        assert_eq!(omm.epoch.femtosecond, 123_456_789);
+    }
+
+    #[test]
+    fn parse_csv_array_skips_malformed_rows_and_counts_them() {
+        let mut text = String::from(ISS_CSV);
+        text.push('\n');
+        text.push_str("BROKEN,ROW\n");
+        text.push_str(ISS_CSV.lines().nth(1).expect("CSV data row"));
+        let parsed = parse_csv_array(&text).expect("CSV with bad row still parses");
+        assert_eq!(parsed.skipped, 1);
+        assert_eq!(parsed.omms.len(), 2);
+        assert_eq!(
+            parsed
+                .omms
+                .iter()
+                .map(|omm| omm.norad_cat_id)
+                .collect::<Vec<_>>(),
+            vec![25544, 25544]
+        );
+    }
+
+    #[test]
+    fn csv_quotes_delimiters() {
+        let mut omm = parse_csv(ISS_CSV).unwrap();
+        omm.object_name = Some("SAT, \"A\"".to_string());
+        let encoded = encode_csv(std::slice::from_ref(&omm));
+        assert!(encoded.contains("\"SAT, \"\"A\"\"\""));
+        let reparsed = parse_csv(&encoded).unwrap();
+        assert_eq!(reparsed.object_name.as_deref(), Some("SAT, \"A\""));
+    }
+
+    #[test]
     fn parse_auto_detects_encoding() {
         let from_kvn = parse(ISS_KVN).unwrap();
         let from_xml = parse(ISS_XML).unwrap();
@@ -1357,6 +1657,11 @@ mod tests {
         const ISS_JSON: &str = include_str!("../../tests/fixtures/omm/25544.json");
         // CelesTrak JSON is a top-level array.
         assert_eq!(parse(ISS_JSON).unwrap(), parse_json(ISS_JSON).unwrap());
+    }
+
+    #[test]
+    fn parse_auto_detects_csv() {
+        assert_eq!(parse(ISS_CSV).unwrap(), parse_csv(ISS_CSV).unwrap());
     }
 
     #[test]
