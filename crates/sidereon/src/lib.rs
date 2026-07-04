@@ -221,6 +221,12 @@ pub use sidereon_core::{
     SatelliteIdError, Wgs84Geodetic,
 };
 pub use sidereon_core::{
+    observable_media_corrections, predict_batch_with_media, predict_batch_with_media_parallel,
+    predict_ranges_with_media, predict_with_media, AppliedMediaCorrections, MediaPredictOptions,
+    MediaPredictedObservables, MediaRangePrediction, ObservableIonosphereCorrection,
+    ObservableMediaOptions, ObservableTroposphereCorrection,
+};
+pub use sidereon_core::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
     repeat_period, sidereal_filter, solar_day_period, SiderealFilterError, SiderealFilterOptions,
     SiderealFilterOutput, SiderealTemplateMethod, SIDEREAL_DAY_NANOS, SIDEREAL_DAY_SECONDS,

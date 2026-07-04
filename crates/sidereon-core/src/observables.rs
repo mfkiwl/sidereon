@@ -9,15 +9,20 @@ use crate::astro::frames::transforms::itrs_to_geodetic_compute;
 use std::f64::consts::PI;
 
 use crate::astro::time::civil;
+use crate::astro::time::model::{Instant, JulianDateSplit, TimeScale};
 use crate::constants::{
-    AZIMUTH_ZENITH_EPS, C_M_S, DEGREES_PER_CIRCLE, DEGREES_PER_SEMICIRCLE, F_L1_HZ, KM_TO_M,
-    MICROSECONDS_PER_SECOND, OBSERVABLE_TRANSMIT_TIME_ITERATIONS, OMEGA_E_DOT_RAD_S,
+    AZIMUTH_ZENITH_EPS, C_M_S, DEGREES_PER_CIRCLE, DEGREES_PER_SEMICIRCLE, F_L1_HZ, J2000_JD,
+    KM_TO_M, MICROSECONDS_PER_SECOND, OBSERVABLE_TRANSMIT_TIME_ITERATIONS, OMEGA_E_DOT_RAD_S,
+    SECONDS_PER_DAY,
 };
 use crate::ephemeris::BroadcastEphemeris;
 use crate::estimation::recipe::SagnacRecipe;
+use crate::frame::Wgs84Geodetic;
 use crate::id::GnssSatelliteId;
+use crate::ionex::{ionex_slant_delay, ionosphere_delay, Ionex, IonoModel};
 use crate::sp3::Sp3;
 use crate::spp::EphemerisSource;
+use crate::tropo::{tropo_mapping, tropo_zenith, MappingModel, Met, TropoModel};
 use crate::validate;
 use crate::Error;
 use rayon::prelude::*;
@@ -353,6 +358,108 @@ impl Default for PredictOptions {
     }
 }
 
+/// Troposphere correction settings for a predicted tracking observable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObservableTroposphereCorrection {
+    /// Surface meteorology used by the Saastamoinen zenith delay.
+    pub met: Met,
+    /// Mapping function applied to the zenith dry and wet delays.
+    pub mapping: MappingModel,
+}
+
+impl Default for ObservableTroposphereCorrection {
+    fn default() -> Self {
+        Self {
+            met: Met::new_unchecked(1013.25, 288.15, 0.5),
+            mapping: MappingModel::Niell,
+        }
+    }
+}
+
+/// Ionosphere correction model for a predicted tracking observable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ObservableIonosphereCorrection<'a> {
+    /// Broadcast ionosphere model evaluated on the requested carrier.
+    Broadcast(IonoModel),
+    /// Parsed IONEX vertical-TEC grid evaluated on the requested carrier.
+    Ionex(&'a Ionex),
+}
+
+/// Optional media corrections for one predicted tracking observable.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ObservableMediaOptions<'a> {
+    /// Neutral-atmosphere slant delay to add to the range, if present.
+    pub troposphere: Option<ObservableTroposphereCorrection>,
+    /// Ionospheric group delay to add to the range, if present.
+    pub ionosphere: Option<ObservableIonosphereCorrection<'a>>,
+}
+
+impl ObservableMediaOptions<'_> {
+    fn is_disabled(self) -> bool {
+        self.troposphere.is_none() && self.ionosphere.is_none()
+    }
+
+    fn needs_instant(self) -> bool {
+        self.troposphere.is_some()
+            || matches!(
+                self.ionosphere,
+                Some(ObservableIonosphereCorrection::Broadcast(_))
+            )
+    }
+
+    fn needs_carrier(self) -> bool {
+        self.ionosphere.is_some()
+    }
+
+    fn needs_ionex_epoch(self) -> bool {
+        matches!(
+            self.ionosphere,
+            Some(ObservableIonosphereCorrection::Ionex(_))
+        )
+    }
+}
+
+/// Prediction options plus optional media corrections.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MediaPredictOptions<'a> {
+    /// Geometry, light-time, Sagnac, and carrier options.
+    pub prediction: PredictOptions,
+    /// Troposphere and ionosphere correction options.
+    pub media: ObservableMediaOptions<'a>,
+}
+
+/// Media delays applied to a predicted tracking observable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppliedMediaCorrections {
+    /// Slant tropospheric delay in meters.
+    pub troposphere_m: f64,
+    /// Ionospheric group delay in meters on the requested carrier.
+    pub ionosphere_m: f64,
+    /// Sum of troposphere and ionosphere delays in meters.
+    pub total_m: f64,
+}
+
+impl Default for AppliedMediaCorrections {
+    fn default() -> Self {
+        Self {
+            troposphere_m: 0.0,
+            ionosphere_m: 0.0,
+            total_m: 0.0,
+        }
+    }
+}
+
+/// Predicted observables with an additional media-corrected range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaPredictedObservables {
+    /// Geometry, range-rate, Doppler, clock, and sky position prediction.
+    pub prediction: PredictedObservables,
+    /// Range after adding the selected media delays, meters.
+    pub range_m: f64,
+    /// Media delays applied to `range_m`.
+    pub media: AppliedMediaCorrections,
+}
+
 /// Satellite state at its signal transmit time for one receive epoch.
 ///
 /// `transmit_position_ecef_m` is the ephemeris position evaluated at
@@ -424,6 +531,95 @@ pub fn j2000_seconds_from_split(jd_whole: f64, jd_fraction: f64) -> Result<f64, 
         "j2000_seconds",
     )
     .map_err(map_input_error)
+}
+
+/// Evaluate optional media range corrections at a supplied topocentric geometry.
+///
+/// This is the correction kernel used by [`predict_with_media`] and
+/// [`predict_ranges_with_media`]. Delays are positive meters and are summed in
+/// IERS TN36 range-sign convention: neutral-atmosphere slant delay first, then
+/// ionospheric group delay on `carrier_hz`.
+pub fn observable_media_corrections(
+    receiver: Wgs84Geodetic,
+    elevation_rad: f64,
+    azimuth_rad: f64,
+    t_rx_j2000_s: f64,
+    carrier_hz: f64,
+    options: ObservableMediaOptions<'_>,
+) -> Result<AppliedMediaCorrections, ObservablesError> {
+    if options.is_disabled() {
+        return Ok(AppliedMediaCorrections::default());
+    }
+    validate::finite(elevation_rad, "elevation_rad").map_err(map_input_error)?;
+    validate::finite(azimuth_rad, "azimuth_rad").map_err(map_input_error)?;
+    if options.needs_carrier() {
+        validate::finite_positive(carrier_hz, "carrier_hz").map_err(map_input_error)?;
+    }
+    let epoch = if options.needs_instant() {
+        Some(media_instant(t_rx_j2000_s)?)
+    } else {
+        None
+    };
+    let ionex_epoch_j2000_s = if options.needs_ionex_epoch() {
+        Some(rounded_j2000_seconds(t_rx_j2000_s)?)
+    } else {
+        None
+    };
+
+    let troposphere_m = match options.troposphere {
+        Some(troposphere) => {
+            let epoch = epoch.expect("troposphere media requires an epoch");
+            let zenith = tropo_zenith(TropoModel::Saastamoinen, receiver, troposphere.met)
+                .map_err(map_media_error)?;
+            let mapping = tropo_mapping(troposphere.mapping, elevation_rad, receiver, epoch)
+                .map_err(map_media_error)?;
+            let delay_m = zenith.dry_m * mapping.dry + zenith.wet_m * mapping.wet;
+            validate::finite(delay_m, "media.troposphere_m").map_err(map_input_error)?;
+            delay_m
+        }
+        None => 0.0,
+    };
+
+    let ionosphere_m = match options.ionosphere {
+        Some(ObservableIonosphereCorrection::Broadcast(model)) => {
+            let epoch = epoch.expect("broadcast ionosphere media requires an epoch");
+            let delay_m = ionosphere_delay(
+                receiver,
+                elevation_rad,
+                azimuth_rad,
+                epoch,
+                carrier_hz,
+                &model,
+            )
+            .map_err(map_media_error)?;
+            validate::finite(delay_m, "media.ionosphere_m").map_err(map_input_error)?;
+            delay_m
+        }
+        Some(ObservableIonosphereCorrection::Ionex(ionex)) => {
+            let ionex_epoch_j2000_s =
+                ionex_epoch_j2000_s.expect("IONEX media requires an integer epoch");
+            let delay_m = ionex_slant_delay(
+                ionex,
+                receiver,
+                elevation_rad,
+                azimuth_rad,
+                ionex_epoch_j2000_s,
+                carrier_hz,
+            )
+            .map_err(map_media_error)?;
+            validate::finite(delay_m, "media.ionosphere_m").map_err(map_input_error)?;
+            delay_m
+        }
+        None => 0.0,
+    };
+
+    let total_m = troposphere_m + ionosphere_m;
+    validate::finite(total_m, "media.total_m").map_err(map_input_error)?;
+    Ok(AppliedMediaCorrections {
+        troposphere_m,
+        ionosphere_m,
+        total_m,
+    })
 }
 
 /// Evaluate ECEF states for parallel satellite and epoch arrays.
@@ -502,6 +698,62 @@ pub fn predict(
     t_rx_j2000_s: f64,
     options: PredictOptions,
 ) -> Result<PredictedObservables, ObservablesError> {
+    let (prediction, _) = predict_core(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
+    Ok(prediction)
+}
+
+/// Predict observables and add optional troposphere and ionosphere range delays.
+///
+/// The embedded [`PredictedObservables`] keeps the geometric range and range-rate
+/// fields unchanged. The corrected one-way range is reported as
+/// [`MediaPredictedObservables::range_m`]. IERS TN36 treats the neutral
+/// atmosphere and ionospheric group delay as positive additions to a code range;
+/// no media range-rate derivative is applied here.
+pub fn predict_with_media(
+    source: &dyn ObservableEphemerisSource,
+    sat: GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    options: MediaPredictOptions<'_>,
+) -> Result<MediaPredictedObservables, ObservablesError> {
+    let (prediction, topocentric) = predict_core(
+        source,
+        sat,
+        receiver_ecef_m,
+        t_rx_j2000_s,
+        options.prediction,
+    )?;
+    if options.media.is_disabled() {
+        return Ok(MediaPredictedObservables {
+            range_m: prediction.geometric_range_m,
+            prediction,
+            media: AppliedMediaCorrections::default(),
+        });
+    }
+    let media = observable_media_corrections(
+        topocentric.receiver,
+        topocentric.elevation_rad,
+        topocentric.azimuth_rad,
+        t_rx_j2000_s,
+        options.prediction.carrier_hz,
+        options.media,
+    )?;
+    let range_m = prediction.geometric_range_m + media.total_m;
+    validate::finite(range_m, "range_m").map_err(map_input_error)?;
+    Ok(MediaPredictedObservables {
+        prediction,
+        range_m,
+        media,
+    })
+}
+
+fn predict_core(
+    source: &dyn ObservableEphemerisSource,
+    sat: GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    options: PredictOptions,
+) -> Result<(PredictedObservables, TopocentricGeometry), ObservablesError> {
     validate_predict_inputs(receiver_ecef_m, t_rx_j2000_s, options)?;
     let solved = solve_transmit_time(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
 
@@ -518,21 +770,24 @@ pub fn predict(
     validate::finite(range_rate, "range_rate_m_s").map_err(map_input_error)?;
     let doppler_hz = -range_rate * options.carrier_hz / C_M_S;
     validate::finite(doppler_hz, "doppler_hz").map_err(map_input_error)?;
-    let (elevation_deg, azimuth_deg) = topocentric(receiver_ecef_m, [dx, dy, dz], range)?;
+    let topocentric = topocentric(receiver_ecef_m, [dx, dy, dz], range)?;
 
-    Ok(PredictedObservables {
-        geometric_range_m: range,
-        range_rate_m_s: range_rate,
-        doppler_hz,
-        sat_clock_s: solved.state.clock_s,
-        elevation_deg,
-        azimuth_deg,
-        transmit_offset_us: solved.transmit_offset_us,
-        transmit_time_j2000_s: solved.transmit_time_j2000_s,
-        los_unit: los,
-        sat_pos_ecef_m: solved.sat_rot_ecef_m,
-        sat_velocity_m_s: velocity_rot,
-    })
+    Ok((
+        PredictedObservables {
+            geometric_range_m: range,
+            range_rate_m_s: range_rate,
+            doppler_hz,
+            sat_clock_s: solved.state.clock_s,
+            elevation_deg: topocentric.elevation_deg,
+            azimuth_deg: topocentric.azimuth_deg,
+            transmit_offset_us: solved.transmit_offset_us,
+            transmit_time_j2000_s: solved.transmit_time_j2000_s,
+            los_unit: los,
+            sat_pos_ecef_m: solved.sat_rot_ecef_m,
+            sat_velocity_m_s: velocity_rot,
+        },
+        topocentric,
+    ))
 }
 
 /// One batch prediction request: the satellite to observe, the static receiver
@@ -563,6 +818,23 @@ pub fn predict_batch(
         .collect()
 }
 
+/// Predict media-corrected observables for many requests, serially.
+///
+/// Element `i` is the result of [`predict_with_media`] for `requests[i]` with
+/// the shared options.
+pub fn predict_batch_with_media(
+    source: &dyn ObservableEphemerisSource,
+    requests: &[PredictRequest],
+    options: MediaPredictOptions<'_>,
+) -> Vec<Result<MediaPredictedObservables, ObservablesError>> {
+    requests
+        .iter()
+        .map(|&(sat, receiver_ecef_m, t_rx_j2000_s)| {
+            predict_with_media(source, sat, receiver_ecef_m, t_rx_j2000_s, options)
+        })
+        .collect()
+}
+
 /// Predict observables for many `(satellite, receiver, epoch)` requests, fanning
 /// the independent requests across a rayon thread pool.
 ///
@@ -581,6 +853,23 @@ pub fn predict_batch_parallel(
         .par_iter()
         .map(|&(sat, receiver_ecef_m, t_rx_j2000_s)| {
             predict(source, sat, receiver_ecef_m, t_rx_j2000_s, options)
+        })
+        .collect()
+}
+
+/// Predict media-corrected observables for many requests in parallel.
+///
+/// Each worker evaluates the same scalar [`predict_with_media`] path and the
+/// indexed parallel collect preserves request order.
+pub fn predict_batch_with_media_parallel(
+    source: &(dyn ObservableEphemerisSource + Sync),
+    requests: &[PredictRequest],
+    options: MediaPredictOptions<'_>,
+) -> Vec<Result<MediaPredictedObservables, ObservablesError>> {
+    requests
+        .par_iter()
+        .map(|&(sat, receiver_ecef_m, t_rx_j2000_s)| {
+            predict_with_media(source, sat, receiver_ecef_m, t_rx_j2000_s, options)
         })
         .collect()
 }
@@ -611,6 +900,17 @@ pub struct RangePrediction {
     pub transmit_time_j2000_s: f64,
     /// Sagnac-transported satellite ECEF position, meters.
     pub sat_pos_ecef_m: [f64; 3],
+}
+
+/// Range-only prediction with an additional media-corrected range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaRangePrediction {
+    /// Geometry-only range prediction.
+    pub prediction: RangePrediction,
+    /// Range after adding the selected media delays, meters.
+    pub range_m: f64,
+    /// Media delays applied to `range_m`.
+    pub media: AppliedMediaCorrections,
 }
 
 /// Predict geometric ranges for many `(satellite, receiver, epoch)` requests in
@@ -661,6 +961,65 @@ pub fn predict_ranges(
     Ok(())
 }
 
+/// Predict media-corrected ranges for many requests.
+///
+/// `out[i].prediction` is the same geometry-only value produced by
+/// [`predict_ranges`] for `requests[i]`. `out[i].range_m` adds the selected
+/// troposphere and ionosphere delays.
+pub fn predict_ranges_with_media(
+    source: &dyn ObservableEphemerisSource,
+    requests: &[RangePredictionRequest],
+    options: MediaPredictOptions<'_>,
+    out: &mut [MediaRangePrediction],
+) -> Result<(), ObservablesError> {
+    if out.len() != requests.len() {
+        return Err(ObservablesError::InvalidInput {
+            field: "out",
+            kind: ObservablesInputErrorKind::OutOfRange,
+        });
+    }
+    for (request, slot) in requests.iter().zip(out.iter_mut()) {
+        if options.media.is_disabled() {
+            let prediction = range_prediction_at_rx(
+                source,
+                request.sat,
+                request.receiver_ecef_m,
+                request.t_rx_j2000_s,
+                options.prediction,
+            )?;
+            *slot = MediaRangePrediction {
+                range_m: prediction.geometric_range_m,
+                prediction,
+                media: AppliedMediaCorrections::default(),
+            };
+            continue;
+        }
+        let (prediction, topocentric) = range_prediction_core(
+            source,
+            request.sat,
+            request.receiver_ecef_m,
+            request.t_rx_j2000_s,
+            options.prediction,
+        )?;
+        let media = observable_media_corrections(
+            topocentric.receiver,
+            topocentric.elevation_rad,
+            topocentric.azimuth_rad,
+            request.t_rx_j2000_s,
+            options.prediction.carrier_hz,
+            options.media,
+        )?;
+        let range_m = prediction.geometric_range_m + media.total_m;
+        validate::finite(range_m, "range_m").map_err(map_input_error)?;
+        *slot = MediaRangePrediction {
+            prediction,
+            range_m,
+            media,
+        };
+    }
+    Ok(())
+}
+
 /// Range-only transmit-time kernel: iterate light time / Sagnac to the geometric
 /// range at receive epoch `t_rx_j2000_s` and project just the [`RangePrediction`]
 /// geometry.
@@ -676,18 +1035,48 @@ fn range_prediction_at_rx(
     t_rx_j2000_s: f64,
     options: PredictOptions,
 ) -> Result<RangePrediction, ObservablesError> {
+    let (prediction, _, _) =
+        range_prediction_state(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
+    Ok(prediction)
+}
+
+fn range_prediction_core(
+    source: &dyn ObservableEphemerisSource,
+    sat: GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    options: PredictOptions,
+) -> Result<(RangePrediction, TopocentricGeometry), ObservablesError> {
+    let (prediction, line_of_sight_m, range) =
+        range_prediction_state(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
+    let topocentric = topocentric(receiver_ecef_m, line_of_sight_m, range)?;
+    Ok((prediction, topocentric))
+}
+
+fn range_prediction_state(
+    source: &dyn ObservableEphemerisSource,
+    sat: GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    options: PredictOptions,
+) -> Result<(RangePrediction, [f64; 3], f64), ObservablesError> {
     validate_transmit_time_inputs(receiver_ecef_m, t_rx_j2000_s)?;
     let solved = solve_transmit_time(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
     let dx = solved.sat_rot_ecef_m[0] - receiver_ecef_m[0];
     let dy = solved.sat_rot_ecef_m[1] - receiver_ecef_m[1];
     let dz = solved.sat_rot_ecef_m[2] - receiver_ecef_m[2];
+    let line_of_sight_m = [dx, dy, dz];
     let range = geometric_range_m([dx, dy, dz])?;
-    Ok(RangePrediction {
-        geometric_range_m: range,
-        sat_clock_s: solved.state.clock_s,
-        transmit_time_j2000_s: solved.transmit_time_j2000_s,
-        sat_pos_ecef_m: solved.sat_rot_ecef_m,
-    })
+    Ok((
+        RangePrediction {
+            geometric_range_m: range,
+            sat_clock_s: solved.state.clock_s,
+            transmit_time_j2000_s: solved.transmit_time_j2000_s,
+            sat_pos_ecef_m: solved.sat_rot_ecef_m,
+        },
+        line_of_sight_m,
+        range,
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -838,6 +1227,77 @@ fn map_input_error(error: validate::FieldError) -> ObservablesError {
     }
 }
 
+fn invalid_observable_input(
+    field: &'static str,
+    kind: ObservablesInputErrorKind,
+) -> ObservablesError {
+    ObservablesError::InvalidInput { field, kind }
+}
+
+fn media_instant(t_rx_j2000_s: f64) -> Result<Instant, ObservablesError> {
+    validate::finite(t_rx_j2000_s, "t_rx_j2000_s").map_err(map_input_error)?;
+    let days = (t_rx_j2000_s / SECONDS_PER_DAY).floor();
+    let seconds_into_day = t_rx_j2000_s - days * SECONDS_PER_DAY;
+    let fraction = seconds_into_day / SECONDS_PER_DAY;
+    let split = JulianDateSplit::new(J2000_JD + days, fraction).map_err(|_| {
+        invalid_observable_input("t_rx_j2000_s", ObservablesInputErrorKind::OutOfRange)
+    })?;
+    Ok(Instant::from_julian_date(TimeScale::Gpst, split))
+}
+
+fn rounded_j2000_seconds(t_rx_j2000_s: f64) -> Result<i64, ObservablesError> {
+    validate::finite(t_rx_j2000_s, "t_rx_j2000_s").map_err(map_input_error)?;
+    let rounded = t_rx_j2000_s.round();
+    if !rounded.is_finite() || rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+        return Err(invalid_observable_input(
+            "t_rx_j2000_s",
+            ObservablesInputErrorKind::OutOfRange,
+        ));
+    }
+    Ok(rounded as i64)
+}
+
+fn map_media_error(error: Error) -> ObservablesError {
+    match error {
+        Error::InvalidInput(message) => map_media_invalid_input(&message),
+        _ => invalid_observable_input("media", ObservablesInputErrorKind::OutOfRange),
+    }
+}
+
+fn map_media_invalid_input(message: &str) -> ObservablesError {
+    let kind = if message.ends_with("not finite") {
+        ObservablesInputErrorKind::NonFinite
+    } else if message.ends_with("not positive") {
+        ObservablesInputErrorKind::NotPositive
+    } else if message.ends_with("negative") {
+        ObservablesInputErrorKind::Negative
+    } else {
+        ObservablesInputErrorKind::OutOfRange
+    };
+    let field = if message.starts_with("elevation_rad ") {
+        "media.elevation_rad"
+    } else if message.starts_with("receiver.lat_rad ") {
+        "media.receiver.lat_rad"
+    } else if message.starts_with("receiver.lon_rad ") {
+        "media.receiver.lon_rad"
+    } else if message.starts_with("receiver.height_m ") {
+        "media.receiver.height_m"
+    } else if message.starts_with("pressure_hpa ") {
+        "media.pressure_hpa"
+    } else if message.starts_with("temperature_k ") {
+        "media.temperature_k"
+    } else if message.starts_with("relative_humidity ") {
+        "media.relative_humidity"
+    } else if message.starts_with("frequency_hz ") {
+        "media.carrier_hz"
+    } else if message.starts_with("azimuth_rad ") {
+        "media.azimuth_rad"
+    } else {
+        "media"
+    };
+    invalid_observable_input(field, kind)
+}
+
 fn sagnac_rotate(pos: [f64; 3], tau_s: f64, apply: bool) -> [f64; 3] {
     let sagnac = if apply {
         SagnacRecipe::ClosedFormZRotation
@@ -852,12 +1312,21 @@ fn sagnac_rotate(pos: [f64; 3], tau_s: f64, apply: bool) -> [f64; 3] {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TopocentricGeometry {
+    receiver: Wgs84Geodetic,
+    elevation_rad: f64,
+    azimuth_rad: f64,
+    elevation_deg: f64,
+    azimuth_deg: f64,
+}
+
 fn topocentric(
     receiver_ecef_m: [f64; 3],
     delta_ecef_m: [f64; 3],
     range_m: f64,
-) -> Result<(f64, f64), ObservablesError> {
-    let (lat_deg, lon_deg, _height_km) = itrs_to_geodetic_compute(
+) -> Result<TopocentricGeometry, ObservablesError> {
+    let (lat_deg, lon_deg, height_km) = itrs_to_geodetic_compute(
         receiver_ecef_m[0] / KM_TO_M,
         receiver_ecef_m[1] / KM_TO_M,
         receiver_ecef_m[2] / KM_TO_M,
@@ -866,9 +1335,15 @@ fn topocentric(
         field: "receiver_ecef_m",
         kind: ObservablesInputErrorKind::OutOfRange,
     })?;
-    // Sidereon' application oracle pins this multiply-then-divide order.
+    // The application oracle pins this multiply-then-divide order.
     let lat = lat_deg * PI / DEGREES_PER_SEMICIRCLE;
     let lon = lon_deg * PI / DEGREES_PER_SEMICIRCLE;
+    let receiver = Wgs84Geodetic::new(lat, lon, height_km * KM_TO_M).map_err(|_| {
+        ObservablesError::InvalidInput {
+            field: "receiver_ecef_m",
+            kind: ObservablesInputErrorKind::OutOfRange,
+        }
+    })?;
 
     let sl = lat.sin();
     let cl = lat.cos();
@@ -888,10 +1363,18 @@ fn topocentric(
     // Outside that threshold the multiply-then-divide order is pinned by the
     // application oracle.
     let horiz_sq = e * e + n * n;
-    let mut azimuth_deg = if horiz_sq < AZIMUTH_ZENITH_EPS * range_m * range_m {
-        0.0
+    let (azimuth_rad, mut azimuth_deg) = if horiz_sq < AZIMUTH_ZENITH_EPS * range_m * range_m {
+        (0.0, 0.0)
     } else {
-        e.atan2(n) * DEGREES_PER_SEMICIRCLE / PI
+        let raw_azimuth_rad = e.atan2(n);
+        (
+            if raw_azimuth_rad < 0.0 {
+                raw_azimuth_rad + 2.0 * PI
+            } else {
+                raw_azimuth_rad
+            },
+            raw_azimuth_rad * DEGREES_PER_SEMICIRCLE / PI,
+        )
     };
     if azimuth_deg < 0.0 {
         azimuth_deg += DEGREES_PER_CIRCLE;
@@ -901,11 +1384,20 @@ fn topocentric(
     // only touches the previously-NaN boundary and leaves in-range values bit
     // identical.
     let sin_elevation = (u / range_m).clamp(-1.0, 1.0);
-    let elevation_deg = sin_elevation.asin() * DEGREES_PER_SEMICIRCLE / PI;
+    let elevation_rad = sin_elevation.asin();
+    let elevation_deg = elevation_rad * DEGREES_PER_SEMICIRCLE / PI;
 
+    validate::finite(elevation_rad, "elevation_rad").map_err(map_input_error)?;
     validate::finite(elevation_deg, "elevation_deg").map_err(map_input_error)?;
+    validate::finite(azimuth_rad, "azimuth_rad").map_err(map_input_error)?;
     validate::finite(azimuth_deg, "azimuth_deg").map_err(map_input_error)?;
-    Ok((elevation_deg, azimuth_deg))
+    Ok(TopocentricGeometry {
+        receiver,
+        elevation_rad,
+        azimuth_rad,
+        elevation_deg,
+        azimuth_deg,
+    })
 }
 
 #[cfg(test)]
@@ -1123,10 +1615,9 @@ mod public_api_tests {
             "test geometry must overshoot the asin domain"
         );
 
-        let (elevation_deg, _azimuth_deg) =
-            topocentric(rx, delta, range).expect("non-equatorial zenith must not error");
-        assert!(elevation_deg.is_finite());
-        assert!((elevation_deg - 90.0).abs() < 1e-9);
+        let geometry = topocentric(rx, delta, range).expect("non-equatorial zenith must not error");
+        assert!(geometry.elevation_deg.is_finite());
+        assert!((geometry.elevation_deg - 90.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1190,6 +1681,418 @@ mod public_api_tests {
             state.los_unit.map(f64::to_bits),
             prediction.los_unit.map(f64::to_bits)
         );
+    }
+}
+
+#[cfg(test)]
+mod media_validation_tests {
+    //! Provenance: IERS TN36 media corrections. The troposphere and ionosphere
+    //! model functions are validated in their own modules; these tests prove the
+    //! observable media wrapper reuses those functions exactly and keeps the
+    //! default-off prediction path bit-identical.
+
+    use super::*;
+    use crate::astro::time::civil::split_julian_date_from_j2000_seconds;
+    use crate::ionex::TecGridSamples;
+    use crate::GnssSystem;
+
+    const T_RX_J2000_S: f64 = 646_272_000.0;
+    const T_RX_J2000_I64: i64 = 646_272_000;
+
+    #[derive(Debug, Clone, Copy)]
+    struct StaticSource {
+        state: ObservableState,
+    }
+
+    impl ObservableEphemerisSource for StaticSource {
+        fn observable_state_at_j2000_s(
+            &self,
+            _sat: GnssSatelliteId,
+            _t_j2000_s: f64,
+        ) -> Result<ObservableState, ObservablesError> {
+            Ok(self.state)
+        }
+    }
+
+    fn epoch() -> Instant {
+        let (jd_whole, fraction) = split_julian_date_from_j2000_seconds(T_RX_J2000_I64);
+        Instant::from_julian_date(
+            TimeScale::Gpst,
+            JulianDateSplit::new(jd_whole, fraction).expect("valid media epoch"),
+        )
+    }
+
+    fn receiver() -> Wgs84Geodetic {
+        Wgs84Geodetic::new(0.0, 0.0, 0.0).expect("valid receiver")
+    }
+
+    fn met() -> Met {
+        Met::new(1013.25, 288.15, 0.5).expect("valid met")
+    }
+
+    fn klobuchar_model() -> IonoModel {
+        IonoModel::Klobuchar(crate::ionex::KlobucharParams {
+            alpha: [0.0; 4],
+            beta: [0.0; 4],
+        })
+    }
+
+    fn ionex() -> Ionex {
+        let map = vec![
+            vec![12.0, 12.0, 12.0],
+            vec![12.0, 12.0, 12.0],
+            vec![12.0, 12.0, 12.0],
+        ];
+        Ionex::from_samples(TecGridSamples {
+            map_epochs: vec![epoch()],
+            lat_nodes_deg: vec![90.0, 0.0, -90.0],
+            lon_nodes_deg: vec![-180.0, 0.0, 180.0],
+            dlat_deg: -90.0,
+            dlon_deg: 180.0,
+            shell_height_km: 450.0,
+            base_radius_km: 6371.0,
+            exponent: 0,
+            tec_maps: vec![map],
+            rms_maps: Vec::new(),
+        })
+        .expect("valid IONEX samples")
+    }
+
+    fn direct_troposphere(elevation_rad: f64) -> f64 {
+        let zenith =
+            tropo_zenith(TropoModel::Saastamoinen, receiver(), met()).expect("zenith delay");
+        let mapping = tropo_mapping(MappingModel::Niell, elevation_rad, receiver(), epoch())
+            .expect("mapping");
+        zenith.dry_m * mapping.dry + zenith.wet_m * mapping.wet
+    }
+
+    fn assert_bits_eq(label: &str, got: f64, expected: f64) {
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "{label}: got {got:?}, expected {expected:?}"
+        );
+    }
+
+    fn assert_prediction_bits_eq(got: &PredictedObservables, expected: &PredictedObservables) {
+        assert_bits_eq(
+            "geometric range",
+            got.geometric_range_m,
+            expected.geometric_range_m,
+        );
+        assert_bits_eq("range-rate", got.range_rate_m_s, expected.range_rate_m_s);
+        assert_bits_eq("Doppler", got.doppler_hz, expected.doppler_hz);
+        assert_eq!(
+            got.sat_clock_s.map(f64::to_bits),
+            expected.sat_clock_s.map(f64::to_bits)
+        );
+        assert_bits_eq("elevation", got.elevation_deg, expected.elevation_deg);
+        assert_bits_eq("azimuth", got.azimuth_deg, expected.azimuth_deg);
+        assert_eq!(got.transmit_offset_us, expected.transmit_offset_us);
+        assert_bits_eq(
+            "transmit time",
+            got.transmit_time_j2000_s,
+            expected.transmit_time_j2000_s,
+        );
+        for k in 0..3 {
+            assert_bits_eq("los", got.los_unit[k], expected.los_unit[k]);
+            assert_bits_eq(
+                "satellite position",
+                got.sat_pos_ecef_m[k],
+                expected.sat_pos_ecef_m[k],
+            );
+            assert_bits_eq(
+                "satellite velocity",
+                got.sat_velocity_m_s[k],
+                expected.sat_velocity_m_s[k],
+            );
+        }
+    }
+
+    fn assert_range_prediction_bits_eq(got: &RangePrediction, expected: &RangePrediction) {
+        assert_bits_eq(
+            "range geometric",
+            got.geometric_range_m,
+            expected.geometric_range_m,
+        );
+        assert_eq!(
+            got.sat_clock_s.map(f64::to_bits),
+            expected.sat_clock_s.map(f64::to_bits)
+        );
+        assert_bits_eq(
+            "range transmit time",
+            got.transmit_time_j2000_s,
+            expected.transmit_time_j2000_s,
+        );
+        for k in 0..3 {
+            assert_bits_eq(
+                "range satellite position",
+                got.sat_pos_ecef_m[k],
+                expected.sat_pos_ecef_m[k],
+            );
+        }
+    }
+
+    #[test]
+    fn media_corrections_match_direct_tropo_and_klobuchar_bits() {
+        for elevation_deg in [5.0_f64, 15.0, 90.0] {
+            let elevation_rad = elevation_deg * PI / DEGREES_PER_SEMICIRCLE;
+            let azimuth_rad = 0.25;
+            let options = ObservableMediaOptions {
+                troposphere: Some(ObservableTroposphereCorrection {
+                    met: met(),
+                    mapping: MappingModel::Niell,
+                }),
+                ionosphere: Some(ObservableIonosphereCorrection::Broadcast(klobuchar_model())),
+            };
+            let got = observable_media_corrections(
+                receiver(),
+                elevation_rad,
+                azimuth_rad,
+                T_RX_J2000_S,
+                F_L1_HZ,
+                options,
+            )
+            .expect("media corrections");
+            let expected_tropo = direct_troposphere(elevation_rad);
+            let expected_iono = ionosphere_delay(
+                receiver(),
+                elevation_rad,
+                azimuth_rad,
+                epoch(),
+                F_L1_HZ,
+                &klobuchar_model(),
+            )
+            .expect("direct Klobuchar");
+
+            assert_bits_eq("troposphere", got.troposphere_m, expected_tropo);
+            assert_bits_eq("Klobuchar", got.ionosphere_m, expected_iono);
+            assert_bits_eq("total", got.total_m, expected_tropo + expected_iono);
+        }
+    }
+
+    #[test]
+    fn media_corrections_match_direct_ionex_bits() {
+        let ionex = ionex();
+        for elevation_deg in [5.0_f64, 15.0, 90.0] {
+            let elevation_rad = elevation_deg * PI / DEGREES_PER_SEMICIRCLE;
+            let azimuth_rad = 1.0;
+            let got = observable_media_corrections(
+                receiver(),
+                elevation_rad,
+                azimuth_rad,
+                T_RX_J2000_S,
+                F_L1_HZ,
+                ObservableMediaOptions {
+                    troposphere: None,
+                    ionosphere: Some(ObservableIonosphereCorrection::Ionex(&ionex)),
+                },
+            )
+            .expect("IONEX media correction");
+            let expected = ionex_slant_delay(
+                &ionex,
+                receiver(),
+                elevation_rad,
+                azimuth_rad,
+                T_RX_J2000_I64,
+                F_L1_HZ,
+            )
+            .expect("direct IONEX");
+
+            assert_bits_eq("IONEX", got.ionosphere_m, expected);
+            assert_bits_eq("IONEX total", got.total_m, expected);
+        }
+    }
+
+    #[test]
+    fn default_media_prediction_matches_predict_bits() {
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
+        let rx = [6_378_137.0, 0.0, 0.0];
+        let source = StaticSource {
+            state: ObservableState {
+                position_ecef_m: [26_378_137.0, 0.0, 0.0],
+                clock_s: Some(0.0),
+            },
+        };
+        let options = PredictOptions {
+            carrier_hz: F_L1_HZ,
+            light_time: false,
+            sagnac: false,
+        };
+        let plain = predict(&source, sat, rx, T_RX_J2000_S, options).expect("plain predict");
+        let media = predict_with_media(
+            &source,
+            sat,
+            rx,
+            T_RX_J2000_S,
+            MediaPredictOptions {
+                prediction: options,
+                media: ObservableMediaOptions::default(),
+            },
+        )
+        .expect("default media predict");
+
+        assert_prediction_bits_eq(&media.prediction, &plain);
+        assert_bits_eq("default range", media.range_m, plain.geometric_range_m);
+        assert_eq!(media.media, AppliedMediaCorrections::default());
+    }
+
+    #[test]
+    fn default_media_prediction_skips_media_epoch_for_large_epoch() {
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
+        let rx = [6_378_137.0, 0.0, 0.0];
+        let source = StaticSource {
+            state: ObservableState {
+                position_ecef_m: [26_378_137.0, 0.0, 0.0],
+                clock_s: Some(0.0),
+            },
+        };
+        let options = PredictOptions {
+            carrier_hz: F_L1_HZ,
+            light_time: false,
+            sagnac: false,
+        };
+        let t_rx = 1.0e20;
+        let plain = predict(&source, sat, rx, t_rx, options).expect("plain predict");
+        let media = predict_with_media(
+            &source,
+            sat,
+            rx,
+            t_rx,
+            MediaPredictOptions {
+                prediction: options,
+                media: ObservableMediaOptions::default(),
+            },
+        )
+        .expect("default media predict");
+
+        assert_prediction_bits_eq(&media.prediction, &plain);
+        assert_bits_eq("default range", media.range_m, plain.geometric_range_m);
+        assert_eq!(media.media, AppliedMediaCorrections::default());
+    }
+
+    #[test]
+    fn below_troposphere_validity_returns_typed_error() {
+        let err = observable_media_corrections(
+            receiver(),
+            2.0 * PI / DEGREES_PER_SEMICIRCLE,
+            0.0,
+            T_RX_J2000_S,
+            F_L1_HZ,
+            ObservableMediaOptions {
+                troposphere: Some(ObservableTroposphereCorrection::default()),
+                ionosphere: None,
+            },
+        )
+        .expect_err("below mapping validity must fail");
+
+        match err {
+            ObservablesError::InvalidInput { field, kind } => {
+                assert_eq!(field, "media.elevation_rad");
+                assert_eq!(kind, ObservablesInputErrorKind::OutOfRange);
+            }
+            other => panic!("expected typed InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_media_prediction_adds_direct_troposphere_bits() {
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
+        let rx = [6_378_137.0, 0.0, 0.0];
+        let elevation_rad = core::f64::consts::FRAC_PI_2;
+        let range_m = 20_000_000.0;
+        let delta = [range_m, 0.0, 0.0];
+        let source = StaticSource {
+            state: ObservableState {
+                position_ecef_m: [rx[0] + delta[0], rx[1] + delta[1], rx[2] + delta[2]],
+                clock_s: Some(0.0),
+            },
+        };
+        let options = MediaPredictOptions {
+            prediction: PredictOptions {
+                carrier_hz: f64::NAN,
+                light_time: false,
+                sagnac: false,
+            },
+            media: ObservableMediaOptions {
+                troposphere: Some(ObservableTroposphereCorrection::default()),
+                ionosphere: None,
+            },
+        };
+        let request = [RangePredictionRequest {
+            sat,
+            receiver_ecef_m: rx,
+            t_rx_j2000_s: T_RX_J2000_S,
+        }];
+        let zero_prediction = RangePrediction {
+            geometric_range_m: 0.0,
+            sat_clock_s: None,
+            transmit_time_j2000_s: 0.0,
+            sat_pos_ecef_m: [0.0; 3],
+        };
+        let mut out = [MediaRangePrediction {
+            prediction: zero_prediction,
+            range_m: 0.0,
+            media: AppliedMediaCorrections::default(),
+        }];
+        predict_ranges_with_media(&source, &request, options, &mut out)
+            .expect("range media prediction");
+        let got = out[0];
+        let expected = got.prediction.geometric_range_m + direct_troposphere(elevation_rad);
+        assert_bits_eq("corrected range", got.range_m, expected);
+    }
+
+    #[test]
+    fn default_range_media_prediction_matches_range_bits_with_unused_carrier() {
+        let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id");
+        let rx = [6_378_137.0, 0.0, 0.0];
+        let source = StaticSource {
+            state: ObservableState {
+                position_ecef_m: [26_378_137.0, 0.0, 0.0],
+                clock_s: Some(0.0),
+            },
+        };
+        let options = PredictOptions {
+            carrier_hz: f64::NAN,
+            light_time: false,
+            sagnac: false,
+        };
+        let request = [RangePredictionRequest {
+            sat,
+            receiver_ecef_m: rx,
+            t_rx_j2000_s: T_RX_J2000_S,
+        }];
+        let zero_prediction = RangePrediction {
+            geometric_range_m: 0.0,
+            sat_clock_s: None,
+            transmit_time_j2000_s: 0.0,
+            sat_pos_ecef_m: [0.0; 3],
+        };
+        let mut plain = [zero_prediction];
+        predict_ranges(&source, &request, options, &mut plain).expect("plain range");
+        let mut media = [MediaRangePrediction {
+            prediction: zero_prediction,
+            range_m: 0.0,
+            media: AppliedMediaCorrections::default(),
+        }];
+        predict_ranges_with_media(
+            &source,
+            &request,
+            MediaPredictOptions {
+                prediction: options,
+                media: ObservableMediaOptions::default(),
+            },
+            &mut media,
+        )
+        .expect("default media range");
+
+        assert_range_prediction_bits_eq(&media[0].prediction, &plain[0]);
+        assert_bits_eq(
+            "default range",
+            media[0].range_m,
+            plain[0].geometric_range_m,
+        );
+        assert_eq!(media[0].media, AppliedMediaCorrections::default());
     }
 }
 
@@ -1402,29 +2305,29 @@ mod tests {
     fn topocentric_azimuth_is_zero_at_exact_zenith() {
         // Satellite displaced purely radially (+X) above an equatorial receiver:
         // east == north == 0, so azimuth is degenerate.
-        let (elevation_deg, azimuth_deg) = topocentric(
+        let geometry = topocentric(
             [EQUATORIAL_RX_X_M, 0.0, 0.0],
             [20_000_000.0, 0.0, 0.0],
             20_000_000.0,
         )
         .expect("zenith topocentric must not error");
-        assert_eq!(azimuth_deg, 0.0);
-        assert!(azimuth_deg.is_finite());
-        assert!((elevation_deg - 90.0).abs() < 1e-9);
+        assert_eq!(geometry.azimuth_deg, 0.0);
+        assert!(geometry.azimuth_deg.is_finite());
+        assert!((geometry.elevation_deg - 90.0).abs() < 1e-9);
     }
 
     #[test]
     fn topocentric_azimuth_is_zero_just_off_zenith() {
         // A ~1e-9 m horizontal nudge is pure rounding-scale noise at a 20,000 km
         // range, so azimuth stays pinned to 0.0 (RTKLIB satazel semantics).
-        let (_, azimuth_deg) = topocentric(
+        let geometry = topocentric(
             [EQUATORIAL_RX_X_M, 0.0, 0.0],
             [20_000_000.0, 1.0e-9, 1.0e-9],
             20_000_000.0,
         )
         .expect("near-zenith topocentric must not error");
-        assert_eq!(azimuth_deg, 0.0);
-        assert!(azimuth_deg.is_finite());
+        assert_eq!(geometry.azimuth_deg, 0.0);
+        assert!(geometry.azimuth_deg.is_finite());
     }
 
     #[test]
