@@ -197,10 +197,16 @@ pub use sidereon_core::quality::{
 };
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
-    combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies, fusion,
-    geodesic, geodetic_time_series, geometry, geometry_quality, ils, inertial, navigation, nmea,
-    observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas,
-    sbas_pl, sidereal, signal, source_localization, ssr, staleness, terrain, tides, velocity,
+    combinations, constants, constellation, data, dgnss, dop, ephemeris, frame_catalog,
+    frequencies, fusion, geodesic, geodetic_time_series, geometry, geometry_quality, ils, inertial,
+    navigation, nmea, observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex,
+    rtcm, rtk, sbas, sbas_pl, sidereal, signal, source_localization, ssr, staleness, terrain,
+    tides, velocity,
+};
+pub use sidereon_core::{
+    catalog, catalog_entry, propagate_position, transform, transform_from_epoch, FrameCatalogError,
+    HelmertParameters, HelmertRates, HelmertTransform, TerrestrialFrame, TerrestrialPositionM,
+    TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
 pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
