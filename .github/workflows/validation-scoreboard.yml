@@ -1,0 +1,52 @@
+name: validation-scoreboard
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+concurrency:
+  group: validation-scoreboard
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore validation history
+        run: |
+          mkdir -p "$RUNNER_TEMP/scoreboard"
+          if git fetch origin validation; then
+            git show origin/validation:history.jsonl > "$RUNNER_TEMP/scoreboard/history.jsonl" || true
+          fi
+      - name: Run scoreboard
+        run: |
+          cargo run -p sidereon-scoreboard -- \
+            --output "$RUNNER_TEMP/scoreboard/latest.json" \
+            --history "$RUNNER_TEMP/scoreboard/history.jsonl"
+      - name: Publish validation branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet refs/remotes/origin/validation; then
+            git switch --track origin/validation
+          else
+            git switch --orphan validation
+            git rm -rf .
+          fi
+          cp "$RUNNER_TEMP/scoreboard/latest.json" latest.json
+          cp "$RUNNER_TEMP/scoreboard/history.jsonl" history.jsonl
+          git add latest.json history.jsonl
+          if git diff --cached --quiet; then
+            echo "No validation changes"
+          else
+            git commit -m "Update validation scoreboard"
+            git push origin HEAD:validation
+          fi
