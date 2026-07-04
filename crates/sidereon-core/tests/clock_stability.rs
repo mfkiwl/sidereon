@@ -4,11 +4,18 @@
 //! NIST SP 1065, section 12.4, Table 31. The series is generated from the
 //! published prime-modulus linear congruential recurrence with seed sample
 //! `n0 = 1234567890`, multiplier `16807`, and modulus `2147483647`.
+//!
+//! Power-law clock-noise validation uses IEEE Std 1139-2008 alpha-mu
+//! slope mapping and the NIST SP 1065 section 7.1 domain-conversion
+//! constants, with PM coefficient tests using the NIST MVAR transfer
+//! function in section 7.
 
 use sidereon_core::clock_stability::{
-    allan_deviation, compute_allan_deviations, hadamard_deviation, modified_adev, overlapping_adev,
-    time_deviation, AllanEstimatorSet, AllanInput, AllanOptions, AllanResult, AllanSeries,
-    GapPolicy, TauGrid,
+    allan_deviation, allan_deviation_power_law_slope, allan_variance_power_law_tau_exponent,
+    compute_allan_deviations, fit_power_law_noise, hadamard_deviation, modified_adev,
+    modified_allan_deviation_power_law_slope, overlapping_adev, time_deviation, AllanEstimatorSet,
+    AllanInput, AllanOptions, AllanResult, AllanSeries, GapPolicy, PowerLawNoiseOptions,
+    PowerLawNoiseType, PowerLawOctaveDominance, PowerLawOctaveFlag, TauGrid,
 };
 
 const NIST_MODULUS: u64 = 2_147_483_647;
@@ -264,6 +271,148 @@ fn fixed_phase_series_has_frozen_bits() {
     );
 }
 
+#[test]
+fn power_law_slope_constants_match_published_alpha_mu_table() {
+    let expected: [(PowerLawNoiseType, f64, f64, i32); 5] = [
+        (PowerLawNoiseType::RandomWalkFM, 0.5, 0.5, 1),
+        (PowerLawNoiseType::FlickerFM, 0.0, 0.0, 0),
+        (PowerLawNoiseType::WhiteFM, -0.5, -0.5, -1),
+        (PowerLawNoiseType::FlickerPM, -1.0, -1.0, -2),
+        (PowerLawNoiseType::WhitePM, -1.0, -1.5, -2),
+    ];
+
+    for (noise_type, adev_slope, mdev_slope, variance_mu) in expected {
+        assert_eq!(
+            allan_deviation_power_law_slope(noise_type).to_bits(),
+            adev_slope.to_bits(),
+            "ADEV slope for {noise_type:?}"
+        );
+        assert_eq!(
+            modified_allan_deviation_power_law_slope(noise_type).to_bits(),
+            mdev_slope.to_bits(),
+            "MDEV slope for {noise_type:?}"
+        );
+        assert_eq!(
+            allan_variance_power_law_tau_exponent(noise_type),
+            variance_mu,
+            "variance tau exponent for {noise_type:?}"
+        );
+    }
+}
+
+#[test]
+fn synthetic_power_law_identification_and_coefficients_are_tight() {
+    let cases = [
+        (PowerLawNoiseType::RandomWalkFM, 8.0),
+        (PowerLawNoiseType::FlickerFM, 4.0),
+        (PowerLawNoiseType::WhiteFM, 2.0),
+        (PowerLawNoiseType::FlickerPM, 1.0),
+        (PowerLawNoiseType::WhitePM, 0.5),
+    ];
+
+    for (noise_type, injected_h) in cases {
+        let options = tight_power_law_options();
+        let (adev, mdev) = synthetic_power_law_curves(noise_type, injected_h, options);
+        let fit = fit_power_law_noise(&adev, &mdev, options).expect("power-law fit");
+
+        assert!(
+            fit.dominant_per_octave.iter().all(|octave| {
+                octave.dominance == PowerLawOctaveDominance::Dominant(noise_type)
+            }),
+            "dominant octaves for {noise_type:?}: {:?}",
+            fit.dominant_per_octave
+        );
+        assert_eq!(fit.regions.len(), 1, "region count for {noise_type:?}");
+        assert_eq!(fit.regions[0].noise_type, noise_type);
+
+        let actual = fit.coefficients[noise_type.coefficient_index()];
+        assert_tight_relative(
+            actual,
+            injected_h,
+            16.0 * f64::EPSILON,
+            &format!("coefficient for {noise_type:?}"),
+        );
+    }
+}
+
+#[test]
+fn modified_allan_slope_disambiguates_white_pm_from_flicker_pm() {
+    let options = tight_power_law_options();
+    let (flicker_adev, flicker_mdev) =
+        synthetic_power_law_curves(PowerLawNoiseType::FlickerPM, 1.0, options);
+    let (white_adev, white_mdev) =
+        synthetic_power_law_curves(PowerLawNoiseType::WhitePM, 1.0, options);
+
+    let flicker_fit =
+        fit_power_law_noise(&flicker_adev, &flicker_mdev, options).expect("flicker PM fit");
+    let white_fit = fit_power_law_noise(&white_adev, &white_mdev, options).expect("white PM fit");
+
+    assert_tight_relative(
+        flicker_fit.dominant_per_octave[0].adev_slope.unwrap(),
+        -1.0,
+        8.0e-15,
+        "flicker PM ADEV slope",
+    );
+    assert_tight_relative(
+        white_fit.dominant_per_octave[0].adev_slope.unwrap(),
+        -1.0,
+        8.0e-15,
+        "white PM ADEV slope",
+    );
+    assert_tight_relative(
+        flicker_fit.dominant_per_octave[0].mdev_slope.unwrap(),
+        -1.0,
+        8.0e-15,
+        "flicker PM MDEV slope",
+    );
+    assert_tight_relative(
+        white_fit.dominant_per_octave[0].mdev_slope.unwrap(),
+        -1.5,
+        8.0e-15,
+        "white PM MDEV slope",
+    );
+    assert_eq!(
+        flicker_fit.dominant_per_octave[0].dominance,
+        PowerLawOctaveDominance::Dominant(PowerLawNoiseType::FlickerPM)
+    );
+    assert_eq!(
+        white_fit.dominant_per_octave[0].dominance,
+        PowerLawOctaveDominance::Dominant(PowerLawNoiseType::WhitePM)
+    );
+}
+
+#[test]
+fn weak_or_mixed_power_law_octaves_are_not_forced() {
+    let options = tight_power_law_options();
+    let mixed = mixed_slope_curve();
+    let mixed_fit = fit_power_law_noise(&mixed, &mixed, options).expect("mixed fit");
+    assert_eq!(
+        mixed_fit.dominant_per_octave[0].dominance,
+        PowerLawOctaveDominance::Ambiguous
+    );
+    assert!(mixed_fit.regions.is_empty());
+    assert!(mixed_fit
+        .coefficients
+        .iter()
+        .all(|coefficient| coefficient.is_nan()));
+
+    let short = AllanResult {
+        tau_s: vec![1.0],
+        deviation: vec![1.0],
+        n: vec![1],
+    };
+    let short_fit = fit_power_law_noise(&short, &short, options).expect("short fit");
+    assert_eq!(
+        short_fit.dominant_per_octave[0].dominance,
+        PowerLawOctaveDominance::Flagged(PowerLawOctaveFlag::UnderSampled)
+    );
+    assert!(short_fit.regions.is_empty());
+    assert!(short_fit
+        .coefficients
+        .iter()
+        .all(|coefficient| coefficient.is_nan()));
+}
+
 fn assert_bits(actual: &[f64], expected: &[u64], context: &str) {
     assert_eq!(actual.len(), expected.len(), "{context} len");
     for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -292,4 +441,92 @@ fn log_log_slope(x: &[f64], y: &[f64]) -> f64 {
             (num + dx * dy, den + dx * dx)
         });
     num / den
+}
+
+fn tight_power_law_options() -> PowerLawNoiseOptions {
+    let mut options = PowerLawNoiseOptions::new(1.0, 0.5);
+    options.slope_tolerance = 1.0e-12;
+    options.scatter_tolerance = 1.0e-12;
+    options
+}
+
+fn synthetic_power_law_curves(
+    noise_type: PowerLawNoiseType,
+    h: f64,
+    options: PowerLawNoiseOptions,
+) -> (AllanResult, AllanResult) {
+    let tau_s = vec![1.0, 2.0, 4.0, 8.0, 16.0];
+    let adev = AllanResult {
+        deviation: tau_s
+            .iter()
+            .map(|&tau_s| synthetic_adev_variance(noise_type, h, tau_s).sqrt())
+            .collect(),
+        n: vec![64; tau_s.len()],
+        tau_s: tau_s.clone(),
+    };
+    let mdev = AllanResult {
+        deviation: tau_s
+            .iter()
+            .map(|&tau_s| synthetic_mdev_variance(noise_type, h, tau_s, options).sqrt())
+            .collect(),
+        n: vec![64; tau_s.len()],
+        tau_s,
+    };
+    (adev, mdev)
+}
+
+fn synthetic_adev_variance(noise_type: PowerLawNoiseType, h: f64, tau_s: f64) -> f64 {
+    let pi = core::f64::consts::PI;
+    match noise_type {
+        PowerLawNoiseType::RandomWalkFM => (2.0 * pi * pi / 3.0) * h * tau_s,
+        PowerLawNoiseType::FlickerFM => 2.0 * core::f64::consts::LN_2 * h,
+        PowerLawNoiseType::WhiteFM => 0.5 * h / tau_s,
+        PowerLawNoiseType::FlickerPM | PowerLawNoiseType::WhitePM => h / (tau_s * tau_s),
+    }
+}
+
+fn synthetic_mdev_variance(
+    noise_type: PowerLawNoiseType,
+    h: f64,
+    tau_s: f64,
+    options: PowerLawNoiseOptions,
+) -> f64 {
+    let pi = core::f64::consts::PI;
+    match noise_type {
+        PowerLawNoiseType::RandomWalkFM => (11.0 * pi * pi / 20.0) * h * tau_s,
+        PowerLawNoiseType::FlickerFM => (27.0 / 20.0) * core::f64::consts::LN_2 * h,
+        PowerLawNoiseType::WhiteFM => 0.25 * h / tau_s,
+        PowerLawNoiseType::FlickerPM => {
+            let numerator = 3.0 * (256.0_f64 / 27.0).ln();
+            numerator * h / (8.0 * pi * pi * tau_s * tau_s)
+        }
+        PowerLawNoiseType::WhitePM => {
+            let numerator = 3.0 * options.measurement_bandwidth_hz * options.basic_tau_s;
+            numerator * h / (4.0 * pi * pi * tau_s * tau_s * tau_s)
+        }
+    }
+}
+
+fn mixed_slope_curve() -> AllanResult {
+    let tau_s = vec![1.0, 1.25, 1.5, 2.0];
+    let mut deviation = Vec::with_capacity(tau_s.len());
+    deviation.push(1.0);
+    deviation.push(deviation[0] * f64::powf(tau_s[1] / tau_s[0], -0.5));
+    deviation.push(deviation[1] * f64::powf(tau_s[2] / tau_s[1], -1.0));
+    deviation.push(deviation[2] * f64::powf(tau_s[3] / tau_s[2], -1.0));
+    AllanResult {
+        n: vec![64; tau_s.len()],
+        tau_s,
+        deviation,
+    }
+}
+
+fn assert_tight_relative(actual: f64, expected: f64, tolerance: f64, context: &str) {
+    let diff = (actual - expected).abs();
+    let scale = expected.abs().max(1.0);
+    assert!(
+        diff <= tolerance * scale,
+        "{context}: got {actual:.17e}, expected {expected:.17e}, diff {diff:.3e}, tolerance {:.3e}",
+        tolerance * scale
+    );
 }
