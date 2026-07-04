@@ -18,6 +18,8 @@
 //! - [`decode_crinex`] / [`load_crinex`] expand Hatanaka-compressed
 //!   observation files,
 //! - [`solve_spp`] runs single-point positioning,
+//! - [`araim`] exposes multi-hypothesis protection levels from supplied
+//!   geometry and integrity support data,
 //! - [`solve_velocity`] solves receiver ECEF velocity and clock drift from
 //!   range-rate or Doppler observations,
 //! - [`solve_rtk_float_with`] / [`solve_rtk_fixed_with`] solve static RTK

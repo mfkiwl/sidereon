@@ -14,6 +14,10 @@ pub struct SatelliteIsmModel {
     pub sigma_ura_m: f64,
     /// Accuracy and continuity one-sigma SIS range error, meters.
     pub sigma_ure_m: f64,
+    /// Effective integrity one-sigma range error after local terms, meters.
+    pub effective_sigma_int_m: Option<f64>,
+    /// Effective accuracy one-sigma range error after local terms, meters.
+    pub effective_sigma_acc_m: Option<f64>,
     /// Nominal SIS bias bound, meters.
     pub b_nom_m: f64,
     /// Prior probability for a satellite fault.
@@ -26,6 +30,27 @@ impl SatelliteIsmModel {
         Self {
             sigma_ura_m,
             sigma_ure_m,
+            effective_sigma_int_m: None,
+            effective_sigma_acc_m: None,
+            b_nom_m,
+            p_sat,
+        }
+    }
+
+    /// Construct a per-satellite model with direct effective range sigmas.
+    pub const fn new_with_effective_sigmas(
+        sigma_ura_m: f64,
+        sigma_ure_m: f64,
+        b_nom_m: f64,
+        p_sat: f64,
+        effective_sigma_int_m: f64,
+        effective_sigma_acc_m: f64,
+    ) -> Self {
+        Self {
+            sigma_ura_m,
+            sigma_ure_m,
+            effective_sigma_int_m: Some(effective_sigma_int_m),
+            effective_sigma_acc_m: Some(effective_sigma_acc_m),
             b_nom_m,
             p_sat,
         }
@@ -41,6 +66,10 @@ pub struct SatelliteIsm {
     pub sigma_ura_m: f64,
     /// Accuracy and continuity one-sigma SIS range error, meters.
     pub sigma_ure_m: f64,
+    /// Effective integrity one-sigma range error after local terms, meters.
+    pub effective_sigma_int_m: Option<f64>,
+    /// Effective accuracy one-sigma range error after local terms, meters.
+    pub effective_sigma_acc_m: Option<f64>,
     /// Nominal SIS bias bound, meters.
     pub b_nom_m: f64,
     /// Prior probability for a satellite fault.
@@ -60,6 +89,29 @@ impl SatelliteIsm {
             id,
             sigma_ura_m,
             sigma_ure_m,
+            effective_sigma_int_m: None,
+            effective_sigma_acc_m: None,
+            b_nom_m,
+            p_sat,
+        }
+    }
+
+    /// Construct a satellite-specific model with direct effective range sigmas.
+    pub const fn new_with_effective_sigmas(
+        id: GnssSatelliteId,
+        sigma_ura_m: f64,
+        sigma_ure_m: f64,
+        b_nom_m: f64,
+        p_sat: f64,
+        effective_sigma_int_m: f64,
+        effective_sigma_acc_m: f64,
+    ) -> Self {
+        Self {
+            id,
+            sigma_ura_m,
+            sigma_ure_m,
+            effective_sigma_int_m: Some(effective_sigma_int_m),
+            effective_sigma_acc_m: Some(effective_sigma_acc_m),
             b_nom_m,
             p_sat,
         }
@@ -69,6 +121,8 @@ impl SatelliteIsm {
         SatelliteIsmModel {
             sigma_ura_m: self.sigma_ura_m,
             sigma_ure_m: self.sigma_ure_m,
+            effective_sigma_int_m: self.effective_sigma_int_m,
+            effective_sigma_acc_m: self.effective_sigma_acc_m,
             b_nom_m: self.b_nom_m,
             p_sat: self.p_sat,
         }
@@ -160,18 +214,31 @@ impl Ism {
 
     pub(crate) fn effective_for(&self, row: &AraimRow) -> Result<EffectiveIsm, AraimError> {
         let model = self.model_for(row.id).ok_or(AraimError::InvalidIsm)?;
-        let elevation_deg = row.elevation_rad.to_degrees();
-        let local_variance_m2 =
-            pseudorange_variance(elevation_deg, PseudorangeVarianceOptions::default())
-                .map_err(|_| AraimError::InvalidIsm)?;
-        let sigma_int_m2 = model.sigma_ura_m * model.sigma_ura_m + local_variance_m2;
-        let sigma_acc_m2 = model.sigma_ure_m * model.sigma_ure_m + local_variance_m2;
-        if !validate_positive_finite(sigma_int_m2) || !validate_positive_finite(sigma_acc_m2) {
+        let (sigma_int_m, sigma_acc_m) = if let (Some(sigma_int_m), Some(sigma_acc_m)) =
+            (model.effective_sigma_int_m, model.effective_sigma_acc_m)
+        {
+            (sigma_int_m, sigma_acc_m)
+        } else {
+            let elevation_deg = row.elevation_rad.to_degrees();
+            let local_variance_m2 =
+                pseudorange_variance(elevation_deg, PseudorangeVarianceOptions::default())
+                    .map_err(|_| AraimError::InvalidIsm)?;
+            let sigma_int_m2 = model.sigma_ura_m * model.sigma_ura_m + local_variance_m2;
+            let sigma_acc_m2 = model.sigma_ure_m * model.sigma_ure_m + local_variance_m2;
+            if !validate_positive_finite(sigma_int_m2) || !validate_positive_finite(sigma_acc_m2) {
+                return Err(AraimError::InvalidIsm);
+            }
+            (sigma_int_m2.sqrt(), sigma_acc_m2.sqrt())
+        };
+        if !validate_positive_finite(sigma_int_m)
+            || !validate_positive_finite(sigma_acc_m)
+            || sigma_acc_m > sigma_int_m
+        {
             return Err(AraimError::InvalidIsm);
         }
         Ok(EffectiveIsm {
-            sigma_int_m: sigma_int_m2.sqrt(),
-            sigma_acc_m: sigma_acc_m2.sqrt(),
+            sigma_int_m,
+            sigma_acc_m,
             b_nom_m: model.b_nom_m,
             p_sat: model.p_sat,
         })
@@ -187,9 +254,19 @@ pub(crate) struct EffectiveIsm {
 }
 
 fn validate_sat_model(model: SatelliteIsmModel) -> bool {
+    let valid_effective_sigmas = match (model.effective_sigma_int_m, model.effective_sigma_acc_m) {
+        (Some(sigma_int_m), Some(sigma_acc_m)) => {
+            validate_positive_finite(sigma_int_m)
+                && validate_positive_finite(sigma_acc_m)
+                && sigma_acc_m <= sigma_int_m
+        }
+        (None, None) => true,
+        _ => false,
+    };
     validate_positive_finite(model.sigma_ura_m)
         && validate_positive_finite(model.sigma_ure_m)
         && model.sigma_ure_m <= model.sigma_ura_m
         && validate_nonneg_finite(model.b_nom_m)
         && validate_probability(model.p_sat, true)
+        && valid_effective_sigmas
 }
