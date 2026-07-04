@@ -1,14 +1,9 @@
-use crate::astro::math::linear::invert_symmetric_pd;
 use crate::astro::math::special::{normal_q, normal_q_inv};
-use crate::dop::ecef_to_enu_rotation;
 use crate::id::GnssSystem;
+use crate::integrity::{gain_matrix_enu_from_design_rows, IntegrityError};
+pub(crate) use crate::integrity::{metric_sigma, GainMatrix};
 
 use super::{clock_system_for_row, validate_probability, AraimError, AraimGeometry};
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GainMatrix {
-    pub enu_rows: [Vec<f64>; 3],
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProtectionEquationTerm {
@@ -49,71 +44,25 @@ pub(crate) fn gain_matrix_enu_for_clock_systems(
     if weights.iter().filter(|&&weight| weight > 0.0).count() < n_state {
         return Err(AraimError::InsufficientGeometry);
     }
+    if weights
+        .iter()
+        .any(|&weight| !weight.is_finite() || weight < 0.0)
+    {
+        return Err(AraimError::NumericalFailure);
+    }
 
-    let mut normal = vec![vec![0.0_f64; n_state]; n_state];
     let mut design_rows: Vec<Vec<f64>> = Vec::with_capacity(geometry.rows.len());
     for (row, &weight) in geometry.rows.iter().zip(weights) {
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(AraimError::NumericalFailure);
-        }
         let design = if weight > 0.0 {
             design_row(clock_systems, row)?
         } else {
             vec![0.0; n_state]
         };
-        if weight > 0.0 {
-            for i in 0..n_state {
-                for j in 0..n_state {
-                    normal[i][j] += design[i] * weight * design[j];
-                }
-            }
-        }
         design_rows.push(design);
     }
 
-    let inverse = invert_symmetric_pd(&normal).ok_or(AraimError::InsufficientGeometry)?;
-    let mut ecef_rows = [
-        vec![0.0; geometry.rows.len()],
-        vec![0.0; geometry.rows.len()],
-        vec![0.0; geometry.rows.len()],
-    ];
-    for (measurement_idx, (design, &weight)) in design_rows.iter().zip(weights).enumerate() {
-        if weight == 0.0 {
-            continue;
-        }
-        for state_idx in 0..3 {
-            let mut value = 0.0;
-            for col in 0..n_state {
-                value += inverse[state_idx][col] * design[col] * weight;
-            }
-            ecef_rows[state_idx][measurement_idx] = value;
-        }
-    }
-
-    let r = ecef_to_enu_rotation(geometry.receiver.lat_rad, geometry.receiver.lon_rad);
-    let mut enu_rows = [
-        vec![0.0; geometry.rows.len()],
-        vec![0.0; geometry.rows.len()],
-        vec![0.0; geometry.rows.len()],
-    ];
-    for coord in 0..3 {
-        for measurement_idx in 0..geometry.rows.len() {
-            enu_rows[coord][measurement_idx] = r[coord][0] * ecef_rows[0][measurement_idx]
-                + r[coord][1] * ecef_rows[1][measurement_idx]
-                + r[coord][2] * ecef_rows[2][measurement_idx];
-        }
-    }
-
-    Ok(GainMatrix { enu_rows })
-}
-
-pub(crate) fn metric_sigma(gain_row: &[f64], sigmas_m: &[f64]) -> f64 {
-    gain_row
-        .iter()
-        .zip(sigmas_m)
-        .map(|(&s, &sigma)| s * s * sigma * sigma)
-        .sum::<f64>()
-        .sqrt()
+    gain_matrix_enu_from_design_rows(&design_rows, weights, geometry.receiver, n_state)
+        .map_err(map_integrity_error)
 }
 
 pub(crate) fn metric_bias(gain_row: &[f64], biases_m: &[f64]) -> f64 {
@@ -294,4 +243,14 @@ fn design_row(clock_systems: &[GnssSystem], row: &super::AraimRow) -> Result<Vec
         .ok_or(AraimError::InsufficientGeometry)?;
     design[3 + clock_idx] = 1.0;
     Ok(design)
+}
+
+fn map_integrity_error(error: IntegrityError) -> AraimError {
+    match error {
+        IntegrityError::Singular => AraimError::InsufficientGeometry,
+        IntegrityError::InvalidInput { .. }
+        | IntegrityError::NonFinite
+        | IntegrityError::NotPositiveSemidefinite
+        | IntegrityError::InvalidProbability { .. } => AraimError::NumericalFailure,
+    }
 }

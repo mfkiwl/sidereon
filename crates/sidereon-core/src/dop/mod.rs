@@ -58,7 +58,10 @@ use crate::astro::math::mat3::{inline_rxr, inline_tr};
 
 use crate::frame::Wgs84Geodetic;
 use crate::id::GnssSystem;
+use crate::integrity::{self, IntegrityError};
 use crate::validate;
+
+pub use crate::integrity::ErrorEllipse2;
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const LOS_UNIT_TOLERANCE: f64 = 1.0e-3;
@@ -227,28 +230,6 @@ pub struct HorizontalErrorEllipse {
     pub semi_minor_m: f64,
     /// Semi-major-axis azimuth in radians, from east toward north.
     pub azimuth_rad: f64,
-}
-
-/// A confidence ellipse from an arbitrary 2x2 covariance block.
-///
-/// Domain-neutral companion to [`HorizontalErrorEllipse`]: the axes carry
-/// whatever unit the covariance is in (square that unit), and `orientation_rad`
-/// is the semi-major-axis direction measured from the first axis toward the
-/// second.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ErrorEllipse2 {
-    /// Requested confidence probability in `(0, 1)`.
-    pub confidence: f64,
-    /// Two-degree-of-freedom chi-square scale `-2 ln(1 - confidence)` applied to
-    /// the covariance eigenvalues.
-    pub chi_square_scale: f64,
-    /// Semi-major axis length (same unit as the square root of the covariance).
-    pub semi_major: f64,
-    /// Semi-minor axis length.
-    pub semi_minor: f64,
-    /// Semi-major-axis orientation in radians, from the first (row/col 0) axis
-    /// toward the second (row/col 1) axis.
-    pub orientation_rad: f64,
 }
 
 /// Why a geometry has no finite DOP.
@@ -616,6 +597,20 @@ pub fn position_covariance_from_geometry_m2(
     })
 }
 
+/// Rotate an ECEF position covariance into local ENU square metres.
+///
+/// The rotation is `R * covariance_ecef_m2 * R^T` using the same geodetic ENU
+/// rows as [`dop`] and [`geometry_cofactor`].
+pub fn rotate_covariance_ecef_to_enu_m2(
+    covariance_ecef_m2: [[f64; 3]; 3],
+    receiver: Wgs84Geodetic,
+) -> Result<[[f64; 3]; 3], DopError> {
+    validate_matrix3(&covariance_ecef_m2, "covariance_ecef_m2")?;
+    validate_receiver(receiver)?;
+    let r = ecef_to_enu_rotation(receiver.lat_rad, receiver.lon_rad);
+    Ok(rotate3(&covariance_ecef_m2, &r))
+}
+
 /// Horizontal confidence ellipse from a local ENU covariance matrix.
 ///
 /// The 2D horizontal covariance is the east/north block of `covariance_enu_m2`.
@@ -660,38 +655,15 @@ pub fn error_ellipse_2x2(
     covariance: [[f64; 2]; 2],
     confidence: f64,
 ) -> Result<ErrorEllipse2, DopError> {
-    for row in &covariance {
-        validate::finite_slice(row, "covariance").map_err(map_validation_error)?;
-    }
-    validate_confidence(confidence)?;
+    integrity::error_ellipse_2x2(covariance, confidence).map_err(map_integrity_error)
+}
 
-    let a = covariance[0][0];
-    let b = 0.5 * (covariance[0][1] + covariance[1][0]);
-    let c = covariance[1][1];
-    let half_delta = 0.5 * (a - c);
-    let center = 0.5 * (a + c);
-    let root = (half_delta * half_delta + b * b).sqrt();
-    let lambda_major = center + root;
-    let lambda_minor = center - root;
-    if !lambda_major.is_finite() || !lambda_minor.is_finite() || lambda_minor < -1.0e-12 {
-        return Err(invalid_input("covariance", "not positive semidefinite"));
-    }
-
-    let chi_square_scale = -2.0 * (1.0 - confidence).ln();
-    let semi_major = (lambda_major.max(0.0) * chi_square_scale).sqrt();
-    let semi_minor = (lambda_minor.max(0.0) * chi_square_scale).sqrt();
-    let orientation_rad = if root == 0.0 {
-        0.0
-    } else {
-        0.5 * (2.0 * b).atan2(a - c)
-    };
-    Ok(ErrorEllipse2 {
-        confidence,
-        chi_square_scale,
-        semi_major,
-        semi_minor,
-        orientation_rad,
-    })
+/// One-sigma ellipse from an arbitrary 2x2 covariance block.
+///
+/// This is the same symmetric eigensolve as [`error_ellipse_2x2`], with a unit
+/// covariance scale instead of a confidence contour scale.
+pub fn error_ellipse_2x2_unit(covariance: [[f64; 2]; 2]) -> Result<ErrorEllipse2, DopError> {
+    integrity::error_ellipse_2x2_unit(covariance).map_err(map_integrity_error)
 }
 
 /// Horizontal confidence ellipse directly from line-of-sight rows and weights.
@@ -757,16 +729,6 @@ fn validate_variance_scale(value: f64) -> Result<(), DopError> {
     }
     if value < 0.0 {
         return Err(invalid_input("range_variance_scale_m2", "negative"));
-    }
-    Ok(())
-}
-
-fn validate_confidence(value: f64) -> Result<(), DopError> {
-    if !value.is_finite() {
-        return Err(invalid_input("confidence", "not finite"));
-    }
-    if !(0.0..1.0).contains(&value) {
-        return Err(invalid_input("confidence", "out of range"));
     }
     Ok(())
 }
@@ -899,6 +861,18 @@ fn map_linear_error(error: LinearError) -> DopError {
 
 fn map_validation_error(error: validate::FieldError) -> DopError {
     invalid_input(error.field(), error.reason())
+}
+
+fn map_integrity_error(error: IntegrityError) -> DopError {
+    match error {
+        IntegrityError::NonFinite => invalid_input("covariance", "not finite"),
+        IntegrityError::NotPositiveSemidefinite => {
+            invalid_input("covariance", "not positive semidefinite")
+        }
+        IntegrityError::InvalidProbability { reason } => invalid_input("confidence", reason),
+        IntegrityError::InvalidInput { field, reason } => invalid_input(field, reason),
+        IntegrityError::Singular => DopError::Singular,
+    }
 }
 
 // --- multi-system DOP (general (3 + n_systems) x (3 + n_systems)) -----------

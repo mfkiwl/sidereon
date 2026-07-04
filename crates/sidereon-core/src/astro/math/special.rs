@@ -8,25 +8,25 @@
 
 /// Gauss error function, deterministic across platforms via the `libm` crate.
 #[inline]
-pub(crate) fn erf(x: f64) -> f64 {
+pub fn erf(x: f64) -> f64 {
     libm::erf(x)
 }
 
 /// Complementary error function, deterministic across platforms via `libm`.
 #[inline]
-pub(crate) fn erfc(x: f64) -> f64 {
+pub fn erfc(x: f64) -> f64 {
     libm::erfc(x)
 }
 
 /// Upper standard-normal tail probability `Q(x) = P(Z > x)`.
 #[inline]
-pub(crate) fn normal_q(x: f64) -> f64 {
+pub fn normal_q(x: f64) -> f64 {
     0.5 * erfc(x * core::f64::consts::FRAC_1_SQRT_2)
 }
 
 /// Inverse complementary error function for `y` in `(0, 2)`.
 #[inline]
-pub(crate) fn erfc_inv(y: f64) -> Option<f64> {
+pub fn erfc_inv(y: f64) -> Option<f64> {
     if !(0.0..2.0).contains(&y) || !y.is_finite() {
         return None;
     }
@@ -35,7 +35,7 @@ pub(crate) fn erfc_inv(y: f64) -> Option<f64> {
 
 /// Inverse upper standard-normal tail probability for `p` in `(0, 1)`.
 #[inline]
-pub(crate) fn normal_q_inv(p: f64) -> Option<f64> {
+pub fn normal_q_inv(p: f64) -> Option<f64> {
     if !(0.0..1.0).contains(&p) || !p.is_finite() {
         return None;
     }

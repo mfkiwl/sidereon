@@ -87,6 +87,7 @@ pub mod constellation; // GNSS constellation identity catalog (CelesTrak/NAVCEN)
 mod crinex; // Hatanaka (CRINEX) observation-file decoder
 pub mod data; // sans-IO GNSS product filename and archive URL catalog
 pub mod dop; // dilution-of-precision geometry (GDOP/PDOP/HDOP/VDOP/TDOP)
+pub mod error_metrics; // covariance-derived CEP, radial, and ellipse metrics
 pub mod frequencies; // canonical GNSS carrier-frequency table
 mod glonass; // GLONASS PZ-90.11 state-vector RK4 propagation
 mod ionex; // Klobuchar broadcast model + IONEX ionospheric maps
@@ -129,6 +130,7 @@ pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric he
 pub mod geometry;
 pub mod geometry_quality;
 pub mod ils; // integer least squares ambiguity-resolution kernels
+pub mod integrity; // shared protection and covariance primitives
 pub mod observation_qc; // RINEX observation completeness and signal rollups
 pub mod qc_obs {
     //! RINEX observation quality-control rollups.
@@ -145,6 +147,12 @@ pub mod terrain_store;
 pub mod tides;
 pub mod tolerances;
 
+pub use crate::error_metrics::{
+    error_ellipse_from_enu_m2, horizontal_radius_at, metrics_from_ecef_covariance_m2,
+    metrics_from_enu_covariance_m2, metrics_from_kinematic_solution,
+    metrics_from_position_covariance, spherical_radius_at, vertical_radius_at, ErrorEllipse,
+    ErrorMetricsError, PercentileRadius, PositionErrorMetrics,
+};
 pub use crate::estimation::{
     alpha_beta_apply_measurement, alpha_beta_filter_step, alpha_beta_predict,
     alpha_beta_steady_state_gains, cfar_ca_false_alarm_probability, cfar_ca_multiplier_from_pfa,
