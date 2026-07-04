@@ -711,6 +711,8 @@ fn receiver_solution(
 ) -> ReceiverSolution {
     let used_count = used_sats.len();
     let redundancy = used_count as isize - (3 + systems.len()) as isize;
+    let n_params = 3 + systems.len();
+    let rank = used_count.min(n_params);
     ReceiverSolution {
         position: ItrfPositionM::new(6_378_137.0, 0.0, 0.0).expect("valid receiver"),
         geodetic: Some(receiver()),
@@ -721,6 +723,15 @@ fn receiver_solution(
         residuals_m: vec![0.0; used_count],
         used_sats,
         rejected_sats: Vec::new(),
+        geometry_quality: crate::geometry_quality::classify(
+            rank,
+            n_params,
+            redundancy as i32,
+            1.0,
+            1.0,
+            false,
+            crate::geometry_quality::GeometryQualityThresholds::default(),
+        ),
         metadata: SolutionMetadata {
             iterations: 1,
             converged: true,

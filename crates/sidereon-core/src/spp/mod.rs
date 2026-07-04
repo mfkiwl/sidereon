@@ -52,8 +52,10 @@
 
 use crate::astro::angles::rad_to_deg_ref;
 use crate::astro::math::least_squares::{
-    self, solve_trf_with, LeastSquaresProblem, SolveOptions, Status, TrustRegionSolve,
+    self, singular_value_diagnostics, solve_trf_with, LeastSquaresProblem, SolveOptions, Status,
+    TrustRegionSolve,
 };
+use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
 use nalgebra::DVector;
 use std::collections::BTreeMap;
 
@@ -277,6 +279,12 @@ pub struct ReceiverSolution {
     pub used_sats: Vec<GnssSatelliteId>,
     /// The excluded satellites, each with its reason.
     pub rejected_sats: Vec<RejectedSat>,
+    /// Geometry observability and covariance-validation diagnostics for the
+    /// converged design. Snapshot SPP has no propagated prior, so
+    /// `ZeroRedundancy` marks unvalidated covariance bounds, `Weak` leaves large
+    /// bounds unclamped, and `RankDeficient` is routed through [`SppError::Singular`]
+    /// instead of returning a solution.
+    pub geometry_quality: GeometryQuality,
     /// Iteration / convergence / model metadata.
     pub metadata: SolutionMetadata,
 }
@@ -1449,6 +1457,22 @@ fn solve_inner(
     } else {
         dop_multi(&los, &clock_index, &systems, n_clocks, &sel.weights, geo).ok()
     };
+    let n_params = xs.len();
+    let jacobian_svd = report.jacobian.clone().svd(false, false);
+    let diagnostics = singular_value_diagnostics(
+        jacobian_svd.singular_values.as_slice(),
+        report.jacobian.nrows(),
+        report.jacobian.ncols(),
+    );
+    if diagnostics.rank < n_params || dop_result.is_none() {
+        return Err(SppError::Singular(
+            least_squares::SolveError::SingularJacobian,
+        ));
+    }
+    let gdop = dop_result
+        .as_ref()
+        .expect("full-rank SPP geometry has DOP")
+        .gdop;
     // The solution's per-system TDOPs come straight from the now-tagged
     // `Dop::system_tdops`; empty when the converged geometry is rank-deficient.
     let system_tdops: Vec<(GnssSystem, f64)> = dop_result
@@ -1462,6 +1486,15 @@ fn solve_inner(
     );
     let metadata_used_count = sel.used.len();
     let metadata_redundancy = redundancy(&systems, metadata_used_count);
+    let geometry_quality = classify(
+        diagnostics.rank,
+        n_params,
+        metadata_redundancy as i32,
+        diagnostics.condition_number,
+        gdop,
+        false,
+        GeometryQualityThresholds::default(),
+    );
 
     Ok(ReceiverSolution {
         position,
@@ -1473,6 +1506,7 @@ fn solve_inner(
         residuals_m,
         used_sats: sel.used,
         rejected_sats: sel.rejected,
+        geometry_quality,
         metadata: SolutionMetadata {
             iterations: report.iterations,
             converged,

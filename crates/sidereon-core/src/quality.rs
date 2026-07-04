@@ -1638,6 +1638,15 @@ mod tests {
             residuals_m: vec![0.1, -0.1, 0.0, 0.05, -0.05],
             used_sats: (1..=5).map(gps).collect(),
             rejected_sats: Vec::new(),
+            geometry_quality: crate::geometry_quality::GeometryQuality {
+                tier: crate::geometry_quality::ObservabilityTier::Nominal,
+                redundancy: 1,
+                rank: 4,
+                condition_number: 1.0,
+                gdop: 2.5,
+                raim_checkable: true,
+                covariance_validated: true,
+            },
             metadata: crate::spp::SolutionMetadata {
                 iterations: 3,
                 converged: true,

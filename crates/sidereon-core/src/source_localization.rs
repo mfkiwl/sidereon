@@ -11,7 +11,12 @@ pub use trust_region_least_squares::loss::Loss;
 use trust_region_least_squares::model::{solve_model, ResidualModel};
 use trust_region_least_squares::trf::{TrfError, TrfOptions, TrfResult, XScale};
 
+use crate::astro::math::least_squares::singular_value_diagnostics;
 use crate::dop::{self, Dop, DopError};
+use crate::geometry_quality::{
+    classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
+};
+use nalgebra::DMatrix;
 
 const ROOT_TOL: f64 = 1.0e-12;
 
@@ -154,21 +159,6 @@ pub struct SourceCovariance {
     pub timing_sigma_s: f64,
 }
 
-/// Geometry and redundancy diagnostics for a source solve.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceGeometryQuality {
-    /// Number of residual rows used by the solve.
-    pub residual_count: usize,
-    /// Number of estimated state parameters.
-    pub parameter_count: usize,
-    /// `residual_count - parameter_count`, saturated at zero.
-    pub redundancy: usize,
-    /// Whether the covariance matrix was available from the normal matrix.
-    pub covariance_available: bool,
-    /// Whether the final normal matrix was rank deficient or not positive definite.
-    pub rank_deficient: bool,
-}
-
 /// Source solution from [`locate_source`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceSolution {
@@ -182,8 +172,12 @@ pub struct SourceSolution {
     pub residuals: Vec<SourceResidual>,
     /// Per-sensor influence diagnostics.
     pub per_sensor_influence: Vec<SourceSensorInfluence>,
-    /// Geometry rank and redundancy summary.
-    pub geometry_quality: SourceGeometryQuality,
+    /// Geometry observability and covariance-validation diagnostics for the
+    /// final timing design. Snapshot source solves use no propagated prior, so
+    /// `ZeroRedundancy` covariance bounds are unvalidated, `Weak` bounds are
+    /// reported without clamping, and `RankDeficient` is routed through a typed
+    /// geometry error instead of returning a solution.
+    pub geometry_quality: GeometryQuality,
     /// Closed-form seed used to start the iterative solve.
     pub initial_guess: SourceInitialGuess,
     /// Trust-region termination status.
@@ -570,27 +564,26 @@ fn build_solution(
     let residuals = problem.residual_records(&result.fun);
     let parameter_count = result.x.len();
     let residual_count = result.fun.len();
+    let geometry_quality =
+        source_geometry_quality_from_jacobian(&result.jac, residual_count, parameter_count)?;
+    if geometry_quality.tier == ObservabilityTier::RankDeficient {
+        return Err(SourceLocalizationError::Geometry(DopError::Singular));
+    }
     let covariance = covariance_from_jacobian(
         &result.jac,
         residual_count,
         parameter_count,
         resolved.dimension,
         timing_sigma_s,
-    );
-    let covariance_available = covariance.is_some();
+    )
+    .ok_or(SourceLocalizationError::Geometry(DopError::Singular))?;
     Ok(SourceSolution {
         position_m,
         origin_time_s,
-        covariance,
+        covariance: Some(covariance),
         residuals,
         per_sensor_influence: Vec::new(),
-        geometry_quality: SourceGeometryQuality {
-            residual_count,
-            parameter_count,
-            redundancy: residual_count.saturating_sub(parameter_count),
-            covariance_available,
-            rank_deficient: !covariance_available,
-        },
+        geometry_quality,
         initial_guess: initial_guess.clone(),
         status: result.status,
         nfev: result.nfev,
@@ -598,6 +591,36 @@ fn build_solution(
         cost: result.cost,
         optimality: result.optimality,
     })
+}
+
+fn source_geometry_quality_from_jacobian(
+    jac: &[f64],
+    m: usize,
+    n: usize,
+) -> Result<GeometryQuality, SourceLocalizationError> {
+    if n == 0 || m == 0 || jac.len() != m.saturating_mul(n) {
+        return Err(SourceLocalizationError::Geometry(DopError::Singular));
+    }
+    let matrix = DMatrix::from_row_slice(m, n, jac);
+    let singular_values = matrix.svd(false, false).singular_values;
+    let diagnostics = singular_value_diagnostics(singular_values.as_slice(), m, n);
+    let gdop = if diagnostics.rank < n {
+        f64::INFINITY
+    } else {
+        cofactor_trace_from_jacobian(jac, m, n)
+            .filter(|trace| *trace >= 0.0 && trace.is_finite())
+            .map(f64::sqrt)
+            .unwrap_or(f64::INFINITY)
+    };
+    Ok(classify(
+        diagnostics.rank,
+        n,
+        m as i32 - n as i32,
+        diagnostics.condition_number,
+        gdop,
+        false,
+        GeometryQualityThresholds::default(),
+    ))
 }
 
 fn chan_ho_initial_guess_resolved(
@@ -1014,6 +1037,21 @@ fn covariance_from_jacobian(
     dimension: usize,
     timing_sigma_s: f64,
 ) -> Option<SourceCovariance> {
+    let cofactor = cofactor_from_jacobian(jac, m, n)?;
+    Some(covariance_from_state_cofactor(
+        &cofactor,
+        dimension,
+        timing_sigma_s,
+        n == dimension + 1,
+    ))
+}
+
+fn cofactor_trace_from_jacobian(jac: &[f64], m: usize, n: usize) -> Option<f64> {
+    let cofactor = cofactor_from_jacobian(jac, m, n)?;
+    Some((0..n).map(|idx| cofactor[idx][idx]).sum())
+}
+
+fn cofactor_from_jacobian(jac: &[f64], m: usize, n: usize) -> Option<Vec<Vec<f64>>> {
     if jac.len() != m.checked_mul(n)? {
         return None;
     }
@@ -1025,13 +1063,7 @@ fn covariance_from_jacobian(
             }
         }
     }
-    let cofactor = crate::astro::math::linear::invert_symmetric_pd(&normal)?;
-    Some(covariance_from_state_cofactor(
-        &cofactor,
-        dimension,
-        timing_sigma_s,
-        n == dimension + 1,
-    ))
+    crate::astro::math::linear::invert_symmetric_pd(&normal)
 }
 
 fn covariance_from_state_cofactor(
@@ -1371,6 +1403,33 @@ mod tests {
     }
 
     #[test]
+    fn locate_source_toa_geometry_quality_is_nominal() {
+        let sensors = vec![
+            Sensor::new(vec![0.0, 0.0, 0.0]),
+            Sensor::new(vec![2.0, 0.0, 0.0]),
+            Sensor::new(vec![0.0, 2.0, 0.0]),
+            Sensor::new(vec![0.0, 0.0, 2.0]),
+            Sensor::new(vec![2.0, 2.0, 2.0]),
+        ];
+        let source = vec![0.4, 0.6, 0.5];
+        let origin = 1.25;
+        let speed = 1.0;
+        let times = arrivals(&sensors, &source, origin, speed);
+
+        let solution = locate_source(&sensors, &times, speed, &SourceLocateOptions::default())
+            .expect("well-posed source solve");
+
+        assert_eq!(
+            solution.geometry_quality.tier,
+            crate::geometry_quality::ObservabilityTier::Nominal
+        );
+        assert_eq!(solution.geometry_quality.rank, 4);
+        assert_eq!(solution.geometry_quality.redundancy, 1);
+        assert!(solution.geometry_quality.raim_checkable);
+        assert!(solution.geometry_quality.covariance_validated);
+    }
+
+    #[test]
     fn locate_source_tdoa_recovers_clean_2d() {
         let sensors = vec![
             Sensor::new(vec![0.0, 0.0]),
@@ -1515,5 +1574,31 @@ mod tests {
             err,
             SourceLocalizationError::Geometry(DopError::Singular)
         ));
+    }
+
+    #[test]
+    fn source_collinear_timing_design_classifies_rank_deficient() {
+        let jac = [
+            1.0 / 300.0,
+            0.0,
+            1.0,
+            -1.0 / 300.0,
+            0.0,
+            1.0,
+            -1.0 / 300.0,
+            0.0,
+            1.0,
+            -1.0 / 300.0,
+            0.0,
+            1.0,
+        ];
+        let quality = source_geometry_quality_from_jacobian(&jac, 4, 3).expect("quality");
+
+        assert_eq!(
+            quality.tier,
+            crate::geometry_quality::ObservabilityTier::RankDeficient
+        );
+        assert!(!quality.raim_checkable);
+        assert!(!quality.covariance_validated);
     }
 }

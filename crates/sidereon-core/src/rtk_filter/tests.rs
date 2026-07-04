@@ -6,6 +6,7 @@ use super::antenna::ReceiverAntennaScratch;
 use super::*;
 use crate::ambiguity::AmbiguityId;
 use crate::constants::{C_M_S, F_L1_HZ};
+use crate::geometry_quality::ObservabilityTier;
 
 // Per-system reference map from reference satellite ids (system = first byte).
 fn refs_of(ids: &[&str]) -> BTreeMap<String, String> {
@@ -268,6 +269,60 @@ fn simple_single_dd_fixture() -> ([f64; 3], Epoch, FilterState, MeasModel, Vec<S
         },
     };
     (base, epoch, state, model, vec!["G02".to_string()])
+}
+
+fn rtk_unit(v: [f64; 3]) -> [f64; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    [v[0] / n, v[1] / n, v[2] / n]
+}
+
+fn rtk_sat_from_direction(base: [f64; 3], direction: [f64; 3]) -> [f64; 3] {
+    let unit = rtk_unit(direction);
+    let range_m = 22_000_000.0;
+    [
+        base[0] + range_m * unit[0],
+        base[1] + range_m * unit[1],
+        base[2] + range_m * unit[2],
+    ]
+}
+
+fn clean_float_epoch(base: [f64; 3], baseline: [f64; 3], sats: &[(&str, [f64; 3], f64)]) -> Epoch {
+    let rover = [
+        base[0] + baseline[0],
+        base[1] + baseline[1],
+        base[2] + baseline[2],
+    ];
+    let mk = |id: &str, pos: [f64; 3], ambiguity_m: f64| SatMeas {
+        sat: id.into(),
+        sd_ambiguity_id: id.into(),
+        base_code_m: range_m(pos, base),
+        base_phase_m: range_m(pos, base),
+        rover_code_m: range_m(pos, rover),
+        rover_phase_m: range_m(pos, rover) + ambiguity_m,
+        base_tx_pos: pos,
+        rover_tx_pos: pos,
+        pos,
+    };
+    Epoch {
+        references: vec![mk(sats[0].0, sats[0].1, sats[0].2)],
+        nonref: sats[1..]
+            .iter()
+            .map(|(id, position, ambiguity)| mk(id, *position, *ambiguity))
+            .collect(),
+        velocity_mps: None,
+        dt_s: 0.0,
+    }
+}
+
+fn float_model(code_sigma_m: f64, phase_sigma_m: f64) -> MeasModel {
+    MeasModel {
+        code_sigma_m,
+        phase_sigma_m,
+        sagnac: false,
+        stochastic: StochasticModel::Simple {
+            elevation_weighting: false,
+        },
+    }
 }
 
 fn single_dd_update_opts() -> UpdateOpts {
@@ -2116,6 +2171,150 @@ fn float_batch_solver_has_frozen_bits_golden() {
             8,
             4,
         )
+    );
+}
+
+#[test]
+fn float_geometry_quality_zero_redundancy_emits_unvalidated_point() {
+    //! Clean-room RTK float geometry: one reference plus three non-reference
+    //! satellites gives six code/phase rows for six float states. Observations
+    //! are generated exactly from the double-difference model.
+
+    let base = [4_075_580.0, 931_854.0, 4_801_568.0];
+    let baseline = [1.2, -0.85, 0.91];
+    let sats: [(&str, [f64; 3], f64); 4] = [
+        ("G01", [15_000_000.0, 7_000_000.0, 21_000_000.0], 0.0),
+        ("G02", [-12_000_000.0, 18_000_000.0, 19_000_000.0], 0.6),
+        ("G03", [20_000_000.0, -10_000_000.0, 17_000_000.0], -1.4),
+        ("G04", [-19_000_000.0, -13_000_000.0, 20_000_000.0], 1.0),
+    ];
+    let epoch = clean_float_epoch(base, baseline, &sats);
+    let ambiguity_ids = vec!["G02".to_string(), "G03".to_string(), "G04".to_string()];
+
+    let solution = solve_float_baseline(
+        &[epoch],
+        base,
+        &ambiguity_ids,
+        baseline,
+        &float_model(0.3, 0.003),
+        FloatSolveOpts {
+            position_tol_m: 1.0e-9,
+            ambiguity_tol_m: 1.0e-9,
+            max_iterations: 5,
+        },
+        None,
+    )
+    .expect("zero-redundancy RTK float solves");
+
+    assert_eq!(
+        solution.geometry_quality.tier,
+        ObservabilityTier::ZeroRedundancy
+    );
+    assert_eq!(solution.geometry_quality.redundancy, 0);
+    assert!(!solution.geometry_quality.covariance_validated);
+    assert!(!solution.geometry_quality.raim_checkable);
+    assert_eq!(solution.n_observations, 6);
+    assert!(solution
+        .residuals
+        .iter()
+        .all(|residual| residual.code_m.abs() < 1.0e-8 && residual.phase_m.abs() < 1.0e-8));
+}
+
+#[test]
+fn float_rank_deficient_geometry_returns_singular_error() {
+    //! Clean-room RTK float geometry with three identical non-reference
+    //! directions. The ambiguity columns are observable, but the baseline block
+    //! has only one independent direction.
+
+    let base = [4_075_580.0, 931_854.0, 4_801_568.0];
+    let baseline = [1.2, -0.85, 0.91];
+    let repeated = [-12_000_000.0, 18_000_000.0, 19_000_000.0];
+    let sats: [(&str, [f64; 3], f64); 4] = [
+        ("G01", [15_000_000.0, 7_000_000.0, 21_000_000.0], 0.0),
+        ("G02", repeated, 0.6),
+        ("G03", repeated, -1.4),
+        ("G04", repeated, 1.0),
+    ];
+    let epoch = clean_float_epoch(base, baseline, &sats);
+    let ambiguity_ids = vec!["G02".to_string(), "G03".to_string(), "G04".to_string()];
+
+    let error = solve_float_baseline(
+        &[epoch],
+        base,
+        &ambiguity_ids,
+        baseline,
+        &float_model(0.3, 0.003),
+        FloatSolveOpts::default(),
+        None,
+    )
+    .expect_err("rank-deficient RTK float geometry must not emit a point");
+
+    assert_eq!(error, FloatSolveError::SingularGeometry);
+}
+
+#[test]
+fn float_geometry_quality_weak_emits_large_unclamped_bound() {
+    //! Clean-room RTK float geometry with clustered satellite directions. The
+    //! design stays full rank with one residual degree of freedom, but the
+    //! covariance projection is intentionally large.
+
+    let base = [4_075_580.0, 931_854.0, 4_801_568.0];
+    let baseline = [1.2, -0.85, 0.91];
+    let dirs = [
+        [1.0, 0.0, 0.0],
+        [1.0, 0.02, 0.0],
+        [1.0, 0.0, 0.02],
+        [1.0, 0.02, 0.02],
+        [1.0, -0.015, 0.01],
+    ];
+    let positions = dirs.map(|dir| rtk_sat_from_direction(base, dir));
+    let sats: [(&str, [f64; 3], f64); 5] = [
+        ("G01", positions[0], 0.0),
+        ("G02", positions[1], 0.6),
+        ("G03", positions[2], -1.4),
+        ("G04", positions[3], 1.0),
+        ("G05", positions[4], -0.3),
+    ];
+    let epoch = clean_float_epoch(base, baseline, &sats);
+    let ambiguity_ids = vec![
+        "G02".to_string(),
+        "G03".to_string(),
+        "G04".to_string(),
+        "G05".to_string(),
+    ];
+
+    let solution = solve_float_baseline(
+        &[epoch],
+        base,
+        &ambiguity_ids,
+        baseline,
+        &float_model(1.0, 1.0),
+        FloatSolveOpts {
+            position_tol_m: 1.0e-9,
+            ambiguity_tol_m: 1.0e-9,
+            max_iterations: 5,
+        },
+        None,
+    )
+    .expect("weak RTK float geometry still solves");
+    let max_ambiguity_variance = solution
+        .ambiguity_covariance_m
+        .chunks(ambiguity_ids.len())
+        .enumerate()
+        .map(|(idx, row)| row[idx])
+        .fold(0.0_f64, f64::max);
+
+    assert_eq!(solution.geometry_quality.tier, ObservabilityTier::Weak);
+    assert!(solution.geometry_quality.raim_checkable);
+    assert!(solution.geometry_quality.covariance_validated);
+    assert!(
+        solution.geometry_quality.gdop > 10.0,
+        "GDOP should remain large, got {}",
+        solution.geometry_quality.gdop
+    );
+    assert!(
+        max_ambiguity_variance > 1.0,
+        "ambiguity variance should not be clamped small, got {max_ambiguity_variance}"
     );
 }
 
