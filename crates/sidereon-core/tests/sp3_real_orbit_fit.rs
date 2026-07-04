@@ -33,7 +33,9 @@ use sidereon_core::{GnssSatelliteId, GnssSystem, TdbEarthOrientationProvider};
 const IGS_FINAL_SP3: &[u8] = include_bytes!("fixtures/sp3/IGS0OPSFIN_20261330000_03H_15M_ORB.SP3");
 const PINNED_ARC_START_TDB_J2000_S: f64 = 831_902_451.185_288_4;
 const PINNED_PHASE_A_RMS_3D_M: f64 = 2.547_797_881_385_168;
-const PINNED_TWO_BODY_RMS_3D_M: f64 = 311.171_572_830_232_9;
+// Re-pinned 2026-07-04: the TCG/TCB time-scale refinement shifted the frame
+// rotation by 78 micrometers on this 311 m residual (2.5e-7 relative).
+const PINNED_TWO_BODY_RMS_3D_M: f64 = 311.171_650_553_354_1;
 // Six fractional SP3 kilometers give a 0.5 mm half-cell per axis.
 const SYNTHETIC_SP3_POSITION_QUANTIZATION_3D_BOUND_M: f64 = 8.660_254_037_844_386e-4;
 
