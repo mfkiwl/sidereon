@@ -188,8 +188,10 @@ pub use frame_catalog::{
     TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
 pub use fusion::{
-    loose_coupling_correction, FusionUpdate, GnssFixMeasurement, InertialFilter,
-    InertialFilterConfig, LooseCouplingConfig,
+    loose_coupling_correction, validate_time_sync_gnss_order, validate_time_sync_imu_order,
+    FusionUpdate, GnssFixMeasurement, InertialFilter, InertialFilterConfig, LooseCouplingConfig,
+    TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
+    DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
 };
 pub use geodesic::{geodesic_direct, geodesic_inverse, GeodesicError};
 pub use geoid::{

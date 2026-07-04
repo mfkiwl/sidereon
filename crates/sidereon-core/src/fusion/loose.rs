@@ -21,6 +21,7 @@ use super::state::{
     invalid_input, validate_covariance_matrix, FusionError, InsFilterState, ERROR_ATTITUDE_INDEX,
     ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_VELOCITY_INDEX,
 };
+use super::timesync::TimeSyncHistory;
 
 const LOOSE_MIN_SATELLITES: usize = 4;
 const POSITION_ROWS: usize = 3;
@@ -219,9 +220,10 @@ impl FusionUpdate {
 /// Closed-loop INS filter with loose GNSS PVT updates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InertialFilter {
-    state: InsFilterState,
-    config: InertialFilterConfig,
-    last_body_rate_wrt_ecef_rps: [f64; 3],
+    pub(super) state: InsFilterState,
+    pub(super) config: InertialFilterConfig,
+    pub(super) last_body_rate_wrt_ecef_rps: [f64; 3],
+    pub(super) time_sync: TimeSyncHistory,
 }
 
 impl InertialFilter {
@@ -238,10 +240,12 @@ impl InertialFilter {
     ) -> Result<Self, FusionError> {
         state.validate()?;
         config.validate()?;
+        let time_sync = TimeSyncHistory::from_initial(&state);
         Ok(Self {
             state,
             config,
             last_body_rate_wrt_ecef_rps: [0.0; 3],
+            time_sync,
         })
     }
 
@@ -267,6 +271,15 @@ impl InertialFilter {
 
     /// Propagate the nominal INS state and error covariance with one IMU sample.
     pub fn propagate(&mut self, sample: ImuSample) -> Result<&InsFilterState, FusionError> {
+        let previous_t_j2000_s = self.state.nominal.t_j2000_s;
+        self.time_sync
+            .validate_next_imu(previous_t_j2000_s, sample)?;
+        self.propagate_core(sample)?;
+        self.time_sync.push_imu(previous_t_j2000_s, sample);
+        Ok(&self.state)
+    }
+
+    pub(super) fn propagate_core(&mut self, sample: ImuSample) -> Result<(), FusionError> {
         self.state.validate()?;
         self.config.validate()?;
 
@@ -302,11 +315,34 @@ impl InertialFilter {
         self.state.reset_error_state();
         self.last_body_rate_wrt_ecef_rps = body_rate_wrt_ecef_rps;
         self.state.validate()?;
-        Ok(&self.state)
+        Ok(())
     }
 
     /// Apply a loose GNSS PVT update at the current propagated epoch.
+    ///
+    /// GNSS epochs must be strictly increasing across the filter's stateful
+    /// update surface, matching the standalone time-sync order validator;
+    /// duplicate or regressed epochs are rejected rather than fused twice.
     pub fn update_loose(
+        &mut self,
+        measurement: &GnssFixMeasurement,
+    ) -> Result<FusionUpdate, FusionError> {
+        if let Some(last) = self.time_sync.last_measurement_t_j2000_s() {
+            if measurement.t_j2000_s <= last {
+                return Err(invalid_input(
+                    "t_j2000_s",
+                    "GNSS measurement epochs must be strictly increasing",
+                ));
+            }
+        }
+        let update = self.update_loose_core(measurement)?;
+        let snapshot = self.snapshot();
+        self.time_sync
+            .push_measurement_and_checkpoint(measurement.clone(), snapshot);
+        Ok(update)
+    }
+
+    pub(super) fn update_loose_core(
         &mut self,
         measurement: &GnssFixMeasurement,
     ) -> Result<FusionUpdate, FusionError> {

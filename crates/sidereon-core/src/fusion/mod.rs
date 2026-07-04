@@ -7,6 +7,7 @@ pub mod ekf;
 pub mod error_state;
 pub mod loose;
 pub mod state;
+pub mod timesync;
 
 pub use crate::inertial::*;
 pub use ekf::{
@@ -29,4 +30,9 @@ pub use state::{
     ERROR_GYRO_SCALE_INDEX, ERROR_MOUNTING_MISALIGNMENT_INDEX,
     ERROR_MOUNTING_MISALIGNMENT_STATE_COUNT, ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15,
     ERROR_STATE_DIMENSION_21, ERROR_VELOCITY_INDEX,
+};
+pub use timesync::{
+    validate_time_sync_gnss_order, validate_time_sync_imu_order, InertialFilterSnapshot,
+    TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
+    DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
 };
