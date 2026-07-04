@@ -151,14 +151,7 @@ pub mod terrain_store;
 pub mod tides;
 pub mod tolerances;
 
-/// GNSS/INS fusion staging surface.
-///
-/// This pass exposes the inertial frame, mechanization, and IMU error-model
-/// primitives only. Measurement updates and filter state are added in later
-/// passes.
-pub mod fusion {
-    pub use crate::inertial::*;
-}
+pub mod fusion; // GNSS/INS error-state prediction and EKF correction over the inertial surface
 
 pub use crate::astro::frames::{
     EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider,
