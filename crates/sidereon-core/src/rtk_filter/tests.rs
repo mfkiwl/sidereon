@@ -325,6 +325,15 @@ fn float_model(code_sigma_m: f64, phase_sigma_m: f64) -> MeasModel {
     }
 }
 
+fn geometry_filter_opts() -> UpdateOpts {
+    let mut opts = single_dd_update_opts();
+    opts.position_tol_m = 1.0e-9;
+    opts.ambiguity_tol_m = 1.0e-9;
+    opts.max_iterations = 5;
+    opts.float_only_systems = vec!["G".to_string()];
+    opts
+}
+
 fn single_dd_update_opts() -> UpdateOpts {
     UpdateOpts {
         hold_sigma_m: 1.0,
@@ -2172,6 +2181,122 @@ fn float_batch_solver_has_frozen_bits_golden() {
             4,
         )
     );
+}
+
+#[test]
+fn filter_geometry_quality_zero_redundancy_cold_start_is_unvalidated() {
+    let base = [4_075_580.0, 931_854.0, 4_801_568.0];
+    let baseline = [1.2, -0.85, 0.91];
+    let sats: [(&str, [f64; 3], f64); 4] = [
+        ("G01", [15_000_000.0, 7_000_000.0, 21_000_000.0], 0.0),
+        ("G02", [-12_000_000.0, 18_000_000.0, 19_000_000.0], 0.6),
+        ("G03", [20_000_000.0, -10_000_000.0, 17_000_000.0], -1.4),
+        ("G04", [-19_000_000.0, -13_000_000.0, 20_000_000.0], 1.0),
+    ];
+    let epoch = clean_float_epoch(base, baseline, &sats);
+    let solution = update_epoch(
+        filter_state(&["G01"], baseline, 1.0e4, 1.0e4),
+        &epoch,
+        base,
+        &float_model(0.3, 0.003),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &geometry_filter_opts(),
+    )
+    .expect("cold-start zero-redundancy filter update");
+
+    assert_eq!(
+        solution.geometry_quality.tier,
+        ObservabilityTier::ZeroRedundancy
+    );
+    assert_eq!(solution.geometry_quality.redundancy, 0);
+    assert!(!solution.geometry_quality.covariance_validated);
+    assert!(!solution.geometry_quality.raim_checkable);
+}
+
+#[test]
+fn filter_geometry_quality_zero_redundancy_with_propagated_prior_is_validated() {
+    let base = [4_075_580.0, 931_854.0, 4_801_568.0];
+    let baseline = [1.2, -0.85, 0.91];
+    let sats: [(&str, [f64; 3], f64); 4] = [
+        ("G01", [15_000_000.0, 7_000_000.0, 21_000_000.0], 0.0),
+        ("G02", [-12_000_000.0, 18_000_000.0, 19_000_000.0], 0.6),
+        ("G03", [20_000_000.0, -10_000_000.0, 17_000_000.0], -1.4),
+        ("G04", [-19_000_000.0, -13_000_000.0, 20_000_000.0], 1.0),
+    ];
+    let epoch = clean_float_epoch(base, baseline, &sats);
+    let first = update_epoch(
+        filter_state(&["G01"], baseline, 1.0e4, 1.0e4),
+        &epoch,
+        base,
+        &float_model(0.3, 0.003),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &geometry_filter_opts(),
+    )
+    .expect("first filter update seeds propagated prior");
+    let second = update_epoch(
+        first.state,
+        &epoch,
+        base,
+        &float_model(0.3, 0.003),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &geometry_filter_opts(),
+    )
+    .expect("second zero-redundancy filter update");
+
+    assert_eq!(
+        second.geometry_quality.tier,
+        ObservabilityTier::ZeroRedundancy
+    );
+    assert_eq!(second.geometry_quality.redundancy, 0);
+    assert!(second.geometry_quality.covariance_validated);
+    assert!(!second.geometry_quality.raim_checkable);
+}
+
+#[test]
+fn filter_geometry_quality_nominal_redundancy_unchanged_by_prior() {
+    let base = [4_075_580.0, 931_854.0, 4_801_568.0];
+    let baseline = [1.2, -0.85, 0.91];
+    let sats: [(&str, [f64; 3], f64); 5] = [
+        ("G01", [15_000_000.0, 7_000_000.0, 21_000_000.0], 0.0),
+        ("G02", [-12_000_000.0, 18_000_000.0, 19_000_000.0], 0.6),
+        ("G03", [20_000_000.0, -10_000_000.0, 17_000_000.0], -1.4),
+        ("G04", [-19_000_000.0, -13_000_000.0, 20_000_000.0], 1.0),
+        ("G05", [9_000_000.0, 22_000_000.0, 16_000_000.0], -0.3),
+    ];
+    let epoch = clean_float_epoch(base, baseline, &sats);
+    let first = update_epoch(
+        filter_state(&["G01"], baseline, 1.0e4, 1.0e4),
+        &epoch,
+        base,
+        &float_model(0.3, 0.003),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &geometry_filter_opts(),
+    )
+    .expect("first nominal filter update");
+    let first_quality = first.geometry_quality;
+    let second = update_epoch(
+        first.state,
+        &epoch,
+        base,
+        &float_model(0.3, 0.003),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &geometry_filter_opts(),
+    )
+    .expect("second nominal filter update");
+
+    assert_eq!(first_quality.tier, ObservabilityTier::Nominal);
+    assert_eq!(first_quality.redundancy, 1);
+    assert!(first_quality.covariance_validated);
+    assert!(first_quality.raim_checkable);
+    assert_eq!(second.geometry_quality.tier, ObservabilityTier::Nominal);
+    assert_eq!(second.geometry_quality.redundancy, 1);
+    assert!(second.geometry_quality.covariance_validated);
+    assert!(second.geometry_quality.raim_checkable);
 }
 
 #[test]

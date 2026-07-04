@@ -97,10 +97,12 @@ pub struct FloatBaselineSolution {
     pub weighted_rms_m: f64,
     pub n_observations: usize,
     /// Geometry observability and covariance-validation diagnostics for the
-    /// final double-difference design. Snapshot RTK float solves use no
-    /// propagated prior in STEP 2, so `ZeroRedundancy` bounds are unvalidated,
-    /// `Weak` bounds are reported without clamping, and `RankDeficient` is
-    /// routed through [`FloatSolveError::SingularGeometry`].
+    /// final double-difference design. Snapshot RTK float solves pass no
+    /// propagated prior into geometry classification, so `ZeroRedundancy`
+    /// bounds are unvalidated, `Weak` bounds are reported without clamping, and
+    /// `RankDeficient` is routed through [`FloatSolveError::SingularGeometry`].
+    /// Sequential filter epochs use the same instantaneous design diagnostics,
+    /// but a full-rank propagated prior can validate zero-redundancy covariance.
     pub geometry_quality: GeometryQuality,
 }
 

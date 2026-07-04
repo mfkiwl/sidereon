@@ -170,8 +170,11 @@ pub struct RtkStaticArcConfig {
 pub struct RtkStaticArcSolution {
     /// Geometry observability and covariance-validation diagnostics for the
     /// static batch design. This mirrors the nested float solution's final
-    /// design; snapshot arc solves use no propagated prior in STEP 2, so
-    /// `ZeroRedundancy` bounds are unvalidated and `Weak` bounds are unclamped.
+    /// design. Snapshot arc solves pass no propagated prior into geometry
+    /// classification, so `ZeroRedundancy` bounds are unvalidated and `Weak`
+    /// bounds are unclamped. Sequential filter epochs use the same instantaneous
+    /// design diagnostics, but a full-rank propagated prior can validate
+    /// zero-redundancy covariance.
     pub geometry_quality: GeometryQuality,
     pub references: BTreeMap<String, String>,
     pub ambiguity_ids: Vec<String>,
@@ -268,9 +271,11 @@ pub struct RtkWideLaneArcConfig {
 pub struct RtkWideLaneArcSolution {
     /// Geometry observability and covariance-validation diagnostics for the
     /// wide-lane ambiguity-estimation design. Each fixed ambiguity is one
-    /// parameter and each usable ambiguity sample is one row; with no propagated
-    /// prior in STEP 2, `ZeroRedundancy` bounds are unvalidated and `Weak` bounds
-    /// are unclamped.
+    /// parameter and each usable ambiguity sample is one row. Snapshot wide-lane
+    /// solves pass no propagated prior into geometry classification, so
+    /// `ZeroRedundancy` bounds are unvalidated and `Weak` bounds are unclamped.
+    /// Sequential filter epochs use the same instantaneous design diagnostics,
+    /// but a full-rank propagated prior can validate zero-redundancy covariance.
     pub geometry_quality: GeometryQuality,
     pub references: BTreeMap<String, String>,
     pub wide_lane_cycles: BTreeMap<String, i64>,
@@ -455,6 +460,11 @@ pub struct RtkArcEpochSolution {
     pub search: Option<IntegerSearchMeta>,
     /// Public residual rows at the reported solution (when enabled in opts).
     pub residuals: Vec<FloatResidual>,
+    /// Geometry observability and covariance-validation diagnostics for this
+    /// epoch's instantaneous double-difference design. Snapshot solves flag
+    /// zero-redundancy covariance as unvalidated; sequential filters validate it
+    /// only after a full-rank propagated prior is carried into the epoch.
+    pub geometry_quality: GeometryQuality,
     /// Per-epoch predicted-residual (innovation) screen result, as produced by the
     /// per-epoch [`update_epoch`] this driver runs. `None` when the screen is
     /// disabled in [`UpdateOpts::innovation_screen`]; otherwise it carries the
@@ -1920,6 +1930,7 @@ fn epoch_solution(
         used_satellite_ids,
         search: update.search.clone(),
         residuals: update.residuals.clone(),
+        geometry_quality: update.geometry_quality,
         innovation_screen: update.innovation_screen.clone(),
     }
 }
