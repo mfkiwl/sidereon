@@ -328,7 +328,7 @@ pub use sidereon_core::astro::forces::{
 pub use sidereon_core::astro::frames::transforms::{
     gcrs_to_teme_compute, gcrs_to_true_of_date_matrix,
 };
-pub use sidereon_core::astro::sgp4::{Loss, XScale};
+pub use sidereon_core::astro::sgp4::{DecayLatch, DecayLatchedError, Loss, XScale};
 pub use sidereon_core::astro::space_weather::{
     ObservationClass, SpaceWeatherPolicy, SpaceWeatherSample, SpaceWeatherTable,
 };

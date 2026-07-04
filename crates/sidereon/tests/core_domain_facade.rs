@@ -53,4 +53,14 @@ fn core_domain_modules_are_reachable_through_facade() {
         .to_bits(),
         (-0.5_f64).to_bits()
     );
+
+    assert_eq!(
+        sidereon::atmosphere::troposphere::NIELL_MIN_MAPPING_ELEVATION_RAD.to_bits(),
+        0x3faa_cee9_f37b_ebd6
+    );
+    let _shadow_model = sidereon::astro::events::eclipse::EarthShadowModel::Wgs84Oblate;
+    assert_eq!(
+        sidereon::astro::events::eclipse::WGS84_FLATTENING.to_bits(),
+        0x3f6b_775a_84f3_e128
+    );
 }

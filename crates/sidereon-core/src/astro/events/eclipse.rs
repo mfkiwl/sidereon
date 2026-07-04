@@ -6,8 +6,29 @@
 //! the Earth-Sun shadow axis. This is the authoritative implementation; the
 //! Elixir binding is a thin marshaling layer over it.
 
-use crate::astro::constants::{astro::SOLAR_RADIUS_KM, earth::MEAN_EARTH_RADIUS_KM};
+use crate::astro::constants::{
+    astro::SOLAR_RADIUS_KM,
+    earth::{MEAN_EARTH_RADIUS_KM, WGS84_F},
+};
 use crate::astro::math::vec3;
+
+/// Public eclipse alias for WGS84 flattening `1 / 298.257223563`.
+pub const WGS84_FLATTENING: f64 = WGS84_F;
+
+/// Earth figure used for conical eclipse geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EarthShadowModel {
+    /// Spherical Earth with [`MEAN_EARTH_RADIUS_KM`].
+    Spherical,
+    /// WGS84 oblate Earth approximation by polar-axis scaling.
+    ///
+    /// The z components of the satellite and Sun vectors are scaled by
+    /// `1 / (1 - WGS84_FLATTENING)` before evaluating the same conical shadow
+    /// geometry. Equatorial geometries are therefore bit-identical to the
+    /// spherical model, while polar grazing geometries see the smaller polar
+    /// radius implied by the flattening.
+    Wgs84Oblate,
+}
 
 /// Illumination state of a satellite relative to Earth's conical shadow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +105,26 @@ pub fn shadow_fraction(sat_pos: [f64; 3], sun_pos: [f64; 3]) -> Result<f64, Ecli
     }
 }
 
+/// Shadow fraction with an explicit Earth figure model.
+///
+/// [`EarthShadowModel::Spherical`] delegates to [`shadow_fraction`] and is
+/// bit-identical to the default API. [`EarthShadowModel::Wgs84Oblate`] applies
+/// the WGS84 polar-axis scaling before evaluating the same conical model.
+pub fn shadow_fraction_with_model(
+    sat_pos: [f64; 3],
+    sun_pos: [f64; 3],
+    model: EarthShadowModel,
+) -> Result<f64, EclipseError> {
+    match model {
+        EarthShadowModel::Spherical => shadow_fraction(sat_pos, sun_pos),
+        EarthShadowModel::Wgs84Oblate => {
+            let sat_pos = scale_polar_axis(sat_pos);
+            let sun_pos = scale_polar_axis(sun_pos);
+            shadow_fraction(sat_pos, sun_pos)
+        }
+    }
+}
+
 /// Classify the satellite's eclipse status from its [`shadow_fraction`].
 pub fn status(sat_pos: [f64; 3], sun_pos: [f64; 3]) -> Result<EclipseStatus, EclipseError> {
     let fraction = shadow_fraction(sat_pos, sun_pos)?;
@@ -94,6 +135,27 @@ pub fn status(sat_pos: [f64; 3], sun_pos: [f64; 3]) -> Result<EclipseStatus, Ecl
     } else {
         Ok(EclipseStatus::Sunlit)
     }
+}
+
+/// Classify eclipse status with an explicit Earth figure model.
+pub fn status_with_model(
+    sat_pos: [f64; 3],
+    sun_pos: [f64; 3],
+    model: EarthShadowModel,
+) -> Result<EclipseStatus, EclipseError> {
+    let fraction = shadow_fraction_with_model(sat_pos, sun_pos, model)?;
+    if fraction >= 1.0 {
+        Ok(EclipseStatus::Umbra)
+    } else if fraction > 0.0 {
+        Ok(EclipseStatus::Penumbra)
+    } else {
+        Ok(EclipseStatus::Sunlit)
+    }
+}
+
+fn scale_polar_axis(v: [f64; 3]) -> [f64; 3] {
+    let z_scale = 1.0 / (1.0 - WGS84_FLATTENING);
+    [v[0], v[1], v[2] * z_scale]
 }
 
 fn validate_nonzero_vec3(v: [f64; 3], field: &'static str) -> Result<(), EclipseError> {
@@ -165,6 +227,42 @@ mod tests {
                 .expect("valid eclipse geometry")
                 .to_bits(),
             1.0_f64.to_bits()
+        );
+    }
+
+    /// Oracle provenance: WGS84 flattening is the published inverse flattening
+    /// `1 / 298.257223563`; the oblate expected value is the same conical
+    /// formula as `shadow_fraction` after applying the documented polar-axis
+    /// scaling.
+    #[test]
+    fn oblate_shadow_model_preserves_equatorial_bits_and_changes_polar_grazing() {
+        assert_eq!(WGS84_FLATTENING.to_bits(), 0x3f6b_775a_84f3_e128);
+
+        let sun = [AU_KM, 0.0, 0.0];
+        for sat in [
+            [7000.0, 0.0, 0.0],
+            [-7000.0, 0.0, 0.0],
+            [-7000.0, 6370.0, 0.0],
+        ] {
+            let default = shadow_fraction(sat, sun).expect("valid eclipse geometry");
+            let spherical = shadow_fraction_with_model(sat, sun, EarthShadowModel::Spherical)
+                .expect("valid spherical geometry");
+            let oblate = shadow_fraction_with_model(sat, sun, EarthShadowModel::Wgs84Oblate)
+                .expect("valid oblate geometry");
+            assert_eq!(spherical.to_bits(), default.to_bits());
+            assert_eq!(oblate.to_bits(), default.to_bits());
+        }
+
+        let polar_grazing = [-7000.0, 0.0, 6370.0];
+        let spherical = shadow_fraction_with_model(polar_grazing, sun, EarthShadowModel::Spherical)
+            .expect("valid spherical geometry");
+        let oblate = shadow_fraction_with_model(polar_grazing, sun, EarthShadowModel::Wgs84Oblate)
+            .expect("valid oblate geometry");
+        assert_eq!(spherical.to_bits(), 0x3fe0_a32f_08e7_fb1f);
+        assert_eq!(oblate.to_bits(), 0x3fc8_7576_4827_2b98);
+        assert!(
+            oblate < spherical,
+            "polar-axis flattening must reduce the grazing shadow fraction"
         );
     }
 
