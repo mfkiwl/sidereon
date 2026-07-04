@@ -201,6 +201,12 @@ pub use inertial::{
     ImuSampleKind, ImuSpec, InertialError, MechanizationConfig, NavState, StrapdownMechanizer,
     WGS84_NORMAL_GRAVITY_EQUATOR_MPS2, WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
 };
+pub use observables::{
+    observable_media_corrections, predict_batch_with_media, predict_batch_with_media_parallel,
+    predict_ranges_with_media, predict_with_media, AppliedMediaCorrections, MediaPredictOptions,
+    MediaPredictedObservables, MediaRangePrediction, ObservableIonosphereCorrection,
+    ObservableMediaOptions, ObservableTroposphereCorrection,
+};
 pub use sbas_pl::{
     sbas_protection_levels, AirborneModel, DegradationParams, ProtectionGeometry, ProtectionRow,
     SbasErrorModel, SbasKMultipliers, SbasPlError, SbasProtection, SbasSisError,
