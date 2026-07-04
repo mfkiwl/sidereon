@@ -145,6 +145,29 @@ pub enum Error {
     Sgp4 { code: i32 },
 }
 
+/// Error from opt-in decay-latched SGP4 propagation.
+///
+/// A latch reports the first observed decay-like epoch for one satellite and
+/// prevents later requests from returning a raw SGP4 state after the satellite
+/// has already been observed below the valid Earth-clearance domain.
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum DecayLatchedError {
+    /// The satellite has already reached a decay-like SGP4 failure.
+    #[error(
+        "SGP4 decay latch first failed at {first_failing_epoch:?}; requested {requested_epoch:?}"
+    )]
+    Decayed {
+        /// First epoch in minutes since element epoch that returned a
+        /// decay-like SGP4 failure through this latch.
+        first_failing_epoch: MinutesSinceEpoch,
+        /// Epoch requested by the current call.
+        requested_epoch: MinutesSinceEpoch,
+    },
+    /// The underlying raw SGP4 propagation failed for a non-latched reason.
+    #[error(transparent)]
+    Propagation(#[from] Error),
+}
+
 const MAX_MINUTES_SINCE_EPOCH: f64 = 10_000_000.0;
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -168,6 +191,58 @@ pub struct Prediction {
 /// For example, 2018-07-04 00:00:00 UTC = `JulianDate(2458303.0, 0.5)`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JulianDate(pub f64, pub f64);
+
+/// Per-satellite latch for decay-like SGP4 propagation failures.
+///
+/// The latch is intentionally separate from [`Satellite`]. Passing it to
+/// [`Satellite::propagate_with_decay_latch`] opts one caller into stateful
+/// post-decay validity checks while [`Satellite::propagate`] remains a raw,
+/// stateless Vallado call.
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct DecayLatch {
+    first_failing_epoch: Option<MinutesSinceEpoch>,
+}
+
+impl DecayLatch {
+    /// Construct an empty decay latch.
+    pub const fn new() -> Self {
+        Self {
+            first_failing_epoch: None,
+        }
+    }
+
+    /// First observed decay-like epoch, in minutes since element epoch.
+    pub const fn first_failing_epoch(self) -> Option<MinutesSinceEpoch> {
+        self.first_failing_epoch
+    }
+
+    /// Clear the recorded decay state.
+    pub fn clear(&mut self) {
+        self.first_failing_epoch = None;
+    }
+
+    fn decayed_error(self, requested_epoch: MinutesSinceEpoch) -> Option<DecayLatchedError> {
+        let first_failing_epoch = self.first_failing_epoch?;
+        if requested_epoch.0 >= first_failing_epoch.0 {
+            Some(DecayLatchedError::Decayed {
+                first_failing_epoch,
+                requested_epoch,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn record_decay(&mut self, epoch: MinutesSinceEpoch) -> MinutesSinceEpoch {
+        match self.first_failing_epoch {
+            Some(first) if first.0 <= epoch.0 => first,
+            _ => {
+                self.first_failing_epoch = Some(epoch);
+                epoch
+            }
+        }
+    }
+}
 
 pub(crate) fn sgp4_julian_date_from_calendar(
     year: i32,
@@ -409,6 +484,36 @@ impl Satellite {
         propagate_satrec((*self.satrec).clone(), t)
     }
 
+    /// Propagate with an opt-in post-decay validity latch.
+    ///
+    /// On the first SGP4 decay-like failure (Vallado code 5 or 6) the latch
+    /// records the requested epoch and this method returns
+    /// [`DecayLatchedError::Decayed`]. Later calls at the same or a later epoch
+    /// return the same latched state without invoking the raw kernel. Earlier
+    /// epochs are still propagated normally. Use [`Satellite::propagate`] when
+    /// raw Vallado behavior is required.
+    pub fn propagate_with_decay_latch(
+        &self,
+        t: MinutesSinceEpoch,
+        latch: &mut DecayLatch,
+    ) -> Result<Prediction, DecayLatchedError> {
+        validate_minutes_since_epoch(t)?;
+        if let Some(error) = latch.decayed_error(t) {
+            return Err(error);
+        }
+        match self.propagate(t) {
+            Ok(prediction) => Ok(prediction),
+            Err(error) if is_decay_like_sgp4_error(&error) => {
+                let first_failing_epoch = latch.record_decay(t);
+                Err(DecayLatchedError::Decayed {
+                    first_failing_epoch,
+                    requested_epoch: t,
+                })
+            }
+            Err(error) => Err(DecayLatchedError::Propagation(error)),
+        }
+    }
+
     /// Propagate to a Julian date, split as `(whole, fraction)`.
     ///
     /// Computes the tsince from the cached epoch via the same subtraction
@@ -418,13 +523,21 @@ impl Satellite {
     /// tsince = (jd - jdsatepoch) * 1440 + (fr - jdsatepochF) * 1440
     /// ```
     pub fn propagate_jd(&self, jd: JulianDate) -> Result<Prediction, Error> {
-        validate::finite(jd.0, "julian_date.whole").map_err(map_input_error)?;
-        validate::finite_in_range_exclusive_upper(jd.1, 0.0, 1.0, "julian_date.fraction")
-            .map_err(map_input_error)?;
-        let tsince =
-            (jd.0 - self.satrec.jdsatepoch) * 1440.0 + (jd.1 - self.satrec.jdsatepochF) * 1440.0;
-        validate::finite(tsince, "minutes_since_epoch").map_err(map_input_error)?;
-        self.propagate(MinutesSinceEpoch(tsince))
+        self.propagate(minutes_since_epoch_from_jd(&self.satrec, jd)?)
+    }
+
+    /// Propagate to a Julian date with an opt-in post-decay validity latch.
+    ///
+    /// The Julian date is converted to minutes since element epoch by the same
+    /// split-JD subtraction used by [`Satellite::propagate_jd`], then processed
+    /// by [`Satellite::propagate_with_decay_latch`].
+    pub fn propagate_jd_with_decay_latch(
+        &self,
+        jd: JulianDate,
+        latch: &mut DecayLatch,
+    ) -> Result<Prediction, DecayLatchedError> {
+        let t = minutes_since_epoch_from_jd(&self.satrec, jd)?;
+        self.propagate_with_decay_latch(t, latch)
     }
 
     pub(crate) fn mean_motion_rad_per_min(&self) -> f64 {
@@ -637,10 +750,7 @@ fn propagate_satrec(
     mut satrec: vallado::ElsetRec,
     t: MinutesSinceEpoch,
 ) -> Result<Prediction, Error> {
-    validate::finite(t.0, "minutes_since_epoch").map_err(map_input_error)?;
-    if t.0.abs() > MAX_MINUTES_SINCE_EPOCH {
-        return Err(invalid_domain("minutes_since_epoch"));
-    }
+    validate_minutes_since_epoch(t)?;
 
     let mut r = [0.0_f64; 3];
     let mut v = [0.0_f64; 3];
@@ -653,6 +763,31 @@ fn propagate_satrec(
         position: r,
         velocity: v,
     })
+}
+
+fn validate_minutes_since_epoch(t: MinutesSinceEpoch) -> Result<(), Error> {
+    validate::finite(t.0, "minutes_since_epoch").map_err(map_input_error)?;
+    if t.0.abs() > MAX_MINUTES_SINCE_EPOCH {
+        return Err(invalid_domain("minutes_since_epoch"));
+    }
+    Ok(())
+}
+
+fn minutes_since_epoch_from_jd(
+    satrec: &vallado::ElsetRec,
+    jd: JulianDate,
+) -> Result<MinutesSinceEpoch, Error> {
+    validate::finite(jd.0, "julian_date.whole").map_err(map_input_error)?;
+    validate::finite_in_range_exclusive_upper(jd.1, 0.0, 1.0, "julian_date.fraction")
+        .map_err(map_input_error)?;
+    let tsince = (jd.0 - satrec.jdsatepoch) * 1440.0 + (jd.1 - satrec.jdsatepochF) * 1440.0;
+    let t = MinutesSinceEpoch(tsince);
+    validate_minutes_since_epoch(t)?;
+    Ok(t)
+}
+
+fn is_decay_like_sgp4_error(error: &Error) -> bool {
+    matches!(error, Error::Sgp4 { code: 5 | 6 })
 }
 
 fn validate_prediction(position: [f64; 3], velocity: [f64; 3]) -> Result<(), Error> {
@@ -901,9 +1036,9 @@ pub fn parse_tle_file_with_opsmode(text: &str, opsmode: OpsMode) -> TleFile {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_tle_file, propagate_batch, propagate_batch_parallel, propagate_elements, ElementSet,
-        Error, JulianDate, MinutesSinceEpoch, Satellite, Sgp4InputErrorKind,
-        MAX_MINUTES_SINCE_EPOCH,
+        parse_tle_file, propagate_batch, propagate_batch_parallel, propagate_elements, DecayLatch,
+        DecayLatchedError, ElementSet, Error, JulianDate, MinutesSinceEpoch, Satellite,
+        Sgp4InputErrorKind, MAX_MINUTES_SINCE_EPOCH,
     };
 
     /// A TLE carrying a multibyte character inside a fixed-width column must
@@ -1422,6 +1557,81 @@ mod tests {
                 batch[1]
             );
         }
+    }
+
+    /// Oracle provenance: NORAD 28872 is the Vallado verification-set
+    /// high-drag object. The committed `sgp4_verification.json` pins
+    /// `tsince = 1440.0` to error code 6. The raw `tsince = 1450.0`
+    /// assertions compare stateless calls before and after latch use
+    /// bit-for-bit, proving the opt-in latch leaves raw propagation untouched.
+    #[test]
+    fn decay_latch_reports_later_epochs_decayed_without_changing_raw_propagation() {
+        let satellite = Satellite::from_tle(DECAY_L1, DECAY_L2).unwrap();
+        let t_decay = MinutesSinceEpoch(1440.0);
+        let t_later = MinutesSinceEpoch(1450.0);
+
+        assert_eq!(
+            satellite.propagate(t_decay).unwrap_err(),
+            Error::Sgp4 { code: 6 },
+            "Vallado fixture must report decayed at 1440 min"
+        );
+
+        let raw_later = satellite
+            .propagate(t_later)
+            .expect("raw Vallado propagation resumes at 1450 min");
+
+        let mut latch = DecayLatch::new();
+        let first = satellite
+            .propagate_with_decay_latch(t_decay, &mut latch)
+            .expect_err("latched propagation must report the first decay epoch");
+        assert_eq!(
+            first,
+            DecayLatchedError::Decayed {
+                first_failing_epoch: t_decay,
+                requested_epoch: t_decay,
+            }
+        );
+        assert_eq!(latch.first_failing_epoch(), Some(t_decay));
+
+        let later = satellite
+            .propagate_with_decay_latch(t_later, &mut latch)
+            .expect_err("later latched propagation must not emit a raw state");
+        assert_eq!(
+            later,
+            DecayLatchedError::Decayed {
+                first_failing_epoch: t_decay,
+                requested_epoch: t_later,
+            }
+        );
+
+        let raw_after_latch = satellite
+            .propagate(t_later)
+            .expect("raw propagation must remain stateless after latch use");
+        assert_eq!(
+            raw_after_latch.position.map(f64::to_bits),
+            raw_later.position.map(f64::to_bits),
+            "raw position bits must not change after latch use"
+        );
+        assert_eq!(
+            raw_after_latch.velocity.map(f64::to_bits),
+            raw_later.velocity.map(f64::to_bits),
+            "raw velocity bits must not change after latch use"
+        );
+
+        let earlier = satellite
+            .propagate_with_decay_latch(MinutesSinceEpoch(120.0), &mut latch)
+            .expect("earlier epochs remain available through the latch");
+        let raw_earlier = satellite
+            .propagate(MinutesSinceEpoch(120.0))
+            .expect("raw earlier epoch ok");
+        assert_eq!(
+            earlier.position.map(f64::to_bits),
+            raw_earlier.position.map(f64::to_bits)
+        );
+        assert_eq!(
+            earlier.velocity.map(f64::to_bits),
+            raw_earlier.velocity.map(f64::to_bits)
+        );
     }
 
     #[test]

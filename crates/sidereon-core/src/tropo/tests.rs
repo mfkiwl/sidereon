@@ -454,12 +454,12 @@ fn tropo_public_helpers_reject_invalid_domains() {
     ));
 }
 
-/// A solver probing an infeasible mid-iteration state must get a finite,
-/// clamped/zeroed delay, not an `Err`. This covers the previously-rejected
-/// transient inputs: sub-horizon and over-zenith elevation, and out-of-range
-/// height, on each public entry.
+/// A solver probing an infeasible mid-iteration state must still get the legacy
+/// zeroed delay for at-or-below-horizon slant calls, while the checked mapping
+/// boundary rejects invalid mapping-factor domains instead of flooring or
+/// clamping them.
 #[test]
-fn tropo_clamps_transient_solver_states() {
+fn tropo_low_elevation_validity_is_checked() {
     use core::f64::consts::FRAC_PI_2;
 
     let receiver = valid_tropo_receiver();
@@ -490,58 +490,61 @@ fn tropo_clamps_transient_solver_states() {
     assert!(over.is_finite() && over > 0.0);
     assert_eq!(over.to_bits(), at_zenith.to_bits());
 
-    // The mapping floor is asin(0.01), so its sine matches the ZWD slant path's
-    // sin(elevation) >= 0.01 floor exactly (bit-for-bit).
-    assert_eq!(super::TROPO_MIN_MAPPING_ELEVATION_RAD.sin(), 0.01);
-    assert_eq!(super::TROPO_MIN_MAPPING_ELEVATION_RAD, (0.01_f64).asin());
+    // Niell's published NMF lower validity bound is 3 degrees. The checked API
+    // pins the exact Rust f64 conversion and keeps the historical alias equal.
+    assert_eq!(
+        super::NIELL_MIN_MAPPING_ELEVATION_RAD.to_bits(),
+        0x3faa_cee9_f37b_ebd6
+    );
+    assert_eq!(
+        super::TROPO_MIN_MAPPING_ELEVATION_RAD.to_bits(),
+        super::NIELL_MIN_MAPPING_ELEVATION_RAD.to_bits()
+    );
 
-    // --- tropo_mapping: elevation floored, over-zenith and height clamped ---
-    let floored = super::tropo_mapping(
+    assert_invalid_input(super::tropo_mapping(
         super::MappingModel::Niell,
-        super::TROPO_MIN_MAPPING_ELEVATION_RAD,
+        0.0004_f64.to_radians(),
         receiver,
         epoch,
-    )
-    .expect("floor elevation ok");
+    ));
+    assert_invalid_input(super::tropo_mapping(
+        super::MappingModel::Vmf1 {
+            ah: 0.0012,
+            aw: 0.0006,
+        },
+        0.0004_f64.to_radians(),
+        receiver,
+        epoch,
+    ));
     for el in [(-5.0_f64).to_radians(), 0.0] {
-        let got = super::tropo_mapping(super::MappingModel::Niell, el, receiver, epoch)
-            .expect("sub-horizon mapping must not error");
-        assert!(got.dry.is_finite() && got.wet.is_finite());
-        assert_eq!(got.dry.to_bits(), floored.dry.to_bits());
-        assert_eq!(got.wet.to_bits(), floored.wet.to_bits());
+        assert_invalid_input(super::tropo_mapping(
+            super::MappingModel::Niell,
+            el,
+            receiver,
+            epoch,
+        ));
     }
-    let over_map =
-        super::tropo_mapping(super::MappingModel::Niell, FRAC_PI_2 + 0.1, receiver, epoch)
-            .expect("over-zenith mapping ok");
-    let zenith_map = super::tropo_mapping(super::MappingModel::Niell, FRAC_PI_2, receiver, epoch)
-        .expect("zenith mapping ok");
-    assert_eq!(over_map.dry.to_bits(), zenith_map.dry.to_bits());
-    assert_eq!(over_map.wet.to_bits(), zenith_map.wet.to_bits());
 
-    let high_rx = crate::frame::Wgs84Geodetic {
-        height_m: 20_000.0,
-        ..receiver
-    };
-    let clamped_hi_rx = crate::frame::Wgs84Geodetic {
-        height_m: super::saastamoinen::MET_GATE_HI_M,
-        ..receiver
-    };
-    let map_high = super::tropo_mapping(
+    // --- tropo_mapping: over-zenith elevation and invalid height are rejected ---
+    assert_invalid_input(super::tropo_mapping(
         super::MappingModel::Niell,
-        30.0_f64.to_radians(),
-        high_rx,
+        FRAC_PI_2 + 0.1,
+        receiver,
         epoch,
-    )
-    .expect("out-of-range height mapping must not error");
-    let map_clamped = super::tropo_mapping(
-        super::MappingModel::Niell,
-        30.0_f64.to_radians(),
-        clamped_hi_rx,
-        epoch,
-    )
-    .expect("clamped height mapping ok");
-    assert_eq!(map_high.dry.to_bits(), map_clamped.dry.to_bits());
-    assert_eq!(map_high.wet.to_bits(), map_clamped.wet.to_bits());
+    ));
+
+    for height_m in [20_000.0, -200.0] {
+        let rx = crate::frame::Wgs84Geodetic {
+            height_m,
+            ..receiver
+        };
+        assert_invalid_input(super::tropo_mapping(
+            super::MappingModel::Niell,
+            30.0_f64.to_radians(),
+            rx,
+            epoch,
+        ));
+    }
 
     // --- tropo_zenith: out-of-range height clamps to the nearest boundary ---
     for (height_m, boundary) in [
@@ -565,10 +568,9 @@ fn tropo_clamps_transient_solver_states() {
     }
 }
 
-/// In-domain inputs (elevation in `(0, pi/2]`, height in `[-100, 1e4]`) take the
-/// identical pre-clamp code path: the relaxed public entries are bit-for-bit
-/// equal to the underlying kernel, so the clamping only ever changes
-/// previously-rejected inputs.
+/// In-domain inputs (elevation in `[3 deg, pi/2]`, height in `[-100, 1e4]`) take the
+/// identical public code path: the checked entries are bit-for-bit equal to the
+/// underlying kernel, so validation only changes out-of-domain inputs.
 #[test]
 fn tropo_in_range_values_are_bit_unchanged() {
     let receiver = valid_tropo_receiver();
@@ -609,6 +611,42 @@ fn tropo_in_range_values_are_bit_unchanged() {
         doy,
     );
     assert_eq!(slant.to_bits(), kernel_slant.slant_m.to_bits());
+}
+
+/// Oracle provenance: the expected values are a direct Niell NMF evaluation
+/// from the published coefficient table at latitude 45 deg, height 400 m,
+/// day-of-year 28, and elevations 3, 30, and 90 deg. Values are pinned as f64
+/// bit patterns from the standalone formula, not derived by this test from the
+/// code under test.
+#[test]
+fn niell_public_mapping_domain_boundaries_match_formula_bits() {
+    let receiver = valid_tropo_receiver();
+    let epoch = valid_tropo_epoch();
+    let cases = [
+        (
+            super::NIELL_MIN_MAPPING_ELEVATION_RAD,
+            0x402d_71f9_ff25_ec96,
+            0x4030_6aac_e4b4_dd24,
+        ),
+        (
+            30.0_f64.to_radians(),
+            0x3fff_e2c7_f20e_6875,
+            0x3fff_f1d8_3226_933b,
+        ),
+        (
+            core::f64::consts::FRAC_PI_2,
+            0x3ff0_0000_0000_0000,
+            0x3ff0_0000_0000_0000,
+        ),
+    ];
+
+    for (elevation_rad, dry_bits, wet_bits) in cases {
+        let mapping =
+            super::tropo_mapping(super::MappingModel::Niell, elevation_rad, receiver, epoch)
+                .expect("in-domain Niell mapping");
+        assert_eq!(mapping.dry.to_bits(), dry_bits);
+        assert_eq!(mapping.wet.to_bits(), wet_bits);
+    }
 }
 
 fn fixture_path_named(parts: &[&str]) -> PathBuf {
