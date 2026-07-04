@@ -19,6 +19,8 @@
 //!   documented grid text format so a caller can supply a full EGM grid;
 //! - [`GeoidGrid::from_egm96_dac`], a loader for the authoritative NGA EGM96
 //!   15-arcminute binary grid (`WW15MGH.DAC`) for decimetre-class datum work;
+//! - [`GeoidGrid::from_egm2008_raster`], a loader for the NGA EGM2008
+//!   row-framed `REAL*4` raster grids at 2.5-arcminute and 1-arcminute spacing;
 //! - [`egm96_undulation`] / [`egm96_grid`], a zero-setup lookup against an
 //!   embedded genuine EGM96 1-degree global grid (a higher-accuracy alternative
 //!   to the coarse built-in);
@@ -106,6 +108,143 @@ impl core::fmt::Display for GeoidError {
 }
 
 impl std::error::Error for GeoidError {}
+
+/// Supported NGA EGM2008 interpolation-raster spacings.
+///
+/// The official rasters store `REAL*4` geoid undulation samples in Fortran
+/// sequential records. Rows run north-to-south, columns run west-to-east from
+/// longitude `0` degrees east, and there is no duplicate `360` degree column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Egm2008GridSpacing {
+    /// The 1-arcminute EGM2008 grid, `10801 x 21600` nodes.
+    OneMinute,
+    /// The 2.5-arcminute EGM2008 grid, `4321 x 8640` nodes.
+    TwoPointFiveMinute,
+}
+
+impl Egm2008GridSpacing {
+    /// Grid spacing in arcminutes.
+    pub fn arc_minutes(self) -> f64 {
+        match self {
+            Self::OneMinute => 1.0,
+            Self::TwoPointFiveMinute => 2.5,
+        }
+    }
+
+    /// Grid spacing in degrees.
+    pub fn degrees(self) -> f64 {
+        self.arc_minutes() / 60.0
+    }
+
+    /// Official global row and column counts for this spacing.
+    pub fn global_dimensions(self) -> (usize, usize) {
+        match self {
+            Self::OneMinute => (EGM2008_1_MIN_N_LAT, EGM2008_1_MIN_N_LON),
+            Self::TwoPointFiveMinute => (EGM2008_2P5_MIN_N_LAT, EGM2008_2P5_MIN_N_LON),
+        }
+    }
+}
+
+/// A full or cropped EGM2008 row-framed raster window.
+///
+/// The window describes the bytes passed to
+/// [`GeoidGrid::from_egm2008_raster_window`]. The byte stream contains one
+/// Fortran sequential record per latitude row, ordered north-to-south, with
+/// `n_lon` `REAL*4` samples per row. The resulting [`GeoidGrid`] stores rows
+/// latitude-ascending and uses the same bilinear interpolation path as every
+/// other geoid grid in this module.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Egm2008RasterWindow {
+    spacing: Egm2008GridSpacing,
+    lat_min_deg: f64,
+    lon_min_deg: f64,
+    n_lat: usize,
+    n_lon: usize,
+}
+
+impl Egm2008RasterWindow {
+    /// Build a window descriptor for EGM2008 row-framed raster bytes.
+    ///
+    /// `lat_min_deg` and `lon_min_deg` are the southwest node of the resulting
+    /// grid in degrees. `n_lat` and `n_lon` are the node counts in the supplied
+    /// byte stream. Returns [`GeoidError`] if a dimension is zero, an origin is
+    /// not finite, the latitude span falls outside `[-90, 90]`, or the longitude
+    /// span exceeds a full global revolution.
+    pub fn new(
+        spacing: Egm2008GridSpacing,
+        lat_min_deg: f64,
+        lon_min_deg: f64,
+        n_lat: usize,
+        n_lon: usize,
+    ) -> Result<Self, GeoidError> {
+        if n_lat == 0 || n_lon == 0 {
+            return Err(GeoidError::InvalidDimensions {
+                expected: 1,
+                found: 0,
+            });
+        }
+        if !lat_min_deg.is_finite() {
+            return Err(GeoidError::InvalidSpacing { field: "lat_min" });
+        }
+        if !lon_min_deg.is_finite() {
+            return Err(GeoidError::InvalidSpacing { field: "lon_min" });
+        }
+        let d = spacing.degrees();
+        let lat_max_deg = lat_min_deg + (n_lat as f64 - 1.0) * d;
+        if lat_min_deg < -90.0 - 1.0e-12 || lat_max_deg > 90.0 + 1.0e-12 {
+            return Err(GeoidError::Parse {
+                reason: format!(
+                    "EGM2008 latitude window [{lat_min_deg}, {lat_max_deg}] exceeds [-90, 90]"
+                ),
+            });
+        }
+        let lon_span_deg = n_lon as f64 * d;
+        if lon_span_deg > 360.0 + 1.0e-12 {
+            return Err(GeoidError::Parse {
+                reason: format!("EGM2008 longitude span {lon_span_deg} exceeds 360 degrees"),
+            });
+        }
+        Ok(Self {
+            spacing,
+            lat_min_deg,
+            lon_min_deg,
+            n_lat,
+            n_lon,
+        })
+    }
+
+    /// Build the official full-global EGM2008 window for a spacing.
+    pub fn global(spacing: Egm2008GridSpacing) -> Self {
+        let (n_lat, n_lon) = spacing.global_dimensions();
+        Self::new(spacing, -90.0, 0.0, n_lat, n_lon)
+            .expect("EGM2008 global raster dimensions are valid")
+    }
+
+    /// Raster spacing for this window.
+    pub fn spacing(self) -> Egm2008GridSpacing {
+        self.spacing
+    }
+
+    /// Southwest latitude of this window in degrees.
+    pub fn lat_min_deg(self) -> f64 {
+        self.lat_min_deg
+    }
+
+    /// Western longitude of this window in degrees.
+    pub fn lon_min_deg(self) -> f64 {
+        self.lon_min_deg
+    }
+
+    /// Latitude node count in this window.
+    pub fn n_lat(self) -> usize {
+        self.n_lat
+    }
+
+    /// Longitude node count in this window.
+    pub fn n_lon(self) -> usize {
+        self.n_lon
+    }
+}
 
 /// A regular latitude/longitude grid of geoid undulation samples (metres) with
 /// bilinear interpolation.
@@ -299,6 +438,47 @@ impl GeoidGrid {
             0.25,
             EGM96_DAC_N_LAT,
             EGM96_DAC_N_LON,
+            values_m,
+        )
+    }
+
+    /// Parse an official full-global NGA EGM2008 interpolation raster.
+    ///
+    /// The byte stream must be the `Und_min1x1_...` or `Und_min2.5x2.5_...`
+    /// raster for the supplied spacing. Both the original big-endian files and
+    /// the NGA small-endian variants are accepted. Each row is a Fortran
+    /// sequential record whose leading and trailing record lengths must match
+    /// `n_lon * 4` bytes, and each sample is decoded as a finite `REAL*4`
+    /// undulation in metres.
+    ///
+    /// Use [`GeoidGrid::from_egm2008_raster_window`] when validating or loading
+    /// a cropped raster window with the same record layout.
+    pub fn from_egm2008_raster(
+        bytes: &[u8],
+        spacing: Egm2008GridSpacing,
+    ) -> Result<Self, GeoidError> {
+        Self::from_egm2008_raster_window(bytes, Egm2008RasterWindow::global(spacing))
+    }
+
+    /// Parse a full or cropped NGA EGM2008 interpolation raster window.
+    ///
+    /// `window` supplies the grid spacing, southwest node, and node dimensions.
+    /// The byte stream must contain exactly one north-to-south Fortran
+    /// sequential record per latitude row, with `n_lon` `REAL*4` samples in each
+    /// row. Both big-endian and small-endian record/sample encodings are
+    /// accepted and are detected from the first record marker.
+    pub fn from_egm2008_raster_window(
+        bytes: &[u8],
+        window: Egm2008RasterWindow,
+    ) -> Result<Self, GeoidError> {
+        let values_m = parse_egm2008_raster_values(bytes, window)?;
+        Self::new(
+            window.lat_min_deg,
+            window.lon_min_deg,
+            window.spacing.degrees(),
+            window.spacing.degrees(),
+            window.n_lat,
+            window.n_lon,
             values_m,
         )
     }
@@ -546,6 +726,136 @@ const EGM96_DAC_N_LAT: usize = 721;
 /// Longitude sample count per record of the NGA EGM96 `WW15MGH.DAC` grid.
 const EGM96_DAC_N_LON: usize = 1440;
 
+/// Latitude row count of the NGA EGM2008 1-arcminute raster.
+const EGM2008_1_MIN_N_LAT: usize = 10801;
+/// Longitude column count of the NGA EGM2008 1-arcminute raster.
+const EGM2008_1_MIN_N_LON: usize = 21600;
+/// Latitude row count of the NGA EGM2008 2.5-arcminute raster.
+const EGM2008_2P5_MIN_N_LAT: usize = 4321;
+/// Longitude column count of the NGA EGM2008 2.5-arcminute raster.
+const EGM2008_2P5_MIN_N_LON: usize = 8640;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RasterEndian {
+    Little,
+    Big,
+}
+
+impl RasterEndian {
+    fn read_u32(self, bytes: [u8; 4]) -> u32 {
+        match self {
+            Self::Little => u32::from_le_bytes(bytes),
+            Self::Big => u32::from_be_bytes(bytes),
+        }
+    }
+
+    fn read_f32(self, bytes: [u8; 4]) -> f32 {
+        match self {
+            Self::Little => f32::from_le_bytes(bytes),
+            Self::Big => f32::from_be_bytes(bytes),
+        }
+    }
+}
+
+fn parse_egm2008_raster_values(
+    bytes: &[u8],
+    window: Egm2008RasterWindow,
+) -> Result<Vec<f64>, GeoidError> {
+    let row_value_bytes = window
+        .n_lon
+        .checked_mul(4)
+        .ok_or_else(|| GeoidError::Parse {
+            reason: "EGM2008 row byte count overflows".to_string(),
+        })?;
+    let row_record_bytes = row_value_bytes
+        .checked_add(8)
+        .ok_or_else(|| GeoidError::Parse {
+            reason: "EGM2008 record byte count overflows".to_string(),
+        })?;
+    let expected = window
+        .n_lat
+        .checked_mul(row_record_bytes)
+        .ok_or_else(|| GeoidError::Parse {
+            reason: "EGM2008 raster byte count overflows".to_string(),
+        })?;
+    if bytes.len() != expected {
+        return Err(GeoidError::Parse {
+            reason: format!(
+                "EGM2008 raster window must be {expected} bytes ({} x {} REAL*4 row records), got {}",
+                window.n_lat,
+                window.n_lon,
+                bytes.len()
+            ),
+        });
+    }
+
+    let row_marker = u32::try_from(row_value_bytes).map_err(|_| GeoidError::Parse {
+        reason: "EGM2008 row marker exceeds u32".to_string(),
+    })?;
+    let endian = detect_egm2008_endian(bytes, row_marker)?;
+    let mut values_m = vec![0.0f64; window.n_lat * window.n_lon];
+    for src_row in 0..window.n_lat {
+        let row_off = src_row * row_record_bytes;
+        let start_marker = endian.read_u32([
+            bytes[row_off],
+            bytes[row_off + 1],
+            bytes[row_off + 2],
+            bytes[row_off + 3],
+        ]);
+        let end_off = row_off + 4 + row_value_bytes;
+        let end_marker = endian.read_u32([
+            bytes[end_off],
+            bytes[end_off + 1],
+            bytes[end_off + 2],
+            bytes[end_off + 3],
+        ]);
+        if start_marker != row_marker || end_marker != row_marker {
+            return Err(GeoidError::Parse {
+                reason: format!(
+                    "EGM2008 record {src_row} marker mismatch: start {start_marker}, end {end_marker}, expected {row_marker}"
+                ),
+            });
+        }
+        let dst_row = window.n_lat - 1 - src_row;
+        for col in 0..window.n_lon {
+            let sample_off = row_off + 4 + col * 4;
+            let value = endian.read_f32([
+                bytes[sample_off],
+                bytes[sample_off + 1],
+                bytes[sample_off + 2],
+                bytes[sample_off + 3],
+            ]);
+            let index = dst_row * window.n_lon + col;
+            if !value.is_finite() {
+                return Err(GeoidError::NonFiniteValue { index });
+            }
+            values_m[index] = f64::from(value);
+        }
+    }
+    Ok(values_m)
+}
+
+fn detect_egm2008_endian(bytes: &[u8], row_marker: u32) -> Result<RasterEndian, GeoidError> {
+    if bytes.len() < 4 {
+        return Err(GeoidError::Parse {
+            reason: "EGM2008 raster is too short for a record marker".to_string(),
+        });
+    }
+    let first = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    let little = u32::from_le_bytes(first) == row_marker;
+    let big = u32::from_be_bytes(first) == row_marker;
+    match (little, big) {
+        (true, false) => Ok(RasterEndian::Little),
+        (false, true) => Ok(RasterEndian::Big),
+        (true, true) => Err(GeoidError::Parse {
+            reason: "EGM2008 record marker has ambiguous byte order".to_string(),
+        }),
+        (false, false) => Err(GeoidError::Parse {
+            reason: format!("EGM2008 first record marker does not match {row_marker}"),
+        }),
+    }
+}
+
 /// Latitude row count of the embedded genuine EGM96 1-degree grid.
 const EGM96_1DEG_N_LAT: usize = 181;
 /// Longitude column count of the embedded genuine EGM96 1-degree grid.
@@ -684,6 +994,35 @@ const BUILTIN_VALUES_M: [f64; BUILTIN_N_LAT * BUILTIN_N_LON] = [
 
 #[cfg(test)]
 mod tests {
+    //! Geoid validation provenance:
+    //!
+    //! EGM96 PROJ fixtures use `us_nga_egm96_15.tif` through PROJ `cct` and
+    //! assert 5 mm agreement with sparse real `WW15MGH.DAC` centimetre nodes.
+    //!
+    //! EGM2008 fixtures use the public NGA `EGM2008_Interpolation_Grid.zip`
+    //! archive from `https://earth-info.nga.mil/php/download.php?file=egm-08interpolation`.
+    //! Archive SHA-256:
+    //! `0f65f16e6fd3f89a6b8022d7a89375d0c29fb275a551927175669bb610904cd0`.
+    //! Source member:
+    //! `Und_min2.5x2.5_egm2008_isw=82_WGS84_TideFree_SE`.
+    //! Source raster SHA-256:
+    //! `ab6f8b94076f78707d1cdae7b066b93a786a0c64b52449e20cf1a1a2f4e74daf`.
+    //! Crop fixture:
+    //! `tests/fixtures/geoid/egm2008_25_norcal_crop.bin`, 25 x 25 nodes,
+    //! 2.5 arcminute spacing, latitude 37.0 to 38.0 degrees, longitude
+    //! -123.0 to -122.0 degrees. Crop SHA-256:
+    //! `e66da6cbde7bb4015dc8b9c436fd93f16af3734e97017700fa3ab632f71f569d`.
+    //! The crop preserves the NGA small-endian `REAL*4` row records for those
+    //! nodes, with record lengths reduced to the cropped row width.
+    //!
+    //! EGM2008 oracle values use PROJ 9.8.1 `cct` with
+    //! `us_nga_egm08_25.tif`, SHA-256
+    //! `4191d471eefebf24091b56dbc604353cb3b8cf8cc70e448bb9ae56a272bef17a`.
+    //! Command:
+    //! `PROJ_DATA=/Volumes/ExternalSSD/sidereon-fleet/.tmp-egm2008/proj cct -d 12 +proj=pipeline +step +inv +proj=vgridshift +grids=us_nga_egm08_25.tif +multiplier=1`.
+    //! With input height zero, the undulation is `-output_z`. The crop test
+    //! asserts agreement to 5 mm.
+
     use super::*;
 
     #[derive(Clone, Copy)]
@@ -692,6 +1031,9 @@ mod tests {
         lon_deg: f64,
         undulation_m: f64,
     }
+
+    const EGM2008_NORCAL_CROP_BYTES: &[u8] =
+        include_bytes!("../tests/fixtures/geoid/egm2008_25_norcal_crop.bin");
 
     // PROJ oracle provenance for the 15-arcminute EGM96 fixture below:
     //
@@ -764,6 +1106,34 @@ mod tests {
         },
     ];
 
+    const PROJ_EGM2008_FIXTURES: &[ProjGeoidFixture] = &[
+        ProjGeoidFixture {
+            lat_deg: 37.774900,
+            lon_deg: -122.419400,
+            undulation_m: -32.163558372373,
+        },
+        ProjGeoidFixture {
+            lat_deg: 37.500000,
+            lon_deg: -122.750000,
+            undulation_m: -33.605857849121,
+        },
+        ProjGeoidFixture {
+            lat_deg: 37.875000,
+            lon_deg: -122.125000,
+            undulation_m: -31.847370147705,
+        },
+        ProjGeoidFixture {
+            lat_deg: 38.000000,
+            lon_deg: -122.000000,
+            undulation_m: -31.767843246460,
+        },
+        ProjGeoidFixture {
+            lat_deg: 37.000000,
+            lon_deg: -123.000000,
+            undulation_m: -36.499370574951,
+        },
+    ];
+
     // Real EGM96 15-arcminute node values, rounded to the centimetre grid the
     // NGA `WW15MGH.DAC` format stores. The sparse test grid writes only these
     // nodes into an otherwise-zero DAC-sized byte buffer; each oracle point
@@ -824,6 +1194,41 @@ mod tests {
             assert!(col < super::EGM96_DAC_N_LON);
             let off = (record * super::EGM96_DAC_N_LON + col) * 2;
             bytes[off..off + 2].copy_from_slice(&cm.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn egm2008_norcal_window() -> Egm2008RasterWindow {
+        Egm2008RasterWindow::new(Egm2008GridSpacing::TwoPointFiveMinute, 37.0, -123.0, 25, 25)
+            .expect("EGM2008 crop window")
+    }
+
+    fn egm2008_test_raster_bytes(
+        window: Egm2008RasterWindow,
+        little_endian: bool,
+        value: impl Fn(usize, usize) -> f32,
+    ) -> Vec<u8> {
+        let row_value_bytes = window.n_lon() * 4;
+        let mut bytes = Vec::with_capacity(window.n_lat() * (row_value_bytes + 8));
+        for src_row in 0..window.n_lat() {
+            if little_endian {
+                bytes.extend_from_slice(&(row_value_bytes as u32).to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&(row_value_bytes as u32).to_be_bytes());
+            }
+            for col in 0..window.n_lon() {
+                let sample = value(src_row, col);
+                if little_endian {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&sample.to_be_bytes());
+                }
+            }
+            if little_endian {
+                bytes.extend_from_slice(&(row_value_bytes as u32).to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&(row_value_bytes as u32).to_be_bytes());
+            }
         }
         bytes
     }
@@ -979,6 +1384,102 @@ mod tests {
     }
 
     #[test]
+    fn from_egm2008_raster_window_decodes_little_and_big_endian_records() {
+        let d = Egm2008GridSpacing::TwoPointFiveMinute.degrees();
+        let window =
+            Egm2008RasterWindow::new(Egm2008GridSpacing::TwoPointFiveMinute, 10.0, 20.0, 2, 3)
+                .expect("EGM2008 test window");
+        for little_endian in [true, false] {
+            let bytes = egm2008_test_raster_bytes(window, little_endian, |src_row, col| {
+                (src_row * 10 + col) as f32
+            });
+            let grid =
+                GeoidGrid::from_egm2008_raster_window(&bytes, window).expect("parse EGM2008");
+            assert_eq!(grid.undulation_deg(10.0, 20.0), 10.0);
+            assert!((grid.undulation_deg(10.0 + d, 20.0 + 2.0 * d) - 2.0).abs() <= 1.0e-12);
+            assert!((grid.undulation_deg(10.0 + 0.5 * d, 20.0 + d) - 6.0).abs() <= 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn from_egm2008_raster_rejects_bad_record_layout() {
+        assert!(matches!(
+            GeoidGrid::from_egm2008_raster(
+                EGM2008_NORCAL_CROP_BYTES,
+                Egm2008GridSpacing::TwoPointFiveMinute,
+            ),
+            Err(GeoidError::Parse { .. })
+        ));
+
+        let window = egm2008_norcal_window();
+        let mut bytes = EGM2008_NORCAL_CROP_BYTES.to_vec();
+        bytes[0] = 0;
+        assert!(matches!(
+            GeoidGrid::from_egm2008_raster_window(&bytes, window),
+            Err(GeoidError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn egm2008_crop_matches_proj_oracle() {
+        let grid = GeoidGrid::from_egm2008_raster_window(
+            EGM2008_NORCAL_CROP_BYTES,
+            egm2008_norcal_window(),
+        )
+        .expect("parse EGM2008 crop");
+        for fixture in PROJ_EGM2008_FIXTURES {
+            let got = grid.undulation_deg(fixture.lat_deg, fixture.lon_deg);
+            assert!(
+                (got - fixture.undulation_m).abs() <= 0.005,
+                "PROJ EGM2008 fixture ({}, {}): got {got}, want {}",
+                fixture.lat_deg,
+                fixture.lon_deg,
+                fixture.undulation_m
+            );
+        }
+    }
+
+    #[test]
+    fn egm2008_regional_crop_clamps_grid_edges() {
+        let grid = GeoidGrid::from_egm2008_raster_window(
+            EGM2008_NORCAL_CROP_BYTES,
+            egm2008_norcal_window(),
+        )
+        .expect("parse EGM2008 crop");
+        assert_eq!(
+            grid.undulation_deg(36.0, -124.0),
+            grid.undulation_deg(37.0, -123.0)
+        );
+        assert_eq!(
+            grid.undulation_deg(39.0, -121.0),
+            grid.undulation_deg(38.0, -122.0)
+        );
+    }
+
+    #[test]
+    fn egm2008_global_longitude_window_wraps_through_shared_kernel() {
+        let spacing = Egm2008GridSpacing::TwoPointFiveMinute;
+        let d = spacing.degrees();
+        let (_, n_lon) = spacing.global_dimensions();
+        let window = Egm2008RasterWindow::new(spacing, 0.0, 0.0, 2, n_lon)
+            .expect("global-longitude EGM2008 window");
+        let bytes = egm2008_test_raster_bytes(window, true, |_, col| {
+            if col == 0 {
+                100.0
+            } else if col == n_lon - 1 {
+                200.0
+            } else {
+                10.0
+            }
+        });
+        let grid =
+            GeoidGrid::from_egm2008_raster_window(&bytes, window).expect("parse EGM2008 wrap");
+
+        assert_eq!(grid.undulation_deg(0.0, 360.0), 100.0);
+        assert_eq!(grid.undulation_deg(0.0, -0.5 * d), 150.0);
+    }
+
+    #[test]
     fn new_rejects_bad_inputs() {
         assert!(matches!(
             GeoidGrid::new(0.0, 0.0, 1.0, 1.0, 2, 2, vec![1.0, 2.0, 3.0]),
@@ -1054,6 +1555,28 @@ mod tests {
             (egm96 - published).abs() < (coarse - published).abs(),
             "egm96 ({egm96}) should beat the coarse built-in ({coarse}) vs {published}"
         );
+    }
+
+    #[test]
+    fn egm96_embedded_outputs_are_bit_pinned() {
+        let fixtures = [
+            (37.0_f64, -122.0_f64, 0xc040_accc_cccc_cccdu64),
+            (37.5_f64, -122.5_f64, 0xc040_de66_6666_6666u64),
+            (
+                16.0 + 46.0 / 60.0 + 33.0 / 3600.0,
+                -(3.0 + 34.0 / 3600.0),
+                0x403c_acb4_79a8_1af4u64,
+            ),
+            (0.125_f64, -179.875_f64, 0x4034_cbf5_c28f_5c29u64),
+        ];
+        for (lat_deg, lon_deg, bits) in fixtures {
+            let got = egm96_undulation(lat_deg.to_radians(), lon_deg.to_radians());
+            assert_eq!(
+                got.to_bits(),
+                bits,
+                "EGM96 bit pin ({lat_deg}, {lon_deg}) got {got}"
+            );
+        }
     }
 
     /// `from_egm96_dac` decodes the NGA `WW15MGH.DAC` layout: big-endian int16
