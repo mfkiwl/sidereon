@@ -18,8 +18,8 @@ use crate::astro::covariance::{Covariance6, Covariance6Error};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{
     CompositeForceModel, DragParameters, ForceModel, J2Gravity, SchwarzschildRelativity,
-    SolarRadiationPressure, SourcedDragForce, SpaceWeatherSource, ThirdBodyGravity, TwoBodyGravity,
-    ZonalGravity,
+    SolarRadiationPressure, SourcedDragForce, SpaceWeatherSource, SphericalHarmonicGravityConfig,
+    ThirdBodyGravity, TwoBodyGravity, ZonalGravity,
 };
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
@@ -88,6 +88,8 @@ pub struct ForceModelComponents {
     pub two_body_mu_km3_s2: Option<f64>,
     /// Optional zonal gravity perturbation.
     pub zonal: Option<ZonalGravity>,
+    /// Optional embedded EGM96 spherical-harmonic perturbation.
+    pub spherical_harmonic: Option<SphericalHarmonicGravityConfig>,
     /// Optional Sun and Moon third-body perturbation.
     pub third_body: Option<ThirdBodyGravity>,
     /// Optional cannonball solar radiation pressure perturbation.
@@ -107,6 +109,7 @@ impl ForceModelComponents {
     pub const EMPTY: Self = Self {
         two_body_mu_km3_s2: None,
         zonal: None,
+        spherical_harmonic: None,
         third_body: None,
         solar_radiation_pressure: None,
         relativity: None,
@@ -125,10 +128,29 @@ impl ForceModelComponents {
         Self {
             two_body_mu_km3_s2: Some(MU_EARTH),
             zonal: Some(ZonalGravity::earth_j2_through_j6()),
+            spherical_harmonic: None,
             third_body: Some(ThirdBodyGravity::default()),
             solar_radiation_pressure,
             relativity: Some(SchwarzschildRelativity::default()),
         }
+    }
+
+    /// Canonical Earth Phase B force set with embedded EGM96 harmonics.
+    pub fn earth_phase_b(
+        max_degree: u16,
+        max_order: u16,
+        solar_radiation_pressure: Option<SolarRadiationPressure>,
+    ) -> Result<Self, PropagationError> {
+        Ok(Self {
+            two_body_mu_km3_s2: Some(MU_EARTH),
+            zonal: None,
+            spherical_harmonic: Some(SphericalHarmonicGravityConfig::earth(
+                max_degree, max_order,
+            )?),
+            third_body: Some(ThirdBodyGravity::default()),
+            solar_radiation_pressure,
+            relativity: Some(SchwarzschildRelativity::default()),
+        })
     }
 
     /// Set or replace central two-body gravity.
@@ -140,6 +162,12 @@ impl ForceModelComponents {
     /// Set or replace zonal gravity.
     pub fn with_zonal(mut self, zonal: ZonalGravity) -> Self {
         self.zonal = Some(zonal);
+        self
+    }
+
+    /// Set or replace embedded EGM96 spherical-harmonic gravity.
+    pub fn with_spherical_harmonic(mut self, gravity: SphericalHarmonicGravityConfig) -> Self {
+        self.spherical_harmonic = Some(gravity);
         self
     }
 
@@ -192,11 +220,26 @@ impl ForceModelKind {
         }
     }
 
+    /// Earth two-body plus Phase B perturbations.
+    pub fn earth_phase_b(
+        max_degree: u16,
+        max_order: u16,
+        solar_radiation_pressure: Option<SolarRadiationPressure>,
+    ) -> Result<Self, PropagationError> {
+        Ok(Self::Composite {
+            components: ForceModelComponents::earth_phase_b(
+                max_degree,
+                max_order,
+                solar_radiation_pressure,
+            )?,
+        })
+    }
+
     /// Build the boxed [`ForceModel`] this variant describes. Reuses the force
     /// model implementations; no acceleration math is duplicated here.
-    fn build(self) -> Box<dyn ForceModel> {
+    fn build(self) -> Result<Box<dyn ForceModel>, PropagationError> {
         match self {
-            ForceModelKind::TwoBody { mu_km3_s2 } => Box::new(TwoBodyGravity { mu: mu_km3_s2 }),
+            ForceModelKind::TwoBody { mu_km3_s2 } => Ok(Box::new(TwoBodyGravity { mu: mu_km3_s2 })),
             ForceModelKind::TwoBodyJ2 {
                 mu_km3_s2,
                 re_km,
@@ -209,15 +252,23 @@ impl ForceModelKind {
                     re: re_km,
                     j2,
                 }));
-                Box::new(composite)
+                Ok(Box::new(composite))
             }
             ForceModelKind::Composite { components } => {
+                if components.zonal.is_some() && components.spherical_harmonic.is_some() {
+                    return Err(PropagationError::InvalidInput(
+                        "zonal and spherical harmonic gravity cannot both be selected".to_string(),
+                    ));
+                }
                 let mut composite = CompositeForceModel::new();
                 if let Some(mu_km3_s2) = components.two_body_mu_km3_s2 {
                     composite.add(Box::new(TwoBodyGravity { mu: mu_km3_s2 }));
                 }
                 if let Some(zonal) = components.zonal {
                     composite.add(Box::new(zonal));
+                }
+                if let Some(spherical_harmonic) = components.spherical_harmonic {
+                    composite.add(Box::new(spherical_harmonic.build()?));
                 }
                 if let Some(third_body) = components.third_body {
                     composite.add(Box::new(third_body));
@@ -228,7 +279,7 @@ impl ForceModelKind {
                 if let Some(relativity) = components.relativity {
                     composite.add(Box::new(relativity));
                 }
-                Box::new(composite)
+                Ok(Box::new(composite))
             }
         }
     }
@@ -508,7 +559,7 @@ impl StatePropagator {
     }
 
     pub(super) fn build_force(&self) -> Result<Box<dyn ForceModel>, PropagationError> {
-        let gravity = self.force_model.build();
+        let gravity = self.force_model.build()?;
         match (self.drag, self.space_weather.clone()) {
             (Some(drag), Some(source)) => {
                 let mut composite = CompositeForceModel::new();
