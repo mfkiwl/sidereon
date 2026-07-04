@@ -8,6 +8,8 @@
 //!   terms. Depends on [`crate::astro::data::iau2000a`] + [`crate::astro::math::mat3`].
 //! - [`precession`] - IAU 2006 precession matrix and the ICRS->J2000 frame bias.
 //!   Depends on [`crate::astro::math::mat3`].
+//! - [`orientation`] - a cacheable full GCRF<->ITRF Earth-orientation
+//!   evaluation built from the existing transform substrate.
 //! - [`transforms`] - the transform engine: TEME->GCRS, GCRS->ITRS,
 //!   ITRS->geodetic (WGS84), geodetic->ITRS, and topocentric az/el/range.
 //!   Depends on [`nutation`], [`precession`], [`crate::astro::math::mat3`],
@@ -24,5 +26,8 @@
 //! float-producing compute functions live here.
 
 pub mod nutation;
+pub mod orientation;
 pub mod precession;
 pub mod transforms;
+
+pub use orientation::{EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider};

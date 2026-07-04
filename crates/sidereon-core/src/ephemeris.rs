@@ -25,9 +25,10 @@ use crate::observables::{ObservableState, ObservablesInputErrorKind};
 pub use crate::orbit_determination::{
     fit_all_sp3_precise_orbits, fit_precise_ephemeris_sample_orbit,
     fit_precise_ephemeris_sample_orbit_with_initial_state, fit_precise_ephemeris_sample_orbits,
+    fit_precise_ephemeris_state_sample_orbit, fit_precise_ephemeris_state_sample_orbits,
     fit_sp3_precise_orbit, fit_sp3_precise_orbit_with_initial_state, fit_sp3_precise_orbits,
     OrbitArcSpan, OrbitFitCovariance, OrbitFitError, OrbitFitOptions, OrbitFitReport,
-    OrbitFitSolution, OrbitResidualLedger, OrbitResidualStats,
+    OrbitFitSolution, OrbitResidualLedger, OrbitResidualStats, OrientedPreciseEphemerisStateSample,
 };
 pub use crate::rinex_nav::{
     cnav_ura_ned_m, cnav_ura_nominal_m, is_beidou_geo, BroadcastGroupDelayTerm,
@@ -36,11 +37,12 @@ pub use crate::rinex_nav::{
     NavMessagePreference,
 };
 pub use crate::sp3::{
-    align_clock_reference, clock_reference_offset, compare_position_series, merge, AgreementMetric,
-    ClockReferenceOffset, EpochAgreement, InterpolationComparison, InterpolationDivergence,
-    MergeCombine, MergeFlag, MergeOptions, MergeReport, PreciseEphemerisInterpolant,
-    PreciseEphemerisSample, PreciseEphemerisSamples, PreciseInterpolantError, PreciseSamplesError,
-    ReferenceState, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State, Sp3TimeSystem, Sp3Version,
+    align_clock_reference, clock_reference_offset, compare_position_series, merge,
+    sp3_ecef_state_to_eci, AgreementMetric, ClockReferenceOffset, EpochAgreement,
+    InterpolationComparison, InterpolationDivergence, MergeCombine, MergeFlag, MergeOptions,
+    MergeReport, PreciseEphemerisInterpolant, PreciseEphemerisSample, PreciseEphemerisSamples,
+    PreciseEphemerisStateSample, PreciseInterpolantError, PreciseSamplesError, ReferenceState, Sp3,
+    Sp3DataType, Sp3Flags, Sp3Header, Sp3State, Sp3TimeSystem, Sp3Version,
 };
 pub use crate::spp::EphemerisSource;
 use crate::{validate, GnssSatelliteId, GnssSystem};

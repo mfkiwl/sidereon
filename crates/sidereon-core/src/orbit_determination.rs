@@ -15,6 +15,7 @@ use nalgebra::{DMatrix, DVector};
 use crate::astro::covariance::{rtn_to_eci_rotation, RtnFrameError};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{DragParameters, SpaceWeatherSource};
+use crate::astro::frames::orientation::EarthOrientation;
 use crate::astro::frames::transforms::{
     gcrs_to_itrs_compute, itrs_to_gcrs_compute, FrameTransformError,
 };
@@ -32,7 +33,7 @@ use crate::astro::time::model::{Instant, TimeScale};
 use crate::astro::time::scales::TimeScales;
 use crate::constants::{M_PER_KM, SECONDS_PER_DAY};
 use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
-use crate::sp3::{PreciseEphemerisSample, Sp3};
+use crate::sp3::{sp3_ecef_state_to_eci, PreciseEphemerisSample, PreciseEphemerisStateSample, Sp3};
 use crate::{GnssSatelliteId, GnssSystem};
 
 const STATE_PARAM_COUNT: usize = 6;
@@ -164,6 +165,29 @@ pub struct OrbitFitReport {
     pub fits: BTreeMap<GnssSatelliteId, OrbitFitSolution>,
     /// RTN residual RMS ledger from the fitted states.
     pub ledger: OrbitResidualLedger,
+}
+
+/// One ECEF SP3 state sample paired with the Earth orientation for that epoch.
+///
+/// This is the state-sample fit input: the sample supplies ITRF position and
+/// velocity, and the orientation supplies the cacheable GCRF/ITRF DCM plus
+/// transport term for the same epoch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrientedPreciseEphemerisStateSample {
+    /// ECEF SP3 position and velocity sample.
+    pub sample: PreciseEphemerisStateSample,
+    /// Earth orientation evaluated at `sample.epoch`.
+    pub orientation: EarthOrientation,
+}
+
+impl OrientedPreciseEphemerisStateSample {
+    /// Pair an SP3 ECEF state sample with its evaluated Earth orientation.
+    pub const fn new(sample: PreciseEphemerisStateSample, orientation: EarthOrientation) -> Self {
+        Self {
+            sample,
+            orientation,
+        }
+    }
 }
 
 /// Error returned by precise-orbit fitting.
@@ -340,6 +364,55 @@ pub fn fit_precise_ephemeris_sample_orbit_with_initial_state(
     Ok(OrbitFitReport { fits, ledger })
 }
 
+/// Fit one satellite from ECEF state samples paired with Earth orientation.
+///
+/// The ECEF positions remain the residual observations. The ECEF velocities are
+/// converted through [`sp3_ecef_state_to_eci`] and used as the arc-start inertial
+/// seed, including the `omega x r` transport term.
+pub fn fit_precise_ephemeris_state_sample_orbit(
+    samples: &[OrientedPreciseEphemerisStateSample],
+    satellite: GnssSatelliteId,
+    options: &OrbitFitOptions,
+) -> Result<OrbitFitReport, OrbitFitError> {
+    fit_precise_ephemeris_state_sample_orbits(samples, &[satellite], options)
+}
+
+/// Fit selected satellites from ECEF state samples paired with Earth
+/// orientation.
+pub fn fit_precise_ephemeris_state_sample_orbits(
+    samples: &[OrientedPreciseEphemerisStateSample],
+    satellites: &[GnssSatelliteId],
+    options: &OrbitFitOptions,
+) -> Result<OrbitFitReport, OrbitFitError> {
+    validate_options(options)?;
+    if satellites.is_empty() {
+        return Err(OrbitFitError::EmptySelection);
+    }
+
+    let mut fits = BTreeMap::new();
+    let mut residuals = Vec::new();
+    let mut time_scale = None;
+    for &satellite in satellites {
+        let work = fit_one_state_sample_arc(samples, satellite, options)?;
+        for residual in &work.residuals {
+            match time_scale {
+                None => time_scale = Some(residual.time_scale),
+                Some(scale) if scale == residual.time_scale => {}
+                Some(_) => return Err(OrbitFitError::MixedTimeScales),
+            }
+        }
+        residuals.extend(work.residuals);
+        fits.insert(satellite, work.solution);
+    }
+
+    let ledger = build_ledger(
+        residuals,
+        time_scale.ok_or(OrbitFitError::EmptySelection)?,
+        options.min_ledger_samples,
+    )?;
+    Ok(OrbitFitReport { fits, ledger })
+}
+
 /// Fit selected satellites from precise ephemeris samples.
 pub fn fit_precise_ephemeris_sample_orbits(
     samples: &[PreciseEphemerisSample],
@@ -397,8 +470,26 @@ fn fit_one_sample_arc(
     initial_seed: Option<CartesianState>,
 ) -> Result<FitWork, OrbitFitError> {
     let observations = collect_observations(samples, satellite)?;
+    fit_one_observation_arc(satellite, observations, options, initial_seed)
+}
+
+fn fit_one_state_sample_arc(
+    samples: &[OrientedPreciseEphemerisStateSample],
+    satellite: GnssSatelliteId,
+    options: &OrbitFitOptions,
+) -> Result<FitWork, OrbitFitError> {
+    let observations = collect_state_observations(samples, satellite)?;
+    fit_one_observation_arc(satellite, observations, options, None)
+}
+
+fn fit_one_observation_arc(
+    satellite: GnssSatelliteId,
+    observations: Vec<OrbitObservation>,
+    options: &OrbitFitOptions,
+    initial_seed: Option<CartesianState>,
+) -> Result<FitWork, OrbitFitError> {
     let seed = match initial_seed {
-        Some(seed) => validate_initial_seed(satellite, seed, &observations)?,
+        Some(seed) => validate_initial_seed(satellite, seed, observations.as_slice())?,
         None => seed_initial_state(satellite, &observations, options)?,
     };
     let seed_vector = state_to_vector(seed);
@@ -506,6 +597,7 @@ struct OrbitObservation {
     time_scales: TimeScales,
     observed_itrs_km: [f64; 3],
     observed_gcrs_km: [f64; 3],
+    observed_gcrs_velocity_km_s: Option<[f64; 3]>,
 }
 
 fn collect_observations(
@@ -526,8 +618,42 @@ fn collect_observations(
             time_scales: ts,
             observed_itrs_km: [x_m / M_PER_KM, y_m / M_PER_KM, z_m / M_PER_KM],
             observed_gcrs_km: [x, y, z],
+            observed_gcrs_velocity_km_s: None,
         });
     }
+    validate_observations(satellite, observations)
+}
+
+fn collect_state_observations(
+    samples: &[OrientedPreciseEphemerisStateSample],
+    satellite: GnssSatelliteId,
+) -> Result<Vec<OrbitObservation>, OrbitFitError> {
+    let mut observations = Vec::new();
+    for oriented in samples
+        .iter()
+        .filter(|oriented| oriented.sample.sat == satellite)
+    {
+        validate_position(oriented.sample.position_ecef_m, satellite)?;
+        validate_velocity(oriented.sample.velocity_ecef_m_s, satellite)?;
+        let inertial = sp3_ecef_state_to_eci(&oriented.sample, &oriented.orientation)
+            .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+        let [x_m, y_m, z_m] = oriented.sample.position_ecef_m;
+        observations.push(OrbitObservation {
+            epoch_j2000_s: inertial.epoch_tdb_seconds,
+            time_scale: oriented.sample.epoch.scale,
+            time_scales: oriented.orientation.time_scales(),
+            observed_itrs_km: [x_m / M_PER_KM, y_m / M_PER_KM, z_m / M_PER_KM],
+            observed_gcrs_km: inertial.position_array(),
+            observed_gcrs_velocity_km_s: Some(inertial.velocity_array()),
+        });
+    }
+    validate_observations(satellite, observations)
+}
+
+fn validate_observations(
+    satellite: GnssSatelliteId,
+    mut observations: Vec<OrbitObservation>,
+) -> Result<Vec<OrbitObservation>, OrbitFitError> {
     observations.sort_by(|a, b| a.epoch_j2000_s.total_cmp(&b.epoch_j2000_s));
     if observations.len() < MIN_SEED_SAMPLES {
         return Err(OrbitFitError::TooFewSamples {
@@ -561,6 +687,20 @@ fn validate_position(
         Err(OrbitFitError::InvalidObservation {
             satellite,
             reason: "position components must be finite",
+        })
+    }
+}
+
+fn validate_velocity(
+    velocity_ecef_m_s: [f64; 3],
+    satellite: GnssSatelliteId,
+) -> Result<(), OrbitFitError> {
+    if velocity_ecef_m_s.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(OrbitFitError::InvalidObservation {
+            satellite,
+            reason: "velocity components must be finite",
         })
     }
 }
@@ -620,6 +760,14 @@ fn seed_initial_state(
     observations: &[OrbitObservation],
     options: &OrbitFitOptions,
 ) -> Result<CartesianState, OrbitFitError> {
+    if let Some(velocity) = observations[0].observed_gcrs_velocity_km_s {
+        return Ok(CartesianState::new(
+            observations[0].epoch_j2000_s,
+            observations[0].observed_gcrs_km,
+            velocity,
+        ));
+    }
+
     if observations.len() >= 3 {
         let r1 = observations[0].observed_gcrs_km;
         let r2 = observations[1].observed_gcrs_km;

@@ -1,9 +1,51 @@
 use crate::astro::error::PropagationError;
+use crate::astro::frames::orientation::EarthOrientationProvider;
 use crate::constants::SECONDS_PER_HOUR;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Default)]
+/// Per-evaluation context shared with force models.
+///
+/// The default context is intentionally empty. A caller that wants a future
+/// body-fixed force to use the precise Earth-fixed frame can attach an
+/// [`EarthOrientationProvider`], while existing force models and default
+/// propagation remain bit-identical.
+#[derive(Clone, Default)]
 pub struct PropagationContext {
-    // For future expansion: frame, atmosphere model, etc.
+    body_fixed_frame_provider: Option<Arc<dyn EarthOrientationProvider>>,
+}
+
+impl core::fmt::Debug for PropagationContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PropagationContext")
+            .field(
+                "body_fixed_frame_provider",
+                &self.body_fixed_frame_provider.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl PropagationContext {
+    /// Build an empty propagation context.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach a body-fixed frame provider.
+    pub fn with_body_fixed_frame_provider(
+        mut self,
+        provider: Arc<dyn EarthOrientationProvider>,
+    ) -> Self {
+        self.body_fixed_frame_provider = Some(provider);
+        self
+    }
+
+    /// Return the body-fixed frame provider, if one was attached.
+    pub fn body_fixed_frame_provider(&self) -> Option<&dyn EarthOrientationProvider> {
+        self.body_fixed_frame_provider
+            .as_deref()
+            .map(|provider| provider as &dyn EarthOrientationProvider)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -148,6 +148,9 @@ pub mod terrain_store;
 pub mod tides;
 pub mod tolerances;
 
+pub use crate::astro::frames::{
+    EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider,
+};
 pub use crate::error_metrics::{
     error_ellipse_from_enu_m2, horizontal_radius_at, metrics_from_ecef_covariance_m2,
     metrics_from_enu_covariance_m2, metrics_from_kinematic_solution,

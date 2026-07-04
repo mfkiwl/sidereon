@@ -302,12 +302,25 @@ impl StatePropagator {
         &self,
         t_end_tdb_seconds: f64,
     ) -> Result<PropagationResult, PropagationError> {
+        let ctx = PropagationContext::default();
+        self.propagate_to_with_context(t_end_tdb_seconds, &ctx)
+    }
+
+    /// Propagate to `t_end_tdb_seconds` with an explicit propagation context.
+    ///
+    /// This is the opt-in path for force models that need shared per-evaluation
+    /// services such as a body-fixed frame provider. Passing
+    /// [`PropagationContext::default`] is equivalent to [`Self::propagate_to`].
+    pub fn propagate_to_with_context(
+        &self,
+        t_end_tdb_seconds: f64,
+        ctx: &PropagationContext,
+    ) -> Result<PropagationResult, PropagationError> {
         let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
-        let ctx = PropagationContext::default();
-        self.run(self.initial, t_end_tdb_seconds, &dynamics, &ctx)
+        self.run(self.initial, t_end_tdb_seconds, &dynamics, ctx)
     }
 
     /// Propagate the initial state and a 6x6 state covariance over a relative
@@ -365,13 +378,26 @@ impl StatePropagator {
         &self,
         t_end_tdb_seconds: f64,
     ) -> Result<StateTransitionMatrix, PropagationError> {
+        let ctx = PropagationContext::default();
+        self.state_transition_matrix_to_with_context(t_end_tdb_seconds, &ctx)
+    }
+
+    /// Build the finite-difference state-transition matrix with an explicit
+    /// propagation context.
+    ///
+    /// Passing [`PropagationContext::default`] is equivalent to
+    /// [`Self::state_transition_matrix_to`].
+    pub fn state_transition_matrix_to_with_context(
+        &self,
+        t_end_tdb_seconds: f64,
+        ctx: &PropagationContext,
+    ) -> Result<StateTransitionMatrix, PropagationError> {
         crate::validate::finite(t_end_tdb_seconds, "t_end_tdb_seconds").map_err(map_field_error)?;
         let force = self.build_force()?;
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
-        let ctx = PropagationContext::default();
-        self.state_transition_matrix_between(self.initial, t_end_tdb_seconds, &dynamics, &ctx)
+        self.state_transition_matrix_between(self.initial, t_end_tdb_seconds, &dynamics, ctx)
     }
 
     pub(super) fn state_transition_matrix_between(
@@ -425,6 +451,19 @@ impl StatePropagator {
         &self,
         epochs_tdb_seconds: &[f64],
     ) -> Result<Vec<CartesianState>, PropagationError> {
+        let ctx = PropagationContext::default();
+        self.ephemeris_with_context(epochs_tdb_seconds, &ctx)
+    }
+
+    /// Sample the trajectory with an explicit propagation context.
+    ///
+    /// Passing [`PropagationContext::default`] is equivalent to
+    /// [`Self::ephemeris`].
+    pub fn ephemeris_with_context(
+        &self,
+        epochs_tdb_seconds: &[f64],
+        ctx: &PropagationContext,
+    ) -> Result<Vec<CartesianState>, PropagationError> {
         validate_initial_state(self.initial)?;
         validate_epoch_finite(self.initial.epoch_tdb_seconds, "initial.epoch_tdb_seconds")?;
         validate_ephemeris_epochs(epochs_tdb_seconds)?;
@@ -433,13 +472,12 @@ impl StatePropagator {
         let dynamics = OrbitalDynamics {
             force_model: force.as_ref(),
         };
-        let ctx = PropagationContext::default();
 
         let mut states = Vec::with_capacity(epochs_tdb_seconds.len());
         let mut current = self.initial;
         for &t in epochs_tdb_seconds {
             if t != current.epoch_tdb_seconds {
-                current = self.run(current, t, &dynamics, &ctx)?.final_state;
+                current = self.run(current, t, &dynamics, ctx)?.final_state;
             }
             states.push(current);
         }
