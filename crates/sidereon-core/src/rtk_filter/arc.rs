@@ -2,7 +2,7 @@
 //!
 //! This leaf owns the high-level "raw rover+base epochs in, per-epoch baseline
 //! solutions out" orchestration that previously lived only in the Elixir binding
-//! (`Sidereon.GNSS.RTK.solve_filter_baseline_epochs/3`). It performs epoch
+//! (`solve_filter_baseline_epochs/3`). It performs epoch
 //! normalization, common-satellite selection, per-system reference selection,
 //! single-/double-difference epoch construction, sequential filter
 //! initialization with phase-minus-code ambiguity seeding, and the per-epoch
@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::astro::math::linear::invert_matrix_first_tie;
 use crate::carrier_phase::CycleSlipOptions;
 use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
 use crate::id::constellation_letter;
@@ -940,10 +941,9 @@ fn posterior_covariance(state: &FilterState) -> Vec<f64> {
     let rows: Vec<Vec<f64>> = (0..n)
         .map(|i| state.information[i * n..i * n + n].to_vec())
         .collect();
-    match crate::ils::invert(&rows) {
-        Ok(cov) => cov.into_iter().flatten().collect(),
-        Err(_) => Vec::new(),
-    }
+    invert_matrix_first_tie(&rows)
+        .map(|cov| cov.into_iter().flatten().collect())
+        .unwrap_or_default()
 }
 
 /// Run the enabled preprocessing stages in fixed order (cycle-slip handling, then

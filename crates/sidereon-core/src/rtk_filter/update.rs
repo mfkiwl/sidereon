@@ -11,7 +11,7 @@
 //! integer search, and measurement-model primitives live in the sibling
 //! `rows`/`normal`/`search`/`model`/`antenna` submodules and are reused here.
 //!
-//! Parity reference: `Sidereon.GNSS.RTK.run_sequential_baseline_filter` /
+//! Parity reference: `run_sequential_baseline_filter` /
 //! `sequential_initial_information`. The prior is a diagonal information matrix
 //! (`1/σ²` on the baseline x/y/z and on each ambiguity diagonal, zero
 //! cross-terms). Adding an ambiguity column on first sighting (a streaming
@@ -23,9 +23,9 @@ use std::collections::BTreeMap;
 
 use crate::astro::math::least_squares::singular_value_diagnostics;
 use crate::astro::math::linear::{
-    invert_3x3_adjugate, invert_flat_first_tie_into, solve_flat_normal_square_root_into,
-    FlatCholeskySolveScratch, FlatLinearScratch as InvertFlatScratch,
-    FlatNormalSolveScratch as SolveNormalScratch,
+    invert_3x3_adjugate, invert_flat_first_tie_into, invert_matrix_first_tie,
+    solve_flat_normal_square_root_into, FlatCholeskySolveScratch,
+    FlatLinearScratch as InvertFlatScratch, FlatNormalSolveScratch as SolveNormalScratch,
 };
 
 use super::antenna::ReceiverAntennaCorrections;
@@ -1415,7 +1415,7 @@ pub(crate) fn search_and_hold(
     let info_rows: Vec<Vec<f64>> = (0..n)
         .map(|i| posterior_information[i * n..i * n + n].to_vec())
         .collect();
-    let cov = crate::ils::invert(&info_rows).map_err(|_| UpdateError::SingularGeometry)?;
+    let cov = invert_matrix_first_tie(&info_rows).ok_or(UpdateError::SingularGeometry)?;
 
     // AR commitment arming gate: skip the search (carry the held set, ratio 0.0)
     // while the baseline-block posterior sigma is above the threshold. Op order
@@ -1749,8 +1749,8 @@ pub fn update_epoch_with_scratch(
     }
 
     // First epoch has no prior motion to propagate (mirrors the Elixir guard
-    // `acc.epochs != []`). Do not infer this from ambiguity columns: the Sidereon
-    // trace path pre-sizes columns to match Elixir's global ordering.
+    // `acc.epochs != []`). Do not infer this from ambiguity columns: the trace
+    // path pre-sizes columns to match Elixir's global ordering.
     let first_epoch = state.epoch_count == 0;
     let epoch_columns_had_prior = epoch_ambiguities_have_propagated_prior(&state, epoch);
 

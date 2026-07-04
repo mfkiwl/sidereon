@@ -18,7 +18,6 @@ use crate::astro::math::linear::{invert_matrix_first_tie, solve_linear_first_tie
 
 use crate::tolerances::LAMBDA_REDUCTION_EPS;
 use crate::validate::{self, FieldError};
-use crate::{Error, Result};
 
 const ILS_RATIO_THRESHOLD_FIELD: &str = "ils ratio_threshold";
 
@@ -171,7 +170,7 @@ pub fn bounded_ils_search(
     validate_covariance_geometry(covariance)?;
     validate_ratio_threshold(ratio_threshold)?;
     let q = symmetrize(covariance);
-    let q_inv = symmetrize(&invert(&q).map_err(|_| IlsError::Singular)?);
+    let q_inv = symmetrize(&invert_matrix_first_tie(&q).ok_or(IlsError::Singular)?);
     ensure_candidate_limit(float_cycles.len(), radius, candidate_limit)?;
 
     // Per-ambiguity candidate integers, ordered by |value - float| then value
@@ -385,28 +384,11 @@ fn ratio_pass(ratio: f64, threshold: f64) -> bool {
     ratio >= threshold
 }
 
-// --- linear algebra (bit-identical to LinearAlgebra) ---------------------
-
 fn symmetrize(m: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = m.len();
     (0..n)
         .map(|i| (0..n).map(|j| (m[i][j] + m[j][i]) / 2.0).collect())
         .collect()
-}
-
-/// Invert by solving `A x = eᵢ` for each unit column, exactly as the reference
-/// `invert_matrix/1`. `pub(crate)` so the RTK-filter kernel can invert the
-/// posterior information into covariance for the ambiguity search.
-pub(crate) fn invert(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>> {
-    invert_matrix_first_tie(a).ok_or_else(|| Error::InvalidInput("singular matrix".into()))
-}
-
-// Index-based loops mirror the reference Gaussian elimination (pivot scan and
-// row updates index `rows` by position); an iterator form would obscure it.
-// `pub(crate)` so the RTK-filter kernel reuses the same Gaussian elimination
-// (partial pivoting, PIVOT_EPSILON singular guard) for its normal-equations solve.
-pub(crate) fn solve_linear(a: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
-    solve_linear_first_tie(a, b).ok_or_else(|| Error::InvalidInput("singular matrix".into()))
 }
 
 // =========================================================================
@@ -652,7 +634,7 @@ pub fn lambda_ils_search(
     let n = float_cycles.len();
     let q = symmetrize(covariance);
     // Inverse is kept only for the diagnostic metadata (LAMBDA itself uses LtDL).
-    let q_inv = symmetrize(&invert(&q).map_err(|_| IlsError::Singular)?);
+    let q_inv = symmetrize(&invert_matrix_first_tie(&q).ok_or(IlsError::Singular)?);
 
     // Column-major copy of the symmetrized covariance for the RTKLIB port.
     let mut q_cm = vec![0.0f64; n * n];
@@ -699,7 +681,7 @@ pub fn lambda_ils_search(
     let mut fixed_candidates: Vec<Vec<i64>> = Vec::with_capacity(m);
     for col in 0..m {
         let b: Vec<f64> = (0..n).map(|i| zn[i + col * n]).collect();
-        let x = solve_linear(&zt, &b).map_err(|_| IlsError::Singular)?;
+        let x = solve_linear_first_tie(&zt, &b).ok_or(IlsError::Singular)?;
         fixed_candidates.push(x.iter().map(|&v| lam_round(v) as i64).collect());
     }
 
@@ -742,20 +724,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inverts_a_known_matrix() {
-        let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
-        let inv = invert(&a).unwrap();
-        // [[0.6, -0.7], [-0.2, 0.4]]
-        assert!((inv[0][0] - 0.6).abs() < 1e-12);
-        assert!((inv[0][1] + 0.7).abs() < 1e-12);
-        assert!((inv[1][0] + 0.2).abs() < 1e-12);
-        assert!((inv[1][1] - 0.4).abs() < 1e-12);
-    }
+    fn bounded_search_reports_first_tie_inverse_bits() {
+        let float = vec![0.1, -0.2];
+        let cov = vec![vec![4.0, 1.0], vec![1.0, 3.0]];
+        let result = bounded_ils_search(&float, &cov, 1, 9, 3.0).unwrap();
 
-    #[test]
-    fn rejects_a_singular_matrix() {
-        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
-        assert!(invert(&a).is_err());
+        assert_eq!(
+            result.covariance_inverse[0][0].to_bits(),
+            0x3fd1745d1745d174
+        );
+        assert_eq!(
+            result.covariance_inverse[0][1].to_bits(),
+            0xbfb745d1745d1746
+        );
+        assert_eq!(
+            result.covariance_inverse[1][0].to_bits(),
+            0xbfb745d1745d1746
+        );
+        assert_eq!(
+            result.covariance_inverse[1][1].to_bits(),
+            0x3fd745d1745d1746
+        );
     }
 
     #[test]
