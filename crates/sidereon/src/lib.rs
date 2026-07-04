@@ -177,8 +177,11 @@ use std::path::Path;
 // Re-export core domain modules whose public helpers are intentionally part of
 // the ergonomic crate surface.
 pub use sidereon_core::astro::forces::{
-    SchwarzschildRelativity, SolarRadiationPressure, ThirdBodyBodies, ThirdBodyGravity,
-    ZonalCoefficients, ZonalDegrees, ZonalGravity,
+    SchwarzschildRelativity, SolarRadiationPressure, SphericalHarmonicCoefficient,
+    SphericalHarmonicGravity, SphericalHarmonicGravityConfig, ThirdBodyBodies, ThirdBodyGravity,
+    ZonalCoefficients, ZonalDegrees, ZonalGravity, EGM96_DEGREE_ORDER_36,
+    EGM96_EMBEDDED_MAX_DEGREE, EGM96_EMBEDDED_MAX_ORDER, EGM96_MU_KM3_S2,
+    EGM96_REFERENCE_RADIUS_KM,
 };
 pub use sidereon_core::astro::frames::{
     EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider,
