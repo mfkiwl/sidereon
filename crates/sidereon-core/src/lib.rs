@@ -162,6 +162,11 @@ pub use crate::estimation::{
     nis_gate_threshold, nis_statistic, normalized_innovation, AlphaBetaGains, AlphaBetaState,
     AlphaBetaStep, PrimitiveError, ScalarKalmanGains, MAD_GAUSSIAN_CONSISTENCY,
 };
+pub use crate::quality::{
+    reliability_araim, reliability_design, wtest_noncentrality, ObservationReliability,
+    RangeReliabilityRow, ReliabilityOptions, ReliabilityReport, ReliabilitySummary,
+};
+pub use araim::ProtectionModel;
 pub use error::{Error, Result};
 pub use frame::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, ItrfPositionM, ItrfVelocityMS,

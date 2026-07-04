@@ -11,6 +11,7 @@ pub mod fault_modes;
 pub mod ism;
 mod mhss;
 pub mod protection;
+pub mod reliability;
 
 #[cfg(test)]
 mod tests;
@@ -18,6 +19,11 @@ mod tests;
 pub use fault_modes::{enumerate_fault_modes, FaultHypothesis};
 pub use ism::{ConstellationIsm, Ism, SatelliteIsm, SatelliteIsmModel};
 pub use mhss::{araim, AraimResult, FaultMode};
+pub use protection::ProtectionModel;
+pub use reliability::{
+    reliability_araim, reliability_design, wtest_noncentrality, ObservationReliability,
+    RangeReliabilityRow, ReliabilityOptions, ReliabilityReport, ReliabilitySummary,
+};
 
 use crate::astro::frames::transforms::geodetic_from_ecef_proj;
 use crate::dop::{ecef_to_enu_rotation, LineOfSight};

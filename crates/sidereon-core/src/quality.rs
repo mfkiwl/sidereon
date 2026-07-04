@@ -7,6 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod normality;
 
+pub use crate::araim::reliability::{
+    reliability_araim, reliability_design, wtest_noncentrality, ObservationReliability,
+    RangeReliabilityRow, ReliabilityOptions, ReliabilityReport, ReliabilitySummary,
+};
+
 use crate::astro::math::linear::{invert_symmetric_pd, normal_equations_weighted};
 use crate::constants::DEG_TO_RAD;
 use crate::spp::{
@@ -97,6 +102,8 @@ pub enum QualityError {
     InvalidDof,
     /// RAIM weights must be positive finite values.
     InvalidWeight,
+    /// Reliability parameter must be positive finite or inside its valid interval.
+    InvalidReliabilityParameter,
     /// RAIM residuals must be finite and aligned with used satellites.
     InvalidResiduals,
     /// A linearized measurement set was empty, ragged, non-finite, or carried
@@ -117,6 +124,7 @@ impl core::fmt::Display for QualityError {
             Self::InvalidSystemCount => write!(f, "invalid RAIM system count"),
             Self::InvalidDof => write!(f, "invalid degrees of freedom"),
             Self::InvalidWeight => write!(f, "invalid RAIM weight"),
+            Self::InvalidReliabilityParameter => write!(f, "invalid reliability parameter"),
             Self::InvalidResiduals => write!(f, "invalid RAIM residuals"),
             Self::InvalidDesign => write!(f, "invalid linearized measurement design"),
             Self::SingularGeometry => write!(f, "singular or rank-deficient geometry"),
