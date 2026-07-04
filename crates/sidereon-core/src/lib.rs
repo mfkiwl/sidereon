@@ -126,6 +126,7 @@ pub mod combinations;
 pub mod dgnss;
 pub mod ephemeris;
 pub mod estimation; // Phase-2 estimation substrate: named operation-order recipes
+pub mod geodesic; // WGS84 geodesic direct and inverse solvers
 pub mod geodetic_time_series; // robust station velocity, trajectory, steps, and fields
 pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric heights)
 pub mod geometry;
@@ -186,6 +187,7 @@ pub use frame::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, ItrfPositionM, ItrfVelocityMS,
     Wgs84Geodetic,
 };
+pub use geodesic::{geodesic_direct, geodesic_inverse, GeodesicError};
 pub use geoid::{
     egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
     geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, GeoidError, GeoidGrid,
