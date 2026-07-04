@@ -176,12 +176,16 @@ use std::path::Path;
 
 // Re-export core domain modules whose public helpers are intentionally part of
 // the ergonomic crate surface.
+pub use sidereon_core::geometry_quality::{
+    classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
+};
 pub use sidereon_core::quality::spp_robust_fde_driver;
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies, geometry,
-    ils, navigation, nmea, observables, orbit, positioning, ppp_corrections, qc_obs, quality,
-    rinex, rtcm, rtk, sbas, signal, source_localization, ssr, staleness, terrain, tides, velocity,
+    geometry_quality, ils, navigation, nmea, observables, orbit, positioning, ppp_corrections,
+    qc_obs, quality, rinex, rtcm, rtk, sbas, signal, source_localization, ssr, staleness, terrain,
+    tides, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
