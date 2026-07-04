@@ -433,17 +433,9 @@ fn robust_mad_template(values: &[f64]) -> Result<f64, SiderealFilterError> {
 }
 
 fn median(values: &[f64]) -> Result<f64, SiderealFilterError> {
-    if values.is_empty() {
-        return Err(invalid_input("values", "must not be empty"));
-    }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        Ok(sorted[mid])
-    } else {
-        Ok((sorted[mid - 1] + sorted[mid]) * 0.5)
-    }
+    crate::astro::math::robust::median_sorting_in_place(&mut sorted)
+        .ok_or_else(|| invalid_input("values", "must not be empty"))
 }
 
 fn map_primitive_error(error: PrimitiveError) -> SiderealFilterError {

@@ -129,19 +129,8 @@ pub fn clock_reference_offset(
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-
     // Inputs are pre-filtered to finite values; total_cmp never panics regardless.
-    values.sort_by(f64::total_cmp);
-
-    let n = values.len();
-    if n % 2 == 1 {
-        Some(values[n / 2])
-    } else {
-        Some((values[n / 2 - 1] + values[n / 2]) / 2.0)
-    }
+    crate::astro::math::robust::median_sorting_in_place(values)
 }
 
 // ===========================================================================

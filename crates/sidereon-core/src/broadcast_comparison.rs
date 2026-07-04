@@ -586,18 +586,8 @@ fn max_abs_or_none(values: &[f64]) -> Option<f64> {
 
 /// Median of a slice (`None` if empty); even counts average the two middles.
 fn median(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
     let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let n = sorted.len();
-    let mid = n / 2;
-    if n % 2 == 1 {
-        Some(sorted[mid])
-    } else {
-        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
-    }
+    crate::astro::math::robust::median_sorting_in_place(&mut sorted)
 }
 
 #[cfg(test)]

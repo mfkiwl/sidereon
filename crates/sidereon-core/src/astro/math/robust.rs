@@ -51,12 +51,23 @@ pub fn median(values: &[f64]) -> Result<f64, RobustError> {
         return Ok(0.0);
     }
     let mut v: Vec<f64> = values.to_vec();
-    v.sort_by(|a, b| a.total_cmp(b));
-    let n = v.len();
+    Ok(median_sorting_in_place(&mut v).unwrap_or(0.0))
+}
+
+/// The shared median kernel: sorts `values` in place by `total_cmp` and
+/// returns the middle element (odd count) or the `(a + b) / 2.0` average of
+/// the two central elements (even count, no FMA). `None` for an empty slice.
+/// No finiteness validation; callers own their input contracts.
+pub(crate) fn median_sorting_in_place(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let n = values.len();
     if n % 2 == 1 {
-        Ok(v[n / 2])
+        Some(values[n / 2])
     } else {
-        Ok((v[n / 2 - 1] + v[n / 2]) / 2.0)
+        Some((values[n / 2 - 1] + values[n / 2]) / 2.0)
     }
 }
 

@@ -797,17 +797,7 @@ fn nominal_clock_drift_s_per_s(deltas: &[ClockOffsetDelta], threshold_s: f64) ->
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-
-    values.sort_by(|a, b| a.total_cmp(b));
-    let mid = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        Some((values[mid - 1] + values[mid]) / 2.0)
-    } else {
-        Some(values[mid])
-    }
+    crate::astro::math::robust::median_sorting_in_place(values)
 }
 
 fn millisecond_clock_step(delta_s: f64, threshold_s: f64) -> bool {
