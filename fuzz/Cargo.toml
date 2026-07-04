@@ -238,6 +238,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "terrain_store_round_trip"
+path = "fuzz_targets/terrain_store_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "cdm_round_trip"
 path = "fuzz_targets/cdm_round_trip.rs"
 test = false
