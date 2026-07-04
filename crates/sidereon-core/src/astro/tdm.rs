@@ -45,7 +45,7 @@ pub struct TdmSegment {
 pub struct TdmField {
     /// The KVN keyword.
     pub key: String,
-    /// The trimmed KVN value, with a trailing bracketed unit removed.
+    /// The trimmed KVN value.
     pub value: String,
 }
 
@@ -122,8 +122,7 @@ pub struct TdmDataRecord {
     pub epoch: String,
     /// The numeric observable value.
     pub value: TdmScalar,
-    /// The unit assigned by CCSDS 503.0-B-2, or by an explicit bracketed input
-    /// unit when one was present.
+    /// The unit assigned by CCSDS 503.0-B-2.
     pub unit: TdmUnit,
 }
 
@@ -191,6 +190,8 @@ pub enum TdmUnit {
     DecibelHertz,
     /// Square meters.
     SquareMeters,
+    /// Meters.
+    Meters,
     /// Seconds per second.
     SecondsPerSecond,
     /// Percent.
@@ -221,6 +222,7 @@ impl TdmUnit {
             Self::DecibelWatts => "dBW",
             Self::DecibelHertz => "dBHz",
             Self::SquareMeters => "m**2",
+            Self::Meters => "m",
             Self::SecondsPerSecond => "s/s",
             Self::Percent => "%",
             Self::Kelvin => "K",
@@ -247,6 +249,18 @@ pub enum TdmInputErrorKind {
     OutOfRange,
     /// An indexed keyword or path component did not contain a valid integer.
     InvalidIndex,
+    /// A TDM data keyword is not defined by CCSDS 503.0-B-2 table 3-5.
+    UnknownKeyword,
+    /// A displayed unit was present even though TDM KVN units are table-defined.
+    UnexpectedUnit,
+    /// An integer-valued field contained a fractional value.
+    NonInteger,
+    /// A non-negative field contained a negative value.
+    Negative,
+    /// A numeric token used a negative zero form.
+    NegativeZero,
+    /// A record unit does not match CCSDS 503.0-B-2 table 3-5.
+    UnitMismatch,
     /// The stored decimal token and `f64` value do not parse to the same bits.
     DecimalMismatch,
 }
@@ -260,6 +274,12 @@ impl fmt::Display for TdmInputErrorKind {
             Self::NotPositive => "not positive",
             Self::OutOfRange => "out of range",
             Self::InvalidIndex => "invalid index",
+            Self::UnknownKeyword => "unknown keyword",
+            Self::UnexpectedUnit => "unexpected unit",
+            Self::NonInteger => "not an integer",
+            Self::Negative => "negative",
+            Self::NegativeZero => "negative zero",
+            Self::UnitMismatch => "unit mismatch",
             Self::DecimalMismatch => "decimal mismatch",
         };
         f.write_str(label)
@@ -433,24 +453,19 @@ pub fn parse_kvn(text: &str) -> Result<Tdm, TdmError> {
             _ => {}
         }
 
-        let (key, value, explicit_unit) =
-            parse_assignment(line).ok_or_else(|| TdmError::MalformedLine {
-                line: line_no,
-                text: line.to_string(),
-            })?;
+        let (key, value) = parse_assignment(line).ok_or_else(|| TdmError::MalformedLine {
+            line: line_no,
+            text: line.to_string(),
+        })?;
 
         if let Some(builder) = data.as_mut() {
             let range_units = pending_metadata
                 .as_ref()
                 .map(|metadata| metadata.range_units.clone())
                 .unwrap_or(TdmUnit::Kilometers);
-            builder.records.push(parse_record(
-                line_no,
-                &key,
-                &value,
-                explicit_unit,
-                &range_units,
-            )?);
+            builder
+                .records
+                .push(parse_record(line_no, &key, &value, &range_units)?);
         } else if let Some(builder) = metadata.as_mut() {
             builder.fields.push(TdmField { key, value });
         } else if pending_metadata.is_none() {
@@ -576,7 +591,7 @@ fn build_metadata(builder: MetadataBuilder) -> Result<TdmMetadata, TdmError> {
         } else if field.key == "TIME_SYSTEM" {
             time_system = empty_to_none(field.value.clone());
         } else if field.key == "RANGE_UNITS" && !field.value.is_empty() {
-            range_units = unit_from_label(&field.value);
+            range_units = range_unit_from_label(&field.value)?;
         }
     }
 
@@ -623,9 +638,15 @@ fn parse_record(
     line: usize,
     keyword: &str,
     value: &str,
-    explicit_unit: Option<TdmUnit>,
     range_units: &TdmUnit,
 ) -> Result<TdmDataRecord, TdmError> {
+    if has_displayed_unit(keyword) || has_displayed_unit(value) {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::UnexpectedUnit,
+        });
+    }
+
     let mut parts = value.split_whitespace();
     let epoch = parts
         .next()
@@ -637,10 +658,10 @@ fn parse_record(
         return Err(malformed_record(line, keyword));
     }
 
-    let scalar = parse_scalar(keyword, value_text)?;
     let observable = observable_from_keyword(keyword)?;
-    validate_record_value(keyword, &observable, scalar.value)?;
-    let unit = explicit_unit.unwrap_or_else(|| unit_for_keyword(keyword, &observable, range_units));
+    let scalar = parse_scalar(keyword, value_text, &observable)?;
+    validate_record_value(keyword, &observable, &scalar)?;
+    let unit = unit_for_keyword(keyword, &observable, range_units);
 
     Ok(TdmDataRecord {
         observable,
@@ -651,7 +672,18 @@ fn parse_record(
     })
 }
 
-fn parse_scalar(field: &str, text: &str) -> Result<TdmScalar, TdmError> {
+fn parse_scalar(
+    field: &str,
+    text: &str,
+    observable: &TdmObservable,
+) -> Result<TdmScalar, TdmError> {
+    if is_nonfinite_float_token(text) {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::NonFinite,
+        });
+    }
+    validate_numeric_token(field, text, observable)?;
     let value = text.parse::<f64>().map_err(|_| TdmError::InvalidField {
         field: field.to_string(),
         kind: TdmInputErrorKind::FloatParse,
@@ -662,10 +694,243 @@ fn parse_scalar(field: &str, text: &str) -> Result<TdmScalar, TdmError> {
             kind: TdmInputErrorKind::NonFinite,
         });
     }
+    let lexical_zero = numeric_token_is_zero(text);
+    if !lexical_zero && decimal_magnitude_below_minimum_positive_double(text) {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::OutOfRange,
+        });
+    }
+    if value == 0.0 && text.trim_start().starts_with('-') {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::NegativeZero,
+        });
+    }
+    if value == 0.0 && !lexical_zero {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::OutOfRange,
+        });
+    }
     Ok(TdmScalar {
         text: text.to_string(),
         value,
     })
+}
+
+fn is_nonfinite_float_token(text: &str) -> bool {
+    matches!(
+        text,
+        "NaN" | "+NaN" | "-NaN" | "Inf" | "+Inf" | "-Inf" | "Infinity" | "+Infinity" | "-Infinity"
+    )
+}
+
+fn validate_numeric_token(
+    field: &str,
+    text: &str,
+    observable: &TdmObservable,
+) -> Result<(), TdmError> {
+    if matches!(observable, TdmObservable::Other(name) if name == "DOPPLER_COUNT") {
+        validate_integer_token(field, text)
+    } else if phase_count_keyword(field) {
+        validate_phase_count_token(field, text)
+    } else if is_ccsds_double_token(text) {
+        Ok(())
+    } else {
+        Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::FloatParse,
+        })
+    }
+}
+
+fn validate_integer_token(field: &str, text: &str) -> Result<(), TdmError> {
+    let digits = strip_ascii_sign(text);
+    if digits.is_empty() {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::NonInteger,
+        });
+    }
+    if !digits.chars().all(|character| character.is_ascii_digit()) {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::NonInteger,
+        });
+    }
+    let value = text.parse::<i64>().map_err(|_| TdmError::InvalidField {
+        field: field.to_string(),
+        kind: TdmInputErrorKind::OutOfRange,
+    })?;
+    if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value) {
+        return Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::OutOfRange,
+        });
+    }
+    Ok(())
+}
+
+fn validate_phase_count_token(field: &str, text: &str) -> Result<(), TdmError> {
+    if is_phase_count_token(text) {
+        Ok(())
+    } else {
+        Err(TdmError::InvalidField {
+            field: field.to_string(),
+            kind: TdmInputErrorKind::FloatParse,
+        })
+    }
+}
+
+fn is_ccsds_double_token(text: &str) -> bool {
+    let Some(unsigned) = strip_optional_sign(text) else {
+        return false;
+    };
+    is_fixed_point_token(unsigned, Some(16)) || is_floating_point_token(unsigned, Some(16))
+}
+
+fn is_phase_count_token(text: &str) -> bool {
+    is_unsigned_integer(text) || is_fixed_point_token(text, None)
+}
+
+fn strip_optional_sign(text: &str) -> Option<&str> {
+    let unsigned = strip_ascii_sign(text);
+    (!unsigned.is_empty()).then_some(unsigned)
+}
+
+fn strip_ascii_sign(text: &str) -> &str {
+    match text.as_bytes().first() {
+        Some(b'+') | Some(b'-') => &text[1..],
+        _ => text,
+    }
+}
+
+fn is_unsigned_integer(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|character| character.is_ascii_digit())
+}
+
+fn is_fixed_point_token(text: &str, max_digits: Option<usize>) -> bool {
+    let Some((integer, fraction)) = text.split_once('.') else {
+        return false;
+    };
+    if integer.is_empty()
+        || fraction.is_empty()
+        || fraction.contains('.')
+        || !is_unsigned_integer(integer)
+        || !is_unsigned_integer(fraction)
+    {
+        return false;
+    }
+    match max_digits {
+        Some(max) => integer.len() + fraction.len() <= max,
+        None => true,
+    }
+}
+
+fn is_floating_point_token(text: &str, max_digits: Option<usize>) -> bool {
+    let Some(exponent_index) = text.find(['E', 'e']) else {
+        return false;
+    };
+    let mantissa = &text[..exponent_index];
+    let exponent = &text[exponent_index + 1..];
+    if exponent.is_empty() || exponent.find(['E', 'e']).is_some() {
+        return false;
+    }
+    let exponent_digits = strip_ascii_sign(exponent);
+    if exponent_digits.is_empty()
+        || !exponent_digits
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return false;
+    }
+    let mut mantissa_chars = mantissa.chars();
+    let Some(integer) = mantissa_chars.next() else {
+        return false;
+    };
+    if !integer.is_ascii_digit() || mantissa_chars.next() != Some('.') {
+        return false;
+    }
+    let fraction = mantissa_chars.as_str();
+    if fraction.is_empty() || !is_unsigned_integer(fraction) {
+        return false;
+    }
+    match max_digits {
+        Some(max) => fraction.len() < max,
+        None => true,
+    }
+}
+
+fn numeric_token_is_zero(text: &str) -> bool {
+    let unsigned = strip_ascii_sign(text);
+    let mantissa = unsigned
+        .find(['E', 'e'])
+        .map_or(unsigned, |exponent_index| &unsigned[..exponent_index]);
+    !mantissa.is_empty()
+        && mantissa
+            .bytes()
+            .filter(|byte| *byte != b'.')
+            .all(|byte| byte == b'0')
+}
+
+fn decimal_magnitude_below_minimum_positive_double(text: &str) -> bool {
+    const MIN_POSITIVE_EXPONENT: i32 = -324;
+    const MIN_POSITIVE_SIGNIFICAND_16: &[u8; 16] = b"4940000000000000";
+
+    let Some((exponent, significand)) = normalized_decimal_parts(text) else {
+        return false;
+    };
+    if exponent < MIN_POSITIVE_EXPONENT {
+        return true;
+    }
+    if exponent > MIN_POSITIVE_EXPONENT {
+        return false;
+    }
+    let significand = significand.as_bytes();
+    for (index, minimum) in MIN_POSITIVE_SIGNIFICAND_16.iter().enumerate() {
+        let digit = significand.get(index).copied().unwrap_or(b'0');
+        if digit != *minimum {
+            return digit < *minimum;
+        }
+    }
+    false
+}
+
+fn normalized_decimal_parts(text: &str) -> Option<(i32, String)> {
+    let unsigned = strip_ascii_sign(text);
+    let (mantissa, exponent_adjust) = if let Some(exponent_index) = unsigned.find(['E', 'e']) {
+        (
+            &unsigned[..exponent_index],
+            parse_exponent_for_bound(&unsigned[exponent_index + 1..]),
+        )
+    } else {
+        (unsigned, 0)
+    };
+    let (integer, fraction) = mantissa.split_once('.')?;
+    let decimal_index = i32::try_from(integer.len()).ok()?;
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    let leading = digits.bytes().position(|byte| byte != b'0')?;
+    let leading = i32::try_from(leading).ok()?;
+    let exponent = exponent_adjust + decimal_index - leading - 1;
+    Some((exponent, digits[leading as usize..].to_string()))
+}
+
+fn parse_exponent_for_bound(text: &str) -> i32 {
+    let negative = text.starts_with('-');
+    let digits = strip_ascii_sign(text);
+    let digits = digits.trim_start_matches('0');
+    if digits.len() > 4 {
+        return if negative { -10_000 } else { 10_000 };
+    }
+    let value = digits.parse::<i32>().unwrap_or(0);
+    if negative {
+        -value
+    } else {
+        value
+    }
 }
 
 fn observable_from_keyword(keyword: &str) -> Result<TdmObservable, TdmError> {
@@ -676,23 +941,27 @@ fn observable_from_keyword(keyword: &str) -> Result<TdmObservable, TdmError> {
         "ANGLE_1" => Ok(TdmObservable::Angle1),
         "ANGLE_2" => Ok(TdmObservable::Angle2),
         "RECEIVE_FREQ" => Ok(TdmObservable::ReceiveFreq { participant: None }),
-        "TRANSMIT_FREQ" => Ok(TdmObservable::TransmitFreq { participant: None }),
-        "TRANSMIT_FREQ_RATE" => Ok(TdmObservable::TransmitFreqRate { participant: None }),
         _ => {
-            if let Some(participant) = indexed_suffix(keyword, "RECEIVE_FREQ")? {
+            if let Some(participant) = indexed_suffix_in_range(keyword, "RECEIVE_FREQ", 1, 5)? {
                 Ok(TdmObservable::ReceiveFreq {
                     participant: Some(participant),
                 })
-            } else if let Some(participant) = indexed_suffix(keyword, "TRANSMIT_FREQ_RATE")? {
+            } else if let Some(participant) =
+                indexed_suffix_in_range(keyword, "TRANSMIT_FREQ_RATE", 1, 5)?
+            {
                 Ok(TdmObservable::TransmitFreqRate {
                     participant: Some(participant),
                 })
-            } else if let Some(participant) = indexed_suffix(keyword, "TRANSMIT_FREQ")? {
+            } else if let Some(participant) =
+                indexed_suffix_in_range(keyword, "TRANSMIT_FREQ", 1, 5)?
+            {
                 Ok(TdmObservable::TransmitFreq {
                     participant: Some(participant),
                 })
-            } else {
+            } else if known_table_3_5_other_keyword(keyword)? {
                 Ok(TdmObservable::Other(keyword.to_string()))
+            } else {
+                Err(unknown_keyword(keyword))
             }
         }
     }
@@ -701,17 +970,79 @@ fn observable_from_keyword(keyword: &str) -> Result<TdmObservable, TdmError> {
 fn validate_record_value(
     keyword: &str,
     observable: &TdmObservable,
-    value: f64,
+    scalar: &TdmScalar,
 ) -> Result<(), TdmError> {
+    let value = scalar.value;
+    if value == 0.0 && scalar.text.trim_start().starts_with('-') {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::NegativeZero,
+        });
+    }
     if matches!(observable, TdmObservable::TransmitFreq { .. }) && value <= 0.0 {
         return Err(TdmError::InvalidField {
             field: keyword.to_string(),
             kind: TdmInputErrorKind::NotPositive,
         });
     }
+    if matches!(observable, TdmObservable::Other(name) if name == "DOPPLER_COUNT") {
+        validate_doppler_count(keyword, scalar)?;
+    }
+    if matches!(observable, TdmObservable::Other(name) if name == "RCS" || name == "STEC" || name == "TEMPERATURE")
+        && value <= 0.0
+    {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::NotPositive,
+        });
+    }
+    if matches!(observable, TdmObservable::Other(name) if name == "TROPO_DRY" || name == "TROPO_WET")
+        && value < 0.0
+    {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::Negative,
+        });
+    }
+    if matches!(observable, TdmObservable::Other(name) if name == "RHUMIDITY")
+        && !(0.0..=100.0).contains(&value)
+    {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::OutOfRange,
+        });
+    }
     if matches!(observable, TdmObservable::Angle1 | TdmObservable::Angle2)
         && !(-180.0..360.0).contains(&value)
     {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::OutOfRange,
+        });
+    }
+    Ok(())
+}
+
+fn validate_doppler_count(keyword: &str, scalar: &TdmScalar) -> Result<(), TdmError> {
+    let text = scalar.text.trim_start();
+    if text.starts_with('-') {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::Negative,
+        });
+    }
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return Err(TdmError::InvalidField {
+            field: keyword.to_string(),
+            kind: TdmInputErrorKind::NonInteger,
+        });
+    }
+    let count = digits.parse::<u64>().map_err(|_| TdmError::InvalidField {
+        field: keyword.to_string(),
+        kind: TdmInputErrorKind::OutOfRange,
+    })?;
+    if count > i32::MAX as u64 {
         return Err(TdmError::InvalidField {
             field: keyword.to_string(),
             kind: TdmInputErrorKind::OutOfRange,
@@ -735,42 +1066,41 @@ fn validate_tdm(tdm: &Tdm) -> Result<(), TdmError> {
                     kind: TdmInputErrorKind::NonFinite,
                 });
             }
-            let parsed = record
-                .value
-                .text
-                .parse::<f64>()
-                .map_err(|_| TdmError::InvalidField {
-                    field: record.keyword.clone(),
-                    kind: TdmInputErrorKind::FloatParse,
-                })?;
-            if parsed.to_bits() != record.value.value.to_bits() {
+            let observable = observable_from_keyword(&record.keyword)?;
+            let parsed = parse_scalar(&record.keyword, &record.value.text, &observable)?;
+            if parsed.value.to_bits() != record.value.value.to_bits() {
                 return Err(TdmError::InvalidField {
                     field: record.keyword.clone(),
                     kind: TdmInputErrorKind::DecimalMismatch,
                 });
             }
-            validate_record_value(&record.keyword, &record.observable, record.value.value)?;
+            if observable != record.observable {
+                return Err(TdmError::InvalidField {
+                    field: record.keyword.clone(),
+                    kind: TdmInputErrorKind::UnknownKeyword,
+                });
+            }
+            let expected_unit = unit_for_keyword(
+                &record.keyword,
+                &record.observable,
+                &segment.metadata.range_units,
+            );
+            if expected_unit != record.unit {
+                return Err(TdmError::InvalidField {
+                    field: record.keyword.clone(),
+                    kind: TdmInputErrorKind::UnitMismatch,
+                });
+            }
+            validate_record_value(&record.keyword, &record.observable, &record.value)?;
         }
     }
     Ok(())
 }
 
-fn parse_assignment(line: &str) -> Option<(String, String, Option<TdmUnit>)> {
+fn parse_assignment(line: &str) -> Option<(String, String)> {
     let (key, raw_value) = line.split_once('=')?;
     let key = key.trim().to_string();
-    let (value, unit) = split_value_unit(raw_value.trim());
-    Some((key, value.to_string(), unit.map(unit_from_label)))
-}
-
-fn split_value_unit(value: &str) -> (&str, Option<&str>) {
-    let trimmed = value.trim_end();
-    if let Some(open) = trimmed.rfind('[') {
-        if trimmed.ends_with(']') {
-            let unit = trimmed[open + 1..trimmed.len() - 1].trim();
-            return (trimmed[..open].trim_end(), Some(unit));
-        }
-    }
-    (trimmed, None)
+    Some((key, raw_value.trim().to_string()))
 }
 
 fn comment_text(line: &str) -> Option<String> {
@@ -812,6 +1142,11 @@ fn malformed_record(line: usize, keyword: &str) -> TdmError {
     }
 }
 
+fn has_displayed_unit(value: &str) -> bool {
+    let trimmed = value.trim_end();
+    trimmed.ends_with(']') && trimmed.rfind('[').is_some()
+}
+
 fn indexed_suffix(key: &str, base: &str) -> Result<Option<u8>, TdmError> {
     let Some(suffix) = key
         .strip_prefix(base)
@@ -828,6 +1163,22 @@ fn indexed_suffix(key: &str, base: &str) -> Result<Option<u8>, TdmError> {
         .map_err(|_| invalid_index(key))
 }
 
+fn indexed_suffix_in_range(
+    key: &str,
+    base: &str,
+    min: u8,
+    max: u8,
+) -> Result<Option<u8>, TdmError> {
+    let Some(index) = indexed_suffix(key, base)? else {
+        return Ok(None);
+    };
+    if (min..=max).contains(&index) {
+        Ok(Some(index))
+    } else {
+        Err(invalid_index(key))
+    }
+}
+
 fn invalid_index(field: &str) -> TdmError {
     TdmError::InvalidField {
         field: field.to_string(),
@@ -835,25 +1186,22 @@ fn invalid_index(field: &str) -> TdmError {
     }
 }
 
-fn unit_from_label(label: &str) -> TdmUnit {
+fn unknown_keyword(field: &str) -> TdmError {
+    TdmError::InvalidField {
+        field: field.to_string(),
+        kind: TdmInputErrorKind::UnknownKeyword,
+    }
+}
+
+fn range_unit_from_label(label: &str) -> Result<TdmUnit, TdmError> {
     match label {
-        "km" => TdmUnit::Kilometers,
-        "s" => TdmUnit::Seconds,
-        "RU" => TdmUnit::RangeUnits,
-        "km/s" => TdmUnit::KilometersPerSecond,
-        "Hz" => TdmUnit::Hertz,
-        "Hz/s" => TdmUnit::HertzPerSecond,
-        "deg" => TdmUnit::Degrees,
-        "dBW" => TdmUnit::DecibelWatts,
-        "dBHz" => TdmUnit::DecibelHertz,
-        "m**2" => TdmUnit::SquareMeters,
-        "s/s" => TdmUnit::SecondsPerSecond,
-        "%" => TdmUnit::Percent,
-        "K" => TdmUnit::Kelvin,
-        "hPa" => TdmUnit::Hectopascals,
-        "TECU" => TdmUnit::TotalElectronContentUnits,
-        "n/a" => TdmUnit::Dimensionless,
-        other => TdmUnit::Unknown(other.to_string()),
+        "km" => Ok(TdmUnit::Kilometers),
+        "s" => Ok(TdmUnit::Seconds),
+        "RU" => Ok(TdmUnit::RangeUnits),
+        _ => Err(TdmError::InvalidField {
+            field: "RANGE_UNITS".to_string(),
+            kind: TdmInputErrorKind::UnitMismatch,
+        }),
     }
 }
 
@@ -871,8 +1219,9 @@ fn unit_for_keyword(keyword: &str, observable: &TdmObservable, range_units: &Tdm
 }
 
 fn unit_for_other_keyword(keyword: &str) -> TdmUnit {
-    if indexed_suffix(keyword, "RECEIVE_PHASE_CT").is_ok_and(|value| value.is_some())
-        || indexed_suffix(keyword, "TRANSMIT_PHASE_CT").is_ok_and(|value| value.is_some())
+    if indexed_suffix_in_range(keyword, "RECEIVE_PHASE_CT", 1, 5).is_ok_and(|value| value.is_some())
+        || indexed_suffix_in_range(keyword, "TRANSMIT_PHASE_CT", 1, 5)
+            .is_ok_and(|value| value.is_some())
     {
         return TdmUnit::Dimensionless;
     }
@@ -880,15 +1229,48 @@ fn unit_for_other_keyword(keyword: &str) -> TdmUnit {
         "CARRIER_POWER" => TdmUnit::DecibelWatts,
         "CLOCK_BIAS" | "DOR" | "VLBI_DELAY" => TdmUnit::Seconds,
         "CLOCK_DRIFT" => TdmUnit::SecondsPerSecond,
-        "DOPPLER_COUNT" | "MAG" | "PC_N0" | "PR_N0" => TdmUnit::Dimensionless,
+        "DOPPLER_COUNT" | "MAG" => TdmUnit::Dimensionless,
+        "PC_N0" | "PR_N0" => TdmUnit::DecibelHertz,
         "PRESSURE" => TdmUnit::Hectopascals,
         "RCS" => TdmUnit::SquareMeters,
         "RHUMIDITY" => TdmUnit::Percent,
         "STEC" => TdmUnit::TotalElectronContentUnits,
         "TEMPERATURE" => TdmUnit::Kelvin,
-        "TROPO_DRY" | "TROPO_WET" => TdmUnit::Unknown("m".to_string()),
-        _ => TdmUnit::Dimensionless,
+        "TROPO_DRY" | "TROPO_WET" => TdmUnit::Meters,
+        _ => unreachable!("table 3-5 keyword checked before unit lookup"),
     }
+}
+
+fn phase_count_keyword(keyword: &str) -> bool {
+    keyword.starts_with("RECEIVE_PHASE_CT_") || keyword.starts_with("TRANSMIT_PHASE_CT_")
+}
+
+fn known_table_3_5_other_keyword(keyword: &str) -> Result<bool, TdmError> {
+    if indexed_suffix_in_range(keyword, "RECEIVE_PHASE_CT", 1, 5)?.is_some()
+        || indexed_suffix_in_range(keyword, "TRANSMIT_PHASE_CT", 1, 5)?.is_some()
+    {
+        return Ok(true);
+    }
+
+    Ok(matches!(
+        keyword,
+        "CARRIER_POWER"
+            | "CLOCK_BIAS"
+            | "CLOCK_DRIFT"
+            | "DOPPLER_COUNT"
+            | "DOR"
+            | "MAG"
+            | "PC_N0"
+            | "PR_N0"
+            | "PRESSURE"
+            | "RCS"
+            | "RHUMIDITY"
+            | "STEC"
+            | "TEMPERATURE"
+            | "TROPO_DRY"
+            | "TROPO_WET"
+            | "VLBI_DELAY"
+    ))
 }
 
 #[cfg(test)]
@@ -922,17 +1304,11 @@ DATA_STOP";
         let records = &tdm.segments[0].data.records;
         assert_eq!(records[0].keyword, "TRANSMIT_FREQ_2");
         assert_eq!(records[0].value.text, "32023442781.733");
-        assert_eq!(
-            records[0].value.value.to_bits(),
-            32023442781.733_f64.to_bits()
-        );
+        assert_eq!(records[0].value.value.to_bits(), 0x421d_d2fb_d576_ee98);
         assert_eq!(records[0].unit, TdmUnit::Hertz);
         assert_eq!(records[1].keyword, "RECEIVE_FREQ_1");
         assert_eq!(records[1].value.text, "32021034790.7265");
-        assert_eq!(
-            records[1].value.value.to_bits(),
-            32021034790.7265_f64.to_bits()
-        );
+        assert_eq!(records[1].value.value.to_bits(), 0x421d_d268_dc9a_e7f0);
     }
 
     #[test]
