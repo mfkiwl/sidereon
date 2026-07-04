@@ -21,8 +21,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::astro::math::least_squares::singular_value_diagnostics;
 use crate::astro::math::linear::{
-    invert_3x3_adjugate, FlatNormalSolveScratch as SolveNormalScratch,
+    invert_3x3_adjugate, invert_flat_first_tie_into, solve_flat_normal_square_root_into,
+    FlatCholeskySolveScratch, FlatLinearScratch as InvertFlatScratch,
+    FlatNormalSolveScratch as SolveNormalScratch,
 };
 
 use super::antenna::ReceiverAntennaCorrections;
@@ -35,15 +38,18 @@ use super::normal::{fold_hold_block_with_ambiguities, fold_measurement_block_ind
 #[cfg(test)]
 use super::rows::DdRow;
 use super::rows::{
-    assign_str, dd_epoch_rows_into, DdRowError, DdRowRecipe, DdRowScratch, EpochRowsScratch,
+    assign_double_difference_ambiguity_id, assign_str, dd_epoch_rows_into, DdRowError, DdRowRecipe,
+    DdRowScratch, EpochRowsScratch,
 };
 use super::search::{search_result_from_ils, IntegerSearchMeta, IntegerStatus};
 use super::state::{FilterState, FilterStateValidationError, FilterStateValidationKind};
 use super::BlockFoldScratch;
 use super::{AmbiguityScale, MeasContext, ReceiverAntennaError};
+use crate::ambiguity::AmbiguityId;
 use crate::estimation::recipe::ResidualNormRecipe;
 use crate::estimation::substrate::ambiguity::resolve_integer_lattice;
 use crate::estimation::substrate::qc::normalized_residual;
+use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
 use crate::id::GnssSystem;
 use crate::validate;
 
@@ -178,6 +184,26 @@ struct HoldPool {
     len: usize,
 }
 
+#[derive(Debug, Default)]
+struct GeometryScratch {
+    rows: EpochRowsScratch,
+    ambiguity_ids: Vec<String>,
+    ambiguity_ids_len: usize,
+    work_ambiguity_id: AmbiguityId,
+    ambiguities_m: Vec<f64>,
+    gram: Vec<f64>,
+    singular_values: Vec<f64>,
+    lambda: Vec<f64>,
+    eta: Vec<f64>,
+    block_indices: Vec<usize>,
+    block_rows: Vec<usize>,
+    fold_block: BlockFoldScratch,
+    covariance: Vec<f64>,
+    cov_invert: InvertFlatScratch,
+    prior_zero_rhs: Vec<f64>,
+    prior_cholesky: FlatCholeskySolveScratch,
+}
+
 /// Reusable buffers for the RTK filter hot path.
 ///
 /// Create one per arc/track and pass it to [`update_epoch_with_scratch`] to keep
@@ -192,6 +218,7 @@ pub struct RtkFilterScratch {
     residual_rows: EpochRowsScratch,
     screen_mask: Vec<bool>,
     held: HoldPool,
+    geometry: GeometryScratch,
 }
 
 impl RtkFilterScratch {
@@ -624,6 +651,13 @@ pub struct EpochUpdate {
     pub fixed_ids: Vec<String>,
     /// Public residual rows computed at the reported solution for this epoch.
     pub residuals: Vec<FloatResidual>,
+    /// Geometry observability and covariance-validation diagnostics for this
+    /// epoch's instantaneous double-difference design. Cold-start filter epochs
+    /// follow snapshot semantics: zero-redundancy covariance is not validated.
+    /// After the filter carries a full-rank propagated prior, that prior can
+    /// validate a zero-redundancy epoch while residual-based RAIM still requires
+    /// positive measurement redundancy.
+    pub geometry_quality: GeometryQuality,
     /// Optional predicted-residual screen metrics.
     pub innovation_screen: Option<InnovationScreen>,
 }
@@ -886,6 +920,306 @@ fn filter_residuals(rows: &[DdRowScratch]) -> Result<Vec<FloatResidual>, UpdateE
     Ok(residuals)
 }
 
+fn epoch_ambiguities_have_propagated_prior(state: &FilterState, epoch: &Epoch) -> bool {
+    state.epoch_count > 0
+        && epoch
+            .references
+            .iter()
+            .chain(&epoch.nonref)
+            .all(|meas| state.index_of(&meas.sd_ambiguity_id).is_some())
+}
+
+fn prior_information_is_positive_definite(
+    information: &[f64],
+    n: usize,
+    zero_rhs: &mut Vec<f64>,
+    scratch: &mut FlatCholeskySolveScratch,
+) -> bool {
+    if n == 0 || information.len() != n.saturating_mul(n) {
+        return false;
+    }
+    zero_rhs.resize(n, 0.0);
+    zero_rhs.fill(0.0);
+    solve_flat_normal_square_root_into(information, zero_rhs, scratch).is_some()
+}
+
+fn has_valid_filter_prior(
+    state: &FilterState,
+    epoch_columns_had_prior: bool,
+    scratch: &mut GeometryScratch,
+) -> bool {
+    epoch_columns_had_prior
+        && prior_information_is_positive_definite(
+            &state.information,
+            state.dim(),
+            &mut scratch.prior_zero_rhs,
+            &mut scratch.prior_cholesky,
+        )
+}
+
+fn filter_epoch_ambiguity_ids(
+    epoch: &Epoch,
+    ambiguity_ids: &mut Vec<String>,
+    work_ambiguity_id: &mut AmbiguityId,
+) -> Result<usize, UpdateError> {
+    let mut len = 0usize;
+    for meas in &epoch.nonref {
+        let reference = epoch
+            .references
+            .iter()
+            .find(|reference| system_of(&reference.sat) == system_of(&meas.sat))
+            .ok_or_else(|| {
+                UpdateError::MissingSystemReference(satellite_system(&meas.sat).to_string())
+            })?;
+        assign_double_difference_ambiguity_id(
+            work_ambiguity_id,
+            &meas.sat,
+            &meas.sd_ambiguity_id,
+            &reference.sat,
+            &reference.sd_ambiguity_id,
+        );
+        if !ambiguity_ids[..len]
+            .iter()
+            .any(|existing| existing == work_ambiguity_id.as_str())
+        {
+            if len == ambiguity_ids.len() {
+                ambiguity_ids.push(String::new());
+            }
+            assign_str(&mut ambiguity_ids[len], work_ambiguity_id.as_str());
+            len += 1;
+        }
+    }
+    Ok(len)
+}
+
+fn fold_filter_geometry_normal(
+    rows: &[DdRowScratch],
+    n: usize,
+    lambda: &mut Vec<f64>,
+    eta: &mut Vec<f64>,
+    block_indices: &mut Vec<usize>,
+    block_rows: &mut Vec<usize>,
+    fold_block: &mut BlockFoldScratch,
+) -> Option<()> {
+    lambda.resize(n * n, 0.0);
+    lambda.fill(0.0);
+    eta.resize(n, 0.0);
+    eta.fill(0.0);
+
+    block_indices.clear();
+    block_indices.extend(0..rows.len());
+    block_indices.sort_by(|&a, &b| {
+        (rows[a].kind, rows[a].ref_sat.as_str()).cmp(&(rows[b].kind, rows[b].ref_sat.as_str()))
+    });
+
+    let mut start = 0;
+    while start < block_indices.len() {
+        let first = block_indices[start];
+        let kind = rows[first].kind;
+        let ref_sat = rows[first].ref_sat.as_str();
+        let mut end = start + 1;
+        while end < block_indices.len() {
+            let idx = block_indices[end];
+            if rows[idx].kind != kind || rows[idx].ref_sat != ref_sat {
+                break;
+            }
+            end += 1;
+        }
+        block_rows.clear();
+        block_rows.extend_from_slice(&block_indices[start..end]);
+        block_rows.sort_by(|&a, &b| rows[a].sat.cmp(&rows[b].sat));
+        fold_measurement_block_indices(lambda, eta, rows, block_rows, fold_block)?;
+        start = end;
+    }
+    Some(())
+}
+
+fn design_singular_value_diagnostics(
+    rows: &[DdRowScratch],
+    n_params: usize,
+    gram: &mut Vec<f64>,
+    singular_values: &mut Vec<f64>,
+) -> Result<crate::astro::math::least_squares::SingularValueDiagnostics, UpdateError> {
+    gram.resize(n_params * n_params, 0.0);
+    gram.fill(0.0);
+    for row in rows {
+        if row.h.len() != n_params {
+            return Err(UpdateError::SingularGeometry);
+        }
+        for i in 0..n_params {
+            let hi = row.h[i];
+            for j in 0..n_params {
+                gram[i * n_params + j] += hi * row.h[j];
+            }
+        }
+    }
+
+    symmetric_eigenvalues_in_place(gram, n_params, singular_values)?;
+    for value in singular_values.iter_mut() {
+        *value = value.max(0.0).sqrt();
+    }
+    Ok(singular_value_diagnostics(
+        singular_values,
+        rows.len(),
+        n_params,
+    ))
+}
+
+fn symmetric_eigenvalues_in_place(
+    matrix: &mut [f64],
+    n: usize,
+    eigenvalues: &mut Vec<f64>,
+) -> Result<(), UpdateError> {
+    if n == 0 || matrix.len() != n.saturating_mul(n) {
+        return Err(UpdateError::SingularGeometry);
+    }
+    validate::finite_slice(matrix, "rtk.geometry_gram").map_err(invalid_update_input)?;
+    let mut scale = 1.0_f64;
+    for value in matrix.iter().copied() {
+        scale = scale.max(value.abs());
+    }
+    let tol = (128.0 * f64::EPSILON * (n as f64) * scale).max(1.0e-12 * scale);
+    let max_sweeps = (16 * n * n).max(32);
+    for _ in 0..max_sweeps {
+        let mut p = 0usize;
+        let mut q = 0usize;
+        let mut max_offdiag = 0.0_f64;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let offdiag = matrix[i * n + j].abs();
+                if offdiag > max_offdiag {
+                    max_offdiag = offdiag;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+
+        if max_offdiag <= tol {
+            break;
+        }
+
+        let app = matrix[p * n + p];
+        let aqq = matrix[q * n + q];
+        let apq = matrix[p * n + q];
+        if apq == 0.0 {
+            break;
+        }
+
+        let tau = (aqq - app) / (2.0 * apq);
+        let t = if tau >= 0.0 {
+            1.0 / (tau + (1.0 + tau * tau).sqrt())
+        } else {
+            -1.0 / (-tau + (1.0 + tau * tau).sqrt())
+        };
+        let c = 1.0 / (1.0 + t * t).sqrt();
+        let s = t * c;
+
+        for k in 0..n {
+            if k != p && k != q {
+                let akp = matrix[k * n + p];
+                let akq = matrix[k * n + q];
+                let new_kp = c * akp - s * akq;
+                let new_kq = s * akp + c * akq;
+                matrix[k * n + p] = new_kp;
+                matrix[p * n + k] = new_kp;
+                matrix[k * n + q] = new_kq;
+                matrix[q * n + k] = new_kq;
+            }
+        }
+
+        matrix[p * n + p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+        matrix[q * n + q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+        matrix[p * n + q] = 0.0;
+        matrix[q * n + p] = 0.0;
+    }
+
+    eigenvalues.resize(n, 0.0);
+    for i in 0..n {
+        eigenvalues[i] = matrix[i * n + i];
+    }
+    validate::finite_slice(eigenvalues, "rtk.geometry_singular_values")
+        .map_err(invalid_update_input)?;
+    Ok(())
+}
+
+fn filter_geometry_quality(
+    ctx: MeasContext,
+    state: &FilterState,
+    epoch: &Epoch,
+    has_valid_prior: bool,
+    scratch: &mut GeometryScratch,
+) -> Result<GeometryQuality, UpdateError> {
+    scratch.ambiguity_ids_len = filter_epoch_ambiguity_ids(
+        epoch,
+        &mut scratch.ambiguity_ids,
+        &mut scratch.work_ambiguity_id,
+    )?;
+    let ambiguity_ids = &scratch.ambiguity_ids[..scratch.ambiguity_ids_len];
+    scratch.ambiguities_m.resize(ambiguity_ids.len(), 0.0);
+    scratch.ambiguities_m.fill(0.0);
+
+    let rows = dd_epoch_rows_into(
+        ctx,
+        epoch,
+        0,
+        state.baseline_m,
+        DdRowRecipe::FloatBaseline {
+            ambiguity_ids,
+            ambiguities_m: &scratch.ambiguities_m,
+        },
+        &mut scratch.rows,
+    )
+    .map_err(update_row_error)?;
+    let n_params = 3 + ambiguity_ids.len();
+    fold_filter_geometry_normal(
+        rows,
+        n_params,
+        &mut scratch.lambda,
+        &mut scratch.eta,
+        &mut scratch.block_indices,
+        &mut scratch.block_rows,
+        &mut scratch.fold_block,
+    )
+    .ok_or(UpdateError::SingularGeometry)?;
+
+    let diagnostics = design_singular_value_diagnostics(
+        rows,
+        n_params,
+        &mut scratch.gram,
+        &mut scratch.singular_values,
+    )?;
+    let gdop = if diagnostics.rank < n_params {
+        f64::INFINITY
+    } else {
+        invert_flat_first_tie_into(
+            &scratch.lambda,
+            n_params,
+            &mut scratch.covariance,
+            &mut scratch.cov_invert,
+        )
+        .ok_or(UpdateError::SingularGeometry)?;
+        let trace: f64 = (0..n_params)
+            .map(|idx| scratch.covariance[idx * n_params + idx])
+            .sum();
+        if trace >= 0.0 && trace.is_finite() {
+            trace.sqrt()
+        } else {
+            f64::INFINITY
+        }
+    };
+
+    Ok(classify(
+        diagnostics.rank,
+        n_params,
+        rows.len() as i32 - n_params as i32,
+        diagnostics.condition_number,
+        gdop,
+        has_valid_prior,
+        GeometryQualityThresholds::default(),
+    ))
+}
+
 fn prepare_innovation_screen(
     state: &FilterState,
     epoch: &Epoch,
@@ -998,18 +1332,13 @@ fn reported_epoch_residuals(
 fn coasted_update(
     mut state: FilterState,
     epoch: &Epoch,
-    base: [f64; 3],
-    model: &MeasModel,
+    ctx: MeasContext,
     opts: &UpdateOpts,
     innovation_screen: Option<InnovationScreen>,
+    geometry_quality: GeometryQuality,
     residual_scratch: &mut EpochRowsScratch,
 ) -> Result<EpochUpdate, UpdateError> {
     let residuals = if opts.report_residuals {
-        let ctx = MeasContext {
-            base,
-            model,
-            antenna: opts.receiver_antenna_corrections.as_ref(),
-        };
         reported_epoch_residuals(
             ctx,
             &state,
@@ -1032,6 +1361,7 @@ fn coasted_update(
         newly_fixed: Vec::new(),
         fixed_ids,
         residuals,
+        geometry_quality,
         innovation_screen,
         state,
     })
@@ -1422,6 +1752,7 @@ pub fn update_epoch_with_scratch(
     // `acc.epochs != []`). Do not infer this from ambiguity columns: the Sidereon
     // trace path pre-sizes columns to match Elixir's global ordering.
     let first_epoch = state.epoch_count == 0;
+    let epoch_columns_had_prior = epoch_ambiguities_have_propagated_prior(&state, epoch);
 
     for r in &epoch.references {
         state.ensure_ambiguity(&r.sd_ambiguity_id, phase_code_seed_m(r));
@@ -1451,6 +1782,11 @@ pub fn update_epoch_with_scratch(
         }
     }
 
+    let has_valid_prior =
+        has_valid_filter_prior(&state, epoch_columns_had_prior, &mut scratch.geometry);
+    let mut geometry_quality =
+        filter_geometry_quality(ctx, &state, epoch, has_valid_prior, &mut scratch.geometry)?;
+
     let mut innovation_screen = prepare_innovation_screen(
         &state,
         epoch,
@@ -1467,10 +1803,10 @@ pub fn update_epoch_with_scratch(
         return coasted_update(
             state,
             epoch,
-            base,
-            model,
+            ctx,
             opts,
             innovation_screen,
+            geometry_quality,
             &mut scratch.residual_rows,
         );
     }
@@ -1501,6 +1837,15 @@ pub fn update_epoch_with_scratch(
                 &mut scratch.screen_rows,
                 &mut scratch.screen_mask,
             )?;
+            let has_valid_prior =
+                has_valid_filter_prior(&state, epoch_columns_had_prior, &mut scratch.geometry);
+            geometry_quality = filter_geometry_quality(
+                ctx,
+                &state,
+                epoch,
+                has_valid_prior,
+                &mut scratch.geometry,
+            )?;
             if innovation_screen
                 .as_ref()
                 .is_some_and(|screen| screen.coasted)
@@ -1508,10 +1853,10 @@ pub fn update_epoch_with_scratch(
                 return coasted_update(
                     state,
                     epoch,
-                    base,
-                    model,
+                    ctx,
                     opts,
                     innovation_screen,
+                    geometry_quality,
                     &mut scratch.residual_rows,
                 );
             }
@@ -1572,6 +1917,7 @@ pub fn update_epoch_with_scratch(
             newly_fixed: Vec::new(),
             fixed_ids,
             residuals,
+            geometry_quality,
             innovation_screen,
             state,
         });
@@ -1683,6 +2029,7 @@ pub fn update_epoch_with_scratch(
         newly_fixed,
         fixed_ids,
         residuals,
+        geometry_quality,
         innovation_screen,
     })
 }
