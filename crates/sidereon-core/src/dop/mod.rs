@@ -125,9 +125,13 @@ pub fn line_of_sight_from_az_el_deg(
 
 /// The dilution-of-precision scalars for a geometry.
 ///
-/// Each is dimensionless: the standard deviation of the solution component is
-/// the corresponding DOP times the (range) measurement standard deviation. The
-/// position split is in the local ENU frame at the receiver.
+/// For GNSS range rows each scalar is dimensionless: the standard deviation of
+/// the solution component is the corresponding DOP times the range measurement
+/// standard deviation. General design rows keep the same field meanings, but
+/// the units follow the row scaling. A timing row with position columns in
+/// seconds per metre yields position DOP in metres per second of timing noise.
+/// The position split is in the local ENU frame at the receiver for GNSS rows,
+/// or in the caller-supplied rotated frame for general rows.
 ///
 /// Produced by [`dop`] for a single receiver-clock state and by the positioning
 /// pipeline's multi-clock geometry path for a multi-system state; the field
@@ -177,6 +181,21 @@ pub struct GeometryCofactor {
     pub position_ecef: [[f64; 3]; 3],
     /// Position cofactor block in local ENU coordinates.
     pub position_enu: [[f64; 3]; 3],
+}
+
+/// Cofactor matrices from a caller-supplied design matrix.
+///
+/// `state` is `(H^T W H)^-1` for the supplied rows. `position` is the leading
+/// position block embedded in a 3x3 matrix, and `position_rotated` is
+/// `R position R^T` using the rotation matrix passed by the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesignGeometryCofactor {
+    /// Full state cofactor matrix in the caller's state-column order.
+    pub state: Vec<Vec<f64>>,
+    /// Leading position block embedded in three axes.
+    pub position: [[f64; 3]; 3],
+    /// Rotated position block used for HDOP and VDOP.
+    pub position_rotated: [[f64; 3]; 3],
 }
 
 /// Position covariance from a GNSS design matrix.
@@ -474,6 +493,110 @@ pub fn geometry_cofactor_with_convention(
     })
 }
 
+/// Compute DOP scalars from a caller-supplied design matrix.
+///
+/// Each row must have `position_dimension + 1` columns. The leading
+/// `position_dimension` columns are position partial derivatives. The final
+/// column is the time or clock state used for TDOP. `position_rotation` is a
+/// 3x3 row rotation applied before HDOP and VDOP are formed. Pass the identity
+/// matrix for a local Cartesian frame, or an ECEF-to-ENU rotation for Earth
+/// fixed rows.
+pub fn dop_from_design_rows(
+    rows: &[Vec<f64>],
+    weights: &[f64],
+    position_dimension: usize,
+    position_rotation: [[f64; 3]; 3],
+) -> Result<Dop, DopError> {
+    let cofactor =
+        geometry_cofactor_from_design_rows(rows, weights, position_dimension, position_rotation)?;
+    let time_col = position_dimension;
+    let q = &cofactor.state;
+    let rotated = cofactor.position_rotated;
+    let qe = rotated[0][0];
+    let qn = rotated[1][1];
+    let qu = rotated[2][2];
+    let qt = q[time_col][time_col];
+    let trace: f64 = (0..q.len()).map(|i| q[i][i]).sum();
+
+    let gdop_arg = trace;
+    let pdop_arg = qe + qn + qu;
+    let hdop_arg = qe + qn;
+    let vdop_arg = qu;
+    let tdop_arg = qt;
+    for arg in [gdop_arg, pdop_arg, hdop_arg, vdop_arg, tdop_arg] {
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let negative_or_nan = !(arg >= 0.0);
+        if negative_or_nan || !arg.is_finite() {
+            return Err(DopError::Singular);
+        }
+    }
+
+    Ok(Dop {
+        gdop: gdop_arg.sqrt(),
+        pdop: pdop_arg.sqrt(),
+        hdop: hdop_arg.sqrt(),
+        vdop: vdop_arg.sqrt(),
+        tdop: tdop_arg.sqrt(),
+        system_tdops: Vec::new(),
+    })
+}
+
+/// Compute a cofactor matrix from caller-supplied design rows.
+///
+/// This is the general counterpart to [`geometry_cofactor`]. It uses the same
+/// weighted normal matrix and positive-definite inverse policy as the
+/// multi-clock DOP path, so rank-deficient layouts return
+/// [`DopError::Singular`].
+pub fn geometry_cofactor_from_design_rows(
+    rows: &[Vec<f64>],
+    weights: &[f64],
+    position_dimension: usize,
+    position_rotation: [[f64; 3]; 3],
+) -> Result<DesignGeometryCofactor, DopError> {
+    validate_design_rows(rows, weights, position_dimension, &position_rotation)?;
+    let p = position_dimension + 1;
+    if rows.len() < p {
+        return Err(DopError::TooFewSatellites);
+    }
+
+    let q = if p == 4 {
+        let fixed_rows: Vec<[f64; 4]> = rows
+            .iter()
+            .map(|row| [row[0], row[1], row[2], row[3]])
+            .collect();
+        let normal = normal_matrix_4_weighted_column_outer(&fixed_rows, weights)
+            .map_err(map_linear_error)?;
+        let fixed = invert_4x4_cofactor(&normal).ok_or(DopError::Singular)?;
+        fixed.iter().map(|row| row.to_vec()).collect()
+    } else {
+        let mut normal = vec![vec![0.0_f64; p]; p];
+        for (row, &weight) in rows.iter().zip(weights) {
+            for i in 0..p {
+                for j in 0..p {
+                    normal[i][j] += row[i] * weight * row[j];
+                }
+            }
+        }
+        invert_symmetric_pd(&normal).ok_or(DopError::Singular)?
+    };
+    validate_general_cofactor_variances(&q)?;
+
+    let mut position = [[0.0_f64; 3]; 3];
+    for i in 0..position_dimension {
+        for j in 0..position_dimension {
+            position[i][j] = q[i][j];
+        }
+    }
+    let position_rotated = rotate3(&position, &position_rotation);
+    validate_matrix3(&position_rotated, "position_rotated")?;
+
+    Ok(DesignGeometryCofactor {
+        state: q,
+        position,
+        position_rotated,
+    })
+}
+
 /// Position covariance from a single-clock GNSS design matrix.
 ///
 /// `range_variance_scale_m2` multiplies the raw cofactor. For unit weights with a
@@ -651,6 +774,44 @@ fn validate_confidence(value: f64) -> Result<(), DopError> {
 fn validate_matrix3(matrix: &[[f64; 3]; 3], field: &'static str) -> Result<(), DopError> {
     for row in matrix {
         validate::finite_slice(row, field).map_err(map_validation_error)?;
+    }
+    Ok(())
+}
+
+fn validate_design_rows(
+    rows: &[Vec<f64>],
+    weights: &[f64],
+    position_dimension: usize,
+    position_rotation: &[[f64; 3]; 3],
+) -> Result<(), DopError> {
+    if !(2..=3).contains(&position_dimension) {
+        return Err(invalid_input("position_dimension", "must be 2 or 3"));
+    }
+    if rows.len() != weights.len() {
+        return Err(invalid_input("weights", "length must match rows"));
+    }
+    let p = position_dimension + 1;
+    for row in rows {
+        if row.len() != p {
+            return Err(invalid_input("rows", "length must match state dimension"));
+        }
+        validate::finite_slice(row, "rows").map_err(map_validation_error)?;
+    }
+    validate_weights(weights)?;
+    validate_matrix3(position_rotation, "position_rotation")
+}
+
+fn validate_general_cofactor_variances(q: &[Vec<f64>]) -> Result<(), DopError> {
+    for row in q {
+        validate::finite_slice(row, "cofactor").map_err(map_validation_error)?;
+    }
+    for (idx, row) in q.iter().enumerate() {
+        let variance = row[idx];
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let negative_or_nan = !(variance >= 0.0);
+        if negative_or_nan || !variance.is_finite() {
+            return Err(DopError::Singular);
+        }
     }
     Ok(())
 }
