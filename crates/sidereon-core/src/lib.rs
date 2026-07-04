@@ -137,6 +137,7 @@ pub mod quality; // measurement weighting, RAIM, and FDE integrity checks
 pub mod rinex;
 pub mod rtk_filter; // sequential RTK baseline filter - serializable state ABI (kernel migration)
 pub mod terrain;
+pub mod terrain_store;
 pub mod tides;
 pub mod tolerances;
 

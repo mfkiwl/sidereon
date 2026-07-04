@@ -17,14 +17,20 @@ const MAX_LOOKUP_LATITUDE_DEG: f64 = 90.0;
 const MIN_LOOKUP_LONGITUDE_DEG: f64 = -180.0;
 const MAX_LOOKUP_LONGITUDE_DEG: f64 = 180.0;
 
+/// Interpolation mode for DTED terrain lookups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DtedInterpolation {
+    /// Return the nearest DTED posting as an orthometric height in metres.
     NearestPosting,
+    /// Bilinearly interpolate the four surrounding DTED postings as an
+    /// orthometric height in metres.
     Bilinear,
 }
 
+/// Lookup options for DTED terrain queries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DtedLookupOptions {
+    /// Interpolation mode used for each orthometric height query.
     pub interpolation: DtedInterpolation,
 }
 
@@ -36,6 +42,11 @@ impl Default for DtedLookupOptions {
     }
 }
 
+/// Lazy DTED terrain reader backed by raw `.dt2` tile bytes.
+///
+/// Heights returned by this reader are orthometric metres, `H`, above the
+/// EGM96 mean sea level geoid used by DTED/SRTM terrain products. They are not
+/// ellipsoidal heights above the WGS84 reference ellipsoid.
 #[derive(Debug)]
 pub struct DtedTerrain {
     root: PathBuf,
@@ -43,6 +54,9 @@ pub struct DtedTerrain {
 }
 
 impl DtedTerrain {
+    /// Build a terrain reader rooted at a directory containing DTED `.dt2`
+    /// tiles, either directly or under the repository's block directories.
+    #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -50,10 +64,14 @@ impl DtedTerrain {
         }
     }
 
+    /// Return the bilinearly interpolated orthometric height `H` in metres at a
+    /// longitude-first geodetic position in degrees.
     pub fn height_m(&mut self, longitude_deg: f64, latitude_deg: f64) -> crate::Result<f64> {
         self.height_m_with_options(longitude_deg, latitude_deg, DtedLookupOptions::default())
     }
 
+    /// Return the orthometric height `H` in metres at a longitude-first
+    /// geodetic position in degrees using explicit lookup options.
     pub fn height_m_with_options(
         &mut self,
         longitude_deg: f64,
@@ -212,7 +230,10 @@ fn height_from_tile(
     Ok(z)
 }
 
-fn validate_lookup_coordinates(longitude_deg: f64, latitude_deg: f64) -> crate::Result<()> {
+pub(crate) fn validate_lookup_coordinates(
+    longitude_deg: f64,
+    latitude_deg: f64,
+) -> crate::Result<()> {
     if !longitude_deg.is_finite() {
         return Err(Error::InvalidInput(
             "longitude_deg must be finite".to_string(),
@@ -236,6 +257,11 @@ fn validate_lookup_coordinates(longitude_deg: f64, latitude_deg: f64) -> crate::
     Ok(())
 }
 
+/// Parsed DTED tile backed by raw `.dt2` bytes.
+///
+/// Posting values are decoded lazily from DTED signed-magnitude samples.
+/// Returned heights are orthometric metres, `H`, above the EGM96 mean sea level
+/// geoid.
 #[derive(Debug)]
 pub struct DtedTile {
     origin_latitude: f64,
@@ -247,6 +273,7 @@ pub struct DtedTile {
 }
 
 impl DtedTile {
+    /// Read and parse a DTED `.dt2` tile from disk.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, String> {
         let bytes =
             fs::read(path.as_ref()).map_err(|e| format!("{}: {e}", path.as_ref().display()))?;
@@ -295,6 +322,8 @@ impl DtedTile {
         })
     }
 
+    /// Return the nearest orthometric posting value in metres for a
+    /// longitude-first geodetic position in degrees.
     pub fn get_elevation(&self, longitude: f64, latitude: f64) -> Result<i16, String> {
         if !self.contains(longitude, latitude) {
             return Err(format!(
@@ -313,6 +342,50 @@ impl DtedTile {
             ));
         }
 
+        let block = self.validated_block(longitude_index)?;
+
+        let sample_start = 8 + latitude_index * 2;
+        let raw = i16::from_be_bytes([block[sample_start], block[sample_start + 1]]);
+        Ok(convert_signed_magnitude(raw))
+    }
+
+    pub(crate) fn origin_latitude(&self) -> f64 {
+        self.origin_latitude
+    }
+
+    pub(crate) fn origin_longitude(&self) -> f64 {
+        self.origin_longitude
+    }
+
+    pub(crate) fn lon_count(&self) -> usize {
+        self.lon_count
+    }
+
+    pub(crate) fn lat_count(&self) -> usize {
+        self.lat_count
+    }
+
+    pub(crate) fn decoded_postings_lon_major(&self) -> Result<Vec<i16>, String> {
+        let mut out = Vec::with_capacity(self.lon_count * self.lat_count);
+        for longitude_index in 0..self.lon_count {
+            let block = self.validated_block(longitude_index)?;
+            for latitude_index in 0..self.lat_count {
+                let sample_start = 8 + latitude_index * 2;
+                let raw = i16::from_be_bytes([block[sample_start], block[sample_start + 1]]);
+                out.push(convert_signed_magnitude(raw));
+            }
+        }
+        Ok(out)
+    }
+
+    fn contains(&self, longitude: f64, latitude: f64) -> bool {
+        latitude >= self.origin_latitude
+            && latitude <= self.origin_latitude + 1.0
+            && longitude >= self.origin_longitude
+            && longitude <= self.origin_longitude + 1.0
+    }
+
+    fn validated_block(&self, longitude_index: usize) -> Result<&[u8], String> {
         let block_start = DATA_OFFSET + longitude_index * self.data_block_length;
         let block_end = block_start + self.data_block_length;
         let block = &self.bytes[block_start..block_end];
@@ -335,17 +408,7 @@ impl DtedTile {
                 "DTED checksum failed for block {longitude_index}: expected {checksum}, found {sum}"
             ));
         }
-
-        let sample_start = 8 + latitude_index * 2;
-        let raw = i16::from_be_bytes([block[sample_start], block[sample_start + 1]]);
-        Ok(convert_signed_magnitude(raw))
-    }
-
-    fn contains(&self, longitude: f64, latitude: f64) -> bool {
-        latitude >= self.origin_latitude
-            && latitude <= self.origin_latitude + 1.0
-            && longitude >= self.origin_longitude
-            && longitude <= self.origin_longitude + 1.0
+        Ok(block)
     }
 }
 
@@ -353,7 +416,7 @@ pub(crate) fn terrain_grid(longitude: f64, latitude: f64) -> (i32, i32) {
     (latitude.floor() as i32, longitude.floor() as i32)
 }
 
-fn terrain_grid_candidates(longitude: f64, latitude: f64) -> Vec<(i32, i32)> {
+pub(crate) fn terrain_grid_candidates(longitude: f64, latitude: f64) -> Vec<(i32, i32)> {
     let (lat, lon) = terrain_grid(longitude, latitude);
     let mut out = vec![(lat, lon)];
     let on_lat_edge = latitude == latitude.floor();
@@ -453,7 +516,7 @@ fn parse_dted_coord(input: &str) -> Result<f64, String> {
     Ok(sign * (degree as f64 + ((minute as f64 + second / 60.0) / 60.0)))
 }
 
-fn py_round_to_usize(value: f64) -> Result<usize, String> {
+pub(crate) fn py_round_to_usize(value: f64) -> Result<usize, String> {
     if value < 0.0 {
         return Err(format!("cannot round negative posting index {value}"));
     }
