@@ -5,6 +5,19 @@ pub(crate) use crate::integrity::{metric_sigma, GainMatrix};
 
 use super::{clock_system_for_row, validate_probability, AraimError, AraimGeometry};
 
+/// Supplies per-row range sigmas for ARAIM protection and reliability designs.
+///
+/// Implementations must return externally supplied, positive finite values.
+/// These values are treated as model input. They are never estimated from
+/// residuals or measured ranges by the reliability design path.
+pub trait ProtectionModel {
+    /// Integrity one-sigma range error for a geometry row, meters.
+    fn sigma_int_m(&self, row: &super::AraimRow) -> Result<f64, AraimError>;
+
+    /// Accuracy one-sigma range error for a geometry row, meters.
+    fn sigma_acc_m(&self, row: &super::AraimRow) -> Result<f64, AraimError>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProtectionEquationTerm {
     pub prior: f64,
@@ -223,7 +236,10 @@ fn validate_term(term: ProtectionEquationTerm) -> Result<(), AraimError> {
     }
 }
 
-fn design_row(clock_systems: &[GnssSystem], row: &super::AraimRow) -> Result<Vec<f64>, AraimError> {
+pub(crate) fn design_row(
+    clock_systems: &[GnssSystem],
+    row: &super::AraimRow,
+) -> Result<Vec<f64>, AraimError> {
     let mut design = vec![0.0_f64; 3 + clock_systems.len()];
     let los = row.line_of_sight;
     if !los.e_x.is_finite()

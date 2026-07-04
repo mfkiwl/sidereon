@@ -184,7 +184,11 @@ pub use sidereon_core::astro::propagator::{ForceModelComponents, ForceModelKind}
 pub use sidereon_core::geometry_quality::{
     classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
 };
-pub use sidereon_core::quality::spp_robust_fde_driver;
+pub use sidereon_core::quality::{
+    reliability_araim, reliability_design, spp_robust_fde_driver, wtest_noncentrality,
+    ObservationReliability, RangeReliabilityRow, ReliabilityOptions, ReliabilityReport,
+    ReliabilitySummary,
+};
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies,
@@ -194,7 +198,7 @@ pub use sidereon_core::{
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
-    ItrfPositionM, ItrfVelocityMS, SatelliteIdError, Wgs84Geodetic,
+    ItrfPositionM, ItrfVelocityMS, ProtectionModel, SatelliteIdError, Wgs84Geodetic,
 };
 pub use sidereon_core::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
