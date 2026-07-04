@@ -15,7 +15,7 @@ use nalgebra::{DMatrix, DVector};
 use crate::astro::covariance::{rtn_to_eci_rotation, RtnFrameError};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{DragParameters, SpaceWeatherSource};
-use crate::astro::frames::orientation::EarthOrientation;
+use crate::astro::frames::orientation::{EarthOrientation, EarthOrientationProvider};
 use crate::astro::frames::transforms::{
     gcrs_to_itrs_compute, itrs_to_gcrs_compute, FrameTransformError,
 };
@@ -334,6 +334,84 @@ pub fn fit_all_sp3_precise_orbits(
     fit_sp3_precise_orbits(product, product.satellites(), options)
 }
 
+/// Fit one satellite from a parsed ECEF SP3 product using an Earth-orientation
+/// provider.
+///
+/// Position records are transformed with the provider's ITRF to GCRF matrix at
+/// each epoch. Products with real SP3 velocity records additionally use
+/// [`sp3_ecef_state_to_eci`] at the matching epochs so the initial velocity seed
+/// can include the rotating-frame transport term without dropping position-only
+/// epochs from a mixed product.
+pub fn fit_sp3_ecef_precise_orbit(
+    product: &Sp3,
+    satellite: GnssSatelliteId,
+    orientation_provider: &dyn EarthOrientationProvider,
+    options: &OrbitFitOptions,
+) -> Result<OrbitFitReport, OrbitFitError> {
+    fit_sp3_ecef_precise_orbits(product, &[satellite], orientation_provider, options)
+}
+
+/// Fit selected satellites from a parsed ECEF SP3 product using an
+/// Earth-orientation provider.
+///
+/// This is the parsed-product entry for real SP3 orbit products whose position
+/// and optional velocity records are expressed in the ITRF/IGS Earth-fixed
+/// frame. The returned residual ledger is computed against the original ECEF
+/// observations. Its arc span is reported on the TDB axis used by the provider
+/// and numerical propagator.
+pub fn fit_sp3_ecef_precise_orbits(
+    product: &Sp3,
+    satellites: &[GnssSatelliteId],
+    orientation_provider: &dyn EarthOrientationProvider,
+    options: &OrbitFitOptions,
+) -> Result<OrbitFitReport, OrbitFitError> {
+    validate_options(options)?;
+    if satellites.is_empty() {
+        return Err(OrbitFitError::EmptySelection);
+    }
+
+    let position_samples = product.precise_ephemeris_samples();
+    let state_samples = product.precise_ephemeris_state_samples();
+    let mut fits = BTreeMap::new();
+    let mut residuals = Vec::new();
+    let mut time_scale = None;
+    for &satellite in satellites {
+        let work = fit_one_sp3_ecef_arc(
+            &position_samples,
+            &state_samples,
+            satellite,
+            orientation_provider,
+            options,
+        )?;
+        for residual in &work.residuals {
+            match time_scale {
+                None => time_scale = Some(residual.time_scale),
+                Some(scale) if scale == residual.time_scale => {}
+                Some(_) => return Err(OrbitFitError::MixedTimeScales),
+            }
+        }
+        residuals.extend(work.residuals);
+        fits.insert(satellite, work.solution);
+    }
+
+    let ledger = build_ledger(
+        residuals,
+        time_scale.ok_or(OrbitFitError::EmptySelection)?,
+        options.min_ledger_samples,
+    )?;
+    Ok(OrbitFitReport { fits, ledger })
+}
+
+/// Fit every satellite declared in a parsed ECEF SP3 product using an
+/// Earth-orientation provider.
+pub fn fit_all_sp3_ecef_precise_orbits(
+    product: &Sp3,
+    orientation_provider: &dyn EarthOrientationProvider,
+    options: &OrbitFitOptions,
+) -> Result<OrbitFitReport, OrbitFitError> {
+    fit_sp3_ecef_precise_orbits(product, product.satellites(), orientation_provider, options)
+}
+
 /// Fit one satellite from precise ephemeris samples.
 pub fn fit_precise_ephemeris_sample_orbit(
     samples: &[PreciseEphemerisSample],
@@ -482,6 +560,22 @@ fn fit_one_state_sample_arc(
     fit_one_observation_arc(satellite, observations, options, None)
 }
 
+fn fit_one_sp3_ecef_arc(
+    position_samples: &[PreciseEphemerisSample],
+    state_samples: &[PreciseEphemerisStateSample],
+    satellite: GnssSatelliteId,
+    orientation_provider: &dyn EarthOrientationProvider,
+    options: &OrbitFitOptions,
+) -> Result<FitWork, OrbitFitError> {
+    let observations = collect_provider_sp3_observations(
+        position_samples,
+        state_samples,
+        satellite,
+        orientation_provider,
+    )?;
+    fit_one_observation_arc(satellite, observations, options, None)
+}
+
 fn fit_one_observation_arc(
     satellite: GnssSatelliteId,
     observations: Vec<OrbitObservation>,
@@ -595,6 +689,7 @@ struct OrbitObservation {
     epoch_j2000_s: f64,
     time_scale: TimeScale,
     time_scales: TimeScales,
+    orientation: Option<EarthOrientation>,
     observed_itrs_km: [f64; 3],
     observed_gcrs_km: [f64; 3],
     observed_gcrs_velocity_km_s: Option<[f64; 3]>,
@@ -616,6 +711,7 @@ fn collect_observations(
             epoch_j2000_s,
             time_scale: sample.epoch.scale,
             time_scales: ts,
+            orientation: None,
             observed_itrs_km: [x_m / M_PER_KM, y_m / M_PER_KM, z_m / M_PER_KM],
             observed_gcrs_km: [x, y, z],
             observed_gcrs_velocity_km_s: None,
@@ -642,12 +738,69 @@ fn collect_state_observations(
             epoch_j2000_s: inertial.epoch_tdb_seconds,
             time_scale: oriented.sample.epoch.scale,
             time_scales: oriented.orientation.time_scales(),
+            orientation: Some(oriented.orientation),
             observed_itrs_km: [x_m / M_PER_KM, y_m / M_PER_KM, z_m / M_PER_KM],
             observed_gcrs_km: inertial.position_array(),
             observed_gcrs_velocity_km_s: Some(inertial.velocity_array()),
         });
     }
     validate_observations(satellite, observations)
+}
+
+fn collect_provider_sp3_observations(
+    samples: &[PreciseEphemerisSample],
+    state_samples: &[PreciseEphemerisStateSample],
+    satellite: GnssSatelliteId,
+    orientation_provider: &dyn EarthOrientationProvider,
+) -> Result<Vec<OrbitObservation>, OrbitFitError> {
+    let mut observations = Vec::new();
+    for sample in samples.iter().filter(|sample| sample.sat == satellite) {
+        validate_position(sample.position_ecef_m, satellite)?;
+        let epoch_tdb_s = tdb_seconds_from_instant(sample.epoch, satellite)?;
+        let orientation = orientation_provider
+            .orientation_at_tdb_seconds(epoch_tdb_s)
+            .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+        let [x_m, y_m, z_m] = sample.position_ecef_m;
+        let position_itrf_km = [x_m / M_PER_KM, y_m / M_PER_KM, z_m / M_PER_KM];
+        let observed_gcrs_km = orientation
+            .itrf_to_gcrf_position_km(position_itrf_km)
+            .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+        let observed_gcrs_velocity_km_s =
+            matching_state_sample(state_samples, sample).map_or(Ok(None), |state_sample| {
+                validate_velocity(state_sample.velocity_ecef_m_s, satellite)?;
+                let state_at_position_epoch = PreciseEphemerisStateSample {
+                    sat: sample.sat,
+                    epoch: sample.epoch,
+                    position_ecef_m: sample.position_ecef_m,
+                    velocity_ecef_m_s: state_sample.velocity_ecef_m_s,
+                    clock_s: sample.clock_s,
+                    clock_rate_s_s: state_sample.clock_rate_s_s,
+                    clock_event: sample.clock_event,
+                };
+                let inertial = sp3_ecef_state_to_eci(&state_at_position_epoch, &orientation)
+                    .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+                Ok(Some(inertial.velocity_array()))
+            })?;
+        observations.push(OrbitObservation {
+            epoch_j2000_s: epoch_tdb_s,
+            time_scale: TimeScale::Tdb,
+            time_scales: orientation.time_scales(),
+            orientation: Some(orientation),
+            observed_itrs_km: position_itrf_km,
+            observed_gcrs_km,
+            observed_gcrs_velocity_km_s,
+        });
+    }
+    validate_observations(satellite, observations)
+}
+
+fn matching_state_sample<'a>(
+    state_samples: &'a [PreciseEphemerisStateSample],
+    sample: &PreciseEphemerisSample,
+) -> Option<&'a PreciseEphemerisStateSample> {
+    state_samples
+        .iter()
+        .find(|state_sample| state_sample.sat == sample.sat && state_sample.epoch == sample.epoch)
 }
 
 fn validate_observations(
@@ -753,6 +906,23 @@ fn time_scales_from_instant(
         satellite,
         reason: error.to_string(),
     })
+}
+
+fn tdb_seconds_from_instant(
+    instant: Instant,
+    satellite: GnssSatelliteId,
+) -> Result<f64, OrbitFitError> {
+    let epoch_j2000_s = instant_j2000_seconds(instant, satellite)?;
+    let ts = time_scales_from_instant(instant, epoch_j2000_s, satellite)?;
+    let tdb_seconds = j2000_seconds_from_split(ts.jd_whole, ts.tdb_fraction);
+    if tdb_seconds.is_finite() {
+        Ok(tdb_seconds)
+    } else {
+        Err(OrbitFitError::InvalidEpoch {
+            satellite,
+            reason: "TDB J2000 seconds are not finite".to_string(),
+        })
+    }
 }
 
 fn seed_initial_state(
@@ -917,17 +1087,11 @@ fn residual_vector_for_params(
     let states = propagate_to_observations(satellite, initial, observations, options)?;
     let mut residual = Vec::with_capacity(observations.len() * 3);
     for (state, observation) in states.iter().zip(observations) {
-        let predicted_itrs = gcrs_to_itrs_compute(
-            state.position_km.x,
-            state.position_km.y,
-            state.position_km.z,
-            &observation.time_scales,
-            false,
-        )
-        .map_err(|source| OrbitFitError::Frame { satellite, source })?;
-        residual.push(predicted_itrs.0 - observation.observed_itrs_km[0]);
-        residual.push(predicted_itrs.1 - observation.observed_itrs_km[1]);
-        residual.push(predicted_itrs.2 - observation.observed_itrs_km[2]);
+        let predicted_itrs =
+            predicted_itrs_position(satellite, state.position_array(), observation)?;
+        residual.push(predicted_itrs[0] - observation.observed_itrs_km[0]);
+        residual.push(predicted_itrs[1] - observation.observed_itrs_km[1]);
+        residual.push(predicted_itrs[2] - observation.observed_itrs_km[2]);
     }
     Ok(residual)
 }
@@ -1039,27 +1203,14 @@ fn rtn_residuals_for_state(
     for (state, observation) in states.iter().zip(observations) {
         let rot = rtn_to_eci_rotation(state.position_array(), state.velocity_array())
             .map_err(|reason| OrbitFitError::RtnFrame { satellite, reason })?;
-        let predicted_itrs = gcrs_to_itrs_compute(
-            state.position_km.x,
-            state.position_km.y,
-            state.position_km.z,
-            &observation.time_scales,
-            false,
-        )
-        .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+        let predicted_itrs =
+            predicted_itrs_position(satellite, state.position_array(), observation)?;
         let diff_itrs = [
-            predicted_itrs.0 - observation.observed_itrs_km[0],
-            predicted_itrs.1 - observation.observed_itrs_km[1],
-            predicted_itrs.2 - observation.observed_itrs_km[2],
+            predicted_itrs[0] - observation.observed_itrs_km[0],
+            predicted_itrs[1] - observation.observed_itrs_km[1],
+            predicted_itrs[2] - observation.observed_itrs_km[2],
         ];
-        let diff_gcrs = itrs_to_gcrs_compute(
-            diff_itrs[0],
-            diff_itrs[1],
-            diff_itrs[2],
-            &observation.time_scales,
-        )
-        .map_err(|source| OrbitFitError::Frame { satellite, source })?;
-        let diff = [diff_gcrs.0, diff_gcrs.1, diff_gcrs.2];
+        let diff = itrs_residual_to_gcrs(satellite, diff_itrs, observation)?;
         let radial_km = diff[0] * rot[0][0] + diff[1] * rot[1][0] + diff[2] * rot[2][0];
         let along_km = diff[0] * rot[0][1] + diff[1] * rot[1][1] + diff[2] * rot[2][1];
         let cross_km = diff[0] * rot[0][2] + diff[1] * rot[1][2] + diff[2] * rot[2][2];
@@ -1073,6 +1224,49 @@ fn rtn_residuals_for_state(
         });
     }
     Ok(residuals)
+}
+
+fn predicted_itrs_position(
+    satellite: GnssSatelliteId,
+    position_gcrs_km: [f64; 3],
+    observation: &OrbitObservation,
+) -> Result<[f64; 3], OrbitFitError> {
+    if let Some(orientation) = observation.orientation {
+        return orientation
+            .gcrf_to_itrf_position_km(position_gcrs_km)
+            .map_err(|source| OrbitFitError::Frame { satellite, source });
+    }
+
+    let predicted = gcrs_to_itrs_compute(
+        position_gcrs_km[0],
+        position_gcrs_km[1],
+        position_gcrs_km[2],
+        &observation.time_scales,
+        false,
+    )
+    .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+    Ok([predicted.0, predicted.1, predicted.2])
+}
+
+fn itrs_residual_to_gcrs(
+    satellite: GnssSatelliteId,
+    diff_itrs_km: [f64; 3],
+    observation: &OrbitObservation,
+) -> Result<[f64; 3], OrbitFitError> {
+    if let Some(orientation) = observation.orientation {
+        return orientation
+            .itrf_to_gcrf_position_km(diff_itrs_km)
+            .map_err(|source| OrbitFitError::Frame { satellite, source });
+    }
+
+    let diff_gcrs = itrs_to_gcrs_compute(
+        diff_itrs_km[0],
+        diff_itrs_km[1],
+        diff_itrs_km[2],
+        &observation.time_scales,
+    )
+    .map_err(|source| OrbitFitError::Frame { satellite, source })?;
+    Ok([diff_gcrs.0, diff_gcrs.1, diff_gcrs.2])
 }
 
 fn ledger_rms_3d_m(residuals: &[RtnResidual]) -> f64 {
