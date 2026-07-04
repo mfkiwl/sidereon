@@ -44,4 +44,13 @@ fn core_domain_modules_are_reachable_through_facade() {
     )
     .expect("facade clock stability");
     assert_eq!(oadev.deviation[0].to_bits(), 0.0_f64.to_bits());
+
+    let _options = sidereon::clock_stability::PowerLawNoiseOptions::sampled_at_nyquist(1.0);
+    assert_eq!(
+        sidereon::clock_stability::allan_deviation_power_law_slope(
+            sidereon::clock_stability::PowerLawNoiseType::WhiteFM
+        )
+        .to_bits(),
+        (-0.5_f64).to_bits()
+    );
 }

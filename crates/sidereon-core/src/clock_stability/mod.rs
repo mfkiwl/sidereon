@@ -9,9 +9,12 @@
 //! [`GapPolicy::OmitTerms`] keeps the series indexed and excludes every estimator
 //! term whose required phase samples cross a missing sample.
 
+use crate::estimation::mad_spread;
 use crate::rinex::observations::RinexObs;
 
 const SQRT_3: f64 = 1.732_050_807_568_877_2;
+const DEFAULT_POWER_LAW_MIN_POINTS_PER_OCTAVE: usize = 2;
+const DEFAULT_POWER_LAW_SLOPE_TOLERANCE: f64 = 0.125;
 
 /// Tagged input samples for Allan-family estimators.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,6 +184,216 @@ pub struct AllanDeviationCurves {
     /// Time deviation, if requested.
     pub tdev: Option<AllanResult>,
 }
+
+/// IEEE 1139 fractional-frequency PSD power-law noise type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PowerLawNoiseType {
+    /// Random-walk frequency modulation, `S_y(f) = h_-2 f^-2`.
+    RandomWalkFM,
+    /// Flicker frequency modulation, `S_y(f) = h_-1 f^-1`.
+    FlickerFM,
+    /// White frequency modulation, `S_y(f) = h_0`.
+    WhiteFM,
+    /// Flicker phase modulation, `S_y(f) = h_1 f`.
+    FlickerPM,
+    /// White phase modulation, `S_y(f) = h_2 f^2`.
+    WhitePM,
+}
+
+impl PowerLawNoiseType {
+    /// Spectral exponent `alpha` in `S_y(f) = h_alpha f^alpha`.
+    pub const fn alpha(self) -> i32 {
+        match self {
+            Self::RandomWalkFM => -2,
+            Self::FlickerFM => -1,
+            Self::WhiteFM => 0,
+            Self::FlickerPM => 1,
+            Self::WhitePM => 2,
+        }
+    }
+
+    /// Index into [`PowerLawNoiseFit::coefficients`].
+    pub const fn coefficient_index(self) -> usize {
+        match self {
+            Self::RandomWalkFM => 0,
+            Self::FlickerFM => 1,
+            Self::WhiteFM => 2,
+            Self::FlickerPM => 3,
+            Self::WhitePM => 4,
+        }
+    }
+}
+
+/// Exact rational log-log slope of ADEV versus tau for a power-law type.
+pub fn allan_deviation_power_law_slope(noise_type: PowerLawNoiseType) -> f64 {
+    match noise_type {
+        PowerLawNoiseType::RandomWalkFM => 0.5,
+        PowerLawNoiseType::FlickerFM => 0.0,
+        PowerLawNoiseType::WhiteFM => -0.5,
+        PowerLawNoiseType::FlickerPM | PowerLawNoiseType::WhitePM => -1.0,
+    }
+}
+
+/// Exact rational log-log slope of MDEV versus tau for a power-law type.
+pub fn modified_allan_deviation_power_law_slope(noise_type: PowerLawNoiseType) -> f64 {
+    match noise_type {
+        PowerLawNoiseType::RandomWalkFM => 0.5,
+        PowerLawNoiseType::FlickerFM => 0.0,
+        PowerLawNoiseType::WhiteFM => -0.5,
+        PowerLawNoiseType::FlickerPM => -1.0,
+        PowerLawNoiseType::WhitePM => -1.5,
+    }
+}
+
+/// Exact tau exponent of Allan variance for a power-law type.
+pub fn allan_variance_power_law_tau_exponent(noise_type: PowerLawNoiseType) -> i32 {
+    match noise_type {
+        PowerLawNoiseType::RandomWalkFM => 1,
+        PowerLawNoiseType::FlickerFM => 0,
+        PowerLawNoiseType::WhiteFM => -1,
+        PowerLawNoiseType::FlickerPM | PowerLawNoiseType::WhitePM => -2,
+    }
+}
+
+/// Options for per-octave power-law identification and coefficient fitting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PowerLawNoiseOptions {
+    /// Minimum tau points required before an octave can be classified.
+    pub min_points_per_octave: usize,
+    /// Maximum absolute slope error allowed for an exact-rational noise type.
+    pub slope_tolerance: f64,
+    /// Maximum robust local-slope scatter allowed before an octave is ambiguous.
+    pub scatter_tolerance: f64,
+    /// Basic sample interval used by the deviation calculation, seconds.
+    pub basic_tau_s: f64,
+    /// Upper measurement bandwidth, hertz, used by phase-modulation conversions.
+    pub measurement_bandwidth_hz: f64,
+}
+
+impl PowerLawNoiseOptions {
+    /// Construct options with the default octave point count and slope tolerances.
+    pub const fn new(basic_tau_s: f64, measurement_bandwidth_hz: f64) -> Self {
+        Self {
+            min_points_per_octave: DEFAULT_POWER_LAW_MIN_POINTS_PER_OCTAVE,
+            slope_tolerance: DEFAULT_POWER_LAW_SLOPE_TOLERANCE,
+            scatter_tolerance: DEFAULT_POWER_LAW_SLOPE_TOLERANCE,
+            basic_tau_s,
+            measurement_bandwidth_hz,
+        }
+    }
+
+    /// Construct options using the Nyquist bandwidth for samples spaced by `basic_tau_s`.
+    pub fn sampled_at_nyquist(basic_tau_s: f64) -> Self {
+        Self::new(basic_tau_s, 0.5 / basic_tau_s)
+    }
+}
+
+/// Why a tau octave could not receive a dominant noise type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerLawOctaveFlag {
+    /// Fewer than [`PowerLawNoiseOptions::min_points_per_octave`] tau points were present.
+    UnderSampled,
+    /// A zero deviation made the log-log slope undefined.
+    DegenerateDeviation,
+    /// MDEV did not have enough tau points to separate phase-modulation types.
+    MissingModifiedAllan,
+}
+
+/// Dominant noise decision for one tau octave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerLawOctaveDominance {
+    /// One power-law type was identified.
+    Dominant(PowerLawNoiseType),
+    /// The octave contains conflicting or off-table slopes.
+    Ambiguous,
+    /// The octave is not classifiable because required data are absent.
+    Flagged(PowerLawOctaveFlag),
+}
+
+/// Per-octave power-law classification from local ADEV and MDEV slopes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerLawOctave {
+    /// First tau in the octave, seconds.
+    pub tau_start_s: f64,
+    /// Last tau used in the octave, seconds.
+    pub tau_end_s: f64,
+    /// Number of ADEV tau points used for the octave slope.
+    pub point_count: usize,
+    /// Fitted ADEV log-log slope for this octave, if available.
+    pub adev_slope: Option<f64>,
+    /// Fitted MDEV log-log slope for this octave, if available.
+    pub mdev_slope: Option<f64>,
+    /// Robust scatter of adjacent ADEV slopes inside the octave, if available.
+    pub slope_scatter: Option<f64>,
+    /// Dominant type, ambiguity, or faithful-bound flag for the octave.
+    pub dominance: PowerLawOctaveDominance,
+}
+
+/// Consecutive tau span that supports one fitted power-law coefficient.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerLawNoiseRegion {
+    /// Noise type identified across the region.
+    pub noise_type: PowerLawNoiseType,
+    /// First tau in the region, seconds.
+    pub tau_start_s: f64,
+    /// Last tau in the region, seconds.
+    pub tau_end_s: f64,
+    /// Number of classified octaves merged into this region.
+    pub octave_count: usize,
+    /// Number of deviation points used in the coefficient fit.
+    pub point_count: usize,
+    /// Mean local slope from the statistic used for classification.
+    pub mean_slope: f64,
+    /// Fitted PSD coefficient for this region.
+    pub coefficient: f64,
+}
+
+/// IEEE 1139 power-law noise identification and coefficient fit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerLawNoiseFit {
+    /// Dominant classification for each tau octave.
+    pub dominant_per_octave: Vec<PowerLawOctave>,
+    /// PSD coefficients `[h_-2, h_-1, h_0, h_1, h_2]`.
+    ///
+    /// Entries are `NaN` when no faithful identified region supports that coefficient.
+    pub coefficients: [f64; 5],
+    /// Consecutive identified tau regions used by the coefficient fit.
+    pub regions: Vec<PowerLawNoiseRegion>,
+}
+
+/// Error from power-law clock-noise identification setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PowerLawNoiseError {
+    /// An option field is outside its accepted range.
+    InvalidOptions {
+        /// Option field name.
+        field: &'static str,
+        /// Reason the field is invalid.
+        reason: &'static str,
+    },
+    /// A supplied deviation curve is structurally invalid.
+    InvalidCurve {
+        /// Curve label.
+        curve: &'static str,
+        /// Reason the curve is invalid.
+        reason: &'static str,
+    },
+}
+
+impl core::fmt::Display for PowerLawNoiseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidOptions { field, reason } => {
+                write!(f, "invalid power-law option {field}: {reason}")
+            }
+            Self::InvalidCurve { curve, reason } => {
+                write!(f, "invalid {curve} curve: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PowerLawNoiseError {}
 
 /// Estimator identifier used in errors and options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +635,46 @@ pub fn time_deviation(
     compute_explicit(series, tau0_s, averaging_factors, AllanEstimator::Tdev)
 }
 
+/// Identify per-octave power-law noise and fit PSD coefficients.
+///
+/// The `adev` argument may be plain or overlapping ADEV. The function consumes
+/// the supplied deviation curves as-is and does not recompute any Allan-family
+/// statistic. ADEV identifies random-walk FM, flicker FM, and white FM regions.
+/// For phase modulation, where ADEV has the same `tau^-1` slope for flicker PM
+/// and white PM, the matching MDEV octave supplies the separating slope.
+///
+/// Coefficients are returned as `[h_-2, h_-1, h_0, h_1, h_2]`. FM coefficients
+/// are fitted from ADEV using the IEEE 1139 Allan-variance conversion constants.
+/// PM coefficients are fitted from MDEV using the modified-Allan conversion
+/// constants derived from the NIST SP 1065 MVAR transfer function, with
+/// `measurement_bandwidth_hz` and `basic_tau_s` applied to white PM.
+pub fn fit_power_law_noise(
+    adev: &AllanResult,
+    mdev: &AllanResult,
+    options: PowerLawNoiseOptions,
+) -> Result<PowerLawNoiseFit, PowerLawNoiseError> {
+    validate_power_law_options(options)?;
+    validate_power_law_curve("ADEV", adev)?;
+    validate_power_law_curve("MDEV", mdev)?;
+
+    let dominant_per_octave = classify_power_law_octaves(adev, mdev, options);
+    let regions = build_power_law_regions(&dominant_per_octave, adev, mdev, options);
+    let mut coefficients = [f64::NAN; 5];
+
+    for noise_type in POWER_LAW_NOISE_TYPES {
+        let coefficient = fit_coefficient_for_type(noise_type, &regions, adev, mdev, options);
+        if let Some(coefficient) = coefficient {
+            coefficients[noise_type.coefficient_index()] = coefficient;
+        }
+    }
+
+    Ok(PowerLawNoiseFit {
+        dominant_per_octave,
+        coefficients,
+        regions,
+    })
+}
+
 fn compute_explicit(
     series: AllanSeries<'_>,
     tau0_s: f64,
@@ -435,6 +688,572 @@ fn compute_explicit(
         &TauGrid::Explicit(averaging_factors.to_vec()),
         estimator,
     )
+}
+
+const POWER_LAW_NOISE_TYPES: [PowerLawNoiseType; 5] = [
+    PowerLawNoiseType::RandomWalkFM,
+    PowerLawNoiseType::FlickerFM,
+    PowerLawNoiseType::WhiteFM,
+    PowerLawNoiseType::FlickerPM,
+    PowerLawNoiseType::WhitePM,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdevSlopeClass {
+    Noise(PowerLawNoiseType),
+    PhaseModulation,
+    Ambiguous,
+}
+
+fn validate_power_law_options(options: PowerLawNoiseOptions) -> Result<(), PowerLawNoiseError> {
+    if options.min_points_per_octave < 2 {
+        return Err(PowerLawNoiseError::InvalidOptions {
+            field: "min_points_per_octave",
+            reason: "must be at least 2",
+        });
+    }
+    if !(options.slope_tolerance.is_finite() && options.slope_tolerance > 0.0) {
+        return Err(PowerLawNoiseError::InvalidOptions {
+            field: "slope_tolerance",
+            reason: "must be finite and positive",
+        });
+    }
+    if !(options.scatter_tolerance.is_finite() && options.scatter_tolerance >= 0.0) {
+        return Err(PowerLawNoiseError::InvalidOptions {
+            field: "scatter_tolerance",
+            reason: "must be finite and nonnegative",
+        });
+    }
+    if !(options.basic_tau_s.is_finite() && options.basic_tau_s > 0.0) {
+        return Err(PowerLawNoiseError::InvalidOptions {
+            field: "basic_tau_s",
+            reason: "must be finite and positive",
+        });
+    }
+    if !(options.measurement_bandwidth_hz.is_finite() && options.measurement_bandwidth_hz > 0.0) {
+        return Err(PowerLawNoiseError::InvalidOptions {
+            field: "measurement_bandwidth_hz",
+            reason: "must be finite and positive",
+        });
+    }
+    Ok(())
+}
+
+fn validate_power_law_curve(
+    curve_name: &'static str,
+    curve: &AllanResult,
+) -> Result<(), PowerLawNoiseError> {
+    if curve.tau_s.len() != curve.deviation.len() || curve.tau_s.len() != curve.n.len() {
+        return Err(PowerLawNoiseError::InvalidCurve {
+            curve: curve_name,
+            reason: "tau, deviation, and term-count lengths must match",
+        });
+    }
+
+    let mut previous_tau_s = None;
+    for (index, (&tau_s, &deviation)) in curve.tau_s.iter().zip(curve.deviation.iter()).enumerate()
+    {
+        if !(tau_s.is_finite() && tau_s > 0.0) {
+            return Err(PowerLawNoiseError::InvalidCurve {
+                curve: curve_name,
+                reason: "tau values must be finite and positive",
+            });
+        }
+        if previous_tau_s.is_some_and(|previous| tau_s <= previous) {
+            return Err(PowerLawNoiseError::InvalidCurve {
+                curve: curve_name,
+                reason: "tau values must be strictly increasing",
+            });
+        }
+        previous_tau_s = Some(tau_s);
+
+        if !(deviation.is_finite() && deviation >= 0.0) {
+            return Err(PowerLawNoiseError::InvalidCurve {
+                curve: curve_name,
+                reason: "deviations must be finite and nonnegative",
+            });
+        }
+        if curve.n[index] == 0 {
+            return Err(PowerLawNoiseError::InvalidCurve {
+                curve: curve_name,
+                reason: "term counts must be positive",
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn classify_power_law_octaves(
+    adev: &AllanResult,
+    mdev: &AllanResult,
+    options: PowerLawNoiseOptions,
+) -> Vec<PowerLawOctave> {
+    let mut octaves = Vec::new();
+    let mut start = 0usize;
+    while start < adev.tau_s.len() {
+        let end = octave_end_index(&adev.tau_s, start);
+        let point_count = end + 1 - start;
+        if point_count < options.min_points_per_octave {
+            let tau_start_s = adev.tau_s[start];
+            octaves.push(PowerLawOctave {
+                tau_start_s,
+                tau_end_s: tau_start_s,
+                point_count,
+                adev_slope: None,
+                mdev_slope: None,
+                slope_scatter: None,
+                dominance: PowerLawOctaveDominance::Flagged(PowerLawOctaveFlag::UnderSampled),
+            });
+            start += 1;
+            continue;
+        }
+
+        octaves.push(classify_power_law_window(start, end, adev, mdev, options));
+        if end >= adev.tau_s.len() - 1 {
+            break;
+        }
+        start = end;
+    }
+    octaves
+}
+
+fn octave_end_index(tau_s: &[f64], start: usize) -> usize {
+    let tau_limit_s = tau_s[start] * 2.0;
+    let tolerance = tau_limit_s.abs().max(1.0) * 32.0 * f64::EPSILON;
+    let mut end = start;
+    while end + 1 < tau_s.len() && tau_s[end + 1] <= tau_limit_s + tolerance {
+        end += 1;
+    }
+    end
+}
+
+fn classify_power_law_window(
+    start: usize,
+    end: usize,
+    adev: &AllanResult,
+    mdev: &AllanResult,
+    options: PowerLawNoiseOptions,
+) -> PowerLawOctave {
+    let tau_start_s = adev.tau_s[start];
+    let tau_end_s = adev.tau_s[end];
+    let point_count = end + 1 - start;
+
+    let Some(adev_slope) = log_log_slope_for_curve(adev, start, end) else {
+        return PowerLawOctave {
+            tau_start_s,
+            tau_end_s,
+            point_count,
+            adev_slope: None,
+            mdev_slope: None,
+            slope_scatter: None,
+            dominance: PowerLawOctaveDominance::Flagged(PowerLawOctaveFlag::DegenerateDeviation),
+        };
+    };
+
+    let adjacent_slopes = adjacent_log_log_slopes(adev, start, end);
+    let slope_scatter = robust_slope_scatter(&adjacent_slopes);
+    let scatter_is_ambiguous =
+        slope_scatter.is_some_and(|scatter| scatter > options.scatter_tolerance);
+    let adev_class = classify_adev_slope(adev_slope, options.slope_tolerance);
+    let local_adev_consistent =
+        local_adev_slopes_consistent(&adjacent_slopes, adev_class, options.slope_tolerance);
+
+    let (mdev_slope, mdev_scatter, local_mdev_consistent) =
+        mdev_slope_in_range(mdev, tau_start_s, tau_end_s, options);
+
+    let dominance = if scatter_is_ambiguous || !local_adev_consistent {
+        PowerLawOctaveDominance::Ambiguous
+    } else {
+        match adev_class {
+            AdevSlopeClass::Noise(noise_type) => {
+                if let Some(mdev_slope) = mdev_slope {
+                    match classify_mdev_slope(mdev_slope, options.slope_tolerance) {
+                        Some(mdev_type) if mdev_type != noise_type => {
+                            PowerLawOctaveDominance::Ambiguous
+                        }
+                        None => PowerLawOctaveDominance::Ambiguous,
+                        Some(_) => PowerLawOctaveDominance::Dominant(noise_type),
+                    }
+                } else {
+                    PowerLawOctaveDominance::Dominant(noise_type)
+                }
+            }
+            AdevSlopeClass::PhaseModulation => match mdev_slope {
+                Some(mdev_slope)
+                    if !mdev_scatter.is_some_and(|scatter| scatter > options.scatter_tolerance)
+                        && local_mdev_consistent =>
+                {
+                    match classify_mdev_slope(mdev_slope, options.slope_tolerance) {
+                        Some(PowerLawNoiseType::FlickerPM) => {
+                            PowerLawOctaveDominance::Dominant(PowerLawNoiseType::FlickerPM)
+                        }
+                        Some(PowerLawNoiseType::WhitePM) => {
+                            PowerLawOctaveDominance::Dominant(PowerLawNoiseType::WhitePM)
+                        }
+                        _ => PowerLawOctaveDominance::Ambiguous,
+                    }
+                }
+                Some(_) => PowerLawOctaveDominance::Ambiguous,
+                None => PowerLawOctaveDominance::Flagged(PowerLawOctaveFlag::MissingModifiedAllan),
+            },
+            AdevSlopeClass::Ambiguous => PowerLawOctaveDominance::Ambiguous,
+        }
+    };
+
+    PowerLawOctave {
+        tau_start_s,
+        tau_end_s,
+        point_count,
+        adev_slope: Some(adev_slope),
+        mdev_slope,
+        slope_scatter,
+        dominance,
+    }
+}
+
+fn log_log_slope_for_curve(curve: &AllanResult, start: usize, end: usize) -> Option<f64> {
+    if end <= start {
+        return None;
+    }
+    let tau = &curve.tau_s[start..=end];
+    let deviation = &curve.deviation[start..=end];
+    if deviation.iter().any(|&value| value <= 0.0) {
+        return None;
+    }
+
+    let n = tau.len() as f64;
+    let (sum_x, sum_y) = tau
+        .iter()
+        .zip(deviation.iter())
+        .fold((0.0, 0.0), |(sum_x, sum_y), (&tau_s, &sigma)| {
+            (sum_x + tau_s.ln(), sum_y + sigma.ln())
+        });
+    let mean_x = sum_x / n;
+    let mean_y = sum_y / n;
+
+    let (num, den) =
+        tau.iter()
+            .zip(deviation.iter())
+            .fold((0.0, 0.0), |(num, den), (&tau_s, &sigma)| {
+                let dx = tau_s.ln() - mean_x;
+                let dy = sigma.ln() - mean_y;
+                (num + dx * dy, den + dx * dx)
+            });
+
+    if den > 0.0 {
+        Some(num / den)
+    } else {
+        None
+    }
+}
+
+fn adjacent_log_log_slopes(curve: &AllanResult, start: usize, end: usize) -> Vec<f64> {
+    let mut slopes = Vec::new();
+    for index in start..end {
+        let tau0 = curve.tau_s[index];
+        let tau1 = curve.tau_s[index + 1];
+        let sigma0 = curve.deviation[index];
+        let sigma1 = curve.deviation[index + 1];
+        if sigma0 <= 0.0 || sigma1 <= 0.0 {
+            continue;
+        }
+        let denominator = tau1.ln() - tau0.ln();
+        if denominator > 0.0 {
+            slopes.push((sigma1.ln() - sigma0.ln()) / denominator);
+        }
+    }
+    slopes
+}
+
+fn robust_slope_scatter(slopes: &[f64]) -> Option<f64> {
+    if slopes.len() < 2 {
+        return Some(0.0);
+    }
+    mad_spread(slopes, 0.0).ok()
+}
+
+fn local_adev_slopes_consistent(slopes: &[f64], expected: AdevSlopeClass, tolerance: f64) -> bool {
+    slopes
+        .iter()
+        .all(|&slope| classify_adev_slope(slope, tolerance) == expected)
+}
+
+fn local_mdev_slopes_consistent(
+    slopes: &[f64],
+    expected: Option<PowerLawNoiseType>,
+    tolerance: f64,
+) -> bool {
+    match expected {
+        Some(expected) => slopes
+            .iter()
+            .all(|&slope| classify_mdev_slope(slope, tolerance) == Some(expected)),
+        None => true,
+    }
+}
+
+fn mdev_slope_in_range(
+    mdev: &AllanResult,
+    tau_start_s: f64,
+    tau_end_s: f64,
+    options: PowerLawNoiseOptions,
+) -> (Option<f64>, Option<f64>, bool) {
+    let indices = curve_indices_in_range(mdev, tau_start_s, tau_end_s);
+    if indices.len() < options.min_points_per_octave {
+        return (None, None, false);
+    }
+    let start = indices[0];
+    let end = *indices.last().expect("nonempty indices");
+    let Some(slope) = log_log_slope_for_curve(mdev, start, end) else {
+        return (None, None, false);
+    };
+    let adjacent = adjacent_log_log_slopes(mdev, start, end);
+    let classified = classify_mdev_slope(slope, options.slope_tolerance);
+    let consistent = local_mdev_slopes_consistent(&adjacent, classified, options.slope_tolerance);
+    (Some(slope), robust_slope_scatter(&adjacent), consistent)
+}
+
+fn curve_indices_in_range(curve: &AllanResult, tau_start_s: f64, tau_end_s: f64) -> Vec<usize> {
+    let tolerance = tau_end_s.abs().max(tau_start_s.abs()).max(1.0) * 32.0 * f64::EPSILON;
+    curve
+        .tau_s
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &tau_s)| {
+            if tau_s + tolerance >= tau_start_s && tau_s <= tau_end_s + tolerance {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn classify_adev_slope(slope: f64, tolerance: f64) -> AdevSlopeClass {
+    let phase_target = -1.0;
+    if (slope - phase_target).abs() <= tolerance {
+        return AdevSlopeClass::PhaseModulation;
+    }
+
+    let candidates = [
+        PowerLawNoiseType::RandomWalkFM,
+        PowerLawNoiseType::FlickerFM,
+        PowerLawNoiseType::WhiteFM,
+    ];
+    let mut best = None;
+    let mut best_distance = f64::INFINITY;
+    for noise_type in candidates {
+        let distance = (slope - allan_deviation_power_law_slope(noise_type)).abs();
+        if distance < best_distance {
+            best = Some(noise_type);
+            best_distance = distance;
+        }
+    }
+    if best_distance <= tolerance {
+        AdevSlopeClass::Noise(best.expect("candidate selected"))
+    } else {
+        AdevSlopeClass::Ambiguous
+    }
+}
+
+fn classify_mdev_slope(slope: f64, tolerance: f64) -> Option<PowerLawNoiseType> {
+    let mut best = None;
+    let mut best_distance = f64::INFINITY;
+    for noise_type in POWER_LAW_NOISE_TYPES {
+        let distance = (slope - modified_allan_deviation_power_law_slope(noise_type)).abs();
+        if distance < best_distance {
+            best = Some(noise_type);
+            best_distance = distance;
+        }
+    }
+    if best_distance <= tolerance {
+        best
+    } else {
+        None
+    }
+}
+
+fn build_power_law_regions(
+    octaves: &[PowerLawOctave],
+    adev: &AllanResult,
+    mdev: &AllanResult,
+    options: PowerLawNoiseOptions,
+) -> Vec<PowerLawNoiseRegion> {
+    let mut regions = Vec::new();
+    let mut current: Option<PowerLawNoiseRegion> = None;
+
+    for octave in octaves {
+        let PowerLawOctaveDominance::Dominant(noise_type) = octave.dominance else {
+            if let Some(region) = current.take() {
+                regions.push(region);
+            }
+            continue;
+        };
+        let Some(slope) = octave_slope_for_region(noise_type, octave) else {
+            continue;
+        };
+
+        if current
+            .as_ref()
+            .is_some_and(|region| region.noise_type == noise_type)
+        {
+            let region = current.as_mut().expect("current region");
+            let next_count = region.octave_count + 1;
+            region.tau_end_s = octave.tau_end_s;
+            region.mean_slope =
+                (region.mean_slope * region.octave_count as f64 + slope) / next_count as f64;
+            region.octave_count = next_count;
+        } else {
+            if let Some(region) = current.take() {
+                regions.push(region);
+            }
+            current = Some(PowerLawNoiseRegion {
+                noise_type,
+                tau_start_s: octave.tau_start_s,
+                tau_end_s: octave.tau_end_s,
+                octave_count: 1,
+                point_count: 0,
+                mean_slope: slope,
+                coefficient: f64::NAN,
+            });
+        }
+    }
+
+    if let Some(region) = current {
+        regions.push(region);
+    }
+
+    for region in &mut regions {
+        region.point_count = count_points_for_region(region.noise_type, region, adev, mdev);
+        if let Some(coefficient) = fit_coefficient_for_ranges(
+            region.noise_type,
+            &[(region.tau_start_s, region.tau_end_s)],
+            adev,
+            mdev,
+            options,
+        ) {
+            region.coefficient = coefficient;
+        }
+    }
+
+    regions
+}
+
+fn octave_slope_for_region(noise_type: PowerLawNoiseType, octave: &PowerLawOctave) -> Option<f64> {
+    match noise_type {
+        PowerLawNoiseType::FlickerPM | PowerLawNoiseType::WhitePM => octave.mdev_slope,
+        _ => octave.adev_slope,
+    }
+}
+
+fn count_points_for_region(
+    noise_type: PowerLawNoiseType,
+    region: &PowerLawNoiseRegion,
+    adev: &AllanResult,
+    mdev: &AllanResult,
+) -> usize {
+    let curve = coefficient_curve(noise_type, adev, mdev);
+    curve_indices_in_range(curve, region.tau_start_s, region.tau_end_s).len()
+}
+
+fn fit_coefficient_for_type(
+    noise_type: PowerLawNoiseType,
+    regions: &[PowerLawNoiseRegion],
+    adev: &AllanResult,
+    mdev: &AllanResult,
+    options: PowerLawNoiseOptions,
+) -> Option<f64> {
+    let ranges = regions
+        .iter()
+        .filter(|region| region.noise_type == noise_type)
+        .map(|region| (region.tau_start_s, region.tau_end_s))
+        .collect::<Vec<_>>();
+    fit_coefficient_for_ranges(noise_type, &ranges, adev, mdev, options)
+}
+
+fn fit_coefficient_for_ranges(
+    noise_type: PowerLawNoiseType,
+    ranges: &[(f64, f64)],
+    adev: &AllanResult,
+    mdev: &AllanResult,
+    options: PowerLawNoiseOptions,
+) -> Option<f64> {
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let curve = coefficient_curve(noise_type, adev, mdev);
+    let mut sum_ab = 0.0;
+    let mut sum_aa = 0.0;
+    for (index, &tau_s) in curve.tau_s.iter().enumerate() {
+        if !ranges
+            .iter()
+            .any(|&(start, end)| tau_in_range(tau_s, start, end))
+        {
+            continue;
+        }
+        let factor = power_law_variance_factor(noise_type, tau_s, options)?;
+        if !(factor.is_finite() && factor > 0.0) {
+            return None;
+        }
+        let variance = curve.deviation[index] * curve.deviation[index];
+        if !(variance.is_finite() && variance >= 0.0) {
+            return None;
+        }
+        sum_ab += factor * variance;
+        sum_aa += factor * factor;
+    }
+
+    if sum_aa > 0.0 {
+        Some(sum_ab / sum_aa)
+    } else {
+        None
+    }
+}
+
+fn coefficient_curve<'a>(
+    noise_type: PowerLawNoiseType,
+    adev: &'a AllanResult,
+    mdev: &'a AllanResult,
+) -> &'a AllanResult {
+    match noise_type {
+        PowerLawNoiseType::FlickerPM | PowerLawNoiseType::WhitePM => mdev,
+        _ => adev,
+    }
+}
+
+fn tau_in_range(tau_s: f64, tau_start_s: f64, tau_end_s: f64) -> bool {
+    let tolerance = tau_end_s.abs().max(tau_start_s.abs()).max(1.0) * 32.0 * f64::EPSILON;
+    tau_s + tolerance >= tau_start_s && tau_s <= tau_end_s + tolerance
+}
+
+fn power_law_variance_factor(
+    noise_type: PowerLawNoiseType,
+    tau_s: f64,
+    options: PowerLawNoiseOptions,
+) -> Option<f64> {
+    if !(tau_s.is_finite() && tau_s > 0.0) {
+        return None;
+    }
+    let pi = core::f64::consts::PI;
+    let factor = match noise_type {
+        PowerLawNoiseType::RandomWalkFM => (2.0 * pi * pi / 3.0) * tau_s,
+        PowerLawNoiseType::FlickerFM => 2.0 * core::f64::consts::LN_2,
+        PowerLawNoiseType::WhiteFM => 0.5 / tau_s,
+        PowerLawNoiseType::FlickerPM => {
+            let numerator = 3.0 * (256.0_f64 / 27.0).ln();
+            numerator / (8.0 * pi * pi * tau_s * tau_s)
+        }
+        PowerLawNoiseType::WhitePM => {
+            let numerator = 3.0 * options.measurement_bandwidth_hz * options.basic_tau_s;
+            numerator / (4.0 * pi * pi * tau_s * tau_s * tau_s)
+        }
+    };
+    if factor.is_finite() && factor > 0.0 {
+        Some(factor)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
