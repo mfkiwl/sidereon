@@ -193,8 +193,8 @@ pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies, fusion,
     geodetic_time_series, geometry, geometry_quality, ils, inertial, navigation, nmea, observables,
-    orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas, sidereal, signal,
-    source_localization, ssr, staleness, terrain, tides, velocity,
+    orbit, positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas, sbas_pl, sidereal,
+    signal, source_localization, ssr, staleness, terrain, tides, velocity,
 };
 pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
@@ -211,6 +211,10 @@ pub use sidereon_core::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
     repeat_period, sidereal_filter, solar_day_period, SiderealFilterError, SiderealFilterOptions,
     SiderealFilterOutput, SiderealTemplateMethod, SIDEREAL_DAY_NANOS, SIDEREAL_DAY_SECONDS,
+};
+pub use sidereon_core::{
+    sbas_protection_levels, AirborneModel, DegradationParams, ProtectionGeometry, ProtectionRow,
+    SbasErrorModel, SbasKMultipliers, SbasPlError, SbasProtection, SbasSisError,
 };
 
 /// Stable RTK input, result, option, status, and error types used by the

@@ -106,6 +106,7 @@ mod rinex_qc; // RINEX observation/navigation lint and mechanical repair
 pub mod rtcm; // RTCM 3 differential-GNSS stream decode/encode (MSM, station, ephemeris)
 pub mod rtk; // RTK double-difference construction
 pub mod sbas;
+pub mod sbas_pl; // SBAS single-hypothesis protection levels
 pub mod sidereal; // repeating-geometry residual filtering and period diagnostics
 pub mod signal; // GPS C/A code, coherent correlation, and acquisition
 pub mod source_localization; // ToA/TDOA source localization from arrival times
@@ -193,6 +194,10 @@ pub use inertial::{
     CorrectedImuIncrement, ImuBias, ImuCalibration, ImuErrorModel, ImuGrade, ImuSample,
     ImuSampleKind, ImuSpec, InertialError, MechanizationConfig, NavState, StrapdownMechanizer,
     WGS84_NORMAL_GRAVITY_EQUATOR_MPS2, WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
+};
+pub use sbas_pl::{
+    sbas_protection_levels, AirborneModel, DegradationParams, ProtectionGeometry, ProtectionRow,
+    SbasErrorModel, SbasKMultipliers, SbasPlError, SbasProtection, SbasSisError,
 };
 pub use sidereal::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
