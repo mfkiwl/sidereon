@@ -34,6 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::carrier_phase::CycleSlipOptions;
+use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
 use crate::id::constellation_letter;
 use crate::rtk::{
     apply_elevation_mask, baseline_reference_satellites, dd_ambiguity_token,
@@ -167,6 +168,11 @@ pub struct RtkStaticArcConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RtkStaticArcSolution {
+    /// Geometry observability and covariance-validation diagnostics for the
+    /// static batch design. This mirrors the nested float solution's final
+    /// design; snapshot arc solves use no propagated prior in STEP 2, so
+    /// `ZeroRedundancy` bounds are unvalidated and `Weak` bounds are unclamped.
+    pub geometry_quality: GeometryQuality,
     pub references: BTreeMap<String, String>,
     pub ambiguity_ids: Vec<String>,
     pub ambiguity_satellites: BTreeMap<String, String>,
@@ -260,6 +266,12 @@ pub struct RtkWideLaneArcConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RtkWideLaneArcSolution {
+    /// Geometry observability and covariance-validation diagnostics for the
+    /// wide-lane ambiguity-estimation design. Each fixed ambiguity is one
+    /// parameter and each usable ambiguity sample is one row; with no propagated
+    /// prior in STEP 2, `ZeroRedundancy` bounds are unvalidated and `Weak` bounds
+    /// are unclamped.
+    pub geometry_quality: GeometryQuality,
     pub references: BTreeMap<String, String>,
     pub wide_lane_cycles: BTreeMap<String, i64>,
     pub epochs: Vec<RtkDualFrequencyArcEpoch>,
@@ -683,6 +695,7 @@ pub fn solve_static_rtk_arc(
     .map_err(RtkStaticArcError::Fixed)?;
 
     Ok(RtkStaticArcSolution {
+        geometry_quality: float_solution.geometry_quality,
         references: batch.references,
         ambiguity_ids: batch.ambiguity_ids,
         ambiguity_satellites: batch.ambiguity_satellites,
@@ -715,8 +728,11 @@ pub fn fix_wide_lane_rtk_arc(
                 .map_err(RtkWideLaneArcError::WideLane)?;
         wide_lane_cycles.extend(fixed);
     }
+    let geometry_quality =
+        wide_lane_geometry_quality(&prepared_epochs, &references, &wide_lane_cycles);
 
     Ok(RtkWideLaneArcSolution {
+        geometry_quality,
         references,
         wide_lane_cycles,
         epochs: prepared_epochs,
@@ -1216,6 +1232,95 @@ fn dual_available_satellites(epoch: &RtkDualFrequencyArcEpoch) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn wide_lane_geometry_quality(
+    epochs: &[RtkDualFrequencyArcEpoch],
+    references: &BTreeMap<String, String>,
+    fixed: &BTreeMap<String, i64>,
+) -> GeometryQuality {
+    let n_params = fixed.len();
+    if n_params == 0 {
+        return classify(
+            0,
+            0,
+            0,
+            1.0,
+            0.0,
+            false,
+            GeometryQualityThresholds::default(),
+        );
+    }
+
+    let ambiguity_ids = fixed.keys().collect::<Vec<_>>();
+    let mut counts = vec![0_usize; n_params];
+    for (system, reference_satellite_id) in references {
+        for epoch in epochs {
+            let available = dual_available_satellites(epoch)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let Some(reference) = epoch.observations.iter().find(|observation| {
+                observation.satellite_id == *reference_satellite_id
+                    && available.contains(&observation.satellite_id)
+            }) else {
+                continue;
+            };
+            let reference_sd = sd_ambiguity_token(
+                &reference.satellite_id,
+                &reference.base.ambiguity_id,
+                &reference.rover.ambiguity_id,
+            );
+            for observation in epoch.observations.iter().filter(|observation| {
+                observation.satellite_id != *reference_satellite_id
+                    && available.contains(&observation.satellite_id)
+                    && constellation_letter(&observation.satellite_id) == system
+            }) {
+                let sat_sd = sd_ambiguity_token(
+                    &observation.satellite_id,
+                    &observation.base.ambiguity_id,
+                    &observation.rover.ambiguity_id,
+                );
+                let dd = dd_ambiguity_token(
+                    &observation.satellite_id,
+                    &sat_sd,
+                    reference_satellite_id,
+                    &reference_sd,
+                );
+                if let Some(index) = ambiguity_ids.iter().position(|id| id.as_str() == dd) {
+                    counts[index] += 1;
+                }
+            }
+        }
+    }
+
+    let n_obs: usize = counts.iter().sum();
+    let rank = counts.iter().filter(|&&count| count > 0).count();
+    let condition_number = if rank < n_params {
+        f64::INFINITY
+    } else {
+        let min = counts.iter().copied().min().unwrap_or(0) as f64;
+        let max = counts.iter().copied().max().unwrap_or(0) as f64;
+        (max / min).sqrt()
+    };
+    let gdop = if rank < n_params {
+        f64::INFINITY
+    } else {
+        counts
+            .iter()
+            .map(|&count| 1.0 / count as f64)
+            .sum::<f64>()
+            .sqrt()
+    };
+
+    classify(
+        rank,
+        n_params,
+        n_obs as i32 - n_params as i32,
+        condition_number,
+        gdop,
+        false,
+        GeometryQualityThresholds::default(),
+    )
 }
 
 fn dual_epochs_for_system(epochs: &[RtkDualFrequencyArcEpoch], system: &str) -> Vec<DualEpoch> {
@@ -2504,6 +2609,7 @@ mod tests {
         )
         .expect("fixed");
         RtkStaticArcSolution {
+            geometry_quality: float_solution.geometry_quality,
             references: batch.references,
             ambiguity_ids: batch.ambiguity_ids,
             ambiguity_satellites: batch.ambiguity_satellites,
@@ -2558,6 +2664,7 @@ mod tests {
         assert_eq!(got.converged, expected.converged);
         assert_eq!(got.status, expected.status);
         assert_eq!(got.n_observations, expected.n_observations);
+        assert_eq!(got.geometry_quality, expected.geometry_quality);
         assert_eq!(got.residuals.len(), expected.residuals.len());
         for (got, expected) in got.residuals.iter().zip(&expected.residuals) {
             assert_eq!(got.epoch_index, expected.epoch_index);

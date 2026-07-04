@@ -15,6 +15,7 @@
 //! solve call it directly.
 //! Operation order reproduces the Elixir reference for the frozen-bits golden.
 
+use crate::astro::math::least_squares::singular_value_diagnostics;
 use crate::astro::math::linear::{
     invert_flat_first_tie_into, solve_matrix_flat_first_tie_into, FlatCholeskySolveScratch,
     FlatLinearScratch as InvertFlatScratch, FlatNormalSolveScratch as SolveNormalScratch,
@@ -24,7 +25,11 @@ use crate::estimation::recipe::{EstimationRecipe, NormalRecipe, ResidualNormReci
 use crate::estimation::substrate::normal::NormalAssembler;
 use crate::estimation::substrate::parameters::ParameterLayout;
 use crate::estimation::substrate::qc::normalized_residual;
+use crate::geometry_quality::{
+    classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
+};
 use crate::validate;
+use nalgebra::DMatrix;
 
 use super::{
     dd_epoch_rows_into, fold_measurement_block_indices, rms, BlockFoldScratch, DdRowError,
@@ -91,6 +96,12 @@ pub struct FloatBaselineSolution {
     pub phase_rms_m: f64,
     pub weighted_rms_m: f64,
     pub n_observations: usize,
+    /// Geometry observability and covariance-validation diagnostics for the
+    /// final double-difference design. Snapshot RTK float solves use no
+    /// propagated prior in STEP 2, so `ZeroRedundancy` bounds are unvalidated,
+    /// `Weak` bounds are reported without clamping, and `RankDeficient` is
+    /// routed through [`FloatSolveError::SingularGeometry`].
+    pub geometry_quality: GeometryQuality,
 }
 
 /// Why the static batch float RTK solve could not complete.
@@ -173,6 +184,8 @@ pub(super) struct FloatSolveScratch {
     solve_matrix: InvertFlatScratch,
     cov_invert: InvertFlatScratch,
     cov_inv_invert: InvertFlatScratch,
+    state_covariance: Vec<f64>,
+    state_cov_invert: InvertFlatScratch,
     a: Vec<f64>,
     b: Vec<f64>,
     c: Vec<f64>,
@@ -402,6 +415,18 @@ fn finalize_float_baseline(
         &mut scratch.cov_inv_invert,
     )
     .ok_or(FloatSolveError::SingularGeometry)?;
+    let n_params = ParameterLayout::rtk(ambiguity_ids.len()).dim();
+    let geometry_quality = float_geometry_quality(
+        &scratch.rows,
+        &normal,
+        n_params,
+        &mut scratch.state_covariance,
+        &mut scratch.state_cov_invert,
+    )
+    .ok_or(FloatSolveError::SingularGeometry)?;
+    if geometry_quality.tier == ObservabilityTier::RankDeficient {
+        return Err(FloatSolveError::SingularGeometry);
+    }
     let residuals = float_residuals(&scratch.rows)?;
     let code_rms_m = rms(residuals.iter().map(|r| r.code_m));
     let phase_rms_m = rms(residuals.iter().map(|r| r.phase_m));
@@ -424,7 +449,52 @@ fn finalize_float_baseline(
         phase_rms_m,
         weighted_rms_m,
         n_observations: scratch.rows.len(),
+        geometry_quality,
     })
+}
+
+fn float_geometry_quality(
+    rows: &[DdRowScratch],
+    normal: &[f64],
+    n_params: usize,
+    state_covariance: &mut Vec<f64>,
+    state_cov_invert: &mut InvertFlatScratch,
+) -> Option<GeometryQuality> {
+    if n_params == 0 || normal.len() != n_params.checked_mul(n_params)? {
+        return None;
+    }
+    let mut design = Vec::with_capacity(rows.len().checked_mul(n_params)?);
+    for row in rows {
+        if row.h.len() != n_params {
+            return None;
+        }
+        design.extend_from_slice(&row.h);
+    }
+    let matrix = DMatrix::from_row_slice(rows.len(), n_params, &design);
+    let singular_values = matrix.svd(false, false).singular_values;
+    let diagnostics = singular_value_diagnostics(singular_values.as_slice(), rows.len(), n_params);
+    let gdop = if diagnostics.rank < n_params {
+        f64::INFINITY
+    } else {
+        invert_flat_first_tie_into(normal, n_params, state_covariance, state_cov_invert)?;
+        let trace: f64 = (0..n_params)
+            .map(|idx| state_covariance[idx * n_params + idx])
+            .sum();
+        if trace >= 0.0 && trace.is_finite() {
+            trace.sqrt()
+        } else {
+            f64::INFINITY
+        }
+    };
+    Some(classify(
+        diagnostics.rank,
+        n_params,
+        rows.len() as i32 - n_params as i32,
+        diagnostics.condition_number,
+        gdop,
+        false,
+        GeometryQualityThresholds::default(),
+    ))
 }
 
 /// Map a shared-builder error onto the float solve's error surface.
