@@ -5,6 +5,9 @@ pub use crate::ephemeris::{
 };
 pub use crate::ephemeris::{BroadcastEphemeris, EphemerisSource, Sp3, SP3};
 pub use crate::frame::{ItrfPositionM, ItrfVelocityMS, Wgs84Geodetic};
+pub use crate::fusion::{
+    FusionUpdate, GnssFixMeasurement, InertialFilter, InertialFilterConfig, LooseCouplingConfig,
+};
 pub use crate::id::{GnssSatelliteId, GnssSystem};
 pub use crate::positioning::{solve, Corrections, Observation, Solution, SolveInputs};
 pub use crate::sidereal::{

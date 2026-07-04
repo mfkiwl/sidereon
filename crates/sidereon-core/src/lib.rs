@@ -187,6 +187,10 @@ pub use frame_catalog::{
     HelmertParameters, HelmertRates, HelmertTransform, TerrestrialFrame, TerrestrialPositionM,
     TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
+pub use fusion::{
+    loose_coupling_correction, FusionUpdate, GnssFixMeasurement, InertialFilter,
+    InertialFilterConfig, LooseCouplingConfig,
+};
 pub use geodesic::{geodesic_direct, geodesic_inverse, GeodesicError};
 pub use geoid::{
     egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
