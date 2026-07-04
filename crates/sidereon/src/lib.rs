@@ -187,10 +187,10 @@ pub use sidereon_core::geometry_quality::{
 pub use sidereon_core::quality::spp_robust_fde_driver;
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
-    combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies, geometry,
-    geometry_quality, ils, navigation, nmea, observables, orbit, positioning, ppp_corrections,
-    qc_obs, quality, rinex, rtcm, rtk, sbas, sidereal, signal, source_localization, ssr, staleness,
-    terrain, tides, velocity,
+    combinations, constants, constellation, data, dgnss, dop, ephemeris, frequencies,
+    geodetic_time_series, geometry, geometry_quality, ils, navigation, nmea, observables, orbit,
+    positioning, ppp_corrections, qc_obs, quality, rinex, rtcm, rtk, sbas, sidereal, signal,
+    source_localization, ssr, staleness, terrain, tides, velocity,
 };
 pub use sidereon_core::{
     geodetic_to_itrf, itrf_to_geodetic, FrameValueError, GnssSatelliteId, GnssSystem,
