@@ -18,10 +18,19 @@
 //! screen/ambiguity policy data and dispatches to the technique's reference
 //! entry point, leaving every existing 0-ULP golden unchanged.
 
+pub mod primitives;
 pub mod recipe;
 pub mod strategies;
 pub(crate) mod substrate;
 
+pub use primitives::{
+    alpha_beta_apply_measurement, alpha_beta_filter_step, alpha_beta_predict,
+    alpha_beta_steady_state_gains, cfar_ca_false_alarm_probability, cfar_ca_multiplier_from_pfa,
+    cfar_ca_pfa_from_multiplier, cfar_ca_threshold, ewma_update, ewma_update_power_of_two,
+    kalman_cv_steady_state_gains, mad_spread, nis_expected_value, nis_gate_test,
+    nis_gate_threshold, nis_statistic, normalized_innovation, AlphaBetaGains, AlphaBetaState,
+    AlphaBetaStep, PrimitiveError, ScalarKalmanGains, MAD_GAUSSIAN_CONSISTENCY,
+};
 pub use recipe::{
     AmbiguityIdPolicy, DifferencingMode, EstimationRecipe, FrameRecipe, NormalRecipe,
     PartialResolution, RangeRecipe, ReferenceTarget, ResidualNormRecipe, SagnacRecipe, ScreenKind,
