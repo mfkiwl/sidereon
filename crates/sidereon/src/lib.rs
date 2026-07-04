@@ -321,7 +321,7 @@ pub use sidereon_core::astro::sgp4::{Loss, XScale};
 pub use sidereon_core::astro::space_weather::{
     ObservationClass, SpaceWeatherPolicy, SpaceWeatherSample, SpaceWeatherTable,
 };
-pub use sidereon_core::astro::{passes, propagator, sgp4, space_weather, state, tca, tle};
+pub use sidereon_core::astro::{omm, passes, propagator, sgp4, space_weather, state, tca, tle};
 pub use sidereon_core::ephemeris::{
     fit_precise_ephemeris_state_sample_orbit, fit_precise_ephemeris_state_sample_orbits,
     sp3_ecef_state_to_eci, OrientedPreciseEphemerisStateSample, PreciseEphemerisStateSample,

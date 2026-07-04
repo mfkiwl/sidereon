@@ -220,6 +220,9 @@ pub enum TleFitError {
     DidNotConverge { result: Box<TleFit> },
     #[error("fitted elements failed final validation: {0}")]
     FinalElements(Sgp4Error),
+    /// The final fitted TLE elements could not be encoded as TLE text.
+    #[error("fitted TLE failed encoding: {0}")]
+    TleEncode(tle::TleError),
 }
 
 /// Fit SGP4 mean elements and optional B* to a TEME ephemeris arc.
@@ -649,7 +652,7 @@ fn build_fit(
         .map_err(TleFitError::FinalElements)?;
 
     let tle_elements = tle_elements_from_fit(&elements, &config.metadata)?;
-    let (line1, line2) = tle::encode(&tle_elements);
+    let (line1, line2) = tle::encode(&tle_elements).map_err(TleFitError::TleEncode)?;
     let tle_satellite = Satellite::from_tle_with_opsmode(&line1, &line2, problem.opsmode)
         .map_err(TleFitError::FinalElements)?;
 
