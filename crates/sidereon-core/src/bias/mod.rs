@@ -1705,6 +1705,8 @@ fn parse_sinex_time_scale(label: &str) -> Option<TimeScale> {
         "C" | "BDT" => Some(TimeScale::Bdt),
         "J" | "QZS" | "QZSST" => Some(TimeScale::Qzsst),
         "TAI" => Some(TimeScale::Tai),
+        "TCG" => Some(TimeScale::Tcg),
+        "TCB" => Some(TimeScale::Tcb),
         _ => None,
     }
 }
@@ -1718,7 +1720,9 @@ fn time_scale_sinex_label(scale: TimeScale) -> &'static str {
         TimeScale::Qzsst => "J",
         TimeScale::Tai => "TAI",
         TimeScale::Tt => "TT",
+        TimeScale::Tcg => "TCG",
         TimeScale::Tdb => "TDB",
+        TimeScale::Tcb => "TCB",
     }
 }
 

@@ -1930,7 +1930,9 @@ fn civil_second_policy_for_time_scale(scale: TimeScale) -> validate::CivilSecond
         TimeScale::Utc | TimeScale::Glonasst => validate::CivilSecondPolicy::UtcLike,
         TimeScale::Tai
         | TimeScale::Tt
+        | TimeScale::Tcg
         | TimeScale::Tdb
+        | TimeScale::Tcb
         | TimeScale::Gpst
         | TimeScale::Gst
         | TimeScale::Bdt

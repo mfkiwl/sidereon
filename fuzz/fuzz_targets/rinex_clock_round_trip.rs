@@ -10,7 +10,9 @@ fuzz_target!(|data: &[u8]| {
     let Ok(original) = RinexClock::parse(&text) else {
         return;
     };
-    let encoded = original.to_rinex_string();
+    let encoded = original
+        .to_rinex_string()
+        .expect("parsed RINEX clock time scale must serialize");
     let reparsed = RinexClock::parse(&encoded).expect("encoded RINEX clock must reparse");
     assert_eq!(reparsed, original);
 });

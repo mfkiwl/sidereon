@@ -21,9 +21,13 @@ pub fn week_epoch_julian_day_number(system: TimeScale) -> Option<i64> {
     match system {
         TimeScale::Gpst | TimeScale::Gst | TimeScale::Qzsst => Some(julian_day_number(1980, 1, 6)),
         TimeScale::Bdt => Some(julian_day_number(2006, 1, 1)),
-        TimeScale::Glonasst | TimeScale::Utc | TimeScale::Tai | TimeScale::Tt | TimeScale::Tdb => {
-            None
-        }
+        TimeScale::Glonasst
+        | TimeScale::Utc
+        | TimeScale::Tai
+        | TimeScale::Tt
+        | TimeScale::Tcg
+        | TimeScale::Tdb
+        | TimeScale::Tcb => None,
     }
 }
 
