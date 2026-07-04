@@ -16,7 +16,11 @@ pub use crate::broadcast::{
     ClockOffset, ClockPolynomial, CnavRates, ConstellationConstants, EccentricAnomaly,
     KeplerianElements, OrbitState, SatelliteState,
 };
-pub use crate::observables::{ObservableEphemerisSource, ObservablesError};
+pub use crate::observables::{
+    is_observable_state_gap, observable_states_at_j2000_s, observable_states_at_shared_j2000_s,
+    ObservableEphemerisSource, ObservableStateBatch, ObservableStateElementStatus,
+    ObservablesError, OBSERVABLE_STATE_MISSING_POSITION_ECEF_M,
+};
 use crate::observables::{ObservableState, ObservablesInputErrorKind};
 pub use crate::rinex_nav::{
     cnav_ura_ned_m, cnav_ura_nominal_m, is_beidou_geo, BroadcastGroupDelayTerm,
@@ -26,8 +30,9 @@ pub use crate::rinex_nav::{
 };
 pub use crate::sp3::{
     align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
-    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport, PreciseEphemerisSample,
-    PreciseEphemerisSamples, PreciseSamplesError, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State,
+    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport,
+    PreciseEphemerisInterpolant, PreciseEphemerisSample, PreciseEphemerisSamples,
+    PreciseInterpolantError, PreciseSamplesError, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State,
     Sp3TimeSystem, Sp3Version,
 };
 pub use crate::spp::EphemerisSource;
@@ -219,7 +224,9 @@ fn sample_one(
 ) -> core::result::Result<EphemerisSampleRow, ObservablesError> {
     match source.observable_state_at_j2000_s(sat, epoch_j2000_s) {
         Ok(state) => sample_row_from_state(sat, epoch_j2000_s, state),
-        Err(error) if is_gap_error(&error) => Ok(EphemerisSampleRow::gap(sat, epoch_j2000_s)),
+        Err(error) if is_observable_state_gap(&error) => {
+            Ok(EphemerisSampleRow::gap(sat, epoch_j2000_s))
+        }
         Err(error) => Err(error),
     }
 }
@@ -240,15 +247,6 @@ fn sample_row_from_state(
         state.position_ecef_m,
         state.clock_s,
     ))
-}
-
-fn is_gap_error(error: &ObservablesError) -> bool {
-    matches!(
-        error,
-        ObservablesError::NoEphemeris
-            | ObservablesError::Ephemeris(crate::Error::EpochOutOfRange)
-            | ObservablesError::Ephemeris(crate::Error::UnknownSatellite(_))
-    )
 }
 
 fn map_sample_input_error(error: validate::FieldError) -> ObservablesError {

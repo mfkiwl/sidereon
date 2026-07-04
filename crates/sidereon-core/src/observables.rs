@@ -33,6 +33,41 @@ pub struct ObservableState {
     pub clock_s: Option<f64>,
 }
 
+/// Position sentinel written for a failed element in [`ObservableStateBatch`].
+///
+/// The matching [`ObservableStateBatch::element_results`] entry carries the
+/// exact scalar error. Consumers must check that result entry before using the
+/// position or clock arrays.
+pub const OBSERVABLE_STATE_MISSING_POSITION_ECEF_M: [f64; 3] = [f64::NAN; 3];
+
+/// Per-element category for a batched satellite-state query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservableStateElementStatus {
+    /// The element contains a usable state.
+    Valid,
+    /// The source has no usable state for this satellite and epoch.
+    Gap,
+    /// The scalar evaluator returned an error that is not a gap.
+    Error,
+}
+
+/// Contiguous output arrays for a batched satellite-state query.
+///
+/// Element `i` of `positions_ecef_m`, `clocks_s`, and `element_results` belongs
+/// to input satellite `i`. When `element_results[i]` is `Ok(())`, the position
+/// and clock entries are the exact [`ObservableState`] returned by the scalar
+/// evaluator. When it is `Err`, `positions_ecef_m[i]` is
+/// [`OBSERVABLE_STATE_MISSING_POSITION_ECEF_M`] and `clocks_s[i]` is `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservableStateBatch {
+    /// Satellite ECEF positions in meters, one entry per input element.
+    pub positions_ecef_m: Vec<[f64; 3]>,
+    /// Satellite clock offsets in seconds, one entry per input element.
+    pub clocks_s: Vec<Option<f64>>,
+    /// Per-element scalar result, preserving the exact scalar error on failure.
+    pub element_results: Vec<Result<(), ObservablesError>>,
+}
+
 /// An ephemeris product usable by [`predict`].
 pub trait ObservableEphemerisSource {
     /// ECEF position and optional satellite clock at seconds since J2000.
@@ -41,6 +76,46 @@ pub trait ObservableEphemerisSource {
         sat: GnssSatelliteId,
         t_j2000_s: f64,
     ) -> Result<ObservableState, ObservablesError>;
+
+    /// ECEF states for parallel satellite and epoch arrays.
+    ///
+    /// `satellites[i]` is evaluated at `epochs_j2000_s[i]`. The output is
+    /// index-aligned with the input and preserves the scalar result for every
+    /// element. A length mismatch is the only batch-level error.
+    fn observable_states_at_j2000_s(
+        &self,
+        satellites: &[GnssSatelliteId],
+        epochs_j2000_s: &[f64],
+    ) -> Result<ObservableStateBatch, ObservablesError> {
+        if satellites.len() != epochs_j2000_s.len() {
+            return Err(ObservablesError::InvalidInput {
+                field: "epochs_j2000_s",
+                kind: ObservablesInputErrorKind::OutOfRange,
+            });
+        }
+
+        let mut batch = ObservableStateBatch::with_capacity(satellites.len());
+        for (&sat, &epoch_j2000_s) in satellites.iter().zip(epochs_j2000_s.iter()) {
+            batch.push_state_result(self.observable_state_at_j2000_s(sat, epoch_j2000_s));
+        }
+        Ok(batch)
+    }
+
+    /// ECEF states for many satellites at one shared epoch.
+    ///
+    /// The output is index-aligned with `satellites` and preserves the scalar
+    /// result for every element.
+    fn observable_states_at_shared_j2000_s(
+        &self,
+        satellites: &[GnssSatelliteId],
+        epoch_j2000_s: f64,
+    ) -> ObservableStateBatch {
+        let mut batch = ObservableStateBatch::with_capacity(satellites.len());
+        for &sat in satellites {
+            batch.push_state_result(self.observable_state_at_j2000_s(sat, epoch_j2000_s));
+        }
+        batch
+    }
 }
 
 impl ObservableEphemerisSource for Sp3 {
@@ -164,6 +239,81 @@ impl core::fmt::Display for ObservablesError {
 
 impl std::error::Error for ObservablesError {}
 
+impl ObservableStateBatch {
+    /// Build an empty batch with capacity for `capacity` elements.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            positions_ecef_m: Vec::with_capacity(capacity),
+            clocks_s: Vec::with_capacity(capacity),
+            element_results: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Number of elements in the batch.
+    pub fn len(&self) -> usize {
+        self.element_results.len()
+    }
+
+    /// Whether the batch contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.element_results.is_empty()
+    }
+
+    /// Reconstruct element `index` as the scalar state result.
+    ///
+    /// Returns `None` when `index` is out of range.
+    pub fn element(&self, index: usize) -> Option<Result<ObservableState, &ObservablesError>> {
+        match self.element_results.get(index)? {
+            Ok(()) => Some(Ok(ObservableState {
+                position_ecef_m: self.positions_ecef_m[index],
+                clock_s: self.clocks_s[index],
+            })),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// Status category for element `index`.
+    ///
+    /// Returns `None` when `index` is out of range.
+    pub fn element_status(&self, index: usize) -> Option<ObservableStateElementStatus> {
+        match self.element_results.get(index)? {
+            Ok(()) => Some(ObservableStateElementStatus::Valid),
+            Err(error) if is_observable_state_gap(error) => Some(ObservableStateElementStatus::Gap),
+            Err(_) => Some(ObservableStateElementStatus::Error),
+        }
+    }
+
+    fn push_state_result(&mut self, result: Result<ObservableState, ObservablesError>) {
+        match result {
+            Ok(state) => {
+                self.positions_ecef_m.push(state.position_ecef_m);
+                self.clocks_s.push(state.clock_s);
+                self.element_results.push(Ok(()));
+            }
+            Err(error) => {
+                self.positions_ecef_m
+                    .push(OBSERVABLE_STATE_MISSING_POSITION_ECEF_M);
+                self.clocks_s.push(None);
+                self.element_results.push(Err(error));
+            }
+        }
+    }
+}
+
+/// Whether a scalar observable-state error represents a data gap.
+///
+/// This is the same classification used by ephemeris grid sampling: missing
+/// data, out-of-range precise interpolation, and unknown satellites are gaps;
+/// malformed inputs and other source errors are not.
+pub fn is_observable_state_gap(error: &ObservablesError) -> bool {
+    matches!(
+        error,
+        ObservablesError::NoEphemeris
+            | ObservablesError::Ephemeris(crate::Error::EpochOutOfRange)
+            | ObservablesError::Ephemeris(crate::Error::UnknownSatellite(_))
+    )
+}
+
 /// Options controlling observable prediction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PredictOptions {
@@ -274,6 +424,29 @@ pub fn j2000_seconds_from_split(jd_whole: f64, jd_fraction: f64) -> Result<f64, 
         "j2000_seconds",
     )
     .map_err(map_input_error)
+}
+
+/// Evaluate ECEF states for parallel satellite and epoch arrays.
+///
+/// This delegates to [`ObservableEphemerisSource::observable_states_at_j2000_s`].
+pub fn observable_states_at_j2000_s(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    epochs_j2000_s: &[f64],
+) -> Result<ObservableStateBatch, ObservablesError> {
+    source.observable_states_at_j2000_s(satellites, epochs_j2000_s)
+}
+
+/// Evaluate ECEF states for many satellites at one shared epoch.
+///
+/// This delegates to
+/// [`ObservableEphemerisSource::observable_states_at_shared_j2000_s`].
+pub fn observable_states_at_shared_j2000_s(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    epoch_j2000_s: f64,
+) -> ObservableStateBatch {
+    source.observable_states_at_shared_j2000_s(satellites, epoch_j2000_s)
 }
 
 /// Evaluate a satellite's transmit-time ECEF state for one static receiver.

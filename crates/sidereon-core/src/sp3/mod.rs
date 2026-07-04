@@ -1066,6 +1066,7 @@ fn next_field<T: std::str::FromStr>(
 
 mod combine;
 mod interp;
+mod interpolant;
 mod samples;
 mod write;
 
@@ -1073,6 +1074,7 @@ pub use combine::{
     align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
     EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport,
 };
+pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
 pub use samples::{PreciseEphemerisSample, PreciseEphemerisSamples, PreciseSamplesError};
 
 #[cfg(all(test, sidereon_repo_tests))]

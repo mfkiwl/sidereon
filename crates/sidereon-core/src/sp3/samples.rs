@@ -46,7 +46,7 @@ use crate::astro::time::model::{Instant, TimeScale};
 use crate::constants::{KM_TO_M, US_TO_S};
 use crate::id::GnssSatelliteId;
 use crate::observables::{ObservableEphemerisSource, ObservableState, ObservablesError};
-use crate::sp3::interp::{instant_to_j2000_seconds, interpolate_precise_state};
+use crate::sp3::interp::{instant_to_j2000_seconds, interpolate_precise_state, PreciseSatSeries};
 use crate::sp3::{Sp3, Sp3State};
 use crate::{Error, Result};
 
@@ -143,18 +143,6 @@ impl core::fmt::Display for PreciseSamplesError {
 
 impl std::error::Error for PreciseSamplesError {}
 
-/// Per-satellite node series in the file-native fit units, ready for the shared
-/// interpolation substrate: floored J2000-second axis, km position axes, and
-/// native `(x, clock_us, clock_event)` clock nodes.
-#[derive(Debug, Clone, PartialEq)]
-struct SatSeries {
-    x: Vec<f64>,
-    kx: Vec<f64>,
-    ky: Vec<f64>,
-    kz: Vec<f64>,
-    clk: Vec<(f64, f64, bool)>,
-}
-
 /// A precise-ephemeris source built from samples rather than parsed text.
 ///
 /// Implements [`crate::observables::ObservableEphemerisSource`] and exposes the
@@ -163,7 +151,7 @@ struct SatSeries {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreciseEphemerisSamples {
     time_scale: TimeScale,
-    nodes: BTreeMap<GnssSatelliteId, SatSeries>,
+    nodes: BTreeMap<GnssSatelliteId, PreciseSatSeries>,
 }
 
 impl PreciseEphemerisSamples {
@@ -182,7 +170,7 @@ impl PreciseEphemerisSamples {
         samples: impl IntoIterator<Item = PreciseEphemerisSample>,
     ) -> core::result::Result<Self, PreciseSamplesError> {
         let mut time_scale: Option<TimeScale> = None;
-        let mut grouped: BTreeMap<GnssSatelliteId, SatSeries> = BTreeMap::new();
+        let mut grouped: BTreeMap<GnssSatelliteId, PreciseSatSeries> = BTreeMap::new();
 
         for sample in samples {
             match time_scale {
@@ -213,13 +201,9 @@ impl PreciseEphemerisSamples {
             // SI -> file-native fit units. The single divide is the correctly
             // rounded inverse of the SP3 parser's `km * KM_TO_M` / `us * US_TO_S`
             // (see the module docs for the non-injective boundary).
-            let series = grouped.entry(sample.sat).or_insert_with(|| SatSeries {
-                x: Vec::new(),
-                kx: Vec::new(),
-                ky: Vec::new(),
-                kz: Vec::new(),
-                clk: Vec::new(),
-            });
+            let series = grouped
+                .entry(sample.sat)
+                .or_insert_with(PreciseSatSeries::new);
             series.x.push(xi);
             series.kx.push(sample.position_ecef_m[0] / KM_TO_M);
             series.ky.push(sample.position_ecef_m[1] / KM_TO_M);
@@ -266,6 +250,10 @@ impl PreciseEphemerisSamples {
     /// The satellites this source can interpolate, in ascending order.
     pub fn satellites(&self) -> impl Iterator<Item = GnssSatelliteId> + '_ {
         self.nodes.keys().copied()
+    }
+
+    pub(super) fn node_series(&self) -> &BTreeMap<GnssSatelliteId, PreciseSatSeries> {
+        &self.nodes
     }
 
     /// Interpolate the state of `sat` at an arbitrary J2000-second epoch.
