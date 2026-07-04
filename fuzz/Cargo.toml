@@ -119,6 +119,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "tdm_parse"
+path = "fuzz_targets/tdm_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tdm_round_trip"
+path = "fuzz_targets/tdm_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "omm_xml_parse"
 path = "fuzz_targets/omm_xml_parse.rs"
 test = false

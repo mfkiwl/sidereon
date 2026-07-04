@@ -34,8 +34,8 @@
 //!   surface,
 //! - [`astro`] exposes time/frame conversions, Sun/Moon positions, RF link
 //!   budgets, solar beta angles, equinoctial element transforms, eclipse
-//!   events, conjunction/covariance utilities, CDM/OMM parsing, TCA screening,
-//!   and orbit propagation,
+//!   events, conjunction/covariance utilities, CDM/OMM/TDM parsing, TCA
+//!   screening, and orbit propagation,
 //! - [`tle`], [`sgp4`], [`passes`], and [`tca`] remain root-level shortcuts for
 //!   SGP4/TLE propagation, topocentric az/el/range over a ground station, and
 //!   close-approach screening,
@@ -321,7 +321,9 @@ pub use sidereon_core::astro::sgp4::{Loss, XScale};
 pub use sidereon_core::astro::space_weather::{
     ObservationClass, SpaceWeatherPolicy, SpaceWeatherSample, SpaceWeatherTable,
 };
-pub use sidereon_core::astro::{omm, passes, propagator, sgp4, space_weather, state, tca, tle};
+pub use sidereon_core::astro::{
+    omm, passes, propagator, sgp4, space_weather, state, tca, tdm, tle,
+};
 pub use sidereon_core::ephemeris::{
     fit_precise_ephemeris_state_sample_orbit, fit_precise_ephemeris_state_sample_orbits,
     sp3_ecef_state_to_eci, OrientedPreciseEphemerisStateSample, PreciseEphemerisStateSample,
@@ -1642,6 +1644,7 @@ mod tests {
         assert!(core::mem::size_of::<astro::conjunction::ConjunctionState>() > 0);
         assert!(core::mem::size_of::<astro::frames::transforms::TemeStateKm>() > 0);
         assert!(core::mem::size_of::<astro::omm::Omm>() > 0);
+        assert!(core::mem::size_of::<astro::tdm::Tdm>() > 0);
     }
 
     #[test]

@@ -50,6 +50,7 @@ pub mod space_weather;
 pub mod spk;
 pub mod state;
 pub mod tca;
+pub mod tdm;
 pub mod time;
 pub mod tle;
 pub mod tolerances;
