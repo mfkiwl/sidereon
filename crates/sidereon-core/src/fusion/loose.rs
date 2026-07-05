@@ -21,6 +21,7 @@ use super::ekf::{
 use super::error_state::{
     linearize_error_state_ecef, predict_error_state_covariance, ErrorStateImuKinematics,
 };
+use super::smoother::FusionPredictionStep;
 use super::state::FusionFilterKind;
 use super::state::{
     invalid_input, validate_covariance_matrix, validate_positive, FusionError, InsFilterState,
@@ -427,7 +428,10 @@ impl InertialFilter {
         Ok(&self.state)
     }
 
-    pub(super) fn propagate_core(&mut self, sample: ImuSample) -> Result<(), FusionError> {
+    pub(super) fn propagate_core(
+        &mut self,
+        sample: ImuSample,
+    ) -> Result<FusionPredictionStep, FusionError> {
         self.state.validate()?;
         self.config.validate()?;
         self.tight.align_with_filter_state(&self.state)?;
@@ -471,7 +475,9 @@ impl InertialFilter {
         self.state.reset_error_state();
         self.last_body_rate_wrt_ecef_rps = body_rate_wrt_ecef_rps;
         self.state.validate()?;
-        Ok(())
+        Ok(FusionPredictionStep {
+            transition: linearization.phi,
+        })
     }
 
     /// Apply a loose GNSS PVT update at the current propagated epoch.

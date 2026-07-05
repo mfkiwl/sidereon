@@ -7,6 +7,7 @@ pub mod ekf;
 pub mod error_state;
 pub mod loose;
 pub mod serial;
+pub mod smoother;
 pub mod state;
 pub mod tight;
 pub mod timesync;
@@ -36,6 +37,10 @@ pub use serial::{
     SerializableTightGnssEpoch, SerializableTightGnssObservation,
     SerializableTightRangeRateObservation, SerializableTimeSyncHistory,
     SerializableTimeSyncHistoryConfig, FUSION_STATE_CODEC_VERSION,
+};
+pub use smoother::{
+    smooth_fusion_rts, FusionRtsEpoch, FusionRtsHistory, FusionRtsHistoryBuilder,
+    SmoothedFusionEpoch, SmoothedFusionTrajectory,
 };
 pub use state::{
     covariance_is_positive_semidefinite, reproject_covariance_psd, validate_covariance_matrix,

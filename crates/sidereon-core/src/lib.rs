@@ -192,8 +192,9 @@ pub use frame_catalog::{
     TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
 pub use fusion::{
-    loose_coupling_correction, ukf_correct_closed_loop, validate_time_sync_gnss_order,
-    validate_time_sync_imu_order, F64Bits, FusionFilterKind, FusionStateCodecError, FusionUpdate,
+    loose_coupling_correction, smooth_fusion_rts, ukf_correct_closed_loop,
+    validate_time_sync_gnss_order, validate_time_sync_imu_order, F64Bits, FusionFilterKind,
+    FusionRtsEpoch, FusionRtsHistory, FusionRtsHistoryBuilder, FusionStateCodecError, FusionUpdate,
     GnssFixMeasurement, IggIiiMeasurementReweighting, InertialFilter, InertialFilterConfig,
     LooseCouplingConfig, SerializableErrorStateLayout, SerializableFusionSnapshot,
     SerializableFusionState, SerializableImuSample, SerializableImuSampleKind,
@@ -203,10 +204,10 @@ pub use fusion::{
     SerializableTightCarrierPhaseObservation, SerializableTightFilterState,
     SerializableTightGnssEpoch, SerializableTightGnssObservation,
     SerializableTightRangeRateObservation, SerializableTimeSyncHistory,
-    SerializableTimeSyncHistoryConfig, TimeSyncHistoryConfig, TimeSyncHistoryStatus,
-    TimeSyncUpdate, UkfUpdateOptions, UnscentedTransformOptions, YangPredictionAdaptiveFactor,
-    DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
-    FUSION_STATE_CODEC_VERSION,
+    SerializableTimeSyncHistoryConfig, SmoothedFusionEpoch, SmoothedFusionTrajectory,
+    TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate, UkfUpdateOptions,
+    UnscentedTransformOptions, YangPredictionAdaptiveFactor, DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY,
+    DEFAULT_TIME_SYNC_IMU_CAPACITY, FUSION_STATE_CODEC_VERSION,
 };
 pub use geodesic::{geodesic_direct, geodesic_inverse, GeodesicError};
 pub use geofence::{

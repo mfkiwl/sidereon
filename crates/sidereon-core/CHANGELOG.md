@@ -10,6 +10,9 @@ All notable changes to `sidereon-core` are documented here.
   Yang two-segment prediction adaptive factor. The prediction factor is gated
   by a Jiang-Zhang Mahalanobis measurement-outlier check so measurement faults
   use measurement reweighting rather than innovation-driven covariance scaling.
+- Fusion RTS fixed-interval smoothing over recorded error-state histories,
+  with recorded forward-pass transitions, predicted and updated checkpoints,
+  smoothed covariances, and loose/tight measurement-agnostic entry points.
 
 ## [0.17.0]
 
