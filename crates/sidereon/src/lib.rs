@@ -209,6 +209,13 @@ pub use sidereon_core::{
     TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
 pub use sidereon_core::{
+    emission_media_batch_at_j2000_s, observable_media_corrections, predict_batch_with_media,
+    predict_batch_with_media_parallel, predict_ranges_with_media, predict_with_media,
+    AppliedMediaCorrections, EmissionMediaBatch, EmissionMediaBatchOptions, EmissionMediaStatus,
+    MediaPredictOptions, MediaPredictedObservables, MediaRangePrediction,
+    ObservableIonosphereCorrection, ObservableMediaOptions, ObservableTroposphereCorrection,
+};
+pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
     mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, simulate_imu_samples,
     simulate_imu_samples_from_increments, true_imu_increment_between, AttitudeQuaternion,
@@ -222,12 +229,6 @@ pub use sidereon_core::{
     geodesic_direct, geodesic_inverse, geodetic_to_itrf, itrf_to_geodetic, FrameValueError,
     GeodesicError, GnssSatelliteId, GnssSystem, ItrfPositionM, ItrfVelocityMS, ProtectionModel,
     SatelliteIdError, Wgs84Geodetic,
-};
-pub use sidereon_core::{
-    observable_media_corrections, predict_batch_with_media, predict_batch_with_media_parallel,
-    predict_ranges_with_media, predict_with_media, AppliedMediaCorrections, MediaPredictOptions,
-    MediaPredictedObservables, MediaRangePrediction, ObservableIonosphereCorrection,
-    ObservableMediaOptions, ObservableTroposphereCorrection,
 };
 pub use sidereon_core::{
     orbit_repeat_lag, periodicity_strength, periodicity_strength_with_sample_interval,
