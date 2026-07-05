@@ -7,8 +7,9 @@
 use std::collections::BTreeSet;
 
 use crate::astro::math::mat3::{inline_rxr, mul_vec3};
-use crate::astro::math::vec3::{add3, cross3};
+use crate::astro::math::vec3::{add3, cross3, norm3, sub3};
 use crate::constants::C_M_S;
+use crate::estimation::recipe::{FrameRecipe, RangeRecipe, SagnacRecipe};
 use crate::inertial::state::skew;
 use crate::inertial::{validate_finite, validate_vec3};
 use crate::observables::{
@@ -16,6 +17,10 @@ use crate::observables::{
 };
 use crate::precise_positioning::{
     predict_range_rate_m_s, ReceiverVelocityState, VelocityObservation,
+};
+use crate::spp::{
+    sat_model, Corrections, EphemerisSource, KlobucharCoeffs, SatModelEnv, SppIonosphere,
+    SppModelRecipe, SurfaceMet,
 };
 
 use super::ekf::{
@@ -187,7 +192,8 @@ impl TightGnssEpoch {
 pub struct TightCouplingConfig {
     /// Body-frame vector from IMU origin to GNSS antenna phase center, in meters.
     pub lever_arm_body_m: [f64; 3],
-    /// Apply fixed-count transmit-time light-time correction.
+    /// Apply the SPP measured-pseudorange transmit-time light-time correction to
+    /// code and carrier-phase rows.
     pub light_time: bool,
     /// Apply Earth-rotation Sagnac correction.
     pub sagnac: bool,
@@ -565,26 +571,24 @@ pub(super) fn tight_coupling_correction(
     let mut variances = Vec::new();
 
     for observation in &epoch.observations {
-        let satellite = transmit_time_satellite_state(
+        let code_satellite = tight_code_satellite_prediction(
             source,
             observation.satellite_id,
             kinematics.antenna_position_ecef_m,
             epoch.t_j2000_s,
+            observation.pseudorange_m,
             options,
         )
         .map_err(map_observables_error)?;
-        let sat_clock_s = satellite
-            .clock_s
-            .ok_or_else(|| invalid_input("satellite_clock_s", "must be present"))?;
 
-        let code_prediction_m = satellite.geometric_range_m + tight_state.clock_bias_m
-            - C_M_S * sat_clock_s
+        let code_prediction_m = code_satellite.clock_corrected_range_m
+            + tight_state.clock_bias_m
             + observation.ionosphere_delay_m
             + observation.troposphere_delay_m;
         let mut row = pseudorange_design_row(
             aug_dim,
             clock_bias,
-            satellite.los_unit,
+            code_satellite.los_unit,
             kinematics.lever_arm_ecef_m,
         );
         innovation.push(observation.pseudorange_m - code_prediction_m);
@@ -592,15 +596,15 @@ pub(super) fn tight_coupling_correction(
         variances.push(observation.pseudorange_sigma_m * observation.pseudorange_sigma_m);
 
         if let Some(carrier_phase) = observation.carrier_phase {
-            let phase_prediction_m = satellite.geometric_range_m + tight_state.clock_bias_m
-                - C_M_S * sat_clock_s
+            let phase_prediction_m = code_satellite.clock_corrected_range_m
+                + tight_state.clock_bias_m
                 - observation.ionosphere_delay_m
                 + observation.troposphere_delay_m
                 + carrier_phase.float_ambiguity_m;
             row = pseudorange_design_row(
                 aug_dim,
                 clock_bias,
-                satellite.los_unit,
+                code_satellite.los_unit,
                 kinematics.lever_arm_ecef_m,
             );
             innovation.push(carrier_phase.phase_range_m - phase_prediction_m);
@@ -609,6 +613,14 @@ pub(super) fn tight_coupling_correction(
         }
 
         if let Some(range_rate) = observation.range_rate {
+            let satellite = transmit_time_satellite_state(
+                source,
+                observation.satellite_id,
+                kinematics.antenna_position_ecef_m,
+                epoch.t_j2000_s,
+                options,
+            )
+            .map_err(map_observables_error)?;
             let velocity_observation = VelocityObservation {
                 sat: observation.satellite_id,
                 satellite_position_m: satellite.position_ecef_m,
@@ -871,27 +883,25 @@ fn tight_measurement_predictions(
     };
     let mut predictions = Vec::new();
     for observation in &epoch.observations {
-        let satellite = transmit_time_satellite_state(
+        let code_satellite = tight_code_satellite_prediction(
             source,
             observation.satellite_id,
             kinematics.antenna_position_ecef_m,
             epoch.t_j2000_s,
+            observation.pseudorange_m,
             options,
         )
         .map_err(map_observables_error)?;
-        let sat_clock_s = satellite
-            .clock_s
-            .ok_or_else(|| invalid_input("satellite_clock_s", "must be present"))?;
         predictions.push(
-            satellite.geometric_range_m + clock_bias_m - C_M_S * sat_clock_s
+            code_satellite.clock_corrected_range_m
+                + clock_bias_m
                 + observation.ionosphere_delay_m
                 + observation.troposphere_delay_m,
         );
 
         if let Some(carrier_phase) = observation.carrier_phase {
             predictions.push(
-                satellite.geometric_range_m + clock_bias_m
-                    - C_M_S * sat_clock_s
+                code_satellite.clock_corrected_range_m + clock_bias_m
                     - observation.ionosphere_delay_m
                     + observation.troposphere_delay_m
                     + carrier_phase.float_ambiguity_m,
@@ -899,6 +909,14 @@ fn tight_measurement_predictions(
         }
 
         if let Some(range_rate) = observation.range_rate {
+            let satellite = transmit_time_satellite_state(
+                source,
+                observation.satellite_id,
+                kinematics.antenna_position_ecef_m,
+                epoch.t_j2000_s,
+                options,
+            )
+            .map_err(map_observables_error)?;
             let velocity_observation = VelocityObservation {
                 sat: observation.satellite_id,
                 satellite_position_m: satellite.position_ecef_m,
@@ -919,6 +937,124 @@ fn tight_measurement_predictions(
     }
     validate_finite_slice(&predictions, "tight_prediction")?;
     Ok(predictions)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodeSatellitePrediction {
+    clock_corrected_range_m: f64,
+    los_unit: [f64; 3],
+}
+
+fn tight_code_satellite_prediction(
+    source: &dyn ObservableEphemerisSource,
+    sat: crate::GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    pseudorange_m: f64,
+    options: TransmitTimeOptions,
+) -> Result<CodeSatellitePrediction, ObservablesError> {
+    if options.light_time {
+        return spp_code_satellite_prediction(
+            source,
+            sat,
+            receiver_ecef_m,
+            t_rx_j2000_s,
+            pseudorange_m,
+            options.sagnac,
+        );
+    }
+
+    let satellite =
+        transmit_time_satellite_state(source, sat, receiver_ecef_m, t_rx_j2000_s, options)?;
+    let sat_clock_s = satellite.clock_s.ok_or(ObservablesError::NoEphemeris)?;
+    Ok(CodeSatellitePrediction {
+        clock_corrected_range_m: satellite.geometric_range_m - C_M_S * sat_clock_s,
+        los_unit: satellite.los_unit,
+    })
+}
+
+fn spp_code_satellite_prediction(
+    source: &dyn ObservableEphemerisSource,
+    sat: crate::GnssSatelliteId,
+    receiver_ecef_m: [f64; 3],
+    t_rx_j2000_s: f64,
+    pseudorange_m: f64,
+    sagnac: bool,
+) -> Result<CodeSatellitePrediction, ObservablesError> {
+    let source = ObservableClockSource { source };
+    let glonass_channels = std::collections::BTreeMap::new();
+    let met = SurfaceMet::default();
+    let env = SatModelEnv {
+        eph: &source,
+        t_rx_j2000_s,
+        t_rx_second_of_day_s: 0.0,
+        day_of_year: 1.0,
+        corrections: Corrections::NONE,
+        met: &met,
+        glonass_channels: &glonass_channels,
+        model: SppModelRecipe {
+            range: RangeRecipe::SppMeasuredPseudorangeFixedIter,
+            sagnac: if sagnac {
+                SagnacRecipe::ClosedFormZRotation
+            } else {
+                SagnacRecipe::Off
+            },
+            frame: FrameRecipe::SppSkyfieldAuThreeIter,
+        },
+    };
+    let model = sat_model(
+        &env,
+        sat,
+        receiver_ecef_m,
+        0.0,
+        pseudorange_m,
+        SppIonosphere::Klobuchar(KlobucharCoeffs {
+            alpha: [0.0; 4],
+            beta: [0.0; 4],
+        }),
+    )
+    .ok_or(ObservablesError::NoEphemeris)?;
+    let line_of_sight = sub3(model.sat_rot_ecef_m, receiver_ecef_m);
+    let range = norm3(line_of_sight);
+    if !range.is_finite() || range <= 0.0 {
+        return Err(ObservablesError::InvalidInput {
+            field: "receiver_ecef_m",
+            kind: crate::observables::ObservablesInputErrorKind::OutOfRange,
+        });
+    }
+    let los_unit = [
+        line_of_sight[0] / range,
+        line_of_sight[1] / range,
+        line_of_sight[2] / range,
+    ];
+    crate::validate::finite_vec3(los_unit, "los_unit").map_err(|_| {
+        ObservablesError::InvalidInput {
+            field: "receiver_ecef_m",
+            kind: crate::observables::ObservablesInputErrorKind::OutOfRange,
+        }
+    })?;
+    Ok(CodeSatellitePrediction {
+        clock_corrected_range_m: model.p_hat_m,
+        los_unit,
+    })
+}
+
+struct ObservableClockSource<'a> {
+    source: &'a dyn ObservableEphemerisSource,
+}
+
+impl EphemerisSource for ObservableClockSource<'_> {
+    fn position_clock_at_j2000_s(
+        &self,
+        sat: crate::GnssSatelliteId,
+        t_j2000_s: f64,
+    ) -> Option<([f64; 3], f64)> {
+        let state = self
+            .source
+            .observable_state_at_j2000_s(sat, t_j2000_s)
+            .ok()?;
+        Some((state.position_ecef_m, state.clock_s?))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1472,6 +1608,302 @@ mod tests {
         assert_eq!(
             correction.innovation[1].to_bits(),
             (measured - predicted_at_nominal.range_rate_m_s).to_bits()
+        );
+    }
+
+    #[derive(Debug, Clone)]
+    struct MovingClockSource {
+        t0_j2000_s: f64,
+        states: Vec<MovingClockState>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct MovingClockState {
+        satellite_id: GnssSatelliteId,
+        position_ecef_m: [f64; 3],
+        velocity_ecef_m_s: [f64; 3],
+        clock_s: f64,
+        clock_drift_s_s: f64,
+    }
+
+    impl ObservableEphemerisSource for MovingClockSource {
+        fn observable_state_at_j2000_s(
+            &self,
+            sat: GnssSatelliteId,
+            t_j2000_s: f64,
+        ) -> Result<ObservableState, ObservablesError> {
+            let state = self
+                .states
+                .iter()
+                .find(|state| state.satellite_id == sat)
+                .ok_or(ObservablesError::NoEphemeris)?;
+            let dt_s = t_j2000_s - self.t0_j2000_s;
+            Ok(ObservableState {
+                position_ecef_m: [
+                    state.position_ecef_m[0] + state.velocity_ecef_m_s[0] * dt_s,
+                    state.position_ecef_m[1] + state.velocity_ecef_m_s[1] * dt_s,
+                    state.position_ecef_m[2] + state.velocity_ecef_m_s[2] * dt_s,
+                ],
+                clock_s: Some(state.clock_s + state.clock_drift_s_s * dt_s),
+            })
+        }
+    }
+
+    impl crate::spp::EphemerisSource for MovingClockSource {
+        fn position_clock_at_j2000_s(
+            &self,
+            sat: GnssSatelliteId,
+            t_j2000_s: f64,
+        ) -> Option<([f64; 3], f64)> {
+            let state = self.states.iter().find(|state| state.satellite_id == sat)?;
+            let dt_s = t_j2000_s - self.t0_j2000_s;
+            Some((
+                [
+                    state.position_ecef_m[0] + state.velocity_ecef_m_s[0] * dt_s,
+                    state.position_ecef_m[1] + state.velocity_ecef_m_s[1] * dt_s,
+                    state.position_ecef_m[2] + state.velocity_ecef_m_s[2] * dt_s,
+                ],
+                state.clock_s + state.clock_drift_s_s * dt_s,
+            ))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct CodeOracleTerms {
+        geometric_m: f64,
+        satellite_clock_m: f64,
+        ionosphere_m: f64,
+        troposphere_m: f64,
+        total_m: f64,
+    }
+
+    impl CodeOracleTerms {
+        fn from_spp_model(
+            source: &MovingClockSource,
+            sat: GnssSatelliteId,
+            receiver: [f64; 3],
+            pseudorange_m: f64,
+            ionosphere_m: f64,
+            troposphere_m: f64,
+            receiver_clock_m: f64,
+        ) -> Self {
+            let glonass_channels = std::collections::BTreeMap::new();
+            let met = SurfaceMet::default();
+            let env = SatModelEnv {
+                eph: source,
+                t_rx_j2000_s: T0,
+                t_rx_second_of_day_s: SOD,
+                day_of_year: DOY,
+                corrections: Corrections::NONE,
+                met: &met,
+                glonass_channels: &glonass_channels,
+                model: SppModelRecipe::reference(),
+            };
+            let model = sat_model(
+                &env,
+                sat,
+                receiver,
+                0.0,
+                pseudorange_m,
+                SppIonosphere::Klobuchar(KlobucharCoeffs {
+                    alpha: [0.0; 4],
+                    beta: [0.0; 4],
+                }),
+            )
+            .expect("SPP model");
+            let geometric_m = norm3(sub3(model.sat_rot_ecef_m, receiver));
+            let satellite_clock_m = model.p_hat_m - geometric_m;
+            let total_m = model.p_hat_m + receiver_clock_m + ionosphere_m + troposphere_m;
+            Self {
+                geometric_m,
+                satellite_clock_m,
+                ionosphere_m,
+                troposphere_m,
+                total_m,
+            }
+        }
+
+        fn from_observable_model(
+            source: &MovingClockSource,
+            sat: GnssSatelliteId,
+            receiver: [f64; 3],
+            ionosphere_m: f64,
+            troposphere_m: f64,
+            receiver_clock_m: f64,
+        ) -> Self {
+            let prediction = transmit_time_satellite_state(
+                source,
+                sat,
+                receiver,
+                T0,
+                TransmitTimeOptions::default(),
+            )
+            .expect("observable model");
+            let satellite_clock_m = -C_M_S * prediction.clock_s.expect("satellite clock");
+            let total_m = prediction.geometric_range_m
+                + satellite_clock_m
+                + receiver_clock_m
+                + ionosphere_m
+                + troposphere_m;
+            Self {
+                geometric_m: prediction.geometric_range_m,
+                satellite_clock_m,
+                ionosphere_m,
+                troposphere_m,
+                total_m,
+            }
+        }
+
+        fn tight_total_m(
+            source: &MovingClockSource,
+            sat: GnssSatelliteId,
+            receiver: [f64; 3],
+            pseudorange_m: f64,
+            ionosphere_m: f64,
+            troposphere_m: f64,
+            receiver_clock_m: f64,
+        ) -> f64 {
+            let prediction = tight_code_satellite_prediction(
+                source,
+                sat,
+                receiver,
+                T0,
+                pseudorange_m,
+                TransmitTimeOptions::default(),
+            )
+            .expect("tight code model");
+            prediction.clock_corrected_range_m + receiver_clock_m + ionosphere_m + troposphere_m
+        }
+    }
+
+    #[test]
+    fn synthetic_code_oracle_pins_tight_to_spp_residual_surface() {
+        let receiver = [WGS84_A_M, 0.0, 0.0];
+        let rows = [
+            (
+                "high-elevation",
+                sat(1),
+                20_800_000.0,
+                normalized([0.96, 0.17, 0.23]),
+                [220.0, -680.0, 120.0],
+                2.0e-5,
+                2.0e-10,
+                1.25,
+                2.40,
+            ),
+            (
+                "low-elevation",
+                sat(2),
+                24_200_000.0,
+                normalized([0.09, 0.98, 0.18]),
+                [-180.0, 1120.0, -460.0],
+                -1.0e-5,
+                -4.0e-10,
+                5.75,
+                8.80,
+            ),
+            (
+                "fast-moving",
+                sat(3),
+                25_400_000.0,
+                normalized([0.34, -0.73, 0.59]),
+                [28_400.0, -31_200.0, 16_400.0],
+                1.5e-5,
+                1.2e-8,
+                3.40,
+                4.65,
+            ),
+        ];
+        let source = MovingClockSource {
+            t0_j2000_s: T0,
+            states: rows
+                .iter()
+                .map(
+                    |(
+                        _label,
+                        satellite_id,
+                        range_m,
+                        direction,
+                        velocity_m_s,
+                        clock_s,
+                        clock_drift_s_s,
+                        _iono_m,
+                        _tropo_m,
+                    )| {
+                        MovingClockState {
+                            satellite_id: *satellite_id,
+                            position_ecef_m: [
+                                receiver[0] + range_m * direction[0],
+                                receiver[1] + range_m * direction[1],
+                                receiver[2] + range_m * direction[2],
+                            ],
+                            velocity_ecef_m_s: *velocity_m_s,
+                            clock_s: *clock_s,
+                            clock_drift_s_s: *clock_drift_s_s,
+                        }
+                    },
+                )
+                .collect(),
+        };
+        let receiver_clock_m = 43.25;
+        let mut max_observable_minus_spp_m = 0.0_f64;
+
+        for (
+            label,
+            satellite_id,
+            range_m,
+            _direction,
+            _velocity_m_s,
+            _clock_s,
+            _clock_drift_s_s,
+            ionosphere_m,
+            troposphere_m,
+        ) in rows
+        {
+            let pseudorange_m = range_m + receiver_clock_m + ionosphere_m + troposphere_m + 11.0;
+            let spp = CodeOracleTerms::from_spp_model(
+                &source,
+                satellite_id,
+                receiver,
+                pseudorange_m,
+                ionosphere_m,
+                troposphere_m,
+                receiver_clock_m,
+            );
+            let observable = CodeOracleTerms::from_observable_model(
+                &source,
+                satellite_id,
+                receiver,
+                ionosphere_m,
+                troposphere_m,
+                receiver_clock_m,
+            );
+            let tight_total_m = CodeOracleTerms::tight_total_m(
+                &source,
+                satellite_id,
+                receiver,
+                pseudorange_m,
+                ionosphere_m,
+                troposphere_m,
+                receiver_clock_m,
+            );
+            let geom_delta_m = observable.geometric_m - spp.geometric_m;
+            let sat_clock_delta_m = observable.satellite_clock_m - spp.satellite_clock_m;
+            let media_delta_m = (observable.ionosphere_m + observable.troposphere_m)
+                - (spp.ionosphere_m + spp.troposphere_m);
+            let total_delta_m = observable.total_m - spp.total_m;
+            eprintln!(
+                "tight C1C oracle {label}: geom_delta_m={geom_delta_m:.9e} \
+                 sat_clock_delta_m={sat_clock_delta_m:.9e} media_delta_m={media_delta_m:.9e} \
+                 total_delta_m={total_delta_m:.9e}"
+            );
+            max_observable_minus_spp_m = max_observable_minus_spp_m.max(total_delta_m.abs());
+            assert_eq!(tight_total_m.to_bits(), spp.total_m.to_bits(), "{label}");
+        }
+
+        assert!(
+            max_observable_minus_spp_m > 1.0e-3,
+            "synthetic oracle should expose the pre-unification discrepancy"
         );
     }
 

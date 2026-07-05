@@ -6,6 +6,10 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Fixed
 
+- Tight GNSS C1C and carrier-phase code-row prediction now uses the same
+  measured-pseudorange transmit-time model as SPP, removing centimetre-level
+  frozen-state residual differences from the prior observable transmit-time
+  approximation.
 - Sample-backed SP3 interpolation now uses the same whole-second epoch-axis
   construction as the parsed-product path. The parsed path was fixed in 0.16.1;
   this closes the remaining `from_samples` record-node boundary case.
