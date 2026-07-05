@@ -23,8 +23,8 @@ use sidereon_core::{
     EarthOrientationProvider, GnssSatelliteId, GnssSystem, TdbEarthOrientationProvider,
 };
 use sidereon_scoreboard::{
-    parse_product_date, resolve_latest_available_rapid_sp3, score_sp3_bytes, FetchOutcome,
-    ProductCandidate, ProductFetcher, ScoreOptions,
+    parse_product_date, resolve_latest_available_rapid_sp3, run_with_fetcher, score_sp3_bytes,
+    FetchOutcome, HttpsFetcher, ProductCandidate, ProductFetcher, ScoreOptions, ScoreboardStatus,
 };
 
 const SP3_POSITION_3D_QUANTIZATION_BOUND_M: f64 = 8.660_254_037_844_386e-4;
@@ -47,14 +47,17 @@ fn fixture_schema_is_exact_and_counts_add_up() {
     assert_keys(
         &value,
         &[
+            "attempted_candidates",
             "date_utc",
             "notes",
             "per_constellation",
             "per_sat",
             "product",
             "sidereon_version",
+            "status",
         ],
     );
+    assert_eq!(value["status"], "scored");
     assert_keys(
         &value["product"],
         &["agency", "name", "parser_skipped_records"],
@@ -76,7 +79,14 @@ fn fixture_schema_is_exact_and_counts_add_up() {
     let skipped = gps["skipped"].as_u64().unwrap();
     assert_eq!(fit_count + skipped, sat_count);
     assert_eq!(report.per_sat.skipped.len(), 1);
-    assert_eq!(report.product.parser_skipped_records, 0);
+    assert_eq!(
+        report
+            .product
+            .as_ref()
+            .expect("scored report has product")
+            .parser_skipped_records,
+        0
+    );
     let skipped = serde_json::to_value(&report.per_sat.skipped[0]).expect("skip row JSON");
     assert_keys(&skipped, &["constellation", "reason", "satellite"]);
 }
@@ -94,7 +104,14 @@ fn parser_skipped_records_are_visible() {
     )
     .expect("fixture scores");
 
-    assert_eq!(report.product.parser_skipped_records, 1);
+    assert_eq!(
+        report
+            .product
+            .as_ref()
+            .expect("scored report has product")
+            .parser_skipped_records,
+        1
+    );
     assert!(report
         .notes
         .iter()
@@ -120,12 +137,88 @@ fn mocked_fetch_resolves_without_network() {
         }
     }
 
-    let resolved = resolve_latest_available_rapid_sp3(date(2020, 6, 25), 1, &MockFetcher)
+    let resolution = resolve_latest_available_rapid_sp3(date(2020, 6, 25), 1, &MockFetcher)
         .expect("previous day resolves");
+    let resolved = resolution.resolved.expect("resolved product");
     assert!(resolved.candidate.name.contains("20201760000"));
     assert_eq!(
         resolved.bytes,
         include_bytes!("fixtures/minimal_sp3.sp3").to_vec()
+    );
+    assert!(resolution
+        .attempted
+        .iter()
+        .any(|candidate| candidate.name == "IGS0OPSRAP_20201760000_01D_15M_ORB.SP3"));
+}
+
+#[test]
+fn no_posted_product_is_no_data_report() {
+    struct MissingFetcher;
+
+    impl ProductFetcher for MissingFetcher {
+        fn fetch(
+            &self,
+            _candidate: &ProductCandidate,
+        ) -> Result<FetchOutcome, sidereon_scoreboard::ScoreboardError> {
+            Ok(FetchOutcome::NotPosted)
+        }
+    }
+
+    let report = run_with_fetcher(date(2026, 7, 5), 0, &MissingFetcher).expect("no-data report");
+    assert_eq!(report.status, ScoreboardStatus::NoData);
+    assert!(report.product.is_none());
+    assert_eq!(report.attempted_candidates.len(), 19);
+    assert!(report.per_constellation.is_empty());
+    assert!(report.per_sat.top.is_empty());
+    assert!(report
+        .attempted_candidates
+        .iter()
+        .any(|candidate| candidate.url.contains("/products/2426/")));
+}
+
+#[test]
+fn candidate_urls_use_product_dates_gps_week() {
+    struct CaptureFetcher;
+
+    impl ProductFetcher for CaptureFetcher {
+        fn fetch(
+            &self,
+            candidate: &ProductCandidate,
+        ) -> Result<FetchOutcome, sidereon_scoreboard::ScoreboardError> {
+            if candidate.name == "IGS0OPSRAP_20261850000_01D_15M_ORB.SP3" {
+                Ok(FetchOutcome::Available(
+                    include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
+                ))
+            } else {
+                Ok(FetchOutcome::NotPosted)
+            }
+        }
+    }
+
+    let resolution = resolve_latest_available_rapid_sp3(date(2026, 7, 5), 1, &CaptureFetcher)
+        .expect("previous GPS week resolves");
+    let resolved = resolution.resolved.expect("resolved product");
+    assert_eq!(
+        resolved.candidate.url,
+        "https://igs.bkg.bund.de/root_ftp/IGS/products/2425/IGS0OPSRAP_20261850000_01D_15M_ORB.SP3.gz"
+    );
+}
+
+#[test]
+#[ignore = "network test for current public SP3 archives"]
+fn live_current_product_candidate_resolves() {
+    let target = sidereon_scoreboard::utc_today().expect("UTC date");
+    let resolution = resolve_latest_available_rapid_sp3(target, 4, &HttpsFetcher)
+        .expect("live resolver does not fail");
+    assert!(
+        resolution.resolved.is_some(),
+        "no posted product in {} attempts: {:#?}",
+        resolution.attempted.len(),
+        resolution
+            .attempted
+            .iter()
+            .map(|candidate| &candidate.url)
+            .collect::<Vec<_>>()
     );
 }
 
