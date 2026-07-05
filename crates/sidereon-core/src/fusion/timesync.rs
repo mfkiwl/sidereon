@@ -108,6 +108,33 @@ pub(super) struct TimeSyncHistory {
     measurements: VecDeque<StoredGnssMeasurement>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct TimeSyncHistorySnapshot {
+    pub(super) config: TimeSyncHistoryConfig,
+    pub(super) imu_samples: Vec<StoredImuSample>,
+    pub(super) checkpoints: Vec<StoredCheckpoint>,
+    pub(super) measurements: Vec<StoredGnssMeasurement>,
+}
+
+impl TimeSyncHistorySnapshot {
+    pub(super) fn from_filter_snapshot(snapshot: InertialFilterSnapshot) -> Self {
+        let t_j2000_s = snapshot.state.nominal.t_j2000_s;
+        Self {
+            config: TimeSyncHistoryConfig::default(),
+            imu_samples: Vec::new(),
+            checkpoints: vec![StoredCheckpoint {
+                t_j2000_s,
+                snapshot,
+            }],
+            measurements: Vec::new(),
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<(), FusionError> {
+        validate_history_snapshot(self)
+    }
+}
+
 impl TimeSyncHistory {
     pub(super) fn from_initial(state: &InsFilterState, tight: &TightFusionState) -> Self {
         let mut history = Self {
@@ -330,6 +357,27 @@ impl TimeSyncHistory {
                 .back()
                 .map(|checkpoint| checkpoint.t_j2000_s),
         }
+    }
+
+    pub(super) fn snapshot_history(&self) -> TimeSyncHistorySnapshot {
+        TimeSyncHistorySnapshot {
+            config: self.config,
+            imu_samples: self.imu_samples.iter().copied().collect(),
+            checkpoints: self.checkpoints.iter().cloned().collect(),
+            measurements: self.measurements.iter().cloned().collect(),
+        }
+    }
+
+    pub(super) fn restore_history(
+        &mut self,
+        snapshot: TimeSyncHistorySnapshot,
+    ) -> Result<(), FusionError> {
+        validate_history_snapshot(&snapshot)?;
+        self.config = snapshot.config;
+        self.imu_samples = snapshot.imu_samples.into();
+        self.checkpoints = snapshot.checkpoints.into();
+        self.measurements = snapshot.measurements.into();
+        Ok(())
     }
 }
 
@@ -660,10 +708,10 @@ impl InertialFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct StoredImuSample {
-    previous_t_j2000_s: f64,
-    sample: ImuSample,
-    previous_rate: Option<RateEndpoint>,
+pub(super) struct StoredImuSample {
+    pub(super) previous_t_j2000_s: f64,
+    pub(super) sample: ImuSample,
+    pub(super) previous_rate: Option<RateEndpoint>,
 }
 
 impl StoredImuSample {
@@ -740,13 +788,13 @@ impl StoredImuSample {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct StoredCheckpoint {
-    t_j2000_s: f64,
-    snapshot: InertialFilterSnapshot,
+pub(super) struct StoredCheckpoint {
+    pub(super) t_j2000_s: f64,
+    pub(super) snapshot: InertialFilterSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum StoredGnssMeasurement {
+pub(super) enum StoredGnssMeasurement {
     Loose(GnssFixMeasurement),
     Tight(TightGnssEpoch),
 }
@@ -768,10 +816,10 @@ struct ReplayMeasurement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct RateEndpoint {
-    t_j2000_s: f64,
-    specific_force_mps2: [f64; 3],
-    angular_rate_rps: [f64; 3],
+pub(super) struct RateEndpoint {
+    pub(super) t_j2000_s: f64,
+    pub(super) specific_force_mps2: [f64; 3],
+    pub(super) angular_rate_rps: [f64; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -845,6 +893,121 @@ fn validate_vec3(value: [f64; 3], field: &'static str) -> Result<(), FusionError
         validate_epoch(component, field)?;
     }
     Ok(())
+}
+
+fn validate_history_snapshot(snapshot: &TimeSyncHistorySnapshot) -> Result<(), FusionError> {
+    snapshot.config.validate()?;
+    if snapshot.imu_samples.len() > snapshot.config.imu_capacity {
+        return Err(invalid_input("imu_samples", "exceeds retained capacity"));
+    }
+    if snapshot.checkpoints.is_empty() {
+        return Err(invalid_input("checkpoints", "must not be empty"));
+    }
+    if snapshot.checkpoints.len() > snapshot.config.checkpoint_capacity {
+        return Err(invalid_input("checkpoints", "exceeds retained capacity"));
+    }
+    if snapshot.measurements.len() > snapshot.config.checkpoint_capacity {
+        return Err(invalid_input(
+            "gnss_measurements",
+            "exceeds retained capacity",
+        ));
+    }
+
+    let mut previous_sample_epoch = None;
+    for stored in &snapshot.imu_samples {
+        validate_epoch(stored.previous_t_j2000_s, "previous_t_j2000_s")?;
+        validate_epoch(stored.sample.t_j2000_s, "imu_sample_t_j2000_s")?;
+        if stored.sample.t_j2000_s <= stored.previous_t_j2000_s {
+            return Err(invalid_input(
+                "imu_samples",
+                "sample interval must be positive",
+            ));
+        }
+        match stored.sample.kind {
+            ImuSampleKind::Rate {
+                specific_force_mps2,
+                angular_rate_rps,
+            } => {
+                validate_vec3(specific_force_mps2, "specific_force_mps2")?;
+                validate_vec3(angular_rate_rps, "angular_rate_rps")?;
+            }
+            ImuSampleKind::Increment {
+                delta_velocity_mps,
+                delta_theta_rad,
+                dt_s,
+            } => {
+                validate_vec3(delta_velocity_mps, "delta_velocity_mps")?;
+                validate_vec3(delta_theta_rad, "delta_theta_rad")?;
+                validate_positive(dt_s, "dt_s")?;
+            }
+        }
+        if let Some(previous_rate) = stored.previous_rate {
+            validate_rate_endpoint(previous_rate)?;
+            if previous_rate.t_j2000_s >= stored.sample.t_j2000_s {
+                return Err(invalid_input(
+                    "previous_rate",
+                    "must be older than the sample endpoint",
+                ));
+            }
+        }
+        if let Some(previous) = previous_sample_epoch {
+            if stored.sample.t_j2000_s <= previous {
+                return Err(invalid_input(
+                    "imu_samples",
+                    "must be strictly ordered by epoch",
+                ));
+            }
+        }
+        previous_sample_epoch = Some(stored.sample.t_j2000_s);
+    }
+
+    let mut previous_checkpoint_epoch = None;
+    for checkpoint in &snapshot.checkpoints {
+        validate_epoch(checkpoint.t_j2000_s, "checkpoint_t_j2000_s")?;
+        checkpoint.snapshot.state.validate()?;
+        validate_vec3(
+            checkpoint.snapshot.last_body_rate_wrt_ecef_rps,
+            "last_body_rate_wrt_ecef_rps",
+        )?;
+        if checkpoint.t_j2000_s != checkpoint.snapshot.state.nominal.t_j2000_s {
+            return Err(invalid_input("checkpoints", "epoch must match snapshot"));
+        }
+        if let Some(previous) = previous_checkpoint_epoch {
+            if checkpoint.t_j2000_s <= previous {
+                return Err(invalid_input(
+                    "checkpoints",
+                    "must be strictly ordered by epoch",
+                ));
+            }
+        }
+        previous_checkpoint_epoch = Some(checkpoint.t_j2000_s);
+    }
+
+    let mut previous_measurement_epoch = None;
+    for measurement in &snapshot.measurements {
+        match measurement {
+            StoredGnssMeasurement::Loose(measurement) => measurement.validate()?,
+            StoredGnssMeasurement::Tight(epoch) => epoch.validate()?,
+        }
+        let epoch = measurement.epoch();
+        if let Some(previous) = previous_measurement_epoch {
+            if epoch <= previous {
+                return Err(invalid_input(
+                    "gnss_measurements",
+                    "must be strictly ordered by epoch",
+                ));
+            }
+        }
+        previous_measurement_epoch = Some(epoch);
+    }
+
+    Ok(())
+}
+
+fn validate_rate_endpoint(endpoint: RateEndpoint) -> Result<(), FusionError> {
+    validate_epoch(endpoint.t_j2000_s, "rate_endpoint_t_j2000_s")?;
+    validate_vec3(endpoint.specific_force_mps2, "specific_force_mps2")?;
+    validate_vec3(endpoint.angular_rate_rps, "angular_rate_rps")
 }
 
 #[cfg(test)]

@@ -24,12 +24,14 @@ use super::ekf::{
     EkfCorrectionReport, EkfUpdateOptions,
 };
 use super::loose::{FusionUpdate, InertialFilter};
+use super::state::FusionFilterKind;
 use super::state::{
     identity, invalid_input, matmul, matrix_add, reproject_covariance_psd, symmetrize_in_place,
     validate_covariance_matrix, validate_finite_slice, validate_nonnegative, validate_positive,
     validate_square_matrix, FusionError, InsFilterState, ERROR_ATTITUDE_INDEX,
     ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_VELOCITY_INDEX,
 };
+use super::ukf::{ukf_measurement_update, UkfUpdateOptions};
 
 /// Receiver-clock bias index in the tight augmented covariance.
 pub const TIGHT_CLOCK_BIAS_OFFSET: usize = 0;
@@ -511,7 +513,15 @@ impl InertialFilter {
             self.last_body_rate_wrt_ecef_rps,
         )?;
         let rows = correction.row_count();
-        let report = apply_tight_correction(self, &correction, self.config.tight.update_options)?;
+        let filter_kind = self.config.filter_kind;
+        let ekf_options = self.config.tight.update_options;
+        let ukf_options = self.config.ukf_update_options;
+        let report = match filter_kind {
+            FusionFilterKind::Ekf => apply_tight_correction(self, &correction, ekf_options)?,
+            FusionFilterKind::Ukf => {
+                apply_tight_ukf_correction(self, source, epoch, &correction, ukf_options)?
+            }
+        };
         Ok(FusionUpdate {
             applied: report.applied,
             nis: report.normalized_innovation_squared,
@@ -718,6 +728,199 @@ fn apply_tight_correction_inner(
     })
 }
 
+fn apply_tight_ukf_correction(
+    filter: &mut InertialFilter,
+    source: &dyn ObservableEphemerisSource,
+    epoch: &TightGnssEpoch,
+    correction: &EkfCorrection,
+    options: UkfUpdateOptions,
+) -> Result<EkfCorrectionReport, FusionError> {
+    filter.state.validate()?;
+    let base_dim = filter.state.dimension();
+    filter.tight.validate(base_dim)?;
+    correction.validate_for_dimension(augmented_dimension(base_dim))?;
+    options.validate_for_dimension(augmented_dimension(base_dim))?;
+
+    let reference_state = filter.state.clone();
+    let reference_tight = filter.tight.clone();
+    let config = filter.config.tight;
+    let body_rate_wrt_ecef_rps = filter.last_body_rate_wrt_ecef_rps;
+    let reference_prediction = tight_measurement_predictions(
+        source,
+        &reference_state,
+        reference_tight.clock_bias_m,
+        reference_tight.clock_drift_m_s,
+        epoch,
+        config,
+        body_rate_wrt_ecef_rps,
+    )?;
+
+    let report = ukf_measurement_update(
+        &filter.tight.augmented_covariance,
+        &correction.innovation,
+        &correction.measurement_covariance,
+        options,
+        |dx| {
+            tight_sigma_measurement_residual(
+                source,
+                &reference_state,
+                &reference_tight,
+                epoch,
+                config,
+                body_rate_wrt_ecef_rps,
+                &reference_prediction,
+                dx,
+            )
+        },
+    )?;
+    if !report.applied {
+        return Ok(report.into_public_report());
+    }
+
+    let dx = report.dx.clone();
+    let posterior_covariance = report.posterior_covariance.clone();
+    apply_closed_loop_navigation_error(&mut filter.state.nominal, &dx[..base_dim])?;
+    apply_closed_loop_scale_error(&mut filter.state, &dx[..base_dim]);
+    filter.tight.clock_bias_m += dx[clock_bias_index(base_dim)];
+    filter.tight.clock_drift_m_s += dx[clock_drift_index(base_dim)];
+    filter.tight.augmented_covariance = posterior_covariance;
+    filter
+        .tight
+        .copy_base_covariance_to_state(&mut filter.state)?;
+    filter.state.reset_error_state();
+    filter.state.validate()?;
+    filter.tight.validate(base_dim)?;
+    Ok(report.into_public_report())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tight_sigma_measurement_residual(
+    source: &dyn ObservableEphemerisSource,
+    reference_state: &InsFilterState,
+    reference_tight: &TightFusionState,
+    epoch: &TightGnssEpoch,
+    config: TightCouplingConfig,
+    body_rate_wrt_ecef_rps: [f64; 3],
+    reference_prediction: &[f64],
+    dx: &[f64],
+) -> Result<Vec<f64>, FusionError> {
+    let base_dim = reference_state.dimension();
+    if dx.len() != augmented_dimension(base_dim) {
+        return Err(FusionError::DimensionMismatch {
+            field: "ukf_sigma_point",
+            expected: augmented_dimension(base_dim),
+            actual: dx.len(),
+        });
+    }
+
+    let mut candidate_state = reference_state.clone();
+    apply_closed_loop_navigation_error(&mut candidate_state.nominal, &dx[..base_dim])?;
+    apply_closed_loop_scale_error(&mut candidate_state, &dx[..base_dim]);
+    candidate_state.validate()?;
+    let mut candidate_body_rate_wrt_ecef_rps = body_rate_wrt_ecef_rps;
+    for axis in 0..3 {
+        candidate_body_rate_wrt_ecef_rps[axis] -= dx[ERROR_GYRO_BIAS_INDEX + axis];
+    }
+    let clock_bias_m = reference_tight.clock_bias_m + dx[clock_bias_index(base_dim)];
+    let clock_drift_m_s = reference_tight.clock_drift_m_s + dx[clock_drift_index(base_dim)];
+    let candidate_prediction = tight_measurement_predictions(
+        source,
+        &candidate_state,
+        clock_bias_m,
+        clock_drift_m_s,
+        epoch,
+        config,
+        candidate_body_rate_wrt_ecef_rps,
+    )?;
+    if candidate_prediction.len() != reference_prediction.len() {
+        return Err(FusionError::DimensionMismatch {
+            field: "tight_prediction",
+            expected: reference_prediction.len(),
+            actual: candidate_prediction.len(),
+        });
+    }
+    Ok(candidate_prediction
+        .iter()
+        .zip(reference_prediction.iter())
+        .map(|(candidate, reference)| candidate - reference)
+        .collect())
+}
+
+fn tight_measurement_predictions(
+    source: &dyn ObservableEphemerisSource,
+    state: &InsFilterState,
+    clock_bias_m: f64,
+    clock_drift_m_s: f64,
+    epoch: &TightGnssEpoch,
+    config: TightCouplingConfig,
+    body_rate_wrt_ecef_rps: [f64; 3],
+) -> Result<Vec<f64>, FusionError> {
+    state.validate()?;
+    epoch.validate()?;
+    config.validate()?;
+    validate_finite_slice(&[clock_bias_m, clock_drift_m_s], "tight_clock")?;
+    validate_vec3(body_rate_wrt_ecef_rps, "body_rate_wrt_ecef_rps").map_err(FusionError::from)?;
+    if epoch.t_j2000_s != state.nominal.t_j2000_s {
+        return Err(invalid_input("t_j2000_s", "must equal nominal state epoch"));
+    }
+
+    let kinematics = antenna_kinematics(state, config.lever_arm_body_m, body_rate_wrt_ecef_rps);
+    let options = TransmitTimeOptions {
+        light_time: config.light_time,
+        sagnac: config.sagnac,
+    };
+    let mut predictions = Vec::new();
+    for observation in &epoch.observations {
+        let satellite = transmit_time_satellite_state(
+            source,
+            observation.satellite_id,
+            kinematics.antenna_position_ecef_m,
+            epoch.t_j2000_s,
+            options,
+        )
+        .map_err(map_observables_error)?;
+        let sat_clock_s = satellite
+            .clock_s
+            .ok_or_else(|| invalid_input("satellite_clock_s", "must be present"))?;
+        predictions.push(
+            satellite.geometric_range_m + clock_bias_m - C_M_S * sat_clock_s
+                + observation.ionosphere_delay_m
+                + observation.troposphere_delay_m,
+        );
+
+        if let Some(carrier_phase) = observation.carrier_phase {
+            predictions.push(
+                satellite.geometric_range_m + clock_bias_m
+                    - C_M_S * sat_clock_s
+                    - observation.ionosphere_delay_m
+                    + observation.troposphere_delay_m
+                    + carrier_phase.float_ambiguity_m,
+            );
+        }
+
+        if let Some(range_rate) = observation.range_rate {
+            let velocity_observation = VelocityObservation {
+                sat: observation.satellite_id,
+                satellite_position_m: satellite.position_ecef_m,
+                satellite_velocity_m_s: satellite.velocity_m_s,
+                measured_range_rate_m_s: range_rate.measured_range_rate_m_s,
+                sigma_m_s: range_rate.sigma_m_s,
+                satellite_clock_drift_m_s: range_rate.satellite_clock_drift_m_s,
+            };
+            let receiver = ReceiverVelocityState {
+                position_m: kinematics.antenna_position_ecef_m,
+                velocity_m_s: kinematics.antenna_velocity_ecef_mps,
+                clock_drift_m_s,
+            };
+            let prediction = predict_range_rate_m_s(&velocity_observation, receiver)
+                .ok_or_else(|| invalid_input("range_rate", "line of sight must be nonzero"))?;
+            predictions.push(prediction.range_rate_m_s);
+        }
+    }
+    validate_finite_slice(&predictions, "tight_prediction")?;
+    Ok(predictions)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AntennaKinematics {
     antenna_position_ecef_m: [f64; 3],
@@ -780,9 +983,9 @@ fn range_rate_design_row(
         row[ERROR_ATTITUDE_INDEX + col] = -(los_unit[0] * lever_velocity_skew[0][col]
             + los_unit[1] * lever_velocity_skew[1][col]
             + los_unit[2] * lever_velocity_skew[2][col]);
-        row[ERROR_GYRO_BIAS_INDEX + col] = los_unit[0] * gyro_bias_velocity_block[0][col]
+        row[ERROR_GYRO_BIAS_INDEX + col] = -(los_unit[0] * gyro_bias_velocity_block[0][col]
             + los_unit[1] * gyro_bias_velocity_block[1][col]
-            + los_unit[2] * gyro_bias_velocity_block[2][col];
+            + los_unit[2] * gyro_bias_velocity_block[2][col]);
     }
     row[clock_drift] = 1.0;
     row
@@ -845,7 +1048,7 @@ mod tests {
         Corrections, KlobucharCoeffs, Observation, SolveInputs, SppError, SurfaceMet,
     };
     use crate::{GnssSatelliteId, GnssSystem};
-    use nalgebra::DMatrix;
+    use nalgebra::{DMatrix, DVector};
 
     const T0: f64 = 646_229_000.0;
     const SOD: f64 = 200.0;
@@ -916,7 +1119,14 @@ mod tests {
     }
 
     fn source_from_directions(receiver: [f64; 3], directions: &[[f64; 3]]) -> LinearSource {
-        let range_m = 22_000_000.0;
+        source_from_directions_at_range(receiver, directions, 22_000_000.0)
+    }
+
+    fn source_from_directions_at_range(
+        receiver: [f64; 3],
+        directions: &[[f64; 3]],
+        range_m: f64,
+    ) -> LinearSource {
         let states = directions
             .iter()
             .enumerate()
@@ -1012,11 +1222,21 @@ mod tests {
         diagonal: &[f64],
         tight: TightCouplingConfig,
     ) -> InertialFilter {
+        filter_with_kind(nominal, diagonal, tight, FusionFilterKind::Ekf)
+    }
+
+    fn filter_with_kind(
+        nominal: NavState,
+        diagonal: &[f64],
+        tight: TightCouplingConfig,
+        filter_kind: FusionFilterKind,
+    ) -> InertialFilter {
         let state = InsFilterState::from_diagonal(nominal, ErrorStateLayout::Fifteen, diagonal)
             .expect("state");
         let mut config =
             super::super::loose::InertialFilterConfig::new(zero_noise_spec()).expect("config");
         config.tight = tight;
+        config.filter_kind = filter_kind;
         InertialFilter::with_config(state, config).expect("filter")
     }
 
@@ -1065,6 +1285,28 @@ mod tests {
             .collect()
     }
 
+    fn position_clock_nees(
+        filter: &InertialFilter,
+        truth_position_m: [f64; 3],
+        truth_clock_m: f64,
+    ) -> f64 {
+        let block = position_clock_block(filter);
+        let flat = block.iter().flatten().copied().collect::<Vec<_>>();
+        let covariance = DMatrix::from_row_slice(4, 4, &flat);
+        let clock = filter.tight_clock_state().expect("clock");
+        let error = DVector::from_vec(vec![
+            filter.state().nominal.position_ecef_m[0] - truth_position_m[0],
+            filter.state().nominal.position_ecef_m[1] - truth_position_m[1],
+            filter.state().nominal.position_ecef_m[2] - truth_position_m[2],
+            clock.bias_m - truth_clock_m,
+        ]);
+        let solved = covariance
+            .cholesky()
+            .expect("posterior covariance SPD")
+            .solve(&error);
+        error.dot(&solved)
+    }
+
     fn snapshot_position_clock_covariance(
         source: &LinearSource,
         receiver: [f64; 3],
@@ -1081,9 +1323,9 @@ mod tests {
             )
             .expect("satellite state");
             let h = [
-                -prediction.los_unit[0],
-                -prediction.los_unit[1],
-                -prediction.los_unit[2],
+                prediction.los_unit[0],
+                prediction.los_unit[1],
+                prediction.los_unit[2],
                 1.0,
             ];
             let inv_var = 1.0 / (observation.pseudorange_sigma_m * observation.pseudorange_sigma_m);
@@ -1233,6 +1475,108 @@ mod tests {
     }
 
     #[test]
+    fn tight_rows_match_closed_loop_finite_difference_signs() {
+        let receiver = [WGS84_A_M + 8.0, -3.0, 2.0];
+        let satellite_id = sat(1);
+        let source = LinearSource::new(
+            T0,
+            vec![(
+                satellite_id,
+                [WGS84_A_M + 8_000.0, 900.0, -1_200.0],
+                [12.0, -7.0, 3.0],
+                0.0,
+            )],
+        );
+        let observation = TightGnssObservation {
+            satellite_id,
+            pseudorange_m: 8_125.25,
+            pseudorange_sigma_m: 0.5,
+            range_rate: Some(TightRangeRateObservation {
+                measured_range_rate_m_s: -4.25,
+                sigma_m_s: 0.125,
+                satellite_clock_drift_m_s: 0.03125,
+            }),
+            carrier_phase: None,
+            ionosphere_delay_m: 0.125,
+            troposphere_delay_m: -0.0625,
+        };
+        let epoch = TightGnssEpoch::new(T0, vec![observation]).expect("epoch");
+        let nominal =
+            NavState::new(T0, receiver, [1.5, -0.75, 0.375], mat3_identity()).expect("nominal");
+        let config = TightCouplingConfig {
+            lever_arm_body_m: [1.25, -0.5, 0.75],
+            light_time: false,
+            sagnac: false,
+            ..tight_config_for_test()
+        };
+        let filter = filter_with_config(nominal, &[1.0; ERROR_STATE_DIMENSION_15], config);
+        let body_rate_wrt_ecef_rps = [0.01, -0.02, 0.03];
+        let correction = tight_coupling_correction(
+            &source,
+            filter.state(),
+            &filter.tight,
+            &epoch,
+            config,
+            body_rate_wrt_ecef_rps,
+        )
+        .expect("correction");
+        let reference_prediction = tight_measurement_predictions(
+            &source,
+            filter.state(),
+            filter.tight.clock_bias_m,
+            filter.tight.clock_drift_m_s,
+            &epoch,
+            config,
+            body_rate_wrt_ecef_rps,
+        )
+        .expect("prediction");
+        let base_dim = filter.state.dimension();
+        let checks = [
+            (0usize, ERROR_POSITION_INDEX, 1.0e-3),
+            (0, ERROR_ATTITUDE_INDEX + 2, 1.0e-3),
+            (0, clock_bias_index(base_dim), 1.0e-3),
+            (1, ERROR_VELOCITY_INDEX + 1, 1.0e-3),
+            (1, ERROR_GYRO_BIAS_INDEX + 2, 1.0e-3),
+            (1, clock_drift_index(base_dim), 1.0e-3),
+        ];
+
+        for (row, column, step) in checks {
+            let mut plus_dx = vec![0.0; augmented_dimension(base_dim)];
+            plus_dx[column] = step;
+            let plus = tight_sigma_measurement_residual(
+                &source,
+                filter.state(),
+                &filter.tight,
+                &epoch,
+                config,
+                body_rate_wrt_ecef_rps,
+                &reference_prediction,
+                &plus_dx,
+            )
+            .expect("plus residual");
+            let mut minus_dx = vec![0.0; augmented_dimension(base_dim)];
+            minus_dx[column] = -step;
+            let minus = tight_sigma_measurement_residual(
+                &source,
+                filter.state(),
+                &filter.tight,
+                &epoch,
+                config,
+                body_rate_wrt_ecef_rps,
+                &reference_prediction,
+                &minus_dx,
+            )
+            .expect("minus residual");
+            let derivative = (plus[row] - minus[row]) / (2.0 * step);
+            let expected = correction.design[row][column];
+            assert!(
+                (derivative - expected).abs() <= 5.0e-7,
+                "row {row}, column {column}, derivative {derivative:.17e}, expected {expected:.17e}"
+            );
+        }
+    }
+
+    #[test]
     fn singular_snapshot_geometry_keeps_unobserved_prior_covariance() {
         let receiver = [WGS84_A_M, 0.0, 0.0];
         let directions = [[1.0, 0.0, 0.0]; 5];
@@ -1311,6 +1655,77 @@ mod tests {
         assert!(
             fused_logdet < snapshot_logdet,
             "fused {fused_logdet:.17e}, snapshot {snapshot_logdet:.17e}"
+        );
+    }
+
+    #[test]
+    fn close_range_tight_ukf_nees_is_no_worse_than_ekf() {
+        let truth_position = [WGS84_A_M + 10.0, 20.0, -15.0];
+        let nominal_position = [
+            truth_position[0] + 8.0,
+            truth_position[1] - 6.0,
+            truth_position[2] + 5.0,
+        ];
+        let directions = [
+            [1.0, 0.0, 0.0],
+            [-0.8, 0.5, 0.2],
+            [0.2, 1.0, -0.1],
+            [-0.2, -0.9, 0.4],
+            [0.1, 0.2, 1.0],
+            [-0.3, 0.1, -1.0],
+        ];
+        let source = source_from_directions_at_range(truth_position, &directions, 80.0);
+        let truth_clock_m = 3.0;
+        let observations = source
+            .states
+            .iter()
+            .map(|(satellite_id, _, _, _)| {
+                let prediction = transmit_time_satellite_state(
+                    &source,
+                    *satellite_id,
+                    truth_position,
+                    T0,
+                    TransmitTimeOptions {
+                        light_time: false,
+                        sagnac: false,
+                    },
+                )
+                .expect("truth prediction");
+                TightGnssObservation::pseudorange(
+                    *satellite_id,
+                    prediction.geometric_range_m + truth_clock_m,
+                    0.25,
+                )
+                .expect("observation")
+            })
+            .collect::<Vec<_>>();
+        let epoch = TightGnssEpoch::new(T0, observations).expect("epoch");
+        let nominal =
+            NavState::new(T0, nominal_position, [0.0; 3], mat3_identity()).expect("nominal");
+        let mut diagonal = vec![1.0e-6; ERROR_STATE_DIMENSION_15];
+        for axis in 0..3 {
+            diagonal[ERROR_POSITION_INDEX + axis] = 100.0;
+        }
+        let tight = TightCouplingConfig {
+            light_time: false,
+            sagnac: false,
+            initial_clock_bias_variance_m2: 100.0,
+            initial_clock_drift_variance_m2_s2: 1.0e-6,
+            clock_bias_random_walk_m2_s: 0.0,
+            clock_drift_random_walk_m2_s3: 0.0,
+            ..TightCouplingConfig::default()
+        };
+        let mut ekf = filter_with_kind(nominal, &diagonal, tight, FusionFilterKind::Ekf);
+        let mut ukf = filter_with_kind(nominal, &diagonal, tight, FusionFilterKind::Ukf);
+
+        ekf.update_tight(&source, &epoch).expect("ekf update");
+        ukf.update_tight(&source, &epoch).expect("ukf update");
+
+        let ekf_nees = position_clock_nees(&ekf, truth_position, truth_clock_m);
+        let ukf_nees = position_clock_nees(&ukf, truth_position, truth_clock_m);
+        assert!(
+            ukf_nees <= ekf_nees,
+            "UKF NEES {ukf_nees:.17e}, EKF NEES {ekf_nees:.17e}"
         );
     }
 
