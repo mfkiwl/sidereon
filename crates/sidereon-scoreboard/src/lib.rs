@@ -13,12 +13,13 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use serde::Serialize;
 use sidereon_core::astro::frames::transforms::FrameTransformError;
 use sidereon_core::astro::propagator::ForceModelKind;
 use sidereon_core::astro::time::civil::civil_from_j2000_seconds;
 use sidereon_core::constants::{J2000_JD, SECONDS_PER_DAY};
-use sidereon_core::data::{mgex_sp3, AnalysisCenter, DataCatalogError, ProductDate, ProductSpec};
+use sidereon_core::data::{DataCatalogError, ProductDate};
 use sidereon_core::ephemeris::{
     fit_precise_ephemeris_sample_orbit, fit_precise_ephemeris_state_sample_orbit, OrbitFitOptions,
     OrbitResidualStats, OrientedPreciseEphemerisStateSample, PreciseEphemerisSample,
@@ -30,8 +31,7 @@ use sidereon_core::{
 };
 
 const UNIX_TO_J2000_S: i64 = 946_728_000;
-const DEFAULT_LOOKBACK_DAYS: u32 = 7;
-const RAPID_CENTER: AnalysisCenter = AnalysisCenter::Gfz;
+const DEFAULT_LOOKBACK_DAYS: u32 = 4;
 
 /// Scoreboard result emitted as JSON.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -40,14 +40,28 @@ pub struct ScoreboardReport {
     pub date_utc: String,
     /// Crate version used to build the scorer.
     pub sidereon_version: String,
+    /// Whether the run scored an SP3 product or recorded a no-data result.
+    pub status: ScoreboardStatus,
     /// Product identity and SP3 producing agency.
-    pub product: ProductReport,
+    pub product: Option<ProductReport>,
+    /// Product URLs attempted before scoring or declaring no data.
+    pub attempted_candidates: Vec<AttemptedCandidateReport>,
     /// Per-constellation aggregate residual summaries.
     pub per_constellation: BTreeMap<String, ConstellationReport>,
     /// Per-satellite best, worst, and skipped rows.
     pub per_sat: PerSatelliteReport,
     /// Caveats and method notes that affect interpretation.
     pub notes: Vec<String>,
+}
+
+/// Scoreboard run status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreboardStatus {
+    /// An SP3 product was fetched and scored.
+    Scored,
+    /// No product was posted in the candidate window.
+    NoData,
 }
 
 /// Product identity in a scoreboard report.
@@ -59,6 +73,21 @@ pub struct ProductReport {
     pub agency: String,
     /// SP3 parser skips for unsupported declaration or record entries.
     pub parser_skipped_records: usize,
+}
+
+/// Product candidate attempted by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttemptedCandidateReport {
+    /// Product date in UTC, formatted as `YYYY-MM-DD`.
+    pub date_utc: String,
+    /// Candidate family, for example `rapid` or `ultra_rapid`.
+    pub cadence: String,
+    /// Archive or analysis-center source.
+    pub source: String,
+    /// Canonical product filename.
+    pub name: String,
+    /// HTTPS archive URL.
+    pub url: String,
 }
 
 /// Per-constellation scoreboard aggregate.
@@ -119,15 +148,37 @@ pub struct SatelliteSkipReport {
     pub reason: String,
 }
 
-/// Candidate product URL resolved through the core data catalog.
+/// Candidate product URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductCandidate {
-    /// Catalog product specification.
-    pub spec: ProductSpec,
+    /// Product date.
+    pub date: ProductDate,
+    /// Candidate family.
+    pub cadence: ProductCadence,
+    /// Archive or analysis-center source.
+    pub source: &'static str,
     /// Canonical product filename.
     pub name: String,
     /// HTTPS archive URL.
     pub url: String,
+}
+
+/// Product candidate family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductCadence {
+    /// Rapid daily product.
+    Rapid,
+    /// Ultra-rapid issued product.
+    UltraRapid,
+}
+
+impl ProductCadence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rapid => "rapid",
+            Self::UltraRapid => "ultra_rapid",
+        }
+    }
 }
 
 /// Product bytes resolved from the latest available candidate.
@@ -139,6 +190,15 @@ pub struct ResolvedProduct {
     pub bytes: Vec<u8>,
 }
 
+/// Product resolution result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductResolution {
+    /// Product bytes when a candidate was posted.
+    pub resolved: Option<ResolvedProduct>,
+    /// Candidates attempted in request order.
+    pub attempted: Vec<ProductCandidate>,
+}
+
 /// Fetch result for one product candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchOutcome {
@@ -146,6 +206,16 @@ pub enum FetchOutcome {
     Available(Vec<u8>),
     /// Candidate was not posted at the archive.
     NotPosted,
+}
+
+enum SatelliteScoreRow {
+    Fit(SatelliteFitReport),
+    Skip(SatelliteSkipReport),
+}
+
+struct SatelliteScoreOutcome {
+    row: SatelliteScoreRow,
+    used_position_fallback: bool,
 }
 
 /// Minimal fetch interface used by the resolver.
@@ -194,12 +264,6 @@ pub enum ScoreboardError {
         /// URL rejected by the fetcher.
         url: String,
     },
-    /// No candidate product was posted within the lookback window.
-    #[error("no rapid SP3 product posted in {attempts} attempted candidates")]
-    ProductNotPosted {
-        /// Number of candidate products checked.
-        attempts: usize,
-    },
     /// An HTTP status other than a not-posted status was returned.
     #[error("HTTP status {status} while fetching {url}")]
     HttpStatus {
@@ -247,19 +311,24 @@ pub fn resolve_latest_available_rapid_sp3(
     target_date: ProductDate,
     lookback_days: u32,
     fetcher: &impl ProductFetcher,
-) -> Result<ResolvedProduct, ScoreboardError> {
-    let mut attempts = 0usize;
-    for date in product_date_candidates(target_date, lookback_days)? {
-        let candidate = rapid_sp3_candidate(date)?;
-        attempts += 1;
+) -> Result<ProductResolution, ScoreboardError> {
+    let mut attempted = Vec::new();
+    for candidate in product_candidates(target_date, lookback_days)? {
+        attempted.push(candidate.clone());
         match fetcher.fetch(&candidate)? {
             FetchOutcome::Available(bytes) => {
-                return Ok(ResolvedProduct { candidate, bytes });
+                return Ok(ProductResolution {
+                    resolved: Some(ResolvedProduct { candidate, bytes }),
+                    attempted,
+                });
             }
             FetchOutcome::NotPosted => {}
         }
     }
-    Err(ScoreboardError::ProductNotPosted { attempts })
+    Ok(ProductResolution {
+        resolved: None,
+        attempted,
+    })
 }
 
 /// Build a scoreboard report from SP3 bytes.
@@ -282,63 +351,30 @@ pub fn score_sp3_bytes(
         Vec::new()
     };
 
+    let sat_results = product
+        .satellites()
+        .par_iter()
+        .map(|&satellite| {
+            score_satellite(
+                satellite,
+                use_state_samples,
+                &state_counts,
+                &position_counts,
+                &oriented_samples,
+                &position_samples,
+                options,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let mut fitted = Vec::new();
     let mut skipped = Vec::new();
     let mut used_position_fallback = false;
-
-    for &satellite in product.satellites() {
-        let position_count = position_counts.get(&satellite).copied().unwrap_or(0);
-        if position_count == 0 {
-            skipped.push(skip_row(satellite, "missing_position_samples"));
-            continue;
-        }
-
-        if use_state_samples {
-            let state_count = state_counts.get(&satellite).copied().unwrap_or(0);
-            if state_count != position_count {
-                skipped.push(skip_row(
-                    satellite,
-                    &format!("partial_velocity_samples:{state_count}/{position_count}"),
-                ));
-                continue;
-            }
-            match fit_precise_ephemeris_state_sample_orbit(
-                &oriented_samples,
-                satellite,
-                &options.fit_options,
-            ) {
-                Ok(report) => {
-                    if let Some(stats) = report.ledger.per_sat.get(&satellite) {
-                        fitted.push(fit_row(satellite, *stats));
-                    } else {
-                        skipped.push(skip_row(satellite, "missing_ledger"));
-                    }
-                }
-                Err(error) => skipped.push(skip_row(satellite, &format!("fit_error:{error}"))),
-            }
-            continue;
-        }
-
-        let sat_position_samples: Vec<PreciseEphemerisSample> = position_samples
-            .iter()
-            .copied()
-            .filter(|sample| sample.sat == satellite)
-            .collect();
-
-        used_position_fallback = true;
-        match fit_precise_ephemeris_sample_orbit(
-            &sat_position_samples,
-            satellite,
-            &options.fit_options,
-        ) {
-            Ok(report) => {
-                if let Some(stats) = report.ledger.per_sat.get(&satellite) {
-                    fitted.push(fit_row(satellite, *stats));
-                } else {
-                    skipped.push(skip_row(satellite, "missing_ledger"));
-                }
-            }
-            Err(error) => skipped.push(skip_row(satellite, &format!("fit_error:{error}"))),
+    for outcome in sat_results {
+        used_position_fallback |= outcome.used_position_fallback;
+        match outcome.row {
+            SatelliteScoreRow::Fit(row) => fitted.push(row),
+            SatelliteScoreRow::Skip(row) => skipped.push(row),
         }
     }
 
@@ -376,11 +412,13 @@ pub fn score_sp3_bytes(
     Ok(ScoreboardReport {
         date_utc: product_date.to_string(),
         sidereon_version: env!("CARGO_PKG_VERSION").to_string(),
-        product: ProductReport {
+        status: ScoreboardStatus::Scored,
+        product: Some(ProductReport {
             name: product_name.to_string(),
             agency: product.header.agency,
             parser_skipped_records: product.skipped_records,
-        },
+        }),
+        attempted_candidates: Vec::new(),
         per_constellation,
         per_sat: PerSatelliteReport {
             top,
@@ -389,6 +427,29 @@ pub fn score_sp3_bytes(
         },
         notes,
     })
+}
+
+/// Build a no-data report from attempted product candidates.
+pub fn no_data_report(
+    target_date: ProductDate,
+    attempted: &[ProductCandidate],
+) -> ScoreboardReport {
+    ScoreboardReport {
+        date_utc: target_date.to_string(),
+        sidereon_version: env!("CARGO_PKG_VERSION").to_string(),
+        status: ScoreboardStatus::NoData,
+        product: None,
+        attempted_candidates: attempted_candidate_reports(attempted),
+        per_constellation: BTreeMap::new(),
+        per_sat: empty_per_satellite_report(),
+        notes: vec![
+            format!(
+                "No rapid or ultra-rapid SP3 product was posted in {} attempted candidates.",
+                attempted.len()
+            ),
+            "This is recorded as no data, not a harness failure.".to_string(),
+        ],
+    }
 }
 
 /// Write the latest report file and append one compact JSON line to history.
@@ -407,6 +468,27 @@ pub fn write_report_outputs(
         file.write_all(b"\n")?;
     }
     Ok(())
+}
+
+fn attempted_candidate_reports(attempted: &[ProductCandidate]) -> Vec<AttemptedCandidateReport> {
+    attempted
+        .iter()
+        .map(|candidate| AttemptedCandidateReport {
+            date_utc: candidate.date.to_string(),
+            cadence: candidate.cadence.as_str().to_string(),
+            source: candidate.source.to_string(),
+            name: candidate.name.clone(),
+            url: candidate.url.clone(),
+        })
+        .collect()
+}
+
+fn empty_per_satellite_report() -> PerSatelliteReport {
+    PerSatelliteReport {
+        top: Vec::new(),
+        bottom: Vec::new(),
+        skipped: Vec::new(),
+    }
 }
 
 /// Format a report as pretty JSON.
@@ -452,13 +534,6 @@ pub fn parse_product_date(value: &str) -> Result<ProductDate, ScoreboardError> {
     ProductDate::new(year, month, day).map_err(ScoreboardError::from)
 }
 
-fn rapid_sp3_candidate(date: ProductDate) -> Result<ProductCandidate, ScoreboardError> {
-    let spec = mgex_sp3(RAPID_CENTER, date, None)?;
-    let name = spec.canonical_filename()?;
-    let url = spec.archive_url()?;
-    Ok(ProductCandidate { spec, name, url })
-}
-
 fn product_date_candidates(
     target: ProductDate,
     lookback_days: u32,
@@ -478,6 +553,127 @@ fn product_date_candidates(
         )?);
     }
     Ok(out)
+}
+
+fn product_candidates(
+    target: ProductDate,
+    lookback_days: u32,
+) -> Result<Vec<ProductCandidate>, ScoreboardError> {
+    let dates = product_date_candidates(target, lookback_days)?;
+    let mut out = Vec::new();
+    for &date in &dates {
+        out.extend(bkg_product_candidates(date)?);
+    }
+    for &date in &dates {
+        out.extend(esa_product_candidates(date)?);
+    }
+    for date in dates {
+        out.extend(gfz_product_candidates(date)?);
+    }
+    Ok(out)
+}
+
+fn bkg_product_candidates(date: ProductDate) -> Result<Vec<ProductCandidate>, ScoreboardError> {
+    let week = date.gps_week()?;
+    let daily_block = date_block(date, "0000");
+    let mut out = vec![product_candidate(
+        date,
+        ProductCadence::Rapid,
+        "BKG IGS",
+        &format!("IGS0OPSRAP_{daily_block}_01D_15M_ORB.SP3"),
+        &format!(
+            "https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/IGS0OPSRAP_{daily_block}_01D_15M_ORB.SP3.gz"
+        ),
+    )];
+    for issue in ["1800", "1200", "0600", "0000"] {
+        let date_block = date_block(date, issue);
+        out.push(product_candidate(
+            date,
+            ProductCadence::UltraRapid,
+            "BKG IGS",
+            &format!("IGS0OPSULT_{date_block}_02D_15M_ORB.SP3"),
+            &format!(
+                "https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/IGS0OPSULT_{date_block}_02D_15M_ORB.SP3.gz"
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn esa_product_candidates(date: ProductDate) -> Result<Vec<ProductCandidate>, ScoreboardError> {
+    let week = date.gps_week()?;
+    let daily_block = date_block(date, "0000");
+    let mut out = vec![product_candidate(
+        date,
+        ProductCadence::Rapid,
+        "ESA",
+        &format!("ESA0OPSRAP_{daily_block}_01D_05M_ORB.SP3"),
+        &format!(
+            "https://navigation-office.esa.int/products/gnss-products/{week}/ESA0OPSRAP_{daily_block}_01D_05M_ORB.SP3.gz"
+        ),
+    )];
+    for issue in ["1800", "1200", "0600", "0000"] {
+        let date_block = date_block(date, issue);
+        out.push(product_candidate(
+            date,
+            ProductCadence::UltraRapid,
+            "ESA",
+            &format!("ESA0OPSULT_{date_block}_02D_05M_ORB.SP3"),
+            &format!(
+                "https://navigation-office.esa.int/products/gnss-products/{week}/ESA0OPSULT_{date_block}_02D_05M_ORB.SP3.gz"
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn gfz_product_candidates(date: ProductDate) -> Result<Vec<ProductCandidate>, ScoreboardError> {
+    let week = date.gps_week()?;
+    let daily_block = date_block(date, "0000");
+    let mut out = vec![product_candidate(
+        date,
+        ProductCadence::Rapid,
+        "GFZ ISDC",
+        &format!("GFZ0OPSRAP_{daily_block}_01D_05M_ORB.SP3"),
+        &format!(
+            "https://isdc-data.gfz.de/gnss/products/rapid/w{week}/GFZ0OPSRAP_{daily_block}_01D_05M_ORB.SP3.gz"
+        ),
+    )];
+    for issue in [
+        "2100", "1800", "1500", "1200", "0900", "0600", "0300", "0000",
+    ] {
+        let date_block = date_block(date, issue);
+        out.push(product_candidate(
+            date,
+            ProductCadence::UltraRapid,
+            "GFZ ISDC",
+            &format!("GFZ0OPSULT_{date_block}_02D_05M_ORB.SP3"),
+            &format!(
+                "https://isdc-data.gfz.de/gnss/products/ultra/w{week}/GFZ0OPSULT_{date_block}_02D_05M_ORB.SP3.gz"
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn product_candidate(
+    date: ProductDate,
+    cadence: ProductCadence,
+    source: &'static str,
+    name: &str,
+    url: &str,
+) -> ProductCandidate {
+    ProductCandidate {
+        date,
+        cadence,
+        source,
+        name: name.to_string(),
+        url: url.to_string(),
+    }
+}
+
+fn date_block(date: ProductDate, issue: &str) -> String {
+    format!("{}{:03}{issue}", date.year, date.day_of_year())
 }
 
 fn product_date_from_j2000_seconds(seconds: i64) -> Result<ProductDate, ScoreboardError> {
@@ -502,9 +698,12 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
 
     let status_output = Command::new("curl")
         .args([
+            "--http1.1",
             "--location",
             "--head",
             "--silent",
+            "--retry",
+            "2",
             "--output",
             "/dev/null",
             "--write-out",
@@ -512,22 +711,22 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
             &candidate.url,
         ])
         .output()?;
-    if !status_output.status.success() {
-        return Err(ScoreboardError::Network {
-            url: candidate.url.clone(),
-            message: String::from_utf8_lossy(&status_output.stderr).to_string(),
-        });
-    }
     let status_text = String::from_utf8_lossy(&status_output.stdout);
     let status = status_text
         .trim()
         .parse::<u16>()
         .map_err(|_| ScoreboardError::Network {
             url: candidate.url.clone(),
-            message: format!("curl returned invalid HTTP status {status_text:?}"),
+            message: curl_message(&status_output.stderr, &status_output.stdout),
         })?;
-    if status == 403 || status == 404 {
+    if status == 0 || status == 403 || status == 404 {
         return Ok(FetchOutcome::NotPosted);
+    }
+    if !status_output.status.success() {
+        return Err(ScoreboardError::Network {
+            url: candidate.url.clone(),
+            message: curl_message(&status_output.stderr, &status_output.stdout),
+        });
     }
     if !(200..300).contains(&status) {
         return Err(ScoreboardError::HttpStatus {
@@ -538,10 +737,13 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
 
     let response = Command::new("curl")
         .args([
+            "--http1.1",
             "--fail",
             "--location",
             "--silent",
             "--show-error",
+            "--retry",
+            "2",
             &candidate.url,
         ])
         .output()?;
@@ -559,6 +761,92 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
         Ok(FetchOutcome::Available(decoded))
     } else {
         Ok(FetchOutcome::Available(bytes))
+    }
+}
+
+fn curl_message(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    if stdout.is_empty() {
+        "curl failed without diagnostic output".to_string()
+    } else {
+        format!("curl failed with output {stdout:?}")
+    }
+}
+
+fn score_satellite(
+    satellite: GnssSatelliteId,
+    use_state_samples: bool,
+    state_counts: &BTreeMap<GnssSatelliteId, usize>,
+    position_counts: &BTreeMap<GnssSatelliteId, usize>,
+    oriented_samples: &[OrientedPreciseEphemerisStateSample],
+    position_samples: &[PreciseEphemerisSample],
+    options: &ScoreOptions,
+) -> SatelliteScoreOutcome {
+    let position_count = position_counts.get(&satellite).copied().unwrap_or(0);
+    if position_count == 0 {
+        return SatelliteScoreOutcome {
+            row: SatelliteScoreRow::Skip(skip_row(satellite, "missing_position_samples")),
+            used_position_fallback: false,
+        };
+    }
+
+    if use_state_samples {
+        let state_count = state_counts.get(&satellite).copied().unwrap_or(0);
+        if state_count != position_count {
+            return SatelliteScoreOutcome {
+                row: SatelliteScoreRow::Skip(skip_row(
+                    satellite,
+                    &format!("partial_velocity_samples:{state_count}/{position_count}"),
+                )),
+                used_position_fallback: false,
+            };
+        }
+        let row = match fit_precise_ephemeris_state_sample_orbit(
+            oriented_samples,
+            satellite,
+            &options.fit_options,
+        ) {
+            Ok(report) => report
+                .ledger
+                .per_sat
+                .get(&satellite)
+                .map(|stats| SatelliteScoreRow::Fit(fit_row(satellite, *stats)))
+                .unwrap_or_else(|| SatelliteScoreRow::Skip(skip_row(satellite, "missing_ledger"))),
+            Err(error) => {
+                SatelliteScoreRow::Skip(skip_row(satellite, &format!("fit_error:{error}")))
+            }
+        };
+        return SatelliteScoreOutcome {
+            row,
+            used_position_fallback: false,
+        };
+    }
+
+    let sat_position_samples: Vec<PreciseEphemerisSample> = position_samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.sat == satellite)
+        .collect();
+    let row = match fit_precise_ephemeris_sample_orbit(
+        &sat_position_samples,
+        satellite,
+        &options.fit_options,
+    ) {
+        Ok(report) => report
+            .ledger
+            .per_sat
+            .get(&satellite)
+            .map(|stats| SatelliteScoreRow::Fit(fit_row(satellite, *stats)))
+            .unwrap_or_else(|| SatelliteScoreRow::Skip(skip_row(satellite, "missing_ledger"))),
+        Err(error) => SatelliteScoreRow::Skip(skip_row(satellite, &format!("fit_error:{error}"))),
+    };
+    SatelliteScoreOutcome {
+        row,
+        used_position_fallback: true,
     }
 }
 
@@ -680,11 +968,25 @@ pub fn run_default(
     target_date: ProductDate,
     lookback_days: u32,
 ) -> Result<ScoreboardReport, ScoreboardError> {
-    let resolved = resolve_latest_available_rapid_sp3(target_date, lookback_days, &HttpsFetcher)?;
-    score_sp3_bytes(
+    run_with_fetcher(target_date, lookback_days, &HttpsFetcher)
+}
+
+/// Run the scoreboard pipeline with a supplied product fetcher.
+pub fn run_with_fetcher(
+    target_date: ProductDate,
+    lookback_days: u32,
+    fetcher: &impl ProductFetcher,
+) -> Result<ScoreboardReport, ScoreboardError> {
+    let resolution = resolve_latest_available_rapid_sp3(target_date, lookback_days, fetcher)?;
+    let Some(resolved) = resolution.resolved else {
+        return Ok(no_data_report(target_date, &resolution.attempted));
+    };
+    let mut report = score_sp3_bytes(
         &resolved.bytes,
         &resolved.candidate.name,
-        resolved.candidate.spec.date,
+        resolved.candidate.date,
         &ScoreOptions::default(),
-    )
+    )?;
+    report.attempted_candidates = attempted_candidate_reports(&resolution.attempted);
+    Ok(report)
 }

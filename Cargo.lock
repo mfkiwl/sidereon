@@ -688,6 +688,7 @@ name = "sidereon-scoreboard"
 version = "0.15.0"
 dependencies = [
  "flate2",
+ "rayon",
  "serde",
  "serde_json",
  "sidereon-core",
