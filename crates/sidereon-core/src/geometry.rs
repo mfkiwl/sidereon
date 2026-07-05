@@ -17,6 +17,13 @@ pub use crate::dop::{
     GeometryCofactor, HorizontalErrorEllipse, LineOfSight, PositionCovariance,
 };
 pub use crate::frame::{ItrfPositionM, ItrfVelocityMS, Wgs84Geodetic};
+pub use crate::geofence::{
+    containment, containment_probability, containment_probability_with_options, crossing,
+    crossing_probability, crossing_probability_with_options, distance_to_boundary, CrossingEvent,
+    CrossingKind, Fence, GeofenceError, GeofencePositionEstimate, PositionUncertainty,
+    ProbabilityHysteresis, ProbabilityMethod, ProbabilityOptions, GEOFENCE_BOUNDARY_TOLERANCE_M,
+    PLANAR_FAST_PATH_MAX_RADIUS_M,
+};
 use crate::observables::{predict, PredictOptions};
 pub use crate::observables::{
     transmit_time_satellite_state, ObservableEphemerisSource, ObservableState, ObservablesError,
