@@ -18,7 +18,7 @@
 
 use super::{
     eval_cubic_spline_for_test as eval_spline, instant_to_j2000_seconds,
-    interpolate_position_neville,
+    interpolate_position_neville, precise_node_j2000_seconds,
 };
 use crate::astro::constants::time::SECONDS_PER_DAY_I64;
 use crate::astro::time::civil::{J2000_JULIAN_DAY_NUMBER, J2000_NOON_OFFSET_S};
@@ -76,11 +76,18 @@ fn small_node_count_special_cases() {
     );
 }
 
+#[test]
+fn node_axis_snaps_split_roundoff_but_truncates_real_fraction() {
+    assert_eq!(precise_node_j2000_seconds(-21593.000000000004), -21593.0);
+    assert_eq!(precise_node_j2000_seconds(10.99999950), 10.0);
+    assert_eq!(precise_node_j2000_seconds(-10.00000050), -11.0);
+}
+
 // --- RTKLIB position parity (interior + day-boundary) ---
 
 /// One RTKLIB-reference position case.
 ///
-/// `query` is the J2000 second (matching this crate's floored node axis), and
+/// `query` is the J2000 second (matching this crate's whole-second node axis), and
 /// `pos_m` is RTKLIB `peph2pos(opt=0)` satellite ECEF position in meters.
 struct Case {
     prn: &'static str,

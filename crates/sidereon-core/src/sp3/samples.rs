@@ -10,8 +10,8 @@
 //! # Byte-identical parity with the SP3 path
 //!
 //! [`PreciseEphemerisSamples::from_samples`] gathers the same node vectors the
-//! SP3 gather builds (floored J2000-second axis; file-native km position; native
-//! microsecond clock) and feeds the shared interpolator. The byte-identity
+//! SP3 gather builds (shared whole-second J2000 axis; file-native km position;
+//! native microsecond clock) and feeds the shared interpolator. The byte-identity
 //! contract is precise:
 //!
 //! - **Byte-identical** holds when the samples are the faithful image of the
@@ -49,7 +49,10 @@ use crate::astro::time::model::{Instant, TimeScale};
 use crate::constants::{KM_TO_M, US_TO_S};
 use crate::id::GnssSatelliteId;
 use crate::observables::{ObservableEphemerisSource, ObservableState, ObservablesError};
-use crate::sp3::interp::{instant_to_j2000_seconds, interpolate_precise_state, PreciseSatSeries};
+use crate::sp3::interp::{
+    instant_to_j2000_seconds, interpolate_precise_state, precise_node_j2000_seconds,
+    PreciseSatSeries,
+};
 use crate::sp3::{Sp3, Sp3State};
 use crate::{Error, Result};
 
@@ -242,9 +245,9 @@ impl PreciseEphemerisSamples {
     /// Samples are grouped by satellite, keeping their supplied order. Each
     /// satellite's series is validated to be strictly increasing in epoch and to
     /// carry at least two nodes. All samples must share one time scale. The node
-    /// substrate is prepared exactly as the SP3 gather prepares it (floored
-    /// J2000-second axis; native km position; native microsecond clock), so the
-    /// interpolation is byte-identical to the SP3 path for samples that are the
+    /// substrate is prepared exactly as the SP3 gather prepares it (shared
+    /// whole-second J2000 axis; native km position; native microsecond clock),
+    /// so the interpolation is byte-identical to the SP3 path for samples that are the
     /// faithful image of the fit nodes (the round-trip case); samples carrying
     /// lower precision interpolate at that precision. See the module docs for the
     /// precise byte-identity contract and the SI-vs-native reconstruction caveat.
@@ -267,18 +270,18 @@ impl PreciseEphemerisSamples {
                 return Err(PreciseSamplesError::NonFiniteSample(sample.sat));
             }
 
-            // Node axis: floored to whole seconds, matching the SP3 gather (the
-            // query, at evaluation time, is not floored). A finite `Instant` can
-            // still map to a non-finite J2000 second (an extreme Julian date
-            // overflowing the difference), which would poison the node axis and
-            // slip past the `w[1] <= w[0]` monotonicity check (NaN comparisons are
-            // false); reject it as unrepresentable.
+            // Node axis: shared whole-second construction, matching the SP3
+            // gather. A finite `Instant` can still map to a non-finite J2000
+            // second (an extreme Julian date overflowing the difference), which
+            // would poison the node axis and slip past the `w[1] <= w[0]`
+            // monotonicity check (NaN comparisons are false); reject it as
+            // unrepresentable.
             let seconds = instant_to_j2000_seconds(&sample.epoch)
                 .ok_or(PreciseSamplesError::EpochNotRepresentable(sample.sat))?;
             if !seconds.is_finite() {
                 return Err(PreciseSamplesError::EpochNotRepresentable(sample.sat));
             }
-            let xi = seconds.floor();
+            let xi = precise_node_j2000_seconds(seconds);
 
             // SI -> file-native fit units. The single divide is the correctly
             // rounded inverse of the SP3 parser's `km * KM_TO_M` / `us * US_TO_S`
