@@ -81,7 +81,7 @@ impl From<crate::inertial::InertialError> for FusionError {
 pub enum FusionFilterKind {
     /// Extended Kalman filter using the linearized error-state model.
     Ekf,
-    /// Unscented Kalman filter placeholder for a later nonlinear pass.
+    /// Unscented Kalman filter using scaled sigma points.
     Ukf,
 }
 
@@ -279,10 +279,12 @@ pub fn validate_covariance_matrix(
 pub fn covariance_is_positive_semidefinite(covariance: &[Vec<f64>]) -> Result<bool, FusionError> {
     let dimension = covariance.len();
     validate_square_matrix(covariance, dimension, "covariance")?;
-    let scale = matrix_scale(covariance);
-    let tolerance = psd_tolerance(dimension, scale);
     for row in 0..dimension {
         for col in (row + 1)..dimension {
+            let tolerance = psd_tolerance(
+                dimension,
+                covariance[row][col].abs().max(covariance[col][row].abs()),
+            );
             if (covariance[row][col] - covariance[col][row]).abs() > tolerance {
                 return Ok(false);
             }
@@ -290,10 +292,16 @@ pub fn covariance_is_positive_semidefinite(covariance: &[Vec<f64>]) -> Result<bo
     }
     let matrix = dmatrix_from_rows(covariance);
     let eigen = matrix.symmetric_eigen();
-    Ok(eigen
-        .eigenvalues
-        .iter()
-        .all(|value| value.is_finite() && *value >= -tolerance))
+    for (idx, value) in eigen.eigenvalues.iter().enumerate() {
+        if !value.is_finite() {
+            return Ok(false);
+        }
+        let tolerance = covariance_eigenvalue_tolerance(covariance, &eigen.eigenvectors, idx);
+        if *value < -tolerance {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Symmetrize and reproject a covariance onto the PSD cone under numerical bounds.
@@ -304,19 +312,21 @@ pub fn reproject_covariance_psd(
     let dimension = covariance.len();
     validate_square_matrix(covariance, dimension, field)?;
     symmetrize_in_place(covariance);
-    let scale = matrix_scale(covariance);
-    let tolerance = psd_tolerance(dimension, scale);
     let matrix = dmatrix_from_rows(covariance);
     let eigen = matrix.symmetric_eigen();
-    let min_eigenvalue = eigen
-        .eigenvalues
-        .iter()
-        .fold(f64::INFINITY, |acc, value| acc.min(*value));
-    if !min_eigenvalue.is_finite() || min_eigenvalue < -tolerance {
-        return Err(FusionError::NonPositiveSemidefinite { field });
+    let mut needs_repair = false;
+    for (idx, value) in eigen.eigenvalues.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(FusionError::NonPositiveSemidefinite { field });
+        }
+        let tolerance = covariance_eigenvalue_tolerance(covariance, &eigen.eigenvectors, idx);
+        if *value < -tolerance {
+            return Err(FusionError::NonPositiveSemidefinite { field });
+        }
+        needs_repair |= *value < 0.0;
     }
 
-    if min_eigenvalue < 0.0 {
+    if needs_repair {
         let mut diagonal = DMatrix::<f64>::zeros(dimension, dimension);
         for idx in 0..dimension {
             diagonal[(idx, idx)] = eigen.eigenvalues[idx].max(0.0);
@@ -522,12 +532,6 @@ pub(crate) fn matrix_sub(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f64>>
     Ok(out)
 }
 
-pub(crate) fn matrix_scale(a: &[Vec<f64>]) -> f64 {
-    a.iter()
-        .flat_map(|row| row.iter())
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
-}
-
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn symmetrize_in_place(matrix: &mut [Vec<f64>]) {
     let dimension = matrix.len();
@@ -597,6 +601,22 @@ fn psd_tolerance(dimension: usize, scale: f64) -> f64 {
     PSD_REL_TOLERANCE * dimension_scale * scale
 }
 
+pub(crate) fn covariance_eigenvalue_tolerance(
+    covariance: &[Vec<f64>],
+    eigenvectors: &DMatrix<f64>,
+    mode: usize,
+) -> f64 {
+    let dimension = covariance.len();
+    let mut scale = 0.0_f64;
+    for row in 0..dimension {
+        let row_weight = eigenvectors[(row, mode)].abs();
+        for col in 0..dimension {
+            scale += row_weight * covariance[row][col].abs() * eigenvectors[(col, mode)].abs();
+        }
+    }
+    psd_tolerance(dimension, scale)
+}
+
 #[cfg(test)]
 mod tests {
     //! Provenance: PSD validation tests lock the fusion safety contract that
@@ -626,5 +646,22 @@ mod tests {
             }
         ));
         assert_eq!(covariance[0][0].to_bits(), (-1.0e-15_f64).to_bits());
+    }
+
+    #[test]
+    fn unrelated_large_variance_does_not_hide_negative_mode() {
+        let covariance = vec![vec![1.0e16, 0.0], vec![0.0, -100.0]];
+        assert!(!covariance_is_positive_semidefinite(&covariance).expect("psd"));
+
+        let mut covariance = covariance;
+        let err = reproject_covariance_psd(&mut covariance, "covariance")
+            .expect_err("negative mode must remain flagged");
+        assert!(matches!(
+            err,
+            FusionError::NonPositiveSemidefinite {
+                field: "covariance"
+            }
+        ));
+        assert_eq!(covariance[1][1].to_bits(), (-100.0_f64).to_bits());
     }
 }

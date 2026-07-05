@@ -189,10 +189,20 @@ pub use frame_catalog::{
     TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
 };
 pub use fusion::{
-    loose_coupling_correction, validate_time_sync_gnss_order, validate_time_sync_imu_order,
-    FusionUpdate, GnssFixMeasurement, InertialFilter, InertialFilterConfig, LooseCouplingConfig,
-    TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
+    loose_coupling_correction, ukf_correct_closed_loop, validate_time_sync_gnss_order,
+    validate_time_sync_imu_order, F64Bits, FusionFilterKind, FusionStateCodecError, FusionUpdate,
+    GnssFixMeasurement, InertialFilter, InertialFilterConfig, LooseCouplingConfig,
+    SerializableErrorStateLayout, SerializableFusionSnapshot, SerializableFusionState,
+    SerializableImuSample, SerializableImuSampleKind, SerializableInsFilterState,
+    SerializableLooseMeasurement, SerializableNavState, SerializableRateEndpoint,
+    SerializableSatelliteId, SerializableStoredCheckpoint, SerializableStoredGnssMeasurement,
+    SerializableStoredImuSample, SerializableTightCarrierPhaseObservation,
+    SerializableTightFilterState, SerializableTightGnssEpoch, SerializableTightGnssObservation,
+    SerializableTightRangeRateObservation, SerializableTimeSyncHistory,
+    SerializableTimeSyncHistoryConfig, TimeSyncHistoryConfig, TimeSyncHistoryStatus,
+    TimeSyncUpdate, UkfUpdateOptions, UnscentedTransformOptions,
     DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
+    FUSION_STATE_CODEC_VERSION,
 };
 pub use geodesic::{geodesic_direct, geodesic_inverse, GeodesicError};
 pub use geoid::{

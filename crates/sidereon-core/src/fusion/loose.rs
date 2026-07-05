@@ -17,12 +17,15 @@ use super::ekf::{ekf_correct_closed_loop, EkfCorrection, EkfCorrectionReport, Ek
 use super::error_state::{
     linearize_error_state_ecef, predict_error_state_covariance, ErrorStateImuKinematics,
 };
+use super::state::FusionFilterKind;
 use super::state::{
     invalid_input, validate_covariance_matrix, FusionError, InsFilterState, ERROR_ATTITUDE_INDEX,
-    ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_VELOCITY_INDEX,
+    ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15,
+    ERROR_STATE_DIMENSION_21, ERROR_VELOCITY_INDEX,
 };
 use super::tight::{TightCouplingConfig, TightFusionState};
 use super::timesync::TimeSyncHistory;
+use super::ukf::{ukf_correct_closed_loop, UkfUpdateOptions};
 
 const LOOSE_MIN_SATELLITES: usize = 4;
 const POSITION_ROWS: usize = 3;
@@ -155,6 +158,8 @@ impl LooseCouplingConfig {
 pub struct InertialFilterConfig {
     /// IMU stochastic model used for covariance prediction.
     pub imu_spec: ImuSpec,
+    /// Measurement-update algorithm used by loose and tight GNSS updates.
+    pub filter_kind: FusionFilterKind,
     /// Deterministic IMU calibration applied before mechanization.
     pub imu_model: ImuErrorModel,
     /// Strapdown mechanization options.
@@ -163,6 +168,8 @@ pub struct InertialFilterConfig {
     pub loose: LooseCouplingConfig,
     /// Tight raw GNSS update options.
     pub tight: TightCouplingConfig,
+    /// UKF correction options used when [`Self::filter_kind`] is [`FusionFilterKind::Ukf`].
+    pub ukf_update_options: UkfUpdateOptions,
 }
 
 impl InertialFilterConfig {
@@ -170,10 +177,12 @@ impl InertialFilterConfig {
     pub fn new(imu_spec: ImuSpec) -> Result<Self, FusionError> {
         let config = Self {
             imu_spec,
+            filter_kind: FusionFilterKind::Ekf,
             imu_model: ImuErrorModel::default(),
             mechanization: MechanizationConfig::default(),
             loose: LooseCouplingConfig::default(),
             tight: TightCouplingConfig::default(),
+            ukf_update_options: UkfUpdateOptions::default(),
         };
         config.validate()?;
         Ok(config)
@@ -188,7 +197,11 @@ impl InertialFilterConfig {
             .validate()
             .map_err(FusionError::from)?;
         self.loose.validate()?;
-        self.tight.validate()
+        self.tight.validate()?;
+        self.ukf_update_options
+            .validate_for_dimension(ERROR_STATE_DIMENSION_15)?;
+        self.ukf_update_options
+            .validate_for_dimension(ERROR_STATE_DIMENSION_21)
     }
 }
 
@@ -205,7 +218,7 @@ pub struct FusionUpdate {
     pub accepted_rows: usize,
     /// Number of rows rejected by any configured innovation screen.
     pub rejected_rows: usize,
-    /// Full EKF correction report from the shared correction primitive.
+    /// Full correction report from the selected update primitive.
     pub ekf: EkfCorrectionReport,
 }
 
@@ -369,11 +382,17 @@ impl InertialFilter {
             self.last_body_rate_wrt_ecef_rps,
         )?;
         let rows = correction.row_count();
-        let report = ekf_correct_closed_loop(
-            &mut self.state,
-            &correction,
-            self.config.loose.update_options,
-        )?;
+        let filter_kind = self.config.filter_kind;
+        let ekf_options = self.config.loose.update_options;
+        let ukf_options = self.config.ukf_update_options;
+        let report = match filter_kind {
+            FusionFilterKind::Ekf => {
+                ekf_correct_closed_loop(&mut self.state, &correction, ekf_options)?
+            }
+            FusionFilterKind::Ukf => {
+                ukf_correct_closed_loop(&mut self.state, &correction, ukf_options)?
+            }
+        };
         self.tight
             .replace_base_covariance_and_clear_cross(&self.state.covariance)?;
         Ok(FusionUpdate::from_report(rows, report))

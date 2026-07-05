@@ -239,6 +239,18 @@ pub use sidereon_core::{
     sbas_protection_levels, AirborneModel, DegradationParams, ProtectionGeometry, ProtectionRow,
     SbasErrorModel, SbasKMultipliers, SbasPlError, SbasProtection, SbasSisError,
 };
+pub use sidereon_core::{
+    ukf_correct_closed_loop, F64Bits, FusionFilterKind, FusionStateCodecError,
+    SerializableErrorStateLayout, SerializableFusionSnapshot, SerializableFusionState,
+    SerializableImuSample, SerializableImuSampleKind, SerializableInsFilterState,
+    SerializableLooseMeasurement, SerializableNavState, SerializableRateEndpoint,
+    SerializableSatelliteId, SerializableStoredCheckpoint, SerializableStoredGnssMeasurement,
+    SerializableStoredImuSample, SerializableTightCarrierPhaseObservation,
+    SerializableTightFilterState, SerializableTightGnssEpoch, SerializableTightGnssObservation,
+    SerializableTightRangeRateObservation, SerializableTimeSyncHistory,
+    SerializableTimeSyncHistoryConfig, UkfUpdateOptions, UnscentedTransformOptions,
+    FUSION_STATE_CODEC_VERSION,
+};
 
 /// Stable RTK input, result, option, status, and error types used by the
 /// ergonomic RTK solve wrappers.

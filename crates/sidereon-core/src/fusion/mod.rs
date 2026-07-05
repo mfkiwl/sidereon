@@ -6,9 +6,11 @@
 pub mod ekf;
 pub mod error_state;
 pub mod loose;
+pub mod serial;
 pub mod state;
 pub mod tight;
 pub mod timesync;
+pub mod ukf;
 
 pub use crate::inertial::*;
 pub use ekf::{
@@ -23,6 +25,17 @@ pub use error_state::{
 pub use loose::{
     loose_coupling_correction, FusionUpdate, GnssFixMeasurement, InertialFilter,
     InertialFilterConfig, LooseCouplingConfig,
+};
+pub use serial::{
+    F64Bits, FusionStateCodecError, SerializableErrorStateLayout, SerializableFusionSnapshot,
+    SerializableFusionState, SerializableImuSample, SerializableImuSampleKind,
+    SerializableInsFilterState, SerializableLooseMeasurement, SerializableNavState,
+    SerializableRateEndpoint, SerializableSatelliteId, SerializableStoredCheckpoint,
+    SerializableStoredGnssMeasurement, SerializableStoredImuSample,
+    SerializableTightCarrierPhaseObservation, SerializableTightFilterState,
+    SerializableTightGnssEpoch, SerializableTightGnssObservation,
+    SerializableTightRangeRateObservation, SerializableTimeSyncHistory,
+    SerializableTimeSyncHistoryConfig, FUSION_STATE_CODEC_VERSION,
 };
 pub use state::{
     covariance_is_positive_semidefinite, reproject_covariance_psd, validate_covariance_matrix,
@@ -42,3 +55,4 @@ pub use timesync::{
     TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
     DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
 };
+pub use ukf::{ukf_correct_closed_loop, UkfUpdateOptions, UnscentedTransformOptions};
