@@ -66,6 +66,10 @@ The Rust interface is the `sidereon` crate above. The other language interfaces 
 
 ## Validation
 
+Evaluation is deterministic: the same product, the same version, and the same platform give
+identical bits, and releases that change evaluation bits for an existing surface say so in the
+changelog. Cross-platform bit identity holds only where a test pins it.
+
 Every numerical routine is cross-checked against the reference implementation or published standard for its domain, not just internal goldens. Each check runs in the test suite against a committed reference fixture whose provenance (tool, version, source) is recorded, and many gates are bit-for-bit.
 
 | Capability | Cross-checked against | Reference |
