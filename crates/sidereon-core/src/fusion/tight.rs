@@ -1010,6 +1010,7 @@ fn map_observables_error(error: ObservablesError) -> FusionError {
             invalid_input("observable_state", "must be finite and in range")
         }
         ObservablesError::Ephemeris(_) => invalid_input("ephemeris", "satellite state failed"),
+        ObservablesError::Media(_) => invalid_input("media", "correction failed"),
     }
 }
 

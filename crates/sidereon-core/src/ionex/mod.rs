@@ -43,6 +43,59 @@ pub use tec_grid::{
     TecGridEpoch, TecGridEvalOptions, TecGridShellGeometry,
 };
 
+/// Policy applied when an IONEX query lands outside the product's coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IonexCoveragePolicy {
+    /// Return a typed error before exposing a held value.
+    #[default]
+    Strict,
+    /// Hold the nearest map or grid edge and return a status marker.
+    Hold,
+}
+
+/// IONEX coverage miss detected during slant-delay evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IonexCoverageError {
+    /// Query epoch precedes the first map epoch.
+    EpochBeforeFirstMap,
+    /// Query epoch follows the last map epoch.
+    EpochAfterLastMap,
+    /// Pierce-point latitude is outside the latitude nodes.
+    LatitudeOutOfRange,
+    /// Pierce-point longitude is outside the longitude nodes.
+    LongitudeOutOfRange,
+}
+
+impl core::fmt::Display for IonexCoverageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let message = match self {
+            Self::EpochBeforeFirstMap => "epoch precedes first map",
+            Self::EpochAfterLastMap => "epoch follows last map",
+            Self::LatitudeOutOfRange => "latitude outside grid",
+            Self::LongitudeOutOfRange => "longitude outside grid",
+        };
+        f.write_str(message)
+    }
+}
+
+/// Coverage status for a successful IONEX slant-delay value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IonexSlantDelayStatus {
+    /// The query was inside the product's temporal and spatial coverage.
+    Valid,
+    /// The value was produced by the explicit hold policy.
+    Held(IonexCoverageError),
+}
+
+/// IONEX slant-delay value with its coverage status.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IonexSlantDelayEvaluation {
+    /// Ionospheric group delay, meters.
+    pub delay_m: f64,
+    /// Coverage status for `delay_m`.
+    pub status: IonexSlantDelayStatus,
+}
+
 pub(crate) use klobuchar::klobuchar_l1_components;
 pub(crate) use slant::pierce_point;
 
@@ -384,8 +437,8 @@ fn single_layer_mapping(el_deg: f64) -> f64 {
 /// Maps the parsed [`Ionex`] vertical-TEC grid to the line of sight in the
 /// single-layer-model convention: a single-layer pierce point at the product's
 /// shell height, an explicit four-term bilinear VTEC per map, a linear-in-time
-/// blend between the two maps bracketing `epoch_j2000_s` (holding the endpoint
-/// map outside coverage), the `1/sqrt(1 - s^2)` obliquity factor, and the
+/// blend between the two maps bracketing `epoch_j2000_s`, the
+/// `1/sqrt(1 - s^2)` obliquity factor, and the
 /// dispersive `40.3e16 / f^2` frequency scaling.
 ///
 /// The receiver geodetic latitude/longitude come from `receiver` (height is
@@ -393,7 +446,8 @@ fn single_layer_mapping(el_deg: f64) -> f64 {
 /// The epoch is taken as integer J2000 seconds so it lands exactly on the
 /// product's own epoch axis, with no float-rounded time entering the temporal
 /// bracket. `frequency_hz` is the carrier on which the delay is reported. The
-/// returned value is positive meters that increase the pseudorange.
+/// returned value is positive meters that increase the pseudorange. This
+/// default entry uses [`IonexCoveragePolicy::Strict`].
 pub fn ionex_slant_delay(
     ionex: &Ionex,
     receiver: Wgs84Geodetic,
@@ -402,22 +456,44 @@ pub fn ionex_slant_delay(
     epoch_j2000_s: i64,
     frequency_hz: f64,
 ) -> Result<f64> {
-    validate_receiver(receiver)?;
-    validate_finite(elevation_rad, "elevation_rad")?;
-    validate_elevation_rad(elevation_rad, "elevation_rad")?;
-    validate_finite(azimuth_rad, "azimuth_rad")?;
-    validate_frequency(frequency_hz)?;
-
-    let delay_m = ionex_slant_delay_unchecked(
+    Ok(ionex_slant_delay_with_policy(
         ionex,
         receiver,
         elevation_rad,
         azimuth_rad,
         epoch_j2000_s,
         frequency_hz,
-    );
-    validate_finite(delay_m, "ionosphere_delay_m")?;
-    Ok(delay_m)
+        IonexCoveragePolicy::Strict,
+    )?
+    .delay_m)
+}
+
+/// IONEX slant delay with an explicit coverage policy.
+pub fn ionex_slant_delay_with_policy(
+    ionex: &Ionex,
+    receiver: Wgs84Geodetic,
+    elevation_rad: f64,
+    azimuth_rad: f64,
+    epoch_j2000_s: i64,
+    frequency_hz: f64,
+    policy: IonexCoveragePolicy,
+) -> Result<IonexSlantDelayEvaluation> {
+    validate_ionex_slant_inputs(receiver, elevation_rad, azimuth_rad, frequency_hz)?;
+
+    let evaluation = ionex_slant_delay_unchecked_with_policy(
+        ionex,
+        IonexSlantRequest {
+            receiver,
+            elevation_rad,
+            azimuth_rad,
+            epoch_j2000_s,
+            frequency_hz,
+        },
+        ionex_vtec_grid_view(ionex),
+        policy,
+    )?;
+    validate_finite(evaluation.delay_m, "ionosphere_delay_m")?;
+    Ok(evaluation)
 }
 
 /// One IONEX slant-delay query for [`ionex_slant_delays`].
@@ -456,26 +532,43 @@ pub fn ionex_slant_delays(
 
     let grid = ionex_vtec_grid_view(ionex);
     for (request, output) in requests.iter().zip(out.iter_mut()) {
-        validate_receiver(request.receiver)?;
-        validate_finite(request.elevation_rad, "elevation_rad")?;
-        validate_elevation_rad(request.elevation_rad, "elevation_rad")?;
-        validate_finite(request.azimuth_rad, "azimuth_rad")?;
-        validate_frequency(request.frequency_hz)?;
+        validate_ionex_slant_request(*request)?;
 
-        let delay_m = ionex_slant_delay_unchecked_with_grid(
+        let evaluation = ionex_slant_delay_unchecked_with_policy(
             ionex,
-            request.receiver,
-            request.elevation_rad,
-            request.azimuth_rad,
-            request.epoch_j2000_s,
-            request.frequency_hz,
+            *request,
             grid,
-        );
+            IonexCoveragePolicy::Strict,
+        )?;
+        let delay_m = evaluation.delay_m;
         validate_finite(delay_m, "ionosphere_delay_m")?;
         debug_assert!(delay_m.is_finite());
         *output = delay_m;
     }
     Ok(())
+}
+
+/// Evaluate IONEX slant delays as one result per request.
+///
+/// This keeps batch-level plumbing out of per-element failures: malformed rows
+/// and strict coverage misses are returned in their own element, matching the
+/// loud batch convention used by terrain lookups.
+pub fn ionex_slant_delay_results(
+    ionex: &Ionex,
+    requests: &[IonexSlantRequest],
+    policy: IonexCoveragePolicy,
+) -> Vec<Result<IonexSlantDelayEvaluation>> {
+    let grid = ionex_vtec_grid_view(ionex);
+    requests
+        .iter()
+        .map(|request| {
+            validate_ionex_slant_request(*request)?;
+            let evaluation =
+                ionex_slant_delay_unchecked_with_policy(ionex, *request, grid, policy)?;
+            validate_finite(evaluation.delay_m, "ionosphere_delay_m")?;
+            Ok(evaluation)
+        })
+        .collect()
 }
 
 impl Ionex {
@@ -505,50 +598,46 @@ impl Ionex {
         self.slant_delays_batch(requests, &mut out)?;
         Ok(out)
     }
+
+    /// Evaluate IONEX slant ionospheric group delays as one result per request.
+    pub fn slant_delays_batch_results(
+        &self,
+        requests: &[IonexSlantRequest],
+        policy: IonexCoveragePolicy,
+    ) -> Vec<Result<IonexSlantDelayEvaluation>> {
+        ionex_slant_delay_results(self, requests, policy)
+    }
 }
 
-fn ionex_slant_delay_unchecked(
+fn ionex_slant_delay_unchecked_with_policy(
     ionex: &Ionex,
-    receiver: Wgs84Geodetic,
-    elevation_rad: f64,
-    azimuth_rad: f64,
-    epoch_j2000_s: i64,
-    frequency_hz: f64,
-) -> f64 {
-    ionex_slant_delay_unchecked_with_grid(
-        ionex,
-        receiver,
-        elevation_rad,
-        azimuth_rad,
-        epoch_j2000_s,
-        frequency_hz,
-        ionex_vtec_grid_view(ionex),
-    )
-}
-
-fn ionex_slant_delay_unchecked_with_grid(
-    ionex: &Ionex,
-    receiver: Wgs84Geodetic,
-    elevation_rad: f64,
-    azimuth_rad: f64,
-    epoch_j2000_s: i64,
-    frequency_hz: f64,
+    request: IonexSlantRequest,
     grid: slant::VtecGridView<'_>,
-) -> f64 {
-    slant::slant_delay_components(
+    policy: IonexCoveragePolicy,
+) -> Result<IonexSlantDelayEvaluation> {
+    let (components, coverage) = slant::slant_delay_components_with_policy(
         slant::PierceLineOfSight {
-            lat_rad: receiver.lat_rad,
-            lon_rad: receiver.lon_rad,
-            az_rad: azimuth_rad,
-            el_rad: elevation_rad,
+            lat_rad: request.receiver.lat_rad,
+            lon_rad: request.receiver.lon_rad,
+            az_rad: request.azimuth_rad,
+            el_rad: request.elevation_rad,
         },
-        frequency_hz,
+        request.frequency_hz,
         ionex.base_radius_km(),
         ionex.shell_height_km(),
-        epoch_j2000_s,
+        request.epoch_j2000_s,
         grid,
+        policy,
     )
-    .delay_m
+    .map_err(Error::IonexOutOfCoverage)?;
+    let status = match coverage {
+        Some(error) => IonexSlantDelayStatus::Held(error),
+        None => IonexSlantDelayStatus::Valid,
+    };
+    Ok(IonexSlantDelayEvaluation {
+        delay_m: components.delay_m,
+        status,
+    })
 }
 
 fn ionex_vtec_grid_view(ionex: &Ionex) -> slant::VtecGridView<'_> {
@@ -560,6 +649,28 @@ fn ionex_vtec_grid_view(ionex: &Ionex) -> slant::VtecGridView<'_> {
         dlat: ionex.dlat_deg(),
         dlon: ionex.dlon_deg(),
     }
+}
+
+fn validate_ionex_slant_request(request: IonexSlantRequest) -> Result<()> {
+    validate_ionex_slant_inputs(
+        request.receiver,
+        request.elevation_rad,
+        request.azimuth_rad,
+        request.frequency_hz,
+    )
+}
+
+fn validate_ionex_slant_inputs(
+    receiver: Wgs84Geodetic,
+    elevation_rad: f64,
+    azimuth_rad: f64,
+    frequency_hz: f64,
+) -> Result<()> {
+    validate_receiver(receiver)?;
+    validate_finite(elevation_rad, "elevation_rad")?;
+    validate_elevation_rad(elevation_rad, "elevation_rad")?;
+    validate_finite(azimuth_rad, "azimuth_rad")?;
+    validate_frequency(frequency_hz)
 }
 
 fn validate_klobuchar_params(params: &KlobucharParams) -> Result<()> {

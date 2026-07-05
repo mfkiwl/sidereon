@@ -6,7 +6,8 @@ use sidereon_core::observables::{
     ObservableIonosphereCorrection, ObservableMediaOptions, PredictOptions,
 };
 use sidereon_core::{
-    atmosphere::Ionex, geodetic_to_itrf, GnssSatelliteId, GnssSystem, Wgs84Geodetic,
+    atmosphere::{Ionex, IonexCoveragePolicy},
+    geodetic_to_itrf, GnssSatelliteId, GnssSystem, Wgs84Geodetic,
 };
 
 const REAL_SP3: &[u8] = include_bytes!("fixtures/sp3/IGS0OPSFIN_20261330000_03H_15M_ORB.SP3");
@@ -31,7 +32,10 @@ fn receiver_ecef_m() -> [f64; 3] {
 fn media_options<'a>(ionex: &'a Ionex) -> ObservableMediaOptions<'a> {
     ObservableMediaOptions {
         troposphere: Some(Default::default()),
-        ionosphere: Some(ObservableIonosphereCorrection::Ionex(ionex)),
+        ionosphere: Some(ObservableIonosphereCorrection::IonexWithPolicy(
+            ionex,
+            IonexCoveragePolicy::Hold,
+        )),
     }
 }
 

@@ -19,7 +19,10 @@ use crate::ephemeris::BroadcastEphemeris;
 use crate::estimation::recipe::SagnacRecipe;
 use crate::frame::Wgs84Geodetic;
 use crate::id::GnssSatelliteId;
-use crate::ionex::{ionex_slant_delay, ionosphere_delay, Ionex, IonoModel};
+use crate::ionex::{
+    ionex_slant_delay, ionex_slant_delay_with_policy, ionosphere_delay, Ionex, IonexCoveragePolicy,
+    IonoModel,
+};
 use crate::sp3::Sp3;
 use crate::spp::EphemerisSource;
 use crate::tropo::{tropo_mapping, tropo_zenith, MappingModel, Met, TropoModel};
@@ -288,6 +291,8 @@ pub enum ObservablesError {
     NoEphemeris,
     /// The underlying ephemeris product returned a structured crate error.
     Ephemeris(Error),
+    /// The selected media model returned a structured crate error.
+    Media(Error),
 }
 
 impl core::fmt::Display for ObservablesError {
@@ -298,6 +303,7 @@ impl core::fmt::Display for ObservablesError {
             }
             Self::NoEphemeris => write!(f, "no ephemeris"),
             Self::Ephemeris(err) => write!(f, "{err}"),
+            Self::Media(err) => write!(f, "{err}"),
         }
     }
 }
@@ -513,6 +519,8 @@ pub enum ObservableIonosphereCorrection<'a> {
     Broadcast(IonoModel),
     /// Parsed IONEX vertical-TEC grid evaluated on the requested carrier.
     Ionex(&'a Ionex),
+    /// Parsed IONEX vertical-TEC grid evaluated with an explicit coverage policy.
+    IonexWithPolicy(&'a Ionex, IonexCoveragePolicy),
 }
 
 /// Optional media corrections for one predicted tracking observable.
@@ -544,7 +552,10 @@ impl ObservableMediaOptions<'_> {
     fn needs_ionex_epoch(self) -> bool {
         matches!(
             self.ionosphere,
-            Some(ObservableIonosphereCorrection::Ionex(_))
+            Some(
+                ObservableIonosphereCorrection::Ionex(_)
+                    | ObservableIonosphereCorrection::IonexWithPolicy(_, _)
+            )
         )
     }
 }
@@ -737,6 +748,23 @@ pub fn observable_media_corrections(
                 carrier_hz,
             )
             .map_err(map_media_error)?;
+            validate::finite(delay_m, "media.ionosphere_m").map_err(map_input_error)?;
+            delay_m
+        }
+        Some(ObservableIonosphereCorrection::IonexWithPolicy(ionex, policy)) => {
+            let ionex_epoch_j2000_s =
+                ionex_epoch_j2000_s.expect("IONEX media requires an integer epoch");
+            let delay_m = ionex_slant_delay_with_policy(
+                ionex,
+                receiver,
+                elevation_rad,
+                azimuth_rad,
+                ionex_epoch_j2000_s,
+                carrier_hz,
+                policy,
+            )
+            .map_err(map_media_error)?
+            .delay_m;
             validate::finite(delay_m, "media.ionosphere_m").map_err(map_input_error)?;
             delay_m
         }
@@ -1501,6 +1529,7 @@ fn rounded_j2000_seconds(t_rx_j2000_s: f64) -> Result<i64, ObservablesError> {
 fn map_media_error(error: Error) -> ObservablesError {
     match error {
         Error::InvalidInput(message) => map_media_invalid_input(&message),
+        Error::IonexOutOfCoverage(_) => ObservablesError::Media(error),
         _ => invalid_observable_input("media", ObservablesInputErrorKind::OutOfRange),
     }
 }

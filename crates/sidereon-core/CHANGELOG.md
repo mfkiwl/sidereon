@@ -2,6 +2,16 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## Unreleased
+
+### Changed
+
+- IONEX slant-delay evaluation now reports out-of-coverage epochs and
+  pierce-point latitude or longitude as typed errors by default instead of a
+  silent hold. Callers can opt into the legacy hold behavior with
+  `IonexCoveragePolicy::Hold`, which returns an explicit status marker, and the
+  new batch result helper reports coverage per element.
+
 ## [0.16.1]
 
 ### Fixed

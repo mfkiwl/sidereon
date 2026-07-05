@@ -331,6 +331,7 @@ fn no_ephemeris(obs: &FloatObservation, error: ObservablesError) -> FloatSolveEr
             ObservablesError::NoEphemeris => NoEphemerisReason::NoEphemeris,
             ObservablesError::InvalidInput { .. } => NoEphemerisReason::Reason(error.to_string()),
             ObservablesError::Ephemeris(err) => NoEphemerisReason::Reason(err.to_string()),
+            ObservablesError::Media(err) => NoEphemerisReason::Reason(err.to_string()),
         },
     }
 }

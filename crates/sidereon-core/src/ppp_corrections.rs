@@ -371,6 +371,12 @@ pub fn build(
                         reason: observables_input_reason(kind),
                     });
                 }
+                Err(ObservablesError::Media(_)) => {
+                    return Err(PppCorrectionsError::InvalidInput {
+                        field: "media",
+                        reason: "out of range",
+                    });
+                }
                 Err(ObservablesError::NoEphemeris | ObservablesError::Ephemeris(_)) => continue,
             };
 

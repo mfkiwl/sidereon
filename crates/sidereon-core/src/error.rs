@@ -23,6 +23,8 @@ pub enum Error {
         /// Integer longitude tile id.
         lon_index: i32,
     },
+    /// An IONEX slant-delay query lies outside the product coverage.
+    IonexOutOfCoverage(crate::ionex::IonexCoverageError),
     /// A requested epoch lies outside the sampled / valid span.
     EpochOutOfRange,
     /// An operation received inputs it cannot combine (e.g. an empty set of
@@ -40,6 +42,7 @@ impl fmt::Display for Error {
                 lat_index,
                 lon_index,
             } => write!(f, "missing terrain tile ({lat_index},{lon_index})"),
+            Error::IonexOutOfCoverage(error) => write!(f, "IONEX out of coverage: {error}"),
             Error::EpochOutOfRange => write!(f, "epoch out of range"),
             Error::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
         }
