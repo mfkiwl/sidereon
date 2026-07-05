@@ -12,7 +12,7 @@
 //! using [`TerrainGeoidModel`].
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -321,6 +321,53 @@ pub struct TerrainStoreTileIndex {
     pub vertical_datum: VerticalDatum,
 }
 
+/// Integer terrain tile id used by DTED and terrain-store accessors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TerrainTileId {
+    /// Integer latitude tile id, e.g. `36` for a tile covering `36..37` degrees.
+    pub lat_index: i32,
+    /// Integer longitude tile id, e.g. `-107` for a tile covering
+    /// `-107..-106` degrees.
+    pub lon_index: i32,
+}
+
+impl TerrainTileId {
+    /// Build an integer terrain tile id.
+    #[must_use]
+    pub const fn new(lat_index: i32, lon_index: i32) -> Self {
+        Self {
+            lat_index,
+            lon_index,
+        }
+    }
+}
+
+/// One explicit DTED tile source for list-based terrain-store conversion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtedTileListEntry {
+    /// Expected integer tile id for `path`.
+    pub tile_id: TerrainTileId,
+    /// Path to the DTED `.dt2` tile bytes.
+    pub path: PathBuf,
+}
+
+impl DtedTileListEntry {
+    /// Build a tile-list entry from a tile id and DTED path.
+    #[must_use]
+    pub fn new(tile_id: TerrainTileId, path: impl Into<PathBuf>) -> Self {
+        Self {
+            tile_id,
+            path: path.into(),
+        }
+    }
+
+    /// Build a tile-list entry from integer tile indices and a DTED path.
+    #[must_use]
+    pub fn from_indices(lat_index: i32, lon_index: i32, path: impl Into<PathBuf>) -> Self {
+        Self::new(TerrainTileId::new(lat_index, lon_index), path)
+    }
+}
+
 /// Errors from terrain store conversion, serialization, and parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerrainStoreError {
@@ -353,6 +400,15 @@ pub enum TerrainStoreError {
         /// Longitude tile id.
         lon_index: i32,
     },
+    /// A list-builder entry's supplied id did not match the DTED file origin.
+    TileIdMismatch {
+        /// Path whose parsed DTED origin did not match the supplied id.
+        path: PathBuf,
+        /// Expected tile id supplied by the caller.
+        expected: TerrainTileId,
+        /// Tile id parsed from the DTED file.
+        found: TerrainTileId,
+    },
     /// A tile payload checksum did not match its index record.
     Checksum {
         /// Latitude tile id.
@@ -381,6 +437,19 @@ impl core::fmt::Display for TerrainStoreError {
                 lat_index,
                 lon_index,
             } => write!(f, "duplicate terrain tile ({lat_index},{lon_index})"),
+            Self::TileIdMismatch {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{} tile id expected ({},{}) but DTED origin is ({},{})",
+                path.display(),
+                expected.lat_index,
+                expected.lon_index,
+                found.lat_index,
+                found.lon_index
+            ),
             Self::Checksum {
                 lat_index,
                 lon_index,
@@ -454,6 +523,7 @@ pub struct MmapTerrain<'a> {
     tiles: Vec<MmapTile>,
     by_grid: HashMap<(i32, i32), usize>,
     tile_index: Vec<TerrainStoreTileIndex>,
+    tile_ids: Vec<TerrainTileId>,
     vertical_datum: VerticalDatum,
 }
 
@@ -494,6 +564,7 @@ impl<'a> MmapTerrain<'a> {
             tiles: parsed.tiles,
             by_grid: parsed.by_grid,
             tile_index: parsed.tile_index,
+            tile_ids: parsed.tile_ids,
             vertical_datum: parsed.vertical_datum,
         })
     }
@@ -514,6 +585,18 @@ impl<'a> MmapTerrain<'a> {
     #[must_use]
     pub fn tile_index(&self) -> &[TerrainStoreTileIndex] {
         &self.tile_index
+    }
+
+    /// Return the number of tiles present in this terrain store.
+    #[must_use]
+    pub fn tile_count(&self) -> usize {
+        self.tile_ids.len()
+    }
+
+    /// Borrow the sorted integer tile ids present in this terrain store.
+    #[must_use]
+    pub fn tile_ids(&self) -> &[TerrainTileId] {
+        &self.tile_ids
     }
 
     /// Return an FNV-1a checksum of the full terrain store byte span.
@@ -590,7 +673,7 @@ impl<'a> MmapTerrain<'a> {
     ) -> Result<OrthometricHeightM> {
         validate_lookup_coordinates(longitude_deg, latitude_deg)?;
         let Some(tile_idx) = self.resolve_grid(longitude_deg, latitude_deg) else {
-            return Ok(OrthometricHeightM::new(0.0));
+            return Err(missing_terrain_tile(longitude_deg, latitude_deg));
         };
         height_from_tile(
             self.bytes.as_ref(),
@@ -675,7 +758,7 @@ impl<'a> MmapTerrain<'a> {
                 }
                 None => {
                     current = None;
-                    out.push(Ok(OrthometricHeightM::new(0.0)));
+                    out.push(Err(missing_terrain_tile(longitude_deg, latitude_deg)));
                 }
             }
         }
@@ -762,62 +845,67 @@ impl<'a> MmapTerrain<'a> {
 
 /// Convert a DTED tile tree into canonical memory-mappable terrain store bytes.
 ///
-/// Input `.dt2` files are discovered recursively below `root` and sorted by
-/// integer tile id. DTED signed-magnitude postings are decoded once into `i16`
-/// orthometric metres. DTED negative zero and SRTM voids already encoded as
-/// zero remain zero, matching the existing lazy DTED reader.
+/// Input `.dt2` files are discovered recursively below `root`, following
+/// symlinked directories and symlinked `.dt2` files. A symlinked file is treated
+/// as DTED when either the link name or the resolved target name ends in
+/// `.dt2`. Tiles are then sorted by integer tile id. DTED signed-magnitude
+/// postings are decoded once into `i16` orthometric metres. DTED negative zero
+/// and SRTM voids already encoded as zero remain zero, matching the existing
+/// lazy DTED reader.
 pub fn dted_tree_to_mmap_store(
     root: impl AsRef<Path>,
 ) -> core::result::Result<Vec<u8>, TerrainStoreError> {
     let root = root.as_ref();
     let mut paths = Vec::new();
     collect_dted_tile_paths(root, &mut paths)?;
-    paths.sort();
+    dted_paths_to_mmap_store(paths)
+}
 
-    let mut pending = Vec::with_capacity(paths.len());
-    for path in paths {
-        let tile = DtedTile::from_path(&path).map_err(|reason| TerrainStoreError::Parse {
-            reason: format!("{}: {reason}", path.display()),
-        })?;
-        let decoded =
-            tile.decoded_postings_lon_major()
-                .map_err(|reason| TerrainStoreError::Parse {
-                    reason: format!("{}: {reason}", path.display()),
-                })?;
-        let mut data = Vec::with_capacity(decoded.len() * 2);
-        for posting in decoded {
-            data.extend_from_slice(&posting.to_le_bytes());
-        }
-        let lat_index = tile.origin_latitude().floor() as i32;
-        let lon_index = tile.origin_longitude().floor() as i32;
-        pending.push(PendingTile {
-            lat_index,
-            lon_index,
-            min_latitude_deg: tile.origin_latitude(),
-            min_longitude_deg: tile.origin_longitude(),
-            max_latitude_deg: tile.origin_latitude() + 1.0,
-            max_longitude_deg: tile.origin_longitude() + 1.0,
-            lon_count: u32::try_from(tile.lon_count()).map_err(|_| TerrainStoreError::Parse {
-                reason: format!("{} longitude count exceeds u32", path.display()),
-            })?,
-            lat_count: u32::try_from(tile.lat_count()).map_err(|_| TerrainStoreError::Parse {
-                reason: format!("{} latitude count exceeds u32", path.display()),
-            })?,
-            data,
-            vertical_datum: VerticalDatum::Egm96MslOrthometric,
-        });
+/// Convert an explicit DTED tile list into canonical memory-mappable terrain
+/// store bytes.
+///
+/// Each entry supplies the expected integer tile id and the DTED `.dt2` path.
+/// The converter parses each DTED header and fails if the file origin does not
+/// match the supplied id. The decoded payload, sorting, duplicate detection,
+/// alignment, and checksums are the same as [`dted_tree_to_mmap_store`].
+pub fn dted_tile_list_to_mmap_store(
+    entries: &[DtedTileListEntry],
+) -> core::result::Result<Vec<u8>, TerrainStoreError> {
+    let mut pending = Vec::with_capacity(entries.len());
+    for entry in entries {
+        pending.push(pending_tile_from_dted_path(
+            &entry.path,
+            Some(entry.tile_id),
+        )?);
     }
-
     build_store(pending)
 }
 
 /// Convert a DTED tile tree and write canonical memory-mappable terrain store
 /// bytes to `output_path`.
+///
+/// Symlinked directories and symlinked `.dt2` files below `root` are followed.
+/// A symlinked file is treated as DTED when either the link name or the resolved
+/// target name ends in `.dt2`.
 pub fn write_dted_tree_to_mmap_store(
     root: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
 ) -> core::result::Result<(), TerrainStoreError> {
     let bytes = dted_tree_to_mmap_store(root)?;
+    let output_path = output_path.as_ref();
+    fs::write(output_path, &bytes).map_err(|err| TerrainStoreError::Io {
+        path: output_path.to_path_buf(),
+        message: err.to_string(),
+    })
+}
+
+/// Convert an explicit DTED tile list and write canonical memory-mappable
+/// terrain store bytes to `output_path`.
+pub fn write_dted_tile_list_to_mmap_store(
+    entries: &[DtedTileListEntry],
+    output_path: impl AsRef<Path>,
+) -> core::result::Result<(), TerrainStoreError> {
+    let bytes = dted_tile_list_to_mmap_store(entries)?;
     let output_path = output_path.as_ref();
     fs::write(output_path, &bytes).map_err(|err| TerrainStoreError::Io {
         path: output_path.to_path_buf(),
@@ -854,6 +942,7 @@ struct ParsedStore {
     tiles: Vec<MmapTile>,
     by_grid: HashMap<(i32, i32), usize>,
     tile_index: Vec<TerrainStoreTileIndex>,
+    tile_ids: Vec<TerrainTileId>,
 }
 
 fn height_from_tile(
@@ -896,32 +985,117 @@ fn height_from_tile(
     Ok(z)
 }
 
+fn dted_paths_to_mmap_store(
+    mut paths: Vec<PathBuf>,
+) -> core::result::Result<Vec<u8>, TerrainStoreError> {
+    paths.sort();
+
+    let mut pending = Vec::with_capacity(paths.len());
+    for path in paths {
+        pending.push(pending_tile_from_dted_path(&path, None)?);
+    }
+    build_store(pending)
+}
+
+fn pending_tile_from_dted_path(
+    path: &Path,
+    expected_id: Option<TerrainTileId>,
+) -> core::result::Result<PendingTile, TerrainStoreError> {
+    let tile = DtedTile::from_path(path).map_err(|reason| TerrainStoreError::Parse {
+        reason: format!("{}: {reason}", path.display()),
+    })?;
+    let decoded = tile
+        .decoded_postings_lon_major()
+        .map_err(|reason| TerrainStoreError::Parse {
+            reason: format!("{}: {reason}", path.display()),
+        })?;
+    let mut data = Vec::with_capacity(decoded.len() * 2);
+    for posting in decoded {
+        data.extend_from_slice(&posting.to_le_bytes());
+    }
+    let lat_index = tile.origin_latitude().floor() as i32;
+    let lon_index = tile.origin_longitude().floor() as i32;
+    let found = TerrainTileId::new(lat_index, lon_index);
+    if let Some(expected) = expected_id {
+        if expected != found {
+            return Err(TerrainStoreError::TileIdMismatch {
+                path: path.to_path_buf(),
+                expected,
+                found,
+            });
+        }
+    }
+    Ok(PendingTile {
+        lat_index,
+        lon_index,
+        min_latitude_deg: tile.origin_latitude(),
+        min_longitude_deg: tile.origin_longitude(),
+        max_latitude_deg: tile.origin_latitude() + 1.0,
+        max_longitude_deg: tile.origin_longitude() + 1.0,
+        lon_count: u32::try_from(tile.lon_count()).map_err(|_| TerrainStoreError::Parse {
+            reason: format!("{} longitude count exceeds u32", path.display()),
+        })?,
+        lat_count: u32::try_from(tile.lat_count()).map_err(|_| TerrainStoreError::Parse {
+            reason: format!("{} latitude count exceeds u32", path.display()),
+        })?,
+        data,
+        vertical_datum: VerticalDatum::Egm96MslOrthometric,
+    })
+}
+
 fn collect_dted_tile_paths(
     root: &Path,
     out: &mut Vec<PathBuf>,
 ) -> core::result::Result<(), TerrainStoreError> {
-    let entries = fs::read_dir(root).map_err(|err| TerrainStoreError::Io {
-        path: root.to_path_buf(),
+    let mut visited_dirs = HashSet::new();
+    collect_dted_tile_paths_inner(root, out, &mut visited_dirs)
+}
+
+fn collect_dted_tile_paths_inner(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    visited_dirs: &mut HashSet<PathBuf>,
+) -> core::result::Result<(), TerrainStoreError> {
+    let metadata = fs::metadata(path).map_err(|err| TerrainStoreError::Io {
+        path: path.to_path_buf(),
         message: err.to_string(),
     })?;
 
-    for entry in entries {
-        let entry = entry.map_err(|err| TerrainStoreError::Io {
-            path: root.to_path_buf(),
+    if metadata.is_dir() {
+        let canonical = fs::canonicalize(path).map_err(|err| TerrainStoreError::Io {
+            path: path.to_path_buf(),
             message: err.to_string(),
         })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|err| TerrainStoreError::Io {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
-        if file_type.is_dir() {
-            collect_dted_tile_paths(&path, out)?;
-        } else if file_type.is_file() && is_dted_tile_path(&path) {
-            out.push(path);
+        if !visited_dirs.insert(canonical) {
+            return Ok(());
         }
+        let entries = fs::read_dir(path).map_err(|err| TerrainStoreError::Io {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| TerrainStoreError::Io {
+                path: path.to_path_buf(),
+                message: err.to_string(),
+            })?;
+            collect_dted_tile_paths_inner(&entry.path(), out, visited_dirs)?;
+        }
+    } else if metadata.is_file() && is_dted_tile_source(path)? {
+        out.push(path.to_path_buf());
     }
     Ok(())
+}
+
+fn is_dted_tile_source(path: &Path) -> core::result::Result<bool, TerrainStoreError> {
+    if is_dted_tile_path(path) {
+        return Ok(true);
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|err| TerrainStoreError::Io {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    Ok(is_dted_tile_path(&canonical))
 }
 
 fn is_dted_tile_path(path: &Path) -> bool {
@@ -996,6 +1170,7 @@ fn parse_store(bytes: &[u8]) -> core::result::Result<ParsedStore, TerrainStoreEr
 
     let mut tiles = Vec::with_capacity(tile_count);
     let mut tile_index = Vec::with_capacity(tile_count);
+    let mut tile_ids = Vec::with_capacity(tile_count);
     let mut by_grid = HashMap::with_capacity(tile_count);
     let mut previous_id = None;
     let mut expected_next = data_offset;
@@ -1115,6 +1290,7 @@ fn parse_store(bytes: &[u8]) -> core::result::Result<ParsedStore, TerrainStoreEr
         by_grid.insert(tile_id, tiles.len());
         tiles.push(MmapTile { index });
         tile_index.push(index);
+        tile_ids.push(TerrainTileId::new(lat_index, lon_index));
         expected_next = end;
     }
 
@@ -1132,7 +1308,16 @@ fn parse_store(bytes: &[u8]) -> core::result::Result<ParsedStore, TerrainStoreEr
         tiles,
         by_grid,
         tile_index,
+        tile_ids,
     })
+}
+
+fn missing_terrain_tile(longitude_deg: f64, latitude_deg: f64) -> Error {
+    let (lat_index, lon_index) = terrain::terrain_grid(longitude_deg, latitude_deg);
+    Error::MissingTerrainTile {
+        lat_index,
+        lon_index,
+    }
 }
 
 fn build_store(mut tiles: Vec<PendingTile>) -> core::result::Result<Vec<u8>, TerrainStoreError> {
