@@ -2,6 +2,14 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Fusion RTS fixed-interval smoothing over recorded error-state histories,
+  with recorded forward-pass transitions, predicted and updated checkpoints,
+  smoothed covariances, and loose/tight measurement-agnostic entry points.
+
 ## [0.17.0]
 
 ### Fixed
