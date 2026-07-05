@@ -29,8 +29,10 @@ use serde_json::Value;
 use super::grid::Ionex;
 use super::slant::{slant_delay_components, PierceLineOfSight, SlantComponents, VtecGridView};
 use super::{
-    galileo_nequick_g_native, ionex_slant_delays, ionosphere_delay, GalileoNequickCoeffs,
-    GalileoNequickEval, IonexSlantRequest, IonoModel, TecGridSamples, TecSample, TecSamplesError,
+    galileo_nequick_g_native, ionex_slant_delay_results, ionex_slant_delay_with_policy,
+    ionex_slant_delays, ionosphere_delay, GalileoNequickCoeffs, GalileoNequickEval,
+    IonexCoverageError, IonexCoveragePolicy, IonexSlantDelayStatus, IonexSlantRequest, IonoModel,
+    TecGridSamples, TecSample, TecSamplesError,
 };
 
 const REAL_IONEX_EXCERPT: &[u8] =
@@ -733,14 +735,14 @@ fn ionex_slant_delays_batch_matches_scalar_bits() {
         },
         IonexSlantRequest {
             receiver: crate::frame::Wgs84Geodetic::new(
-                55.0_f64.to_radians(),
-                -175.0_f64.to_radians(),
+                0.0_f64.to_radians(),
+                0.0_f64.to_radians(),
                 10.0,
             )
             .expect("valid receiver"),
-            elevation_rad: 75.0_f64.to_radians(),
-            azimuth_rad: 15.0_f64.to_radians(),
-            epoch_j2000_s: epochs[1] + 900,
+            elevation_rad: 90.0_f64.to_radians(),
+            azimuth_rad: 0.0_f64.to_radians(),
+            epoch_j2000_s: epochs[1],
             frequency_hz: f_l1,
         },
     ];
@@ -823,6 +825,248 @@ fn ionex_slant_delays_batch_matches_scalar_bits() {
             "batch validation error must match scalar validation error"
         );
     }
+}
+
+fn coverage_ionex(epoch_s: &[i64]) -> Ionex {
+    let mut samples = valid_tec_grid_samples();
+    // Forces a zenith pierce point to land exactly on the receiver coordinate.
+    samples.base_radius_km = 0.0;
+    samples.map_epochs = epoch_s
+        .iter()
+        .map(|&seconds| super::ionex_epoch_from_j2000_seconds(seconds))
+        .collect();
+    let map = vec![vec![10.0, 11.0], vec![12.0, 13.0]];
+    samples.tec_maps = epoch_s.iter().map(|_| map.clone()).collect();
+    Ionex::from_samples(samples).expect("coverage-test IONEX")
+}
+
+fn coverage_request(lat_deg: f64, lon_deg: f64, epoch_j2000_s: i64) -> IonexSlantRequest {
+    IonexSlantRequest {
+        receiver: crate::frame::Wgs84Geodetic::new(lat_deg.to_radians(), lon_deg.to_radians(), 0.0)
+            .expect("valid receiver"),
+        elevation_rad: core::f64::consts::FRAC_PI_2,
+        azimuth_rad: 0.0,
+        epoch_j2000_s,
+        frequency_hz: 1_575_420_000.0,
+    }
+}
+
+fn assert_ionex_coverage_error<T: core::fmt::Debug>(
+    result: crate::Result<T>,
+    expected: IonexCoverageError,
+) {
+    assert_eq!(
+        result.expect_err("request must fail coverage"),
+        crate::error::Error::IonexOutOfCoverage(expected)
+    );
+}
+
+#[test]
+fn ionex_strict_rejects_epoch_outside_coverage_and_hold_marks_status() {
+    let ionex = coverage_ionex(&[0, 10]);
+    let first = coverage_request(0.5, 0.5, 0);
+    let last = coverage_request(0.5, 0.5, 10);
+    let before = coverage_request(0.5, 0.5, -1);
+    let after = coverage_request(0.5, 0.5, 11);
+
+    for request in [first, last] {
+        let strict = ionex_slant_delay_with_policy(
+            &ionex,
+            request.receiver,
+            request.elevation_rad,
+            request.azimuth_rad,
+            request.epoch_j2000_s,
+            request.frequency_hz,
+            IonexCoveragePolicy::Strict,
+        )
+        .expect("boundary epoch is covered");
+        assert_eq!(strict.status, IonexSlantDelayStatus::Valid);
+        let scalar = super::ionex_slant_delay(
+            &ionex,
+            request.receiver,
+            request.elevation_rad,
+            request.azimuth_rad,
+            request.epoch_j2000_s,
+            request.frequency_hz,
+        )
+        .expect("strict scalar boundary epoch is covered");
+        assert_eq!(scalar.to_bits(), strict.delay_m.to_bits());
+    }
+
+    assert_ionex_coverage_error(
+        super::ionex_slant_delay(
+            &ionex,
+            before.receiver,
+            before.elevation_rad,
+            before.azimuth_rad,
+            before.epoch_j2000_s,
+            before.frequency_hz,
+        ),
+        IonexCoverageError::EpochBeforeFirstMap,
+    );
+    assert_ionex_coverage_error(
+        super::ionex_slant_delay(
+            &ionex,
+            after.receiver,
+            after.elevation_rad,
+            after.azimuth_rad,
+            after.epoch_j2000_s,
+            after.frequency_hz,
+        ),
+        IonexCoverageError::EpochAfterLastMap,
+    );
+
+    let held_before = ionex_slant_delay_with_policy(
+        &ionex,
+        before.receiver,
+        before.elevation_rad,
+        before.azimuth_rad,
+        before.epoch_j2000_s,
+        before.frequency_hz,
+        IonexCoveragePolicy::Hold,
+    )
+    .expect("hold policy returns before-coverage value");
+    assert_eq!(
+        held_before.status,
+        IonexSlantDelayStatus::Held(IonexCoverageError::EpochBeforeFirstMap)
+    );
+
+    let held_after = ionex_slant_delay_with_policy(
+        &ionex,
+        after.receiver,
+        after.elevation_rad,
+        after.azimuth_rad,
+        after.epoch_j2000_s,
+        after.frequency_hz,
+        IonexCoveragePolicy::Hold,
+    )
+    .expect("hold policy returns after-coverage value");
+    assert_eq!(
+        held_after.status,
+        IonexSlantDelayStatus::Held(IonexCoverageError::EpochAfterLastMap)
+    );
+}
+
+#[test]
+fn ionex_strict_rejects_spatial_outside_coverage_and_includes_boundaries() {
+    let ionex = coverage_ionex(&[0]);
+    for request in [coverage_request(1.0, 0.0, 0), coverage_request(0.0, 1.0, 0)] {
+        let eval = ionex_slant_delay_with_policy(
+            &ionex,
+            request.receiver,
+            request.elevation_rad,
+            request.azimuth_rad,
+            request.epoch_j2000_s,
+            request.frequency_hz,
+            IonexCoveragePolicy::Strict,
+        )
+        .expect("grid boundary is covered");
+        assert_eq!(eval.status, IonexSlantDelayStatus::Valid);
+    }
+
+    let north = coverage_request(1.25, 0.5, 0);
+    let south = coverage_request(-0.25, 0.5, 0);
+    let west = coverage_request(0.5, -0.25, 0);
+    let east = coverage_request(0.5, 1.25, 0);
+
+    for request in [north, south] {
+        assert_ionex_coverage_error(
+            super::ionex_slant_delay(
+                &ionex,
+                request.receiver,
+                request.elevation_rad,
+                request.azimuth_rad,
+                request.epoch_j2000_s,
+                request.frequency_hz,
+            ),
+            IonexCoverageError::LatitudeOutOfRange,
+        );
+    }
+    for request in [west, east] {
+        assert_ionex_coverage_error(
+            super::ionex_slant_delay(
+                &ionex,
+                request.receiver,
+                request.elevation_rad,
+                request.azimuth_rad,
+                request.epoch_j2000_s,
+                request.frequency_hz,
+            ),
+            IonexCoverageError::LongitudeOutOfRange,
+        );
+    }
+
+    let held = ionex_slant_delay_with_policy(
+        &ionex,
+        east.receiver,
+        east.elevation_rad,
+        east.azimuth_rad,
+        east.epoch_j2000_s,
+        east.frequency_hz,
+        IonexCoveragePolicy::Hold,
+    )
+    .expect("hold policy returns spatial edge value");
+    assert_eq!(
+        held.status,
+        IonexSlantDelayStatus::Held(IonexCoverageError::LongitudeOutOfRange)
+    );
+}
+
+#[test]
+fn ionex_batch_results_report_coverage_per_element() {
+    let ionex = coverage_ionex(&[0, 10]);
+    let requests = [
+        coverage_request(0.5, 0.5, 0),
+        coverage_request(0.5, 0.5, -1),
+        coverage_request(0.5, 1.25, 0),
+        IonexSlantRequest {
+            frequency_hz: 0.0,
+            ..coverage_request(0.5, 0.5, 0)
+        },
+    ];
+
+    let strict = ionex_slant_delay_results(&ionex, &requests, IonexCoveragePolicy::Strict);
+    assert_eq!(strict.len(), requests.len());
+    assert_eq!(
+        strict[0].as_ref().expect("first element covered").status,
+        IonexSlantDelayStatus::Valid
+    );
+    assert_eq!(
+        strict[1]
+            .as_ref()
+            .expect_err("second element before coverage"),
+        &crate::error::Error::IonexOutOfCoverage(IonexCoverageError::EpochBeforeFirstMap)
+    );
+    assert_eq!(
+        strict[2]
+            .as_ref()
+            .expect_err("third element longitude coverage"),
+        &crate::error::Error::IonexOutOfCoverage(IonexCoverageError::LongitudeOutOfRange)
+    );
+    assert!(
+        matches!(strict[3], Err(crate::error::Error::InvalidInput(_))),
+        "invalid request should stay element-local"
+    );
+
+    let held = ionex.slant_delays_batch_results(&requests[..3], IonexCoveragePolicy::Hold);
+    assert_eq!(
+        held[0].as_ref().expect("first element covered").status,
+        IonexSlantDelayStatus::Valid
+    );
+    assert_eq!(
+        held[1].as_ref().expect("second element held").status,
+        IonexSlantDelayStatus::Held(IonexCoverageError::EpochBeforeFirstMap)
+    );
+    assert_eq!(
+        held[2].as_ref().expect("third element held").status,
+        IonexSlantDelayStatus::Held(IonexCoverageError::LongitudeOutOfRange)
+    );
+
+    let mut out = [0.0; 3];
+    assert_ionex_coverage_error(
+        ionex_slant_delays(&ionex, &requests[..3], &mut out),
+        IonexCoverageError::EpochBeforeFirstMap,
+    );
 }
 
 #[test]

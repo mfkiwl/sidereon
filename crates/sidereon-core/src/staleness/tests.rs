@@ -32,8 +32,8 @@ fn make_ionex(year: i64, month: i64, day: i64, base_tec: i64) -> Ionex {
     let mut text = String::new();
     text.push_str(&ionex_record("1.0", "IONEX VERSION / TYPE"));
     text.push_str(&ionex_record("2", "# OF MAPS IN FILE"));
-    text.push_str(&ionex_record("2.0 -2.0 -2.0", "LAT1 / LAT2 / DLAT"));
-    text.push_str(&ionex_record("-2.0 2.0 2.0", "LON1 / LON2 / DLON"));
+    text.push_str(&ionex_record("80.0 -80.0 -80.0", "LAT1 / LAT2 / DLAT"));
+    text.push_str(&ionex_record("-180.0 180.0 180.0", "LON1 / LON2 / DLON"));
     text.push_str(&ionex_record("450.0 450.0 0.0", "HGT1 / HGT2 / DHGT"));
     text.push_str(&ionex_record("6371.0", "BASE RADIUS"));
     text.push_str(&ionex_record("0", "EXPONENT"));
@@ -45,9 +45,9 @@ fn make_ionex(year: i64, month: i64, day: i64, base_tec: i64) -> Ionex {
             "EPOCH OF CURRENT MAP",
         ));
         for lat_idx in 0..3i64 {
-            let lat = 2.0 - (lat_idx as f64) * 2.0;
+            let lat = 80.0 - (lat_idx as f64) * 80.0;
             text.push_str(&ionex_record(
-                &format!("{lat:.1} -2.0 2.0 2.0 450.0"),
+                &format!("{lat:.1} -180.0 180.0 180.0 450.0"),
                 "LAT/LON1/LON2/DLON/H",
             ));
             let a = base_tec + lat_idx * 10 + map_idx * 100;

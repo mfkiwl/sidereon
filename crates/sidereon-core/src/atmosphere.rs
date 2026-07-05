@@ -4,9 +4,11 @@
 pub mod ionosphere {
     pub use crate::ionex::{
         galileo_effective_ionisation_level, galileo_nequick_g_native, ionex_slant_delay,
-        ionex_slant_delays, ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m,
-        nequick_g_stec_tecu, regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs,
-        GalileoNequickEval, Ionex, IonexSlantRequest, IonoModel, KlobucharParams, NequickGRayEval,
+        ionex_slant_delay_results, ionex_slant_delay_with_policy, ionex_slant_delays,
+        ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m, nequick_g_stec_tecu,
+        regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs, GalileoNequickEval,
+        Ionex, IonexCoverageError, IonexCoveragePolicy, IonexSlantDelayEvaluation,
+        IonexSlantDelayStatus, IonexSlantRequest, IonoModel, KlobucharParams, NequickGRayEval,
         TecGrid, TecGridEpoch, TecGridEvalOptions, TecGridSamples, TecGridShellGeometry, TecSample,
         TecSamplesError,
     };
@@ -28,11 +30,13 @@ pub mod troposphere {
 
 pub use ionosphere::{
     galileo_effective_ionisation_level, galileo_nequick_g_native, ionex_slant_delay,
-    ionex_slant_delays, ionosphere_delay, klobuchar, klobuchar_native, nequick_g_delay_m,
-    nequick_g_stec_tecu, regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs,
-    GalileoNequickEval, Ionex, IonexGrid, IonexSlantRequest, IonoModel, KlobucharParams,
-    NequickGRayEval, TecGrid, TecGridEpoch, TecGridEvalOptions, TecGridSamples,
-    TecGridShellGeometry, TecSample, TecSamplesError,
+    ionex_slant_delay_results, ionex_slant_delay_with_policy, ionex_slant_delays, ionosphere_delay,
+    klobuchar, klobuchar_native, nequick_g_delay_m, nequick_g_stec_tecu,
+    regular_tec_grid_delay_xyz, regular_tec_xyz, GalileoNequickCoeffs, GalileoNequickEval, Ionex,
+    IonexCoverageError, IonexCoveragePolicy, IonexGrid, IonexSlantDelayEvaluation,
+    IonexSlantDelayStatus, IonexSlantRequest, IonoModel, KlobucharParams, NequickGRayEval, TecGrid,
+    TecGridEpoch, TecGridEvalOptions, TecGridSamples, TecGridShellGeometry, TecSample,
+    TecSamplesError,
 };
 pub use troposphere::{
     tropo_mapping, tropo_slant, tropo_zenith, tropo_zwd_delay_xyz, zwd_zenith_wet_delay,

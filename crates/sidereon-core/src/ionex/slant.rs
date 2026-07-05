@@ -19,7 +19,7 @@
 //! the operation tree is identical to the reference recipe and the result is
 //! bit-stable.
 
-use super::j2000_seconds_from_instant;
+use super::{j2000_seconds_from_instant, IonexCoverageError, IonexCoveragePolicy};
 use crate::astro::time::model::Instant;
 
 /// Ionospheric frequency-scaling constant `40.3 * 1e16`.
@@ -84,9 +84,13 @@ pub(crate) fn pierce_point(
 /// Full 360-degree grids wrap by `+-360` steps. Regional grids cover only an
 /// interval on the longitude circle, so out-of-coverage pierce points are held
 /// at the nearest interval edge instead of extrapolating past the edge cell.
-fn normalize_lon_deg(mut lon_deg: f64, lon1: f64, lon2: f64) -> f64 {
+fn normalize_lon_deg_with_coverage(
+    mut lon_deg: f64,
+    lon1: f64,
+    lon2: f64,
+) -> (f64, Option<IonexCoverageError>) {
     if !lon_deg.is_finite() {
-        return lon_deg;
+        return (lon_deg, None);
     }
 
     if lon2 - lon1 >= 360.0 {
@@ -96,7 +100,7 @@ fn normalize_lon_deg(mut lon_deg: f64, lon1: f64, lon2: f64) -> f64 {
         while lon_deg > lon2 {
             lon_deg -= 360.0;
         }
-        return lon_deg;
+        return (lon_deg, None);
     }
 
     let base_turn = ((lon_deg - lon1) / 360.0).floor();
@@ -119,7 +123,12 @@ fn normalize_lon_deg(mut lon_deg: f64, lon1: f64, lon2: f64) -> f64 {
             best_lon = clamped - offset;
         }
     }
-    best_lon
+    let coverage = if best_distance == 0.0 {
+        None
+    } else {
+        Some(IonexCoverageError::LongitudeOutOfRange)
+    };
+    (best_lon, coverage)
 }
 
 /// Lower bracket index along an axis with signed `step` and `n` nodes.
@@ -280,6 +289,7 @@ pub(crate) struct VtecGridView<'a> {
     pub dlon: f64,
 }
 
+#[cfg(all(test, sidereon_repo_tests))]
 pub(crate) fn slant_delay_components(
     los: PierceLineOfSight,
     frequency_hz: f64,
@@ -288,6 +298,34 @@ pub(crate) fn slant_delay_components(
     epoch_s: i64,
     grid: VtecGridView,
 ) -> SlantComponents {
+    slant_delay_components_with_coverage(los, frequency_hz, re_km, h_km, epoch_s, grid).0
+}
+
+pub(crate) fn slant_delay_components_with_policy(
+    los: PierceLineOfSight,
+    frequency_hz: f64,
+    re_km: f64,
+    h_km: f64,
+    epoch_s: i64,
+    grid: VtecGridView,
+    policy: IonexCoveragePolicy,
+) -> Result<(SlantComponents, Option<IonexCoverageError>), IonexCoverageError> {
+    let (components, coverage) =
+        slant_delay_components_with_coverage(los, frequency_hz, re_km, h_km, epoch_s, grid);
+    match (policy, coverage) {
+        (IonexCoveragePolicy::Strict, Some(error)) => Err(error),
+        (_, coverage) => Ok((components, coverage)),
+    }
+}
+
+fn slant_delay_components_with_coverage(
+    los: PierceLineOfSight,
+    frequency_hz: f64,
+    re_km: f64,
+    h_km: f64,
+    epoch_s: i64,
+    grid: VtecGridView,
+) -> (SlantComponents, Option<IonexCoverageError>) {
     let PierceLineOfSight {
         lat_rad,
         lon_rad,
@@ -307,14 +345,30 @@ pub(crate) fn slant_delay_components(
 
     let lon1 = lon_arr[0];
     let lon2 = lon_arr[lon_arr.len() - 1];
-    let lam_deg = normalize_lon_deg(geom.lambda_ipp_deg, lon1, lon2);
+    let (lam_deg, lon_coverage) = normalize_lon_deg_with_coverage(geom.lambda_ipp_deg, lon1, lon2);
     let phi_deg = geom.phi_ipp_deg;
+    let lat_hi = lat_arr[0];
+    let lat_lo = lat_arr[lat_arr.len() - 1];
+    let lat_coverage = if phi_deg > lat_hi || phi_deg < lat_lo {
+        Some(IonexCoverageError::LatitudeOutOfRange)
+    } else {
+        None
+    };
 
     // Temporal bracket (hold the endpoint map outside coverage). A single-map
     // product has no interval to interpolate across, so it holds that one map
     // (weight 0); the second sample index is held at `ti` so it can never read
     // past the end. Multi-map products keep the original bracketing exactly.
     let nmaps = map_epochs.len();
+    let first_epoch_s = map_epoch_j2000_s(map_epochs, 0);
+    let last_epoch_s = map_epoch_j2000_s(map_epochs, nmaps - 1);
+    let time_coverage = if epoch_s < first_epoch_s {
+        Some(IonexCoverageError::EpochBeforeFirstMap)
+    } else if epoch_s > last_epoch_s {
+        Some(IonexCoverageError::EpochAfterLastMap)
+    } else {
+        None
+    };
     let (ti, ti1, w) = if nmaps <= 1 {
         (0usize, 0usize, 0.0)
     } else {
@@ -350,7 +404,7 @@ pub(crate) fn slant_delay_components(
 
     let delay_m = (K_IONO / (frequency_hz * frequency_hz)) * stec;
 
-    SlantComponents {
+    let components = SlantComponents {
         s,
         psi: geom.psi,
         phi_ipp_deg: phi_deg,
@@ -366,7 +420,9 @@ pub(crate) fn slant_delay_components(
         m,
         stec,
         delay_m,
-    }
+    };
+    let coverage = time_coverage.or(lat_coverage).or(lon_coverage);
+    (components, coverage)
 }
 
 fn map_epoch_j2000_s(map_epochs: &[Instant], index: usize) -> i64 {
