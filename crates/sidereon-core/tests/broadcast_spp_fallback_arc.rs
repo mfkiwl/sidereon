@@ -169,12 +169,41 @@ fn assert_solution_bits_eq(a: &ReceiverSolution, b: &ReceiverSolution) {
     assert_eq!(a.position.z_m.to_bits(), b.position.z_m.to_bits());
     assert_eq!(a.geodetic, b.geodetic);
     assert_eq!(a.rx_clock_s.to_bits(), b.rx_clock_s.to_bits());
+    assert_eq!(a.rx_clock_drift_s_s, b.rx_clock_drift_s_s);
     assert_eq!(a.system_clocks_s.len(), b.system_clocks_s.len());
     for ((a_sys, a_clk), (b_sys, b_clk)) in a.system_clocks_s.iter().zip(b.system_clocks_s.iter()) {
         assert_eq!(a_sys, b_sys);
         assert_eq!(a_clk.to_bits(), b_clk.to_bits());
     }
     assert_eq!(a.dop, b.dop);
+    assert_eq!(
+        a.position_covariance
+            .ecef_m2
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        b.position_covariance
+            .ecef_m2
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        a.position_covariance
+            .enu_m2
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        b.position_covariance
+            .enu_m2
+            .iter()
+            .flatten()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         a.residuals_m
             .iter()

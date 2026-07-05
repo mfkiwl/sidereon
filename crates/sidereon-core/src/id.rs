@@ -161,7 +161,7 @@ impl std::error::Error for ParseSatelliteIdError {}
 impl core::str::FromStr for GnssSatelliteId {
     type Err = ParseSatelliteIdError;
 
-    /// Parse a canonical SP3/RINEX satellite token (`G01`, `E12`, `C30`): a
+    /// Parse a SP3/RINEX satellite token (`G01`, `G 1`, `G1`, `E12`, `C30`): a
     /// constellation letter followed by the within-system PRN. Whitespace around
     /// the token and around the PRN is ignored, matching the SP3/RINEX field
     /// readers. This is the single canonical satellite-token parser; the
@@ -171,7 +171,7 @@ impl core::str::FromStr for GnssSatelliteId {
         let first = token.chars().next().ok_or(ParseSatelliteIdError)?;
         let system = GnssSystem::from_letter(first).ok_or(ParseSatelliteIdError)?;
         let prn_token = token[first.len_utf8()..].trim();
-        if prn_token.len() != 2 || !prn_token.bytes().all(|b| b.is_ascii_digit()) {
+        if !(1..=2).contains(&prn_token.len()) || !prn_token.bytes().all(|b| b.is_ascii_digit()) {
             return Err(ParseSatelliteIdError);
         }
         let prn = prn_token.parse::<u8>().map_err(|_| ParseSatelliteIdError)?;
@@ -286,6 +286,14 @@ mod tests {
             Ok(GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id"))
         );
         assert_eq!(
+            "G 1".parse(),
+            Ok(GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id"))
+        );
+        assert_eq!(
+            "G1".parse(),
+            Ok(GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite id"))
+        );
+        assert_eq!(
             "G32".parse(),
             Ok(GnssSatelliteId::new(GnssSystem::Gps, 32).expect("valid satellite id"))
         );
@@ -340,8 +348,8 @@ mod tests {
     #[test]
     fn satellite_token_rejects_bad_prn_width_and_range() {
         for token in [
-            "G0", "G1", "G001", "G00", "G33", "G255", "R28", "E37", "C64", "J10", "I15", "S01",
-            "S19", "S59",
+            "G0", "G001", "G00", "G33", "G255", "R28", "E37", "C64", "J10", "I15", "S01", "S19",
+            "S59",
         ] {
             assert_eq!(
                 token.parse::<GnssSatelliteId>(),

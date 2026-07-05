@@ -67,6 +67,33 @@ use crate::{Error, Result};
 const OBS_FIELD_WIDTH: usize = 16;
 /// Width of the numeric part of one observation field (`F14.3`).
 const OBS_VALUE_WIDTH: usize = 14;
+const HEADER_LABELS: &[&str] = &[
+    "RINEX VERSION / TYPE",
+    "PGM / RUN BY / DATE",
+    "COMMENT",
+    "APPROX POSITION XYZ",
+    "ANTENNA: DELTA H/E/N",
+    "SYS / # / OBS TYPES",
+    "# / TYPES OF OBSERV",
+    "SYS / SCALE FACTOR",
+    "SYS / PHASE SHIFT",
+    "TIME OF FIRST OBS",
+    "TIME OF LAST OBS",
+    "INTERVAL",
+    "GLONASS SLOT / FRQ #",
+    "GLONASS COD/PHS/BIS",
+    "SIGNAL STRENGTH UNIT",
+    "LEAP SECONDS",
+    "# OF SATELLITES",
+    "PRN / # OF OBS",
+    "MARKER NAME",
+    "MARKER NUMBER",
+    "MARKER TYPE",
+    "OBSERVER / AGENCY",
+    "REC # / TYPE / VERS",
+    "ANT # / TYPE",
+    "END OF HEADER",
+];
 
 /// A civil epoch as it appears on a RINEX observation epoch line, in the file's
 /// own time scale (no leap-second shifting). This is the natural boundary for
@@ -680,6 +707,7 @@ struct Parser {
     antenna: Option<AntennaInfo>,
     n_satellites: Option<usize>,
     prn_obs_counts: BTreeMap<GnssSatelliteId, Vec<Option<usize>>>,
+    prn_obs_counts_current: Option<GnssSatelliteId>,
     phase_shifts: Vec<ObsPhaseShift>,
     scale_factors: Vec<ObsScaleFactor>,
     scale_factor_continuation: Option<ScaleFactorContinuation>,
@@ -736,6 +764,7 @@ impl Parser {
             antenna: None,
             n_satellites: None,
             prn_obs_counts: BTreeMap::new(),
+            prn_obs_counts_current: None,
             phase_shifts: Vec::new(),
             scale_factors: Vec::new(),
             scale_factor_continuation: None,
@@ -773,7 +802,9 @@ impl Parser {
     fn parse_header<'a, I: Iterator<Item = &'a str>>(&mut self, lines: &mut I) -> Result<()> {
         let mut saw_end = false;
         for raw in lines.by_ref() {
-            let line = raw.trim_end_matches(['\r', '\n']);
+            let raw_line = raw.trim_end_matches(['\r', '\n']);
+            let line = normalize_header_line(raw_line);
+            let line = line.as_ref();
             let label = raw_field_from(line, 60).trim();
             match label {
                 "RINEX VERSION / TYPE" => self.parse_version(line)?,
@@ -856,12 +887,21 @@ impl Parser {
     }
 
     fn parse_version(&mut self, line: &str) -> Result<()> {
-        let version = field(line, 0, 20).trim();
-        let version = strict_f64_token(version, "version", line)?;
+        let version_field = field(line, 0, 20).trim();
+        let version = strict_f64_token(version_field, "version", line).or_else(|_| {
+            let token = field(line, 0, 60)
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| Error::Parse(format!("RINEX OBS bad version field in {line:?}")))?;
+            strict_f64_token(token, "version", line)
+        })?;
         // The file type letter is at column 20; observation files carry 'O'.
         let type_field = field(line, 20, 40);
-        self.is_observation =
-            type_field.trim_start().starts_with('O') || type_field.contains("OBSERVATION");
+        let body = field(line, 0, 60);
+        self.is_observation = type_field.trim_start().starts_with('O')
+            || type_field.contains("OBSERVATION")
+            || body.contains("OBSERVATION")
+            || body.split_whitespace().any(|token| token == "O");
         if !self.is_observation {
             return Err(Error::Parse(format!(
                 "RINEX file is not observation data: {type_field:?}"
@@ -924,12 +964,15 @@ impl Parser {
         // adds more codes to the current system.
         let sys_field = field(line, 0, 1).trim();
         if !sys_field.is_empty() {
+            let count = match strict_int_field::<usize>(line, 3, 6, "obs_type_count") {
+                Ok(count) => count,
+                Err(_) => return self.parse_obs_types_whitespace(line),
+            };
             self.ensure_obs_type_count_complete(line)?;
             let letter = sys_field.chars().next().unwrap();
             let system = GnssSystem::from_letter(letter).ok_or_else(|| {
                 Error::Parse(format!("RINEX OBS unknown system letter {letter:?}"))
             })?;
-            let count = strict_int_field::<usize>(line, 3, 6, "obs_type_count")?;
             self.current_obs_sys = Some(system);
             self.obs_codes_remaining = count;
             self.obs_codes.entry(system).or_default();
@@ -972,6 +1015,63 @@ impl Parser {
             }
             self.rinex2_obs_codes.push(code.to_string());
             self.rinex2_obs_codes_remaining -= 1;
+        }
+        Ok(())
+    }
+
+    fn parse_obs_types_whitespace(&mut self, line: &str) -> Result<()> {
+        let tokens: Vec<&str> = field(line, 0, 60).split_whitespace().collect();
+        if tokens.is_empty() {
+            return Err(Error::Parse(format!(
+                "RINEX OBS malformed SYS / # / OBS TYPES record: {line:?}"
+            )));
+        }
+
+        if tokens.len() >= 2 && tokens[0].len() == 1 {
+            if let Ok(count) = strict_int_token::<usize>(tokens[1], "obs_type_count", line) {
+                let letter = tokens[0]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| Error::Parse("RINEX OBS missing system letter".into()))?;
+                let system = GnssSystem::from_letter(letter).ok_or_else(|| {
+                    Error::Parse(format!("RINEX OBS unknown system letter {letter:?}"))
+                })?;
+                self.ensure_obs_type_count_complete(line)?;
+                self.current_obs_sys = Some(system);
+                self.obs_codes_remaining = count;
+                self.obs_codes.entry(system).or_default();
+                return self.push_obs_type_tokens(system, &tokens[2..], line);
+            }
+        }
+
+        let Some(system) = self.current_obs_sys else {
+            return Err(Error::Parse(format!(
+                "RINEX OBS malformed SYS / # / OBS TYPES record: {line:?}"
+            )));
+        };
+        if self.obs_codes_remaining == 0 {
+            return Err(Error::Parse(format!(
+                "RINEX OBS {system} SYS / # / OBS TYPES lists more codes than declared in {line:?}"
+            )));
+        }
+        self.push_obs_type_tokens(system, &tokens, line)
+    }
+
+    fn push_obs_type_tokens(
+        &mut self,
+        system: GnssSystem,
+        codes: &[&str],
+        line: &str,
+    ) -> Result<()> {
+        let list = self.obs_codes.entry(system).or_default();
+        for code in codes {
+            if self.obs_codes_remaining == 0 {
+                return Err(Error::Parse(format!(
+                    "RINEX OBS {system} SYS / # / OBS TYPES lists more codes than declared in {line:?}"
+                )));
+            }
+            list.push((*code).to_string());
+            self.obs_codes_remaining -= 1;
         }
         Ok(())
     }
@@ -1258,17 +1358,29 @@ impl Parser {
 
     fn parse_prn_obs_counts(&mut self, line: &str) -> Result<()> {
         let token = field(line, 0, 3).trim();
-        if token.is_empty() {
-            return Ok(());
-        }
-        let Some(sat) = parse_sv_token(token) else {
-            self.push_unrepresentable_satellite_skip(token);
-            return Ok(());
+        let sat = if token.is_empty() {
+            let Some(sat) = self.prn_obs_counts_current else {
+                return Ok(());
+            };
+            sat
+        } else {
+            let Some(sat) = parse_sv_token(token) else {
+                self.prn_obs_counts_current = None;
+                self.push_unrepresentable_satellite_skip(token);
+                return Ok(());
+            };
+            self.prn_obs_counts_current = Some(sat);
+            sat
         };
         let count = self.obs_codes.get(&sat.system).map_or(0, Vec::len);
-        let mut values = Vec::with_capacity(count);
-        for idx in 0..count {
+        let already = self.prn_obs_counts.get(&sat).map_or(0, Vec::len);
+        let remaining = count.saturating_sub(already);
+        let mut values = Vec::with_capacity(remaining.min(9));
+        for idx in 0..remaining {
             let start = 3 + idx * 6;
+            if start + 6 > 60 {
+                break;
+            }
             let raw = field(line, start, start + 6).trim();
             if raw.is_empty() {
                 values.push(None);
@@ -1276,7 +1388,7 @@ impl Parser {
                 values.push(Some(strict_int_token::<usize>(raw, "prn_obs_count", line)?));
             }
         }
-        self.prn_obs_counts.insert(sat, values);
+        self.prn_obs_counts.entry(sat).or_default().extend(values);
         Ok(())
     }
 
@@ -1643,6 +1755,38 @@ impl Parser {
             })
             .map_or(1.0, |record| record.factor)
     }
+}
+
+fn normalize_header_line(line: &str) -> Cow<'_, str> {
+    let fixed_label = raw_field_from(line, 60).trim();
+    if HEADER_LABELS.contains(&fixed_label) {
+        return Cow::Borrowed(line);
+    }
+
+    for &label in HEADER_LABELS {
+        let Some(index) = line.rfind(label) else {
+            continue;
+        };
+        if !line[index + label.len()..].trim().is_empty() {
+            continue;
+        }
+        let content = line[..index].trim_end();
+        let content = truncate_header_content(content);
+        return Cow::Owned(format!("{content:<60}{label}"));
+    }
+
+    Cow::Borrowed(line)
+}
+
+fn truncate_header_content(content: &str) -> Cow<'_, str> {
+    if content.len() <= 60 {
+        return Cow::Borrowed(content);
+    }
+    let mut end = 60;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(content[..end].to_string())
 }
 
 /// Parse a RINEX-3 epoch line `> YYYY MM DD HH MM SS.sssssss  F NN [clock]`,
@@ -2088,15 +2232,21 @@ fn truncate_to_char_boundary(record: &mut String, len: usize) {
 }
 
 /// Whether `line` lexically begins with a RINEX satellite designator (a system
-/// letter followed by two PRN digits), whether or not it parses to a
+/// letter followed by one or two PRN digits), whether or not it parses to a
 /// representable [`GnssSatelliteId`]. Used to find satellite-record boundaries
 /// when skipping an unknown/out-of-range record, so that a following
 /// unrepresentable record (e.g. another extended GLONASS slot) is not mistaken
 /// for a wrapped continuation line. Observation continuation lines begin with a
 /// right-justified numeric field, never a letter, so they never match.
 fn starts_with_sat_designator(line: &str) -> bool {
-    let b = line.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit()
+    let Some(token) = line.get(0..3) else {
+        return false;
+    };
+    let b = token.as_bytes();
+    let prn = token[1..].trim();
+    b[0].is_ascii_alphabetic()
+        && (1..=2).contains(&prn.len())
+        && prn.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Consume the wrapped continuation lines of a satellite record being skipped

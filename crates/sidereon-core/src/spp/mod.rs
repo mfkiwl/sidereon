@@ -55,6 +55,7 @@ use crate::astro::math::least_squares::{
     self, singular_value_diagnostics, solve_trf_with, LeastSquaresProblem, SolveOptions, Status,
     TrustRegionSolve,
 };
+use crate::astro::math::linear::invert_symmetric_pd;
 use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
 use nalgebra::DVector;
 use std::collections::BTreeMap;
@@ -74,7 +75,7 @@ pub use fallback::{
 pub use source::EphemerisSource;
 
 pub use crate::constants::{C_M_S, F_L1_HZ, OMEGA_E_DOT_RAD_S};
-use crate::dop::{dop, dop_multi, Dop, LineOfSight};
+use crate::dop::{dop, dop_multi, Dop, LineOfSight, PositionCovariance};
 use crate::estimation::recipe::{
     EstimationRecipe, FrameRecipe, RangeRecipe, SagnacRecipe, SolverRecipe,
 };
@@ -89,12 +90,17 @@ use crate::ionex::{
     galileo_nequick_g_native_unchecked, klobuchar_native_unchecked, GalileoNequickEval,
     KlobucharParams,
 };
+use crate::observables::ObservableEphemerisSource;
 use crate::quality::{
     validate_receiver_solution, SolutionValidationError, SolutionValidationOptions,
 };
 use crate::sbas::SbasIonoGrid;
 use crate::tropo::slant_components;
 use crate::validate;
+use crate::velocity::{
+    self, VelocityError, VelocityObservable, VelocityObservation, VelocitySolution,
+    VelocitySolveOptions,
+};
 
 /// The single-frequency carrier (Hz) the ionosphere correction is reported on
 /// for a constellation with one fixed single-frequency carrier, or `None` for a
@@ -240,6 +246,7 @@ pub struct SolutionMetadata {
 
 /// A receiver position/clock solution with its geometry diagnostics.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReceiverSolution {
     /// Converged receiver position, ITRF/IGS ECEF meters.
     pub position: ItrfPositionM,
@@ -250,6 +257,10 @@ pub struct ReceiverSolution {
     /// only clock; for a multi-system solve the other systems' absolute clocks
     /// are in `system_clocks_s`.
     pub rx_clock_s: f64,
+    /// Receiver clock drift in seconds per second when a Doppler/range-rate
+    /// velocity solve was run with this receiver position. Pseudorange-only
+    /// solves leave this as `None`.
+    pub rx_clock_drift_s_s: Option<f64>,
     /// The absolute receiver clock for each GNSS in the solve, in ascending
     /// system order, in seconds. One entry for a single-system solve; one per
     /// constellation for a multi-system solve. The first entry equals
@@ -272,6 +283,12 @@ pub struct ReceiverSolution {
     /// per-system TDOPs already GNSS-tagged in [`Dop::system_tdops`], so this is
     /// a direct copy and needs no re-tagging.
     pub system_tdops: Vec<(GnssSystem, f64)>,
+    /// Position covariance in square metres.
+    ///
+    /// `ecef_m2` is the ITRF/IGS ECEF covariance. `enu_m2` is the same block
+    /// rotated into the local geodetic east-north-up frame at the solved
+    /// receiver position.
+    pub position_covariance: PositionCovariance,
     /// Post-fit residuals in meters, in `used_sats` order (unweighted
     /// `P_meas - P_hat`).
     pub residuals_m: Vec<f64>,
@@ -287,6 +304,64 @@ pub struct ReceiverSolution {
     pub geometry_quality: GeometryQuality,
     /// Iteration / convergence / model metadata.
     pub metadata: SolutionMetadata,
+}
+
+/// One Doppler row for an SPP-family receiver velocity solve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DopplerObservation {
+    /// Satellite identifier.
+    pub satellite_id: GnssSatelliteId,
+    /// Doppler shift in hertz.
+    pub doppler_hz: f64,
+    /// Carrier frequency in hertz.
+    pub carrier_hz: f64,
+    /// Satellite clock drift in seconds per second.
+    pub sat_clock_drift_s_s: f64,
+}
+
+/// Inputs for the SPP-family Doppler velocity solve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DopplerVelocityInputs {
+    /// Doppler observations for one epoch.
+    pub observations: Vec<DopplerObservation>,
+    /// Receiver ECEF/ITRF position in metres.
+    pub receiver_ecef_m: [f64; 3],
+    /// Receive epoch, seconds since J2000.
+    pub t_rx_j2000_s: f64,
+    /// Apply fixed-point light-time correction in the geometry substrate.
+    pub light_time: bool,
+    /// Apply Earth-rotation Sagnac correction in the geometry substrate.
+    pub sagnac: bool,
+}
+
+impl DopplerVelocityInputs {
+    /// Build Doppler velocity inputs from a receiver position solution.
+    pub fn from_receiver_solution(
+        solution: &ReceiverSolution,
+        observations: Vec<DopplerObservation>,
+        t_rx_j2000_s: f64,
+    ) -> Self {
+        Self {
+            observations,
+            receiver_ecef_m: solution.position.as_array(),
+            t_rx_j2000_s,
+            light_time: true,
+            sagnac: true,
+        }
+    }
+}
+
+/// Result from solving position and, when possible, Doppler velocity together.
+#[derive(Debug, Clone)]
+pub struct SppDopplerSolution {
+    /// Receiver position solution. `rx_clock_drift_s_s` is populated when
+    /// `velocity` is `Some`.
+    pub receiver: ReceiverSolution,
+    /// Solved ECEF velocity and clock drift. `None` when no Doppler rows were
+    /// supplied or the velocity system was not solvable.
+    pub velocity: Option<VelocitySolution>,
+    /// Velocity-solve failure when Doppler rows were present but not solvable.
+    pub velocity_error: Option<VelocityError>,
 }
 
 impl ReceiverSolution {
@@ -1162,6 +1237,81 @@ pub fn solve(
     )
 }
 
+/// Solve receiver ECEF velocity and clock drift from Doppler rows using SPP
+/// position geometry.
+pub fn solve_doppler_velocity(
+    source: &dyn ObservableEphemerisSource,
+    inputs: &DopplerVelocityInputs,
+) -> Result<VelocitySolution, VelocityError> {
+    let observations: Vec<_> = inputs
+        .observations
+        .iter()
+        .map(|obs| VelocityObservation {
+            satellite_id: obs.satellite_id,
+            value: obs.doppler_hz,
+            carrier_hz: obs.carrier_hz,
+            sat_clock_drift_s_s: obs.sat_clock_drift_s_s,
+        })
+        .collect();
+    velocity::solve(
+        source,
+        &observations,
+        inputs.receiver_ecef_m,
+        inputs.t_rx_j2000_s,
+        VelocitySolveOptions {
+            observable: VelocityObservable::Doppler,
+            light_time: inputs.light_time,
+            sagnac: inputs.sagnac,
+        },
+    )
+}
+
+/// Solve SPP position and attach a Doppler velocity/clock-drift estimate when
+/// the Doppler rows are usable.
+///
+/// A pseudorange-only or underdetermined Doppler epoch still returns the
+/// receiver position; in that case `receiver.rx_clock_drift_s_s` and `velocity`
+/// are `None`, with the velocity failure retained in `velocity_error`.
+pub fn solve_with_doppler_velocity<E>(
+    eph: &E,
+    inputs: &SolveInputs,
+    doppler_observations: &[DopplerObservation],
+    with_geodetic: bool,
+) -> Result<SppDopplerSolution, SppError>
+where
+    E: EphemerisSource + ObservableEphemerisSource,
+{
+    let mut receiver = solve(eph, inputs, with_geodetic)?;
+    if doppler_observations.is_empty() {
+        return Ok(SppDopplerSolution {
+            receiver,
+            velocity: None,
+            velocity_error: None,
+        });
+    }
+
+    let velocity_inputs = DopplerVelocityInputs::from_receiver_solution(
+        &receiver,
+        doppler_observations.to_vec(),
+        inputs.t_rx_j2000_s,
+    );
+    match solve_doppler_velocity(eph, &velocity_inputs) {
+        Ok(velocity) => {
+            receiver.rx_clock_drift_s_s = Some(velocity.clock_drift_s_s);
+            Ok(SppDopplerSolution {
+                receiver,
+                velocity: Some(velocity),
+                velocity_error: None,
+            })
+        }
+        Err(error) => Ok(SppDopplerSolution {
+            receiver,
+            velocity: None,
+            velocity_error: Some(error),
+        }),
+    }
+}
+
 /// SPP's trust-region stage recognizes the owned deterministic solver
 /// ([`SolverRecipe::OwnedDeterministicTrf`]), which owns the dense subproblem
 /// factorization with a fixed reduction order and its own frozen-bits golden;
@@ -1323,6 +1473,7 @@ fn solve_inner(
 
     let mut outer_iterations = 0usize;
     let mut final_robust_scale_m: Option<f64> = None;
+    let mut final_weights = sel.weights.clone();
 
     // Outer Huber/IRLS reweighting loop, ONLY on the robust path. Each iteration
     // recomputes the unweighted post-fit residuals at the current converged
@@ -1366,6 +1517,7 @@ fn solve_inner(
                 return Err(SppError::EphemerisLost { satellite });
             }
             report = next?;
+            final_weights = eff;
             outer_iterations += 1;
             final_robust_scale_m = Some(scale);
             // Position L2 step between successive outer solves.
@@ -1400,7 +1552,7 @@ fn solve_inner(
         .map_err(|satellite| SppError::EphemerisLost { satellite })?;
 
     // DOP from the converged geometry: line-of-sight unit vectors to the
-    // Sagnac-rotated satellite positions, with the frozen weights. A
+    // Sagnac-rotated satellite positions, with the final solve weights. A
     // single-system solve uses the 0-ULP four-state cofactor inverse; a
     // multi-system solve uses the general (3 + n_systems) inverse with one clock
     // column per GNSS (a deterministic geometry diagnostic, not a 0-ULP target).
@@ -1450,12 +1602,12 @@ fn solve_inner(
     // single-system 0-ULP `dop` carries no constellation identity, so tag its
     // lone clock here with the one system in the solve.
     let dop_result = if n_clocks == 1 {
-        dop(&los, &sel.weights, geo).ok().map(|mut d| {
+        dop(&los, &final_weights, geo).ok().map(|mut d| {
             d.system_tdops = vec![(systems[0], d.tdop)];
             d
         })
     } else {
-        dop_multi(&los, &clock_index, &systems, n_clocks, &sel.weights, geo).ok()
+        dop_multi(&los, &clock_index, &systems, n_clocks, &final_weights, geo).ok()
     };
     let n_params = xs.len();
     let jacobian_svd = report.jacobian.clone().svd(false, false);
@@ -1479,6 +1631,10 @@ fn solve_inner(
         .as_ref()
         .map(|d| d.system_tdops.clone())
         .unwrap_or_default();
+    let position_covariance =
+        spp_position_covariance(&los, &clock_index, n_clocks, &final_weights, geo).ok_or(
+            SppError::Singular(least_squares::SolveError::SingularJacobian),
+        )?;
 
     let converged = matches!(
         report.status,
@@ -1500,9 +1656,11 @@ fn solve_inner(
         position,
         geodetic,
         rx_clock_s,
+        rx_clock_drift_s_s: None,
         system_clocks_s,
         dop: dop_result,
         system_tdops,
+        position_covariance,
         residuals_m,
         used_sats: sel.used,
         rejected_sats: sel.rejected,
@@ -1521,6 +1679,48 @@ fn solve_inner(
             raim_checkable: metadata_redundancy >= 1,
         },
     })
+}
+
+fn spp_position_covariance(
+    los: &[LineOfSight],
+    clock_index: &[usize],
+    n_clocks: usize,
+    weights: &[f64],
+    receiver: Wgs84Geodetic,
+) -> Option<PositionCovariance> {
+    if los.len() != clock_index.len() || los.len() != weights.len() || n_clocks == 0 {
+        return None;
+    }
+    let p = 3 + n_clocks;
+    if los.len() < p {
+        return None;
+    }
+
+    let mut normal = vec![vec![0.0_f64; p]; p];
+    for k in 0..los.len() {
+        if clock_index[k] >= n_clocks {
+            return None;
+        }
+        let mut row = vec![0.0_f64; p];
+        row[0] = -los[k].e_x;
+        row[1] = -los[k].e_y;
+        row[2] = -los[k].e_z;
+        row[3 + clock_index[k]] = 1.0;
+        let weight = weights[k];
+        for i in 0..p {
+            for j in 0..p {
+                normal[i][j] += row[i] * weight * row[j];
+            }
+        }
+    }
+    let q = invert_symmetric_pd(&normal)?;
+    let ecef_m2 = [
+        [q[0][0], q[0][1], q[0][2]],
+        [q[1][0], q[1][1], q[1][2]],
+        [q[2][0], q[2][1], q[2][2]],
+    ];
+    let enu_m2 = crate::dop::rotate_covariance_ecef_to_enu_m2(ecef_m2, receiver).ok()?;
+    Some(PositionCovariance { ecef_m2, enu_m2 })
 }
 
 /// Run SPP under the public API's language-independent validation/orchestration
