@@ -446,6 +446,7 @@ impl TightFusionState {
         let mut next = matrix_add(&propagated, &q)?;
         symmetrize_in_place(&mut next);
         reproject_covariance_psd(&mut next, "tight_augmented_covariance")?;
+        self.clock_bias_m += self.clock_drift_m_s * dt_s;
         self.augmented_covariance = next;
         self.validate(base_dim)
     }

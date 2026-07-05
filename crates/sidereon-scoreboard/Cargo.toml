@@ -8,5 +8,5 @@ publish = false
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sidereon-core = { path = "../sidereon-core", version = "0.16.0" }
+sidereon-core = { path = "../sidereon-core", version = "0.16.1" }
 thiserror = "1.0"
