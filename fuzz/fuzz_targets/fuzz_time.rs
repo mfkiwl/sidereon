@@ -92,10 +92,13 @@ fuzz_target!(|data: &[u8]| {
         ),
     );
     let _ = scales::julian_day_number(input.year, input.month, input.day);
-    assert_success(
-        "scales::find_leap_seconds",
-        scales::find_leap_seconds(input.seconds[6]),
-    );
+    let leap = scales::find_leap_seconds(input.seconds[6]);
+    if input.seconds[6].is_finite() {
+        assert!(leap.is_finite(), "ok-nonfinite scales::find_leap_seconds");
+    } else {
+        // Documented contract: non-finite input returns NaN.
+        assert!(leap.is_nan(), "non-nan for non-finite scales::find_leap_seconds");
+    }
     let table = scales::leap_second_table();
     let _ = (table.first_mjd, table.last_mjd, table.entries);
     let prov = scales::ut1_coverage();
