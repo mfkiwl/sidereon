@@ -13,6 +13,8 @@ All notable changes to `sidereon-core` are documented here.
 - Fusion RTS fixed-interval smoothing over recorded error-state histories,
   with recorded forward-pass transitions, predicted and updated checkpoints,
   smoothed covariances, and loose/tight measurement-agnostic entry points.
+- Simulator-backed field-behavior pins for loose fusion smoothing, outage
+  coast, and low-satellite tight consistency.
 
 ## [0.17.0]
 
