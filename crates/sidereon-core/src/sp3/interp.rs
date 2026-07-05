@@ -35,7 +35,7 @@
 //!
 //! Nodes are **integer seconds since J2000** (2000-01-01 12:00:00 in the file's
 //! own time scale), exactly as gnssanalysis builds them in `datetime2j2000`
-//! (`gn_datetime.py:286-288`): epochs floored to whole seconds, differenced
+//! (`gn_datetime.py:286-288`): epochs quantized to whole seconds, differenced
 //! against the J2000 origin, kept as `i64`, then promoted to `f64` on entry to
 //! the spline. The parser stores that seconds axis from the epoch record's civil
 //! fields with integer whole-second arithmetic, so node bucketing does not
@@ -44,7 +44,7 @@
 //! no longer matches the parsed axis within the shared whole-second tolerance.
 //!
 //! J2000 = JD 2451545.0. Query seconds from [`Sp3::position`] are computed from
-//! the supplied [`Instant`] in a cancellation-safe way and are never floored.
+//! the supplied [`Instant`] in a cancellation-safe way and are never quantized.
 //!
 //! # Units
 //!
@@ -78,10 +78,12 @@ use crate::tolerances::WHOLE_SECOND_EPS_S;
 use crate::validate;
 use crate::{Error, Result};
 
+const NODE_AXIS_SPLIT_ROUNDOFF_EPS_S: f64 = 1.0e-11;
+
 /// Per-satellite precise node series in native fit units.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PreciseSatSeries {
-    /// Floored J2000-second node axis.
+    /// Whole-second J2000 node axis.
     pub(super) x: Vec<f64>,
     /// X position nodes in SP3-native kilometers.
     pub(super) kx: Vec<f64>,
@@ -221,10 +223,10 @@ pub(super) fn gather_sp3_precise_series(source: &Sp3, sat: GnssSatelliteId) -> P
     let mut series = PreciseSatSeries::new();
 
     for (idx, ep) in source.epochs.iter().enumerate() {
-        // Node axis: floored to whole seconds to match gnssanalysis
-        // datetime2j2000. The query is never floored.
+        // Node axis: shared whole-second construction. The query is never
+        // quantized.
         let xi = match sp3_epoch_j2000_seconds(source, idx, ep) {
-            Some(v) => v.floor(),
+            Some(v) => precise_node_j2000_seconds(v),
             None => continue,
         };
         // Use the parser's native km/us node values. Reconstructing km from the
@@ -255,12 +257,29 @@ pub(super) fn sp3_epoch_j2000_seconds(source: &Sp3, idx: usize, epoch: &Instant)
     }
 }
 
+/// Convert an epoch expressed as J2000 seconds onto the SP3 interpolation node
+/// axis.
+///
+/// SP3 record epochs are whole-second in normal products. Some split-Julian
+/// representations convert a whole-second epoch to `N - epsilon`; applying a
+/// raw `floor()` labels that node as `N - 1`. Snap values that are within the
+/// proven split-JD roundoff bound to the nearest whole second, and keep the
+/// gnssanalysis truncation policy for genuinely fractional epochs.
+pub(super) fn precise_node_j2000_seconds(seconds: f64) -> f64 {
+    let nearest = seconds.round();
+    if (seconds - nearest).abs() <= NODE_AXIS_SPLIT_ROUNDOFF_EPS_S {
+        nearest
+    } else {
+        seconds.floor()
+    }
+}
+
 /// Interpolate a satellite state from already-gathered native-unit nodes.
 ///
 /// This is the shared interpolation substrate. Both the SP3-parsed source
 /// ([`Sp3::position_at_j2000_seconds`]) and the sample-backed source
 /// ([`crate::sp3::PreciseEphemerisSamples`]) gather the same node vectors
-/// (ascending floored J2000 seconds `x`; native km `kx/ky/kz`; native
+/// (ascending whole-second J2000 seconds `x`; native km `kx/ky/kz`; native
 /// `(x, clock_us, clock_event)` clock nodes) and drive this one function, so a
 /// source built from samples produces byte-identical states to the SP3 source
 /// those samples serialize to.
@@ -488,19 +507,22 @@ fn fitted_span_distance(arc: &ClockSplineArc, query: f64) -> f64 {
 }
 
 /// Convert a parser [`Instant`] to seconds since J2000, as `f64`, **exact**
-/// (not floored).
+/// (not quantized).
 ///
 /// The split-JD difference is taken whole-part first to avoid cancellation.
-/// This returns the precise instant; flooring belongs to the *node axis* only:
+/// This returns the precise instant; whole-second quantization belongs to the
+/// *node axis* only:
 ///
-/// - **Node epochs** are floored to whole seconds at the call site to mirror
-///   gnssanalysis `datetime2j2000` (`datetime64[s]` truncation), so the spline's
-///   x-axis is bit-identical to the reference. SP3 epochs are integer-second in
-///   practice, so this floor is a no-op on real data but kept for faithfulness.
-/// - The **query** is evaluated at this exact value, never floored: flooring a
-///   sub-second query epoch would discard up to ~1 s, a kilometre-scale position
-///   error at orbital speed (this was a real bug - the node and query
-///   conversions must NOT share the flooring).
+/// - **Node epochs** are quantized to whole seconds at the call site to mirror
+///   gnssanalysis `datetime2j2000` (`datetime64[s]` truncation), with
+///   values inside the split-JD roundoff bound snapped before truncation so
+///   split-Julian round-off does not move a record node by one second. SP3
+///   epochs are integer-second in practice, so this is a no-op on exact parsed
+///   axes and keeps the sample-backed path aligned with the parsed path.
+/// - The **query** is evaluated at this exact value, never quantized: truncating
+///   a sub-second query epoch would discard up to ~1 s, a kilometre-scale
+///   position error at orbital speed (this was a real bug - the node and query
+///   conversions must NOT share quantization).
 pub(super) fn instant_to_j2000_seconds(instant: &Instant) -> Option<f64> {
     match instant.repr {
         InstantRepr::JulianDate(split) => {

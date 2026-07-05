@@ -12,6 +12,7 @@ use sidereon_core::ephemeris::{observable_states_at_j2000_s, PreciseEphemerisInt
 use sidereon_core::{GnssSatelliteId, GnssSystem};
 
 const COD_5M_FIXTURE: &str = "tests/fixtures/sp3/COD0MGXFIN_20201770000_01D_05M_ORB.SP3";
+const GAP_15M_FIXTURE: &str = "tests/fixtures/sp3/GAP_G01_20201760000_15M.sp3";
 const SP3_POSITION_RESOLUTION_M: f64 = 1.0e-3;
 const SP3_CLOCK_RESOLUTION_S: f64 = 1.0e-12;
 
@@ -95,6 +96,31 @@ fn text_records(text: &str, sat: GnssSatelliteId) -> Vec<TextRecord> {
     out
 }
 
+fn floor_sensitive_45m_fixture_text() -> String {
+    let header_src = fixture_text(GAP_15M_FIXTURE);
+    let epoch_start = header_src.find("\n*  ").expect("first epoch line") + 1;
+    let mut text = String::from(&header_src[..epoch_start]);
+
+    for i in 0..12 {
+        let second_of_day = 6 * 3600 + 7 + i * 2700;
+        let hour = second_of_day / 3600;
+        let minute = (second_of_day % 3600) / 60;
+        let second = second_of_day % 60;
+        let x_km = 20_000.0 + 10.0 * i as f64;
+        let y_km = 14_000.0 + 7.0 * i as f64;
+        let z_km = 21_000.0 - 5.0 * i as f64;
+        let clock_us = 100.0 + i as f64;
+        text.push_str(&format!(
+            "*  2000  1  1 {hour:2} {minute:2} {second:2}.00000000\n"
+        ));
+        text.push_str(&format!(
+            "PG01{x_km:14.6}{y_km:14.6}{z_km:14.6}{clock_us:14.6}\n"
+        ));
+    }
+    text.push_str("EOF\n");
+    text
+}
+
 fn assert_record_matches(
     record: TextRecord,
     state_position_m: [f64; 3],
@@ -125,10 +151,30 @@ fn assert_record_matches(
     }
 }
 
+fn assert_state_bits_eq(
+    sat: GnssSatelliteId,
+    epoch_j2000_s: f64,
+    parsed: sidereon_core::ephemeris::Sp3State,
+    from_samples: sidereon_core::ephemeris::Sp3State,
+) {
+    assert_eq!(
+        parsed.position.as_array().map(f64::to_bits),
+        from_samples.position.as_array().map(f64::to_bits),
+        "{sat} position bits differ at {epoch_j2000_s}"
+    );
+    assert_eq!(
+        parsed.clock_s.map(f64::to_bits),
+        from_samples.clock_s.map(f64::to_bits),
+        "{sat} clock bits differ at {epoch_j2000_s}"
+    );
+}
+
 #[test]
-fn exact_record_epochs_match_sp3_text_oracle() {
+fn exact_record_epochs_match_sp3_text_oracle_on_both_construction_paths() {
     let text = fixture_text(COD_5M_FIXTURE);
     let sp3 = Sp3::parse(text.as_bytes()).expect("parse SP3 fixture");
+    let samples = PreciseEphemerisInterpolant::from_samples(sp3.precise_ephemeris_samples())
+        .expect("sample-backed interpolant");
     let sat = gps(1);
     let records = text_records(&text, sat);
     assert!(
@@ -141,10 +187,75 @@ fn exact_record_epochs_match_sp3_text_oracle() {
     );
 
     for &record in records.iter().take(144) {
-        let state = sp3
+        let parsed = sp3
             .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
-            .expect("interpolated state at record epoch");
-        assert_record_matches(record, state.position.as_array(), state.clock_s);
+            .expect("parsed state at record epoch");
+        assert_record_matches(record, parsed.position.as_array(), parsed.clock_s);
+
+        let from_samples = samples
+            .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
+            .expect("sample-backed state at record epoch");
+        assert_record_matches(
+            record,
+            from_samples.position.as_array(),
+            from_samples.clock_s,
+        );
+    }
+}
+
+#[test]
+fn exact_record_epochs_match_sp3_text_oracle_on_45m_sample_backed_path() {
+    let text = floor_sensitive_45m_fixture_text();
+    let sp3 = Sp3::parse(text.as_bytes()).expect("parse SP3 fixture");
+    let samples = PreciseEphemerisInterpolant::from_samples(sp3.precise_ephemeris_samples())
+        .expect("sample-backed interpolant");
+    let sat = gps(1);
+    let records = text_records(&text, sat);
+    assert_eq!(records.len(), 12, "fixture record coverage changed");
+    for window in records.windows(2) {
+        assert_eq!(
+            window[1].epoch.j2000_s - window[0].epoch.j2000_s,
+            2700.0,
+            "fixture is no longer 45-minute cadence"
+        );
+    }
+
+    for record in records {
+        let parsed = sp3
+            .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
+            .expect("parsed state at record epoch");
+        assert_record_matches(record, parsed.position.as_array(), parsed.clock_s);
+
+        let from_samples = samples
+            .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
+            .expect("sample-backed state at record epoch");
+        assert_record_matches(
+            record,
+            from_samples.position.as_array(),
+            from_samples.clock_s,
+        );
+    }
+}
+
+#[test]
+fn sample_backed_path_matches_parsed_path_bits_at_45m_midpoints() {
+    let text = floor_sensitive_45m_fixture_text();
+    let sp3 = Sp3::parse(text.as_bytes()).expect("parse SP3 fixture");
+    let samples = PreciseEphemerisInterpolant::from_samples(sp3.precise_ephemeris_samples())
+        .expect("sample-backed interpolant");
+    let sat = gps(1);
+    let records = text_records(&text, sat);
+    assert_eq!(records.len(), 12, "fixture record coverage changed");
+
+    for window in records.windows(2) {
+        let midpoint = 0.5 * (window[0].epoch.j2000_s + window[1].epoch.j2000_s);
+        let parsed = sp3
+            .position_at_j2000_seconds(sat, midpoint)
+            .expect("parsed midpoint state");
+        let from_samples = samples
+            .position_at_j2000_seconds(sat, midpoint)
+            .expect("sample-backed midpoint state");
+        assert_state_bits_eq(sat, midpoint, parsed, from_samples);
     }
 }
 

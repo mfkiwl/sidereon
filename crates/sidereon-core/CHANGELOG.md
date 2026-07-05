@@ -4,6 +4,12 @@ All notable changes to `sidereon-core` are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Sample-backed SP3 interpolation now uses the same whole-second epoch-axis
+  construction as the parsed-product path. The parsed path was fixed in 0.16.1;
+  this closes the remaining `from_samples` record-node boundary case.
+
 ### Changed
 
 - IONEX slant-delay evaluation now reports out-of-coverage epochs and

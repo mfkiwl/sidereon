@@ -17,12 +17,14 @@
 //!   `extrapolate=True`, fit on the contiguous clock sub-arc containing the
 //!   query (the arc is split at each `E` clock-event epoch).
 //!
-//! **Node axis**: integer seconds since J2000, floored to whole seconds (the
-//! query epoch is **not** floored). **Units**: the fit is in the file-native
-//! units the references consume, kilometers for position and microseconds for
-//! clock, and the single unit multiply to SI (meters `* 1000`, seconds `* 1e-6`)
-//! happens **after** evaluation. **Coverage**: a query more than one nominal node
-//! spacing beyond the node span, or deep inside an interior gap, is rejected
+//! **Node axis**: integer seconds since J2000, snapped to whole seconds when
+//! within the split-JD roundoff bound and otherwise truncated with the reference
+//! policy (the query epoch is **not** quantized). **Units**: the fit is in the
+//! file-native units the references consume, kilometers for position and
+//! microseconds for clock, and the single unit multiply to SI (meters `* 1000`,
+//! seconds `* 1e-6`) happens **after** evaluation. **Coverage**: a query more
+//! than one nominal node spacing beyond the node span, or deep inside an
+//! interior gap, is rejected
 //! ([`crate::Error::EpochOutOfRange`]) rather than extrapolated.
 //!
 //! A consumer migrating from a global cubic spline over SP3 (for example scipy
