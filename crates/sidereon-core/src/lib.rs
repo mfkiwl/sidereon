@@ -114,6 +114,7 @@ mod sp3; // SP3-c / SP3-d parser + arbitrary-epoch interpolation
 mod spp; // single-point positioning (least-squares PVT)
 pub mod ssr; // SSR correction store and corrected broadcast ephemeris source
 pub mod staleness; // product-staleness graceful degradation for time-varying products
+mod static_positioning; // multi-epoch static position fusion
 mod tropo; // Saastamoinen zenith + Niell (NMF) mapping troposphere
 pub mod velocity; // receiver velocity / clock-drift least-squares solve
 

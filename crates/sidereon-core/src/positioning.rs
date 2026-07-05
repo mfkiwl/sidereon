@@ -14,6 +14,11 @@ pub use crate::spp::{
     DEFAULT_HUBER_K, DEFAULT_ROBUST_MAX_OUTER, DEFAULT_ROBUST_OUTER_TOL_M,
     DEFAULT_ROBUST_SCALE_FLOOR_M, ELEVATION_MASK_RAD, SIGMA0_M, TRANSMIT_TIME_ITERATIONS,
 };
+pub use crate::static_positioning::{
+    solve_static, StaticClockBias, StaticCovariance, StaticEpoch, StaticEpochInfluence,
+    StaticInfluenceStatus, StaticResidual, StaticSatelliteBatchInfluence, StaticSatelliteInfluence,
+    StaticSolution, StaticSolutionMetadata, StaticSolveError, StaticSolveOptions,
+};
 
 /// Role-oriented alias for a solved receiver state.
 pub type Solution = ReceiverSolution;
