@@ -6,6 +6,8 @@
 //! sampled by zero-order hold, and correlation/acquisition are direct nested
 //! sums over samples and Doppler bins.
 
+pub mod analysis;
+
 use crate::constants::F_L1_HZ;
 use crate::tolerances::DOPPLER_GRID_EDGE_EPS_HZ;
 use crate::validate;
