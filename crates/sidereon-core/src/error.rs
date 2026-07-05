@@ -16,6 +16,13 @@ pub enum Error {
     Parse(String),
     /// A requested satellite is not present in the product.
     UnknownSatellite(crate::GnssSatelliteId),
+    /// A requested terrain tile is not present in the terrain store.
+    MissingTerrainTile {
+        /// Integer latitude tile id.
+        lat_index: i32,
+        /// Integer longitude tile id.
+        lon_index: i32,
+    },
     /// A requested epoch lies outside the sampled / valid span.
     EpochOutOfRange,
     /// An operation received inputs it cannot combine (e.g. an empty set of
@@ -29,6 +36,10 @@ impl fmt::Display for Error {
         match self {
             Error::Parse(msg) => write!(f, "parse error: {msg}"),
             Error::UnknownSatellite(id) => write!(f, "unknown satellite: {id}"),
+            Error::MissingTerrainTile {
+                lat_index,
+                lon_index,
+            } => write!(f, "missing terrain tile ({lat_index},{lon_index})"),
             Error::EpochOutOfRange => write!(f, "epoch out of range"),
             Error::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
         }

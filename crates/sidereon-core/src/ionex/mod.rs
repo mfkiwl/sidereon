@@ -478,6 +478,35 @@ pub fn ionex_slant_delays(
     Ok(())
 }
 
+impl Ionex {
+    /// Evaluate a batch of IONEX slant ionospheric group delays into `out`.
+    ///
+    /// This is the method form of [`ionex_slant_delays`]. Parsed products and
+    /// products built with [`Ionex::from_samples`] use the same stored grid
+    /// fields, so both routes reach the same scalar kernel in input order. Each
+    /// output element is bit-identical to the matching [`ionex_slant_delay`]
+    /// call.
+    pub fn slant_delays_batch(
+        &self,
+        requests: &[IonexSlantRequest],
+        out: &mut [f64],
+    ) -> Result<()> {
+        ionex_slant_delays(self, requests, out)
+    }
+
+    /// Evaluate a batch of IONEX slant ionospheric group delays into a new
+    /// contiguous vector.
+    ///
+    /// This convenience method allocates exactly one output vector and delegates
+    /// to [`Self::slant_delays_batch`]. Values are bit-identical to the scalar
+    /// [`ionex_slant_delay`] sequence for the same requests.
+    pub fn slant_delays_batch_vec(&self, requests: &[IonexSlantRequest]) -> Result<Vec<f64>> {
+        let mut out = vec![0.0; requests.len()];
+        self.slant_delays_batch(requests, &mut out)?;
+        Ok(out)
+    }
+}
+
 fn ionex_slant_delay_unchecked(
     ionex: &Ionex,
     receiver: Wgs84Geodetic,

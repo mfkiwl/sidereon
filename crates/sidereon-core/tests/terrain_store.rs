@@ -16,9 +16,12 @@ use sidereon_core::data::hgt_to_dted;
 use sidereon_core::geoid::egm96_undulation;
 use sidereon_core::terrain::{DtedInterpolation, DtedLookupOptions, DtedTerrain};
 use sidereon_core::terrain_store::{
-    dted_tree_to_mmap_store, terrain_store_checksum64, Egm96FifteenMinuteGeoid, MmapTerrain,
-    OrthometricHeightM, TerrainDatumError, TerrainGeoidModel, VerticalDatum,
+    dted_tile_list_to_mmap_store, dted_tree_to_mmap_store, terrain_store_checksum64,
+    DtedTileListEntry, Egm96FifteenMinuteGeoid, MmapTerrain, OrthometricHeightM, TerrainDatumError,
+    TerrainGeoidModel, TerrainTileId, VerticalDatum,
 };
+
+const MULTI_TILE_STORE_CHECKSUM64: u64 = 0xff51_4a67_6a94_d479;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -49,7 +52,7 @@ fn multi_tile_points() -> Vec<(f64, f64)> {
     let json: Value =
         serde_json::from_slice(&fs::read(fixture_path("dted_points.json")).expect("fixture json"))
             .expect("parse fixture json");
-    let mut points: Vec<(f64, f64)> = json["multi_tile_cases"]
+    let points: Vec<(f64, f64)> = json["multi_tile_cases"]
         .as_array()
         .expect("multi tile cases")
         .iter()
@@ -60,7 +63,6 @@ fn multi_tile_points() -> Vec<(f64, f64)> {
             )
         })
         .collect();
-    points.push((-104.5, 36.5));
     points
 }
 
@@ -93,6 +95,11 @@ fn mmap_store_matches_dted_reader_over_multi_tile_fixture() {
 
     assert_eq!(mmap.vertical_datum(), VerticalDatum::Egm96MslOrthometric);
     assert_eq!(mmap.tile_index().len(), 2);
+    assert_eq!(mmap.tile_count(), 2);
+    assert_eq!(
+        mmap.tile_ids(),
+        &[TerrainTileId::new(36, -107), TerrainTileId::new(36, -106)]
+    );
     for tile in mmap.tile_index() {
         assert_eq!(tile.vertical_datum, VerticalDatum::Egm96MslOrthometric);
         assert_eq!(tile.data_offset as usize % 4096, 0);
@@ -154,11 +161,43 @@ fn mmap_store_matches_dted_reader_for_hgt_void_collapsed_to_zero() {
 }
 
 #[test]
+fn absent_mmap_tile_returns_typed_error_not_zero() {
+    let root = fixture_path("tiles");
+    let bytes = dted_tree_to_mmap_store(&root).expect("convert DTED tree");
+    let mut mmap = MmapTerrain::from_bytes(&bytes).expect("parse terrain store");
+    let missing_lon = -104.5;
+    let missing_lat = 36.5;
+
+    let err = mmap
+        .height_m(missing_lon, missing_lat)
+        .expect_err("missing tile must not return zero");
+    assert_eq!(
+        err,
+        sidereon_core::Error::MissingTerrainTile {
+            lat_index: 36,
+            lon_index: -105
+        }
+    );
+
+    let typed_err = mmap
+        .orthometric_height_m(missing_lon, missing_lat)
+        .expect_err("typed missing tile must not return zero");
+    assert_eq!(typed_err, err);
+
+    let batch = mmap.height_batch(&[(missing_lon, missing_lat)], DtedLookupOptions::default());
+    assert_eq!(batch, vec![Err(err)]);
+}
+
+#[test]
 fn dted_tree_conversion_is_byte_stable() {
     let root = fixture_path("tiles");
     let first = dted_tree_to_mmap_store(&root).expect("first conversion");
     let second = dted_tree_to_mmap_store(&root).expect("second conversion");
     assert_eq!(first, second);
+    assert_eq!(
+        terrain_store_checksum64(&first),
+        MULTI_TILE_STORE_CHECKSUM64
+    );
     assert_eq!(
         terrain_store_checksum64(&first),
         terrain_store_checksum64(&second)
@@ -171,6 +210,96 @@ fn dted_tree_conversion_is_byte_stable() {
         terrain_store_checksum64(&reserialized)
     );
     assert_eq!(first, reserialized);
+}
+
+#[test]
+fn dted_tile_list_conversion_matches_directory_bytes() {
+    let root = fixture_path("tiles");
+    let directory_bytes = dted_tree_to_mmap_store(&root).expect("directory conversion");
+    let entries = [
+        DtedTileListEntry::from_indices(36, -107, root.join("n36_w107_1arc_v3.dt2")),
+        DtedTileListEntry::from_indices(36, -106, root.join("n36_w106_1arc_v3.dt2")),
+    ];
+    let list_bytes = dted_tile_list_to_mmap_store(&entries).expect("list conversion");
+
+    assert_eq!(list_bytes, directory_bytes);
+    assert_eq!(
+        terrain_store_checksum64(&list_bytes),
+        MULTI_TILE_STORE_CHECKSUM64
+    );
+    assert_eq!(
+        terrain_store_checksum64(&list_bytes),
+        terrain_store_checksum64(&directory_bytes)
+    );
+}
+
+#[test]
+fn dted_tile_list_rejects_wrong_tile_id() {
+    let root = fixture_path("tiles");
+    let entries = [DtedTileListEntry::from_indices(
+        35,
+        -107,
+        root.join("n36_w107_1arc_v3.dt2"),
+    )];
+    let err = dted_tile_list_to_mmap_store(&entries).expect_err("wrong id must fail");
+    assert!(matches!(
+        err,
+        sidereon_core::terrain_store::TerrainStoreError::TileIdMismatch { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn dted_tree_conversion_follows_symlinked_files_and_directories() {
+    use std::os::unix::fs::symlink;
+
+    let root = fixture_path("tiles");
+    let real = dted_tree_to_mmap_store(&root).expect("real tree conversion");
+
+    let file_root = temp_path("terrain-store-symlinked-files");
+    fs::create_dir_all(&file_root).expect("create symlink file root");
+    for tile_name in ["n36_w107_1arc_v3.dt2", "n36_w106_1arc_v3.dt2"] {
+        symlink(root.join(tile_name), file_root.join(tile_name)).expect("create tile symlink");
+    }
+    let file_linked = dted_tree_to_mmap_store(&file_root).expect("symlinked file conversion");
+    assert_eq!(file_linked, real);
+    assert_eq!(
+        terrain_store_checksum64(&file_linked),
+        MULTI_TILE_STORE_CHECKSUM64
+    );
+
+    let alias_root = temp_path("terrain-store-symlinked-alias-files");
+    fs::create_dir_all(&alias_root).expect("create alias symlink file root");
+    symlink(
+        root.join("n36_w107_1arc_v3.dt2"),
+        alias_root.join("west_alias"),
+    )
+    .expect("create west alias symlink");
+    symlink(
+        root.join("n36_w106_1arc_v3.dt2"),
+        alias_root.join("east_alias"),
+    )
+    .expect("create east alias symlink");
+    let alias_linked = dted_tree_to_mmap_store(&alias_root).expect("alias symlink conversion");
+    assert_eq!(alias_linked, real);
+    assert_eq!(
+        terrain_store_checksum64(&alias_linked),
+        MULTI_TILE_STORE_CHECKSUM64
+    );
+
+    let dir_root = temp_path("terrain-store-symlinked-dir");
+    fs::create_dir_all(&dir_root).expect("create symlink directory root");
+    symlink(&root, dir_root.join("linked_tiles")).expect("create directory symlink");
+    let dir_linked = dted_tree_to_mmap_store(&dir_root).expect("symlinked directory conversion");
+    assert_eq!(dir_linked, real);
+    assert_eq!(
+        terrain_store_checksum64(&dir_linked),
+        MULTI_TILE_STORE_CHECKSUM64
+    );
+
+    fs::remove_dir_all(file_root).expect("remove symlink file root");
+    fs::remove_dir_all(alias_root).expect("remove alias symlink file root");
+    fs::remove_dir_all(dir_root).expect("remove symlink directory root");
 }
 
 #[test]

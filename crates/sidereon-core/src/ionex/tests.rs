@@ -703,7 +703,16 @@ fn ionex_slant_delays_batch_matches_scalar_bits() {
 
     for product in [&parsed, &sample_built] {
         let mut out = vec![f64::NAN; requests.len()];
-        ionex_slant_delays(product, &requests, &mut out).expect("valid batch");
+        product
+            .slant_delays_batch(&requests, &mut out)
+            .expect("valid method batch");
+        let vec_out = product
+            .slant_delays_batch_vec(&requests)
+            .expect("valid vector batch");
+        assert_eq!(vec_out, out, "vector batch matches slice-output batch");
+        let mut free_out = vec![f64::NAN; requests.len()];
+        ionex_slant_delays(product, &requests, &mut free_out).expect("valid function batch");
+        assert_eq!(free_out, out, "function batch matches method batch");
         for (request, got) in requests.iter().zip(out) {
             let scalar = super::ionex_slant_delay(
                 product,

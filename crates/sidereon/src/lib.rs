@@ -201,7 +201,7 @@ pub use sidereon_core::{
     frequencies, fusion, geodesic, geodetic_time_series, geometry, geometry_quality, ils, inertial,
     navigation, nmea, observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex,
     rtcm, rtk, sbas, sbas_pl, sidereal, signal, source_localization, ssr, staleness, terrain,
-    tides, velocity,
+    terrain_store, tides, velocity,
 };
 pub use sidereon_core::{
     catalog, catalog_entry, propagate_position, transform, transform_from_epoch, FrameCatalogError,
