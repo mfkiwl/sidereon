@@ -23,8 +23,8 @@ pub use error_state::{
     ErrorStateImuKinematics, ErrorStateLinearization,
 };
 pub use loose::{
-    loose_coupling_correction, FusionUpdate, GnssFixMeasurement, InertialFilter,
-    InertialFilterConfig, LooseCouplingConfig,
+    loose_coupling_correction, FusionUpdate, GnssFixMeasurement, IggIiiMeasurementReweighting,
+    InertialFilter, InertialFilterConfig, LooseCouplingConfig, YangPredictionAdaptiveFactor,
 };
 pub use serial::{
     F64Bits, FusionStateCodecError, SerializableErrorStateLayout, SerializableFusionSnapshot,

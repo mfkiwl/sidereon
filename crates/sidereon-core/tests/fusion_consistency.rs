@@ -13,10 +13,11 @@ use sidereon_core::astro::math::mat3::mul_vec3;
 use sidereon_core::astro::math::vec3::{add3, cross3, norm3, scale3};
 use sidereon_core::constants::C_M_S;
 use sidereon_core::fusion::{
-    ErrorStateLayout, FusionUpdate, GnssFixMeasurement, InertialFilter, InertialFilterConfig,
-    InsFilterState, TightCouplingConfig, TightGnssEpoch, TightGnssObservation,
-    TightRangeRateObservation, ERROR_ACCEL_BIAS_INDEX, ERROR_ATTITUDE_INDEX, ERROR_GYRO_BIAS_INDEX,
-    ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15, ERROR_VELOCITY_INDEX,
+    ErrorStateLayout, FusionUpdate, GnssFixMeasurement, IggIiiMeasurementReweighting,
+    InertialFilter, InertialFilterConfig, InsFilterState, LooseCouplingConfig, TightCouplingConfig,
+    TightGnssEpoch, TightGnssObservation, TightRangeRateObservation, ERROR_ACCEL_BIAS_INDEX,
+    ERROR_ATTITUDE_INDEX, ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15,
+    ERROR_VELOCITY_INDEX,
 };
 use sidereon_core::inertial::{
     mechanize_ecef, simulate_imu_samples_from_increments, true_imu_increment_between,
@@ -53,6 +54,8 @@ const TURNTABLE_GYRO_BIAS_ERROR_RPS: [f64; 3] = [0.006, -0.004, 0.003];
 const TURNTABLE_GYRO_BIAS_ERROR_SIGMA_RPS: f64 = 0.0015;
 const TURNTABLE_SEED_TAG: u64 = 0x7e12_a11e_1e4e_a2b5;
 const TURNTABLE_NEES_DIMENSION: usize = 6;
+const LOOSE_OUTLIER_BUDGET_STRIDE: usize = 10;
+const LOOSE_OUTLIER_MAGNITUDE_M: f64 = 120.0;
 
 #[derive(Debug, Clone, Copy)]
 enum FilterKind {
@@ -196,6 +199,27 @@ fn mismatched_noise_campaign_drives_nees_outside_chi_square_band() {
             result.nees_upper
         );
     }
+}
+
+#[test]
+fn loose_igg_iii_outlier_budget_keeps_nees_in_band_where_plain_exits() {
+    let robust = run_loose_outlier_budget_ensemble(true);
+    assert!(
+        (robust.nees_lower..=robust.nees_upper).contains(&robust.nees_average),
+        "robust loose outlier-budget NEES {:.17e} outside [{:.17e}, {:.17e}] at dof {}",
+        robust.nees_average,
+        robust.nees_lower,
+        robust.nees_upper,
+        robust.nees_dof
+    );
+
+    let plain = run_loose_outlier_budget_ensemble(false);
+    assert!(
+        plain.nees_average > plain.nees_upper,
+        "plain loose outlier-budget NEES {:.17e} did not exceed upper band {:.17e}",
+        plain.nees_average,
+        plain.nees_upper
+    );
 }
 
 #[test]
@@ -378,9 +402,90 @@ fn run_turntable_lever_arm_ensemble() -> EnsembleResult {
     }
 }
 
+fn run_loose_outlier_budget_ensemble(robust: bool) -> EnsembleResult {
+    let profile = ImuProfile::all()[0];
+    let scenario = MotionScenario::AggressiveDynamics;
+    let trajectory = truth_trajectory(scenario);
+    let increments = truth_increments(&trajectory);
+    let truth = *trajectory.last().expect("final truth");
+    let loose = if robust {
+        LooseCouplingConfig {
+            measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
+            ..LooseCouplingConfig::default()
+        }
+    } else {
+        LooseCouplingConfig::default()
+    };
+    let mut nees_sum = 0.0;
+    let mut nis_sum = 0.0;
+    let mut nis_dof = 0usize;
+
+    for run in 0..RUNS_PER_SCENARIO {
+        let seed = ensemble_seed(FilterKind::Loose, profile, scenario, run);
+        let mut rng = SplitMix64::new(seed);
+        let initial = trajectory[0];
+        let nominal = initial_nominal(initial, &mut rng);
+        let mut filter = make_filter_with_loose_config(nominal, profile.spec, loose);
+        let sequence = simulate_imu_samples_from_increments(
+            &increments,
+            profile.spec,
+            ImuSimulationOptions {
+                seed: seed ^ 0x6d5f_c2a4_1c37_9e21,
+                ..ImuSimulationOptions::default()
+            },
+        )
+        .expect("IMU sequence");
+
+        for sample in sequence.samples {
+            filter.propagate(sample).expect("propagate");
+        }
+
+        let mut measurement = loose_measurement(&truth, &mut rng, 1.0);
+        if run % LOOSE_OUTLIER_BUDGET_STRIDE == 0 {
+            measurement.position_ecef_m[0] += LOOSE_OUTLIER_MAGNITUDE_M;
+        }
+        let update = filter.update_loose(&measurement).expect("loose update");
+        assert!(update.applied);
+        assert_eq!(update.rows, 6);
+        assert_eq!(update.accepted_rows, update.rows);
+        assert_eq!(update.rejected_rows, 0);
+        nis_sum += update.nis;
+        nis_dof += update.rows;
+        nees_sum += nees_position_velocity(&filter, &truth);
+    }
+
+    let nees_dof = RUNS_PER_SCENARIO * 6;
+    let (nees_lower, nees_upper) = chi_square_average_band(nees_dof);
+    let (nis_lower, nis_upper) = chi_square_average_band(nis_dof);
+    EnsembleResult {
+        nees_average: nees_sum / RUNS_PER_SCENARIO as f64,
+        nis_average: nis_sum / RUNS_PER_SCENARIO as f64,
+        nees_lower,
+        nees_upper,
+        nis_lower,
+        nis_upper,
+        nees_dof,
+        nis_dof,
+    }
+}
+
 fn make_filter(nominal: NavState, spec: ImuSpec) -> InertialFilter {
     let covariance_diagonal = initial_covariance_diagonal();
     make_filter_with_tight_config(nominal, spec, [0.0; 3], &covariance_diagonal)
+}
+
+fn make_filter_with_loose_config(
+    nominal: NavState,
+    spec: ImuSpec,
+    loose: LooseCouplingConfig,
+) -> InertialFilter {
+    let covariance_diagonal = initial_covariance_diagonal();
+    let state =
+        InsFilterState::from_diagonal(nominal, ErrorStateLayout::Fifteen, &covariance_diagonal)
+            .expect("filter state");
+    let mut config = InertialFilterConfig::new(spec).expect("filter config");
+    config.loose = loose;
+    InertialFilter::with_config(state, config).expect("filter")
 }
 
 fn make_filter_with_tight_config(

@@ -2,6 +2,15 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## Unreleased
+
+### Added
+
+- Loose GNSS updates can opt into IGG-III measurement variance inflation and a
+  Yang two-segment prediction adaptive factor. The prediction factor is gated
+  by a Jiang-Zhang Mahalanobis measurement-outlier check so measurement faults
+  use measurement reweighting rather than innovation-driven covariance scaling.
+
 ## [0.17.0]
 
 ### Fixed

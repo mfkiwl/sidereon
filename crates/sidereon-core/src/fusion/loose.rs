@@ -13,14 +13,18 @@ use crate::inertial::{
     ImuSpec, MechanizationConfig,
 };
 
-use super::ekf::{ekf_correct_closed_loop, EkfCorrection, EkfCorrectionReport, EkfUpdateOptions};
+use super::ekf::{
+    ekf_correct_closed_loop, ekf_correct_closed_loop_with_predicted_covariance_scale,
+    innovation_covariance, normalized_innovation_squared, EkfCorrection, EkfCorrectionReport,
+    EkfUpdateOptions,
+};
 use super::error_state::{
     linearize_error_state_ecef, predict_error_state_covariance, ErrorStateImuKinematics,
 };
 use super::state::FusionFilterKind;
 use super::state::{
-    invalid_input, validate_covariance_matrix, FusionError, InsFilterState, ERROR_ATTITUDE_INDEX,
-    ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15,
+    invalid_input, validate_covariance_matrix, validate_positive, FusionError, InsFilterState,
+    ERROR_ATTITUDE_INDEX, ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15,
     ERROR_STATE_DIMENSION_21, ERROR_VELOCITY_INDEX,
 };
 use super::tight::{TightCouplingConfig, TightFusionState};
@@ -30,6 +34,8 @@ use super::ukf::{ukf_correct_closed_loop, UkfUpdateOptions};
 const LOOSE_MIN_SATELLITES: usize = 4;
 const POSITION_ROWS: usize = 3;
 const POSITION_VELOCITY_ROWS: usize = 6;
+const IGG_III_REJECTION_VARIANCE_SCALE: f64 = 1.0e4;
+const DEFAULT_PREDICTION_ADAPTATION_GATE_PROBABILITY: f64 = 0.99;
 
 /// GNSS PVT measurement used by the loose-coupled INS update.
 ///
@@ -131,6 +137,10 @@ pub struct LooseCouplingConfig {
     pub lever_arm_body_m: [f64; 3],
     /// Generic EKF correction options applied to each loose update.
     pub update_options: EkfUpdateOptions,
+    /// Optional IGG-III variance inflation on standardized innovation rows.
+    pub measurement_reweighting: Option<IggIiiMeasurementReweighting>,
+    /// Optional Yang two-segment predicted-covariance inflation.
+    pub prediction_adaptation: Option<YangPredictionAdaptiveFactor>,
 }
 
 impl Default for LooseCouplingConfig {
@@ -138,6 +148,8 @@ impl Default for LooseCouplingConfig {
         Self {
             lever_arm_body_m: [0.0; 3],
             update_options: EkfUpdateOptions::default(),
+            measurement_reweighting: None,
+            prediction_adaptation: None,
         }
     }
 }
@@ -149,7 +161,112 @@ impl LooseCouplingConfig {
         if let Some(gate) = self.update_options.innovation_gate {
             gate.validate()?;
         }
+        if let Some(reweighting) = self.measurement_reweighting {
+            reweighting.validate()?;
+        }
+        if let Some(adaptation) = self.prediction_adaptation {
+            adaptation.validate()?;
+        }
         Ok(())
+    }
+}
+
+/// IGG-III measurement variance inflation for loose GNSS updates.
+///
+/// The standardized innovation `v_i / sqrt(S_ii)` selects one of three
+/// variance-domain segments from Remote Sensing 13(10):1943, Eq. 32: unchanged
+/// below `k0`, IGG-III middle-segment inflation up to `k1`, and a fixed
+/// `1e4` variance scale in the rejection segment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IggIiiMeasurementReweighting {
+    /// Lower standardized-innovation break point. Literature range: `[1.5, 3.0]`.
+    pub k0_sigma: f64,
+    /// Upper standardized-innovation break point. Literature range: `[3.0, 8.0]`.
+    pub k1_sigma: f64,
+}
+
+impl IggIiiMeasurementReweighting {
+    /// Common loose-GNSS setting inside the cited ranges.
+    pub const fn standard() -> Self {
+        Self {
+            k0_sigma: 2.0,
+            k1_sigma: 5.0,
+        }
+    }
+
+    /// Validate IGG-III break points against the cited ranges.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        validate_finite(self.k0_sigma, "igg_iii_k0_sigma").map_err(FusionError::from)?;
+        validate_finite(self.k1_sigma, "igg_iii_k1_sigma").map_err(FusionError::from)?;
+        if !(1.5..=3.0).contains(&self.k0_sigma) {
+            return Err(invalid_input(
+                "igg_iii_k0_sigma",
+                "must be in the literature range [1.5, 3.0]",
+            ));
+        }
+        if !(3.0..=8.0).contains(&self.k1_sigma) {
+            return Err(invalid_input(
+                "igg_iii_k1_sigma",
+                "must be in the literature range [3.0, 8.0]",
+            ));
+        }
+        if self.k0_sigma < self.k1_sigma {
+            Ok(())
+        } else {
+            Err(invalid_input(
+                "igg_iii_thresholds",
+                "k0_sigma must be smaller than k1_sigma",
+            ))
+        }
+    }
+}
+
+/// Yang two-segment predicted-residual adaptive factor for loose GNSS updates.
+///
+/// `threshold` is the `c` value used with the un-square-rooted statistic
+/// `innovation^T innovation / tr(S)`. The Jiang-Zhang Sensors 2018 guard is
+/// part of this option: if the raw innovation Mahalanobis distance exceeds
+/// `chi2_inv(outlier_gate_probability, rows)`, prediction adaptation is
+/// disabled for that epoch and measurement-side reweighting handles the fault.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YangPredictionAdaptiveFactor {
+    /// Two-segment threshold `c` for the predicted-residual statistic.
+    pub threshold: f64,
+    /// Probability used for the chi-square Mahalanobis measurement-outlier gate.
+    pub outlier_gate_probability: f64,
+}
+
+impl YangPredictionAdaptiveFactor {
+    /// Conservative default for the un-square-rooted statistic and 99% gate.
+    pub const fn standard() -> Self {
+        Self {
+            threshold: 1.0,
+            outlier_gate_probability: DEFAULT_PREDICTION_ADAPTATION_GATE_PROBABILITY,
+        }
+    }
+
+    /// Validate threshold and chi-square probability.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        validate_finite(self.threshold, "yang_prediction_threshold").map_err(FusionError::from)?;
+        validate_finite(
+            self.outlier_gate_probability,
+            "yang_outlier_gate_probability",
+        )
+        .map_err(FusionError::from)?;
+        if self.threshold <= 0.0 {
+            return Err(invalid_input(
+                "yang_prediction_threshold",
+                "must be positive",
+            ));
+        }
+        if self.outlier_gate_probability > 0.0 && self.outlier_gate_probability < 1.0 {
+            Ok(())
+        } else {
+            Err(invalid_input(
+                "yang_outlier_gate_probability",
+                "must be in (0, 1)",
+            ))
+        }
     }
 }
 
@@ -197,11 +314,21 @@ impl InertialFilterConfig {
             .validate()
             .map_err(FusionError::from)?;
         self.loose.validate()?;
+        if self.configures_ukf_prediction_adaptation() {
+            return Err(invalid_input(
+                "loose_prediction_adaptation",
+                "prediction adaptation is defined for EKF loose updates",
+            ));
+        }
         self.tight.validate()?;
         self.ukf_update_options
             .validate_for_dimension(ERROR_STATE_DIMENSION_15)?;
         self.ukf_update_options
             .validate_for_dimension(ERROR_STATE_DIMENSION_21)
+    }
+
+    fn configures_ukf_prediction_adaptation(&self) -> bool {
+        self.filter_kind == FusionFilterKind::Ukf && self.loose.prediction_adaptation.is_some()
     }
 }
 
@@ -381,16 +508,26 @@ impl InertialFilter {
             self.config.loose.lever_arm_body_m,
             self.last_body_rate_wrt_ecef_rps,
         )?;
-        let rows = correction.row_count();
+        let prepared = prepare_loose_correction(&self.state, correction, self.config.loose)?;
+        let rows = prepared.correction.row_count();
         let filter_kind = self.config.filter_kind;
         let ekf_options = self.config.loose.update_options;
         let ukf_options = self.config.ukf_update_options;
         let report = match filter_kind {
             FusionFilterKind::Ekf => {
-                ekf_correct_closed_loop(&mut self.state, &correction, ekf_options)?
+                if prepared.predicted_covariance_scale == 1.0 {
+                    ekf_correct_closed_loop(&mut self.state, &prepared.correction, ekf_options)?
+                } else {
+                    ekf_correct_closed_loop_with_predicted_covariance_scale(
+                        &mut self.state,
+                        &prepared.correction,
+                        ekf_options,
+                        prepared.predicted_covariance_scale,
+                    )?
+                }
             }
             FusionFilterKind::Ukf => {
-                ukf_correct_closed_loop(&mut self.state, &correction, ukf_options)?
+                ukf_correct_closed_loop(&mut self.state, &prepared.correction, ukf_options)?
             }
         };
         self.tight
@@ -477,6 +614,142 @@ pub fn loose_coupling_correction(
     }
 
     EkfCorrection::new(innovation, design, measurement.covariance.clone())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedLooseCorrection {
+    correction: EkfCorrection,
+    predicted_covariance_scale: f64,
+}
+
+fn prepare_loose_correction(
+    state: &InsFilterState,
+    correction: EkfCorrection,
+    config: LooseCouplingConfig,
+) -> Result<PreparedLooseCorrection, FusionError> {
+    if config.measurement_reweighting.is_none() && config.prediction_adaptation.is_none() {
+        return Ok(PreparedLooseCorrection {
+            correction,
+            predicted_covariance_scale: 1.0,
+        });
+    }
+
+    let raw_innovation_covariance = innovation_covariance(&state.covariance, &correction)?;
+    let correction = if let Some(reweighting) = config.measurement_reweighting {
+        apply_igg_iii_reweighting(&correction, &raw_innovation_covariance, reweighting)?
+    } else {
+        correction
+    };
+    let predicted_covariance_scale = if let Some(adaptation) = config.prediction_adaptation {
+        yang_predicted_covariance_scale(state, &correction, &raw_innovation_covariance, adaptation)?
+    } else {
+        1.0
+    };
+
+    Ok(PreparedLooseCorrection {
+        correction,
+        predicted_covariance_scale,
+    })
+}
+
+fn apply_igg_iii_reweighting(
+    correction: &EkfCorrection,
+    innovation_covariance: &[Vec<f64>],
+    reweighting: IggIiiMeasurementReweighting,
+) -> Result<EkfCorrection, FusionError> {
+    reweighting.validate()?;
+    let mut gammas = Vec::with_capacity(correction.row_count());
+    let mut all_one = true;
+    for (row, s_row) in innovation_covariance
+        .iter()
+        .enumerate()
+        .take(correction.row_count())
+    {
+        let variance = s_row[row];
+        validate_positive(variance, "innovation_covariance_diagonal")?;
+        let standardized = (correction.innovation[row] / variance.sqrt()).abs();
+        let gamma =
+            igg_iii_variance_scale(standardized, reweighting.k0_sigma, reweighting.k1_sigma);
+        all_one &= gamma.to_bits() == 1.0_f64.to_bits();
+        gammas.push(gamma);
+    }
+
+    if all_one {
+        return Ok(correction.clone());
+    }
+
+    let covariance = inflate_measurement_covariance(&correction.measurement_covariance, &gammas);
+    EkfCorrection::new(
+        correction.innovation.clone(),
+        correction.design.clone(),
+        covariance,
+    )
+}
+
+fn igg_iii_variance_scale(abs_standardized: f64, k0_sigma: f64, k1_sigma: f64) -> f64 {
+    if abs_standardized <= k0_sigma {
+        1.0
+    } else if abs_standardized < k1_sigma {
+        let ratio = abs_standardized / k0_sigma;
+        let transition = (k1_sigma - k0_sigma) / (k1_sigma - abs_standardized);
+        ratio * transition * transition
+    } else {
+        IGG_III_REJECTION_VARIANCE_SCALE
+    }
+}
+
+fn inflate_measurement_covariance(covariance: &[Vec<f64>], gammas: &[f64]) -> Vec<Vec<f64>> {
+    let sqrt_gammas = gammas.iter().map(|gamma| gamma.sqrt()).collect::<Vec<_>>();
+    let mut inflated = covariance.to_vec();
+    for row in 0..inflated.len() {
+        for col in 0..inflated[row].len() {
+            inflated[row][col] *= sqrt_gammas[row] * sqrt_gammas[col];
+        }
+    }
+    inflated
+}
+
+fn yang_predicted_covariance_scale(
+    state: &InsFilterState,
+    correction: &EkfCorrection,
+    raw_innovation_covariance: &[Vec<f64>],
+    adaptation: YangPredictionAdaptiveFactor,
+) -> Result<f64, FusionError> {
+    adaptation.validate()?;
+    let raw_mahalanobis =
+        normalized_innovation_squared(raw_innovation_covariance, &correction.innovation)?;
+    let outlier_threshold =
+        crate::quality::chi2_inv(adaptation.outlier_gate_probability, correction.row_count())
+            .map_err(|_| {
+                invalid_input(
+                    "yang_outlier_gate_probability",
+                    "must produce a chi-square threshold",
+                )
+            })?;
+    // Jiang and Zhang, Sensors 2018: innovation-driven adaptation is disabled
+    // when the Mahalanobis gate flags a measurement outlier.
+    if raw_mahalanobis > outlier_threshold {
+        return Ok(1.0);
+    }
+
+    let innovation_covariance = innovation_covariance(&state.covariance, correction)?;
+    let trace = innovation_covariance
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| row[idx])
+        .sum::<f64>();
+    validate_positive(trace, "innovation_covariance_trace")?;
+    let squared_norm = correction
+        .innovation
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>();
+    let statistic = squared_norm / trace;
+    if statistic <= adaptation.threshold {
+        Ok(1.0)
+    } else {
+        Ok(statistic / adaptation.threshold)
+    }
 }
 
 fn body_rate_relative_to_ecef(
@@ -994,6 +1267,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn igg_iii_noop_region_matches_plain_l2_to_bits() {
+        let measurement = direct_position_velocity_measurement(
+            30.0,
+            [WGS84_A_M + 0.25, -0.125, 0.0625],
+            [0.03125, -0.015625, 0.0078125],
+            1.0,
+        );
+        let mut plain = direct_update_filter(30.0, LooseCouplingConfig::default());
+        let mut robust = direct_update_filter(
+            30.0,
+            LooseCouplingConfig {
+                measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
+                ..LooseCouplingConfig::default()
+            },
+        );
+
+        let plain_update = plain.update_loose(&measurement).expect("plain update");
+        let robust_update = robust.update_loose(&measurement).expect("robust update");
+
+        assert_eq!(plain_update, robust_update);
+        assert_eq!(plain.state(), robust.state());
+    }
+
+    #[test]
+    fn igg_iii_single_outlier_stays_within_tenth_sigma_of_clean_run() {
+        // With P = R = 1 and gamma = 1e4, a 50 m rejection-row outlier moves
+        // the robust scalar posterior by 50 / 10001 = 0.0071 clean posterior
+        // sigma. The assertion uses 0.1 sigma to leave numerical margin.
+        const X_SIGMA: f64 = 0.1;
+        let clean_measurement =
+            direct_position_velocity_measurement(40.0, [WGS84_A_M, 0.0, 0.0], [0.0; 3], 1.0);
+        let outlier_measurement =
+            direct_position_velocity_measurement(40.0, [WGS84_A_M + 50.0, 0.0, 0.0], [0.0; 3], 1.0);
+        let robust_config = LooseCouplingConfig {
+            measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
+            ..LooseCouplingConfig::default()
+        };
+        let mut clean = direct_update_filter(40.0, LooseCouplingConfig::default());
+        let mut plain = direct_update_filter(40.0, LooseCouplingConfig::default());
+        let mut robust = direct_update_filter(40.0, robust_config);
+
+        clean
+            .update_loose(&clean_measurement)
+            .expect("clean update");
+        plain
+            .update_loose(&outlier_measurement)
+            .expect("plain update");
+        robust
+            .update_loose(&outlier_measurement)
+            .expect("robust update");
+
+        let clean_x = clean.state().nominal.position_ecef_m[0];
+        let clean_sigma =
+            clean.state().covariance[ERROR_POSITION_INDEX][ERROR_POSITION_INDEX].sqrt();
+        let robust_error = (robust.state().nominal.position_ecef_m[0] - clean_x).abs();
+        let plain_error = (plain.state().nominal.position_ecef_m[0] - clean_x).abs();
+        assert!(
+            robust_error <= X_SIGMA * clean_sigma,
+            "robust error {robust_error:.17e}, bound {:.17e}",
+            X_SIGMA * clean_sigma
+        );
+        assert!(
+            plain_error > X_SIGMA * clean_sigma,
+            "plain error {plain_error:.17e}, bound {:.17e}",
+            X_SIGMA * clean_sigma
+        );
+    }
+
+    #[test]
+    fn yang_prediction_adaptation_inflates_covariance_when_gate_passes() {
+        let measurement =
+            direct_position_velocity_measurement(50.0, [WGS84_A_M + 5.0, 0.0, 0.0], [0.0; 3], 1.0);
+        let mut plain = direct_update_filter(50.0, LooseCouplingConfig::default());
+        let mut adaptive = direct_update_filter(
+            50.0,
+            LooseCouplingConfig {
+                prediction_adaptation: Some(YangPredictionAdaptiveFactor {
+                    threshold: 0.1,
+                    outlier_gate_probability: 0.99,
+                }),
+                ..LooseCouplingConfig::default()
+            },
+        );
+
+        plain.update_loose(&measurement).expect("plain update");
+        adaptive
+            .update_loose(&measurement)
+            .expect("adaptive update");
+
+        let plain_error = (plain.state().nominal.position_ecef_m[0] - (WGS84_A_M + 5.0)).abs();
+        let adaptive_error =
+            (adaptive.state().nominal.position_ecef_m[0] - (WGS84_A_M + 5.0)).abs();
+        assert!(
+            adaptive_error < plain_error,
+            "adaptive error {adaptive_error:.17e}, plain error {plain_error:.17e}"
+        );
+    }
+
+    #[test]
+    fn yang_prediction_adaptation_is_disabled_by_mahalanobis_outlier_gate() {
+        let measurement =
+            direct_position_velocity_measurement(60.0, [WGS84_A_M + 50.0, 0.0, 0.0], [0.0; 3], 1.0);
+        let robust_only = LooseCouplingConfig {
+            measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
+            ..LooseCouplingConfig::default()
+        };
+        let robust_and_adaptive = LooseCouplingConfig {
+            prediction_adaptation: Some(YangPredictionAdaptiveFactor {
+                threshold: 0.1,
+                outlier_gate_probability: 0.99,
+            }),
+            ..robust_only
+        };
+        let mut robust = direct_update_filter(60.0, robust_only);
+        let mut guarded = direct_update_filter(60.0, robust_and_adaptive);
+
+        let robust_update = robust.update_loose(&measurement).expect("robust update");
+        let guarded_update = guarded.update_loose(&measurement).expect("guarded update");
+
+        assert_eq!(robust_update, guarded_update);
+        assert_eq!(robust.state(), guarded.state());
+    }
+
     fn inverted_static_sample(
         state: &NavState,
         t_j2000_s: f64,
@@ -1085,6 +1482,45 @@ mod tests {
 
     fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    fn direct_update_filter(t_j2000_s: f64, loose: LooseCouplingConfig) -> InertialFilter {
+        let nominal = NavState::new(t_j2000_s, [WGS84_A_M, 0.0, 0.0], [0.0; 3], mat3_identity())
+            .expect("nominal");
+        let mut diagonal = vec![1.0; ERROR_STATE_DIMENSION_15];
+        for value in diagonal.iter_mut().take(6) {
+            *value = 1.0;
+        }
+        let state = reference_filter_state(nominal, &diagonal).expect("filter state");
+        let spec = ImuSpec::datasheet(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            crate::inertial::config::RANDOM_WALK_BIAS_TAU_S,
+            crate::inertial::config::RANDOM_WALK_BIAS_TAU_S,
+            None,
+            None,
+        );
+        let mut config = InertialFilterConfig::new(spec).expect("config");
+        config.loose = loose;
+        InertialFilter::with_config(state, config).expect("filter")
+    }
+
+    fn direct_position_velocity_measurement(
+        t_j2000_s: f64,
+        position_ecef_m: [f64; 3],
+        velocity_ecef_mps: [f64; 3],
+        sigma: f64,
+    ) -> GnssFixMeasurement {
+        GnssFixMeasurement::position_velocity(
+            t_j2000_s,
+            position_ecef_m,
+            velocity_ecef_mps,
+            covariance_from_diag(&[sigma * sigma; 6]),
+            8,
+        )
+        .expect("measurement")
     }
 
     struct SplitMix64 {

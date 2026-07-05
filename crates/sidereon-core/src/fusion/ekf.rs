@@ -175,6 +175,58 @@ pub fn ekf_correct_closed_loop(
     apply_correction(state, correction)
 }
 
+/// Apply one EKF correction using an inflated predicted covariance.
+///
+/// The scale is used for the innovation covariance, Kalman gain, and Joseph
+/// covariance update. A scale of `1.0` is intentionally routed through
+/// [`ekf_correct_closed_loop`] by callers that need bit-exact default behavior.
+pub(super) fn ekf_correct_closed_loop_with_predicted_covariance_scale(
+    state: &mut InsFilterState,
+    correction: &EkfCorrection,
+    options: EkfUpdateOptions,
+    predicted_covariance_scale: f64,
+) -> Result<EkfCorrectionReport, FusionError> {
+    state.validate()?;
+    correction.validate_for_dimension(state.dimension())?;
+    validate_positive(predicted_covariance_scale, "predicted_covariance_scale")?;
+
+    let predicted_covariance = scaled_covariance(&state.covariance, predicted_covariance_scale);
+    validate_covariance_matrix(
+        &predicted_covariance,
+        state.dimension(),
+        "scaled_covariance",
+    )?;
+
+    if let Some(gate) = options.innovation_gate {
+        gate.validate()?;
+        let full_s = innovation_covariance(&predicted_covariance, correction)?;
+        let (screened, report) = screen_correction(correction, &full_s, gate)?;
+        let full_nis = normalized_innovation_squared(&full_s, &correction.innovation)?;
+        if report.coasted {
+            return Ok(EkfCorrectionReport {
+                applied: false,
+                normalized_innovation_squared: full_nis,
+                accepted_rows: report.accepted_rows,
+                rejected_rows: report.rejected_rows,
+                innovation_gate: Some(report),
+                innovation_covariance: full_s,
+                kalman_gain: vec![vec![0.0; correction.row_count()]; state.dimension()],
+                dx: vec![0.0; state.dimension()],
+            });
+        }
+        let accepted_rows = report.accepted_rows;
+        let rejected_rows = report.rejected_rows;
+        let mut applied =
+            apply_correction_with_predicted_covariance(state, &screened, &predicted_covariance)?;
+        applied.accepted_rows = accepted_rows;
+        applied.rejected_rows = rejected_rows;
+        applied.innovation_gate = Some(report);
+        return Ok(applied);
+    }
+
+    apply_correction_with_predicted_covariance(state, correction, &predicted_covariance)
+}
+
 /// Compute Joseph-form covariance update.
 pub fn joseph_covariance_update(
     covariance: &[Vec<f64>],
@@ -277,10 +329,20 @@ fn apply_correction(
     state: &mut InsFilterState,
     correction: &EkfCorrection,
 ) -> Result<EkfCorrectionReport, FusionError> {
+    let covariance = state.covariance.clone();
+    apply_correction_with_predicted_covariance(state, correction, &covariance)
+}
+
+fn apply_correction_with_predicted_covariance(
+    state: &mut InsFilterState,
+    correction: &EkfCorrection,
+    predicted_covariance: &[Vec<f64>],
+) -> Result<EkfCorrectionReport, FusionError> {
     let dimension = state.dimension();
-    let s = innovation_covariance(&state.covariance, correction)?;
+    validate_covariance_matrix(predicted_covariance, dimension, "predicted_covariance")?;
+    let s = innovation_covariance(predicted_covariance, correction)?;
     let h_t = transpose(&correction.design)?;
-    let p_h_t = matmul(&state.covariance, &h_t)?;
+    let p_h_t = matmul(predicted_covariance, &h_t)?;
     let mut kalman_gain = vec![vec![0.0; correction.row_count()]; dimension];
     let mut scratch = crate::astro::math::linear::FlatCholeskySolveScratch::default();
     for row in 0..dimension {
@@ -289,7 +351,7 @@ fn apply_correction(
     let dx = matvec(&kalman_gain, &correction.innovation)?;
     let nis = normalized_innovation_squared(&s, &correction.innovation)?;
     let covariance = joseph_covariance_update(
-        &state.covariance,
+        predicted_covariance,
         &correction.design,
         &kalman_gain,
         &correction.measurement_covariance,
@@ -311,6 +373,13 @@ fn apply_correction(
         kalman_gain,
         dx,
     })
+}
+
+fn scaled_covariance(covariance: &[Vec<f64>], scale: f64) -> Vec<Vec<f64>> {
+    covariance
+        .iter()
+        .map(|row| row.iter().map(|value| value * scale).collect())
+        .collect()
 }
 
 pub(super) fn innovation_covariance(
