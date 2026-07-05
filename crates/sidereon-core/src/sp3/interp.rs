@@ -105,6 +105,41 @@ impl PreciseSatSeries {
     }
 }
 
+/// One clock sub-arc with precomputed not-a-knot cubic coefficients.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ClockSplineArc {
+    /// Clock node axis for this sub-arc.
+    pub(super) x: Vec<f64>,
+    /// Cubic coefficient for `(query - x[i])^3`, in native microseconds.
+    pub(super) c0: Vec<f64>,
+    /// Cubic coefficient for `(query - x[i])^2`, in native microseconds.
+    pub(super) c1: Vec<f64>,
+    /// Cubic coefficient for `(query - x[i])`, in native microseconds.
+    pub(super) c2: Vec<f64>,
+    /// Constant coefficient, in native microseconds.
+    pub(super) c3: Vec<f64>,
+}
+
+impl ClockSplineArc {
+    fn from_nodes(nodes: &[(f64, f64, bool)]) -> Self {
+        let x: Vec<_> = nodes.iter().map(|node| node.0).collect();
+        if nodes.len() < 2 {
+            return Self {
+                x,
+                c0: Vec::new(),
+                c1: Vec::new(),
+                c2: Vec::new(),
+                c3: Vec::new(),
+            };
+        }
+
+        let y: Vec<_> = nodes.iter().map(|node| node.1).collect();
+        let dydx = solve_not_a_knot_slopes(&x, &y);
+        let (c0, c1, c2, c3) = hermite_segment_coeffs(&x, &y, &dydx);
+        Self { x, c0, c1, c2, c3 }
+    }
+}
+
 impl Sp3 {
     /// The product's parsed epochs as seconds since J2000, in the file's own time
     /// scale, ascending.
@@ -243,6 +278,47 @@ pub(super) fn interpolate_precise_state(
     clk_nodes: &[(f64, f64, bool)],
     query: f64,
 ) -> Result<Sp3State> {
+    let (x_m, y_m, z_m) = interpolate_precise_position(sat, pos_x, pos_kx, pos_ky, pos_kz, query)?;
+    let clock_s = interpolate_clock(clk_nodes, query);
+
+    Ok(Sp3State {
+        position: ItrfPositionM::new(x_m, y_m, z_m).expect("valid ITRF position"),
+        clock_s,
+        velocity: None,
+        clock_rate_s_s: None,
+        flags: crate::sp3::Sp3Flags::default(),
+    })
+}
+
+pub(super) fn interpolate_precise_state_with_clock_arcs(
+    sat: GnssSatelliteId,
+    pos_x: &[f64],
+    pos_kx: &[f64],
+    pos_ky: &[f64],
+    pos_kz: &[f64],
+    clock_arcs: &[ClockSplineArc],
+    query: f64,
+) -> Result<Sp3State> {
+    let (x_m, y_m, z_m) = interpolate_precise_position(sat, pos_x, pos_kx, pos_ky, pos_kz, query)?;
+    let clock_s = interpolate_fitted_clock(clock_arcs, query);
+
+    Ok(Sp3State {
+        position: ItrfPositionM::new(x_m, y_m, z_m).expect("valid ITRF position"),
+        clock_s,
+        velocity: None,
+        clock_rate_s_s: None,
+        flags: crate::sp3::Sp3Flags::default(),
+    })
+}
+
+fn interpolate_precise_position(
+    sat: GnssSatelliteId,
+    pos_x: &[f64],
+    pos_kx: &[f64],
+    pos_ky: &[f64],
+    pos_kz: &[f64],
+    query: f64,
+) -> Result<(f64, f64, f64)> {
     let query = validate::finite(query, "query_j2000_s").map_err(map_query_input)?;
 
     if pos_x.is_empty() {
@@ -287,17 +363,9 @@ pub(super) fn interpolate_precise_state(
         }
     }
 
-    let (x_m, y_m, z_m) = interpolate_position_neville(pos_x, pos_kx, pos_ky, pos_kz, query);
-
-    let clock_s = interpolate_clock(clk_nodes, query);
-
-    Ok(Sp3State {
-        position: ItrfPositionM::new(x_m, y_m, z_m).expect("valid ITRF position"),
-        clock_s,
-        velocity: None,
-        clock_rate_s_s: None,
-        flags: crate::sp3::Sp3Flags::default(),
-    })
+    Ok(interpolate_position_neville(
+        pos_x, pos_kx, pos_ky, pos_kz, query,
+    ))
 }
 
 fn map_query_input(error: validate::FieldError) -> Error {
@@ -334,8 +402,13 @@ fn validate_strictly_increasing_nodes(x: &[f64]) -> Result<()> {
 /// not-a-knot spline on the contiguous sub-arc containing `query`. Returns
 /// `None` if that sub-arc has fewer than two nodes.
 fn interpolate_clock(clk_nodes: &[(f64, f64, bool)], query: f64) -> Option<f64> {
-    if clk_nodes.len() < 2 {
-        return None;
+    let arcs = fit_clock_spline_arcs(clk_nodes);
+    interpolate_fitted_clock(&arcs, query)
+}
+
+pub(super) fn fit_clock_spline_arcs(clk_nodes: &[(f64, f64, bool)]) -> Vec<ClockSplineArc> {
+    if clk_nodes.is_empty() {
+        return Vec::new();
     }
 
     // Partition into contiguous sub-arcs split at clock-event epochs. A
@@ -343,79 +416,68 @@ fn interpolate_clock(clk_nodes: &[(f64, f64, bool)], query: f64) -> Option<f64> 
     // sub-arc before it and starts a new one (the flagged node belongs to the
     // new sub-arc, since the reset takes effect there).
     let mut sub_start = 0usize;
-    let mut chosen: Option<(usize, usize)> = None; // [start, end) into clk_nodes
+    let mut arcs = Vec::new();
     for i in 0..clk_nodes.len() {
         let is_break = clk_nodes[i].2 && i > sub_start;
         if is_break {
             // Sub-arc [sub_start, i) ends here.
-            if range_contains_query(clk_nodes, sub_start, i, query) {
-                chosen = Some((sub_start, i));
-            }
+            arcs.push(ClockSplineArc::from_nodes(&clk_nodes[sub_start..i]));
             sub_start = i;
         }
     }
     // Trailing sub-arc [sub_start, len).
-    if chosen.is_none() && range_contains_query(clk_nodes, sub_start, clk_nodes.len(), query) {
-        chosen = Some((sub_start, clk_nodes.len()));
+    arcs.push(ClockSplineArc::from_nodes(&clk_nodes[sub_start..]));
+    arcs
+}
+
+/// Interpolate the clock channel from precomputed clock spline sub-arcs.
+pub(super) fn interpolate_fitted_clock(arcs: &[ClockSplineArc], query: f64) -> Option<f64> {
+    let mut chosen: Option<usize> = None;
+    for (idx, arc) in arcs.iter().enumerate() {
+        if arc_contains_query(arc, query) {
+            chosen = Some(idx);
+            break;
+        }
     }
     // If the query is outside every sub-arc span (extrapolation), use the
     // sub-arc nearest the query so the default extrapolate=True behavior holds
     // within the contiguous piece on that side.
-    let (start, end) = match chosen {
-        Some(r) => r,
-        None => nearest_subarc(clk_nodes, query)?,
+    let arc = match chosen {
+        Some(idx) => &arcs[idx],
+        None => nearest_fitted_subarc(arcs, query)?,
     };
 
-    if end - start < 2 {
+    if arc.x.len() < 2 {
         return None;
     }
-    let x: Vec<f64> = clk_nodes[start..end].iter().map(|n| n.0).collect();
-    let y: Vec<f64> = clk_nodes[start..end].iter().map(|n| n.1).collect();
-    Some(eval_cubic_spline(&x, &y, query) * US_TO_S)
+    Some(evaluate_ppoly(&arc.x, &arc.c0, &arc.c1, &arc.c2, &arc.c3, query) * US_TO_S)
 }
 
-/// Whether `query` lies within the closed node-span of sub-arc `[start, end)`.
-fn range_contains_query(nodes: &[(f64, f64, bool)], start: usize, end: usize, query: f64) -> bool {
-    if end <= start {
+/// Whether `query` lies within the closed node-span of a fitted sub-arc.
+fn arc_contains_query(arc: &ClockSplineArc, query: f64) -> bool {
+    if arc.x.is_empty() {
         return false;
     }
-    let lo = nodes[start].0;
-    let hi = nodes[end - 1].0;
+    let lo = arc.x[0];
+    let hi = arc.x[arc.x.len() - 1];
     query >= lo && query <= hi
 }
 
 /// Find the sub-arc (split at clock-event epochs) whose node-span is nearest to
 /// `query` for extrapolation. Returns `[start, end)` or `None` if empty.
-#[allow(clippy::needless_range_loop)]
-fn nearest_subarc(nodes: &[(f64, f64, bool)], query: f64) -> Option<(usize, usize)> {
-    if nodes.is_empty() {
-        return None;
-    }
-    // Rebuild sub-arc boundaries (same rule as interpolate_clock).
-    let mut bounds: Vec<(usize, usize)> = Vec::new();
-    let mut sub_start = 0usize;
-    for i in 0..nodes.len() {
-        if nodes[i].2 && i > sub_start {
-            bounds.push((sub_start, i));
-            sub_start = i;
-        }
-    }
-    bounds.push((sub_start, nodes.len()));
-
-    // Pick the sub-arc minimizing distance from query to its [lo, hi] span.
-    bounds
-        .into_iter()
-        .filter(|&(s, e)| e - s >= 2)
-        .min_by(|&(s1, e1), &(s2, e2)| {
-            let d1 = span_distance(nodes, s1, e1, query);
-            let d2 = span_distance(nodes, s2, e2, query);
+fn nearest_fitted_subarc(arcs: &[ClockSplineArc], query: f64) -> Option<&ClockSplineArc> {
+    arcs.iter()
+        .filter(|arc| arc.x.len() >= 2)
+        .min_by(|arc1, arc2| {
+            let d1 = fitted_span_distance(arc1, query);
+            let d2 = fitted_span_distance(arc2, query);
             d1.partial_cmp(&d2).unwrap_or(core::cmp::Ordering::Equal)
         })
 }
 
-fn span_distance(nodes: &[(f64, f64, bool)], start: usize, end: usize, query: f64) -> f64 {
-    let lo = nodes[start].0;
-    let hi = nodes[end - 1].0;
+fn fitted_span_distance(arc: &ClockSplineArc, query: f64) -> f64 {
+    let lo = arc.x[0];
+    let hi = arc.x[arc.x.len() - 1];
     if query < lo {
         lo - query
     } else if query > hi {
@@ -459,7 +521,7 @@ pub(super) fn instant_to_j2000_seconds(instant: &Instant) -> Option<f64> {
 
 /// Number of nodes in the sliding interpolation window (RTKLIB `NMAX`=10 ->
 /// degree-10 polynomial, 11 nodes).
-const NEVILLE_POINTS: usize = 11;
+pub(super) const NEVILLE_POINTS: usize = 11;
 
 /// Sliding-window Lagrange (Neville) satellite-POSITION interpolation, matching
 /// RTKLIB `preceph.c` pephpos/interppol. Replaces the global not-a-knot cubic
@@ -552,7 +614,7 @@ fn interpolate_position_neville(
 
 /// Neville's algorithm evaluated at 0, reproducing RTKLIB `rtkcmn.c` interppol
 /// (the abscissa `x` carries node-minus-query offsets, so the query is 0).
-fn neville(x: &[f64], y: &[f64]) -> f64 {
+pub(super) fn neville(x: &[f64], y: &[f64]) -> f64 {
     let n = y.len();
     let mut c: [f64; NEVILLE_POINTS] = [0.0; NEVILLE_POINTS];
     c[..n].copy_from_slice(&y[..n]);
@@ -568,6 +630,7 @@ fn neville(x: &[f64], y: &[f64]) -> f64 {
 /// `scipy.interpolate.CubicSpline(x, y)(query)` bit-for-bit.
 ///
 /// `x` must be strictly increasing with `x.len() == y.len() >= 2`.
+#[cfg(all(test, sidereon_repo_tests))]
 fn eval_cubic_spline(x: &[f64], y: &[f64], query: f64) -> f64 {
     let n = x.len();
     debug_assert_eq!(n, y.len());

@@ -346,7 +346,9 @@ pub use sidereon_core::astro::{
 };
 pub use sidereon_core::ephemeris::{
     fit_precise_ephemeris_state_sample_orbit, fit_precise_ephemeris_state_sample_orbits,
-    sp3_ecef_state_to_eci, OrientedPreciseEphemerisStateSample, PreciseEphemerisStateSample,
+    precise_interpolant_store_checksum64, sp3_ecef_state_to_eci, MmapPreciseEphemerisInterpolant,
+    OrientedPreciseEphemerisStateSample, PreciseEphemerisInterpolant, PreciseEphemerisStateSample,
+    PreciseInterpolantStoreError,
 };
 
 /// Root-level shortcut for satellite-relative frames and CW propagation.

@@ -1083,6 +1083,7 @@ fn next_field<T: std::str::FromStr>(
 mod combine;
 mod interp;
 mod interpolant;
+mod interpolant_store;
 mod samples;
 mod verify;
 mod write;
@@ -1092,6 +1093,10 @@ pub use combine::{
     EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport,
 };
 pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
+pub use interpolant_store::{
+    precise_interpolant_store_checksum64, MmapPreciseEphemerisInterpolant,
+    PreciseInterpolantStoreError,
+};
 pub use samples::{
     sp3_ecef_state_to_eci, PreciseEphemerisSample, PreciseEphemerisSamples,
     PreciseEphemerisStateSample, PreciseSamplesError,
