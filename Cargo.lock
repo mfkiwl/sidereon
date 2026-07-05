@@ -464,24 +464,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "oxiproj-core"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fd55084061e6d473ccff30d3abf4f16cf34692bbf92ba90836cbab0fd0fc8b6"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "oxiproj-geodesic"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3812d82cc533a5f60f3ff01dce05dcb2fa885be7f1a2589118fd51b07aae2bb6"
-dependencies = [
- "oxiproj-core",
-]
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -693,12 +675,11 @@ dependencies = [
  "cc",
  "libm",
  "nalgebra",
- "oxiproj-geodesic",
  "rayon",
  "roxmltree",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror",
  "trust-region-least-squares",
 ]
 
@@ -710,7 +691,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sidereon-core",
- "thiserror 1.0.69",
+ "thiserror",
 ]
 
 [[package]]
@@ -755,16 +736,7 @@ version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
-dependencies = [
- "thiserror-impl 2.0.18",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -772,17 +744,6 @@ name = "thiserror-impl"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "2.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",

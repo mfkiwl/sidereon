@@ -3,7 +3,7 @@ name = "sidereon-core"
 version = "0.16.0"
 authors = []
 edition = "2021"
-description = "The complete Sidereon engine: numerical astrodynamics propagation core plus the GNSS domain layer (SP3, broadcast ephemeris, multi-GNSS positioning, RTK/PPP, ionosphere/troposphere, DOP) behind a default-on gnss feature"
+description = "Numerical astrodynamics propagation core plus the GNSS domain layer (SP3, broadcast ephemeris, multi-GNSS positioning, RTK/PPP, ionosphere/troposphere, DOP) behind a default-on gnss feature"
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/sidereon-core"
@@ -29,7 +29,6 @@ exclude = [
 nalgebra = { workspace = true }
 thiserror = "1.0"
 libm = "0.2"
-oxiproj-geodesic = "0.1.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 roxmltree = "0.21"
