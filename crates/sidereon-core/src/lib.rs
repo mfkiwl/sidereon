@@ -25,6 +25,7 @@
 //! - [`signal`] - GPS C/A code generation, correlation, and acquisition,
 //! - [`ppp_corrections`] - static-arc PPP correction precomputation,
 //! - [`atmosphere`] - ionosphere and troposphere corrections,
+//! - [`scenario`] - deterministic synthetic GNSS observation scenarios,
 //! - [`orbit`] - compact reduced-orbit fitting/evaluation.
 //!
 //! Implementation modules (`sp3`, `rinex_nav`, `spp`, etc.) are crate-private.
@@ -107,6 +108,7 @@ pub mod rtcm; // RTCM 3 differential-GNSS stream decode/encode (MSM, station, ep
 pub mod rtk; // RTK double-difference construction
 pub mod sbas;
 pub mod sbas_pl; // SBAS single-hypothesis protection levels
+pub mod scenario; // scenario-driven synthetic GNSS observable generation
 pub mod sidereal; // repeating-geometry residual filtering and period diagnostics
 pub mod signal; // GPS C/A code, coherent correlation, and acquisition
 pub mod source_localization; // ToA/TDOA source localization from arrival times
