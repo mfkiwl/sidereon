@@ -279,13 +279,14 @@ pub fn validate_covariance_matrix(
 pub fn covariance_is_positive_semidefinite(covariance: &[Vec<f64>]) -> Result<bool, FusionError> {
     let dimension = covariance.len();
     validate_square_matrix(covariance, dimension, "covariance")?;
+    let scale = covariance
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let symmetry_tolerance = psd_tolerance(dimension, scale);
     for row in 0..dimension {
         for col in (row + 1)..dimension {
-            let tolerance = psd_tolerance(
-                dimension,
-                covariance[row][col].abs().max(covariance[col][row].abs()),
-            );
-            if (covariance[row][col] - covariance[col][row]).abs() > tolerance {
+            if (covariance[row][col] - covariance[col][row]).abs() > symmetry_tolerance {
                 return Ok(false);
             }
         }
@@ -624,6 +625,22 @@ mod tests {
     //! false covariance.
 
     use super::*;
+
+    #[test]
+    fn symmetry_tolerance_is_matrix_relative_for_tiny_off_diagonals() {
+        // A rotated block-diagonal covariance: off-diagonal pairs are float dust
+        // around zero whose absolute difference dwarfs their own magnitude but is
+        // negligible against the matrix scale. Element-relative symmetry
+        // tolerances reject this PSD matrix; the tolerance must be
+        // matrix-scale-relative.
+        let mut covariance = vec![vec![0.0; 6]; 6];
+        for (idx, variance) in [2.25, 2.25, 9.0, 0.0025, 0.0025, 0.0025].iter().enumerate() {
+            covariance[idx][idx] = *variance;
+        }
+        covariance[0][3] = 1.0e-19;
+        covariance[3][0] = -3.0e-19;
+        assert!(covariance_is_positive_semidefinite(&covariance).expect("validate"));
+    }
 
     #[test]
     fn zero_covariance_is_psd() {
