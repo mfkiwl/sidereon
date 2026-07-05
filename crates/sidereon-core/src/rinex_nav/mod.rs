@@ -1140,7 +1140,15 @@ fn validate_v4_ephemeris_marker(
         return Ok(());
     };
 
-    if marker_sv != body_sv {
+    let same_satellite = match (
+        marker_sv.parse::<GnssSatelliteId>(),
+        body_sv.parse::<GnssSatelliteId>(),
+    ) {
+        (Ok(marker), Ok(body)) => marker == body,
+        _ => marker_sv == body_sv,
+    };
+
+    if !same_satellite {
         return Err(NavParseError::BadField {
             satellite: marker_sv.to_string(),
             field: "frame marker",
@@ -1551,8 +1559,14 @@ fn parse_rinex_version(version: &str) -> Option<RinexVersion> {
 }
 
 fn is_record_start(line: &str) -> bool {
-    let b = line.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit()
+    let Some(token) = line.get(0..3) else {
+        return false;
+    };
+    let b = token.as_bytes();
+    let prn = token[1..].trim();
+    b[0].is_ascii_alphabetic()
+        && (1..=2).contains(&prn.len())
+        && prn.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The four broadcast-orbit values of a continuation line (columns 4/23/42/61).

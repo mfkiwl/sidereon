@@ -30,12 +30,14 @@ use serde_json::Value;
 
 use super::test_support;
 use super::{
-    solve, solve_spp_batch_parallel, solve_spp_batch_serial, solve_with_policy, Corrections,
-    KlobucharCoeffs, Observation, RejectionReason, RobustConfig, SatModelEnv, SolveInputs,
-    SolvePolicy, SolvePolicyError, SppError, SppInputErrorKind, SppIonosphere, SppModelRecipe,
-    SurfaceMet,
+    clock_systems, solve, solve_spp_batch_parallel, solve_spp_batch_serial, solve_with_policy,
+    Corrections, KlobucharCoeffs, Observation, RejectionReason, RobustConfig, SatModelEnv,
+    SolveInputs, SolvePolicy, SolvePolicyError, SppError, SppInputErrorKind, SppIonosphere,
+    SppModelRecipe, SurfaceMet, C_M_S,
 };
 use crate::astro::math::least_squares::{jacobian_2point, FD_REL_STEP_2POINT};
+use crate::astro::math::robust::{huber_weight, mad_scale};
+use crate::dop::{LineOfSight, PositionCovariance};
 use crate::geometry_quality::ObservabilityTier;
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::ionex::GalileoNequickCoeffs;
@@ -169,6 +171,7 @@ fn assert_solution_bits_eq(left: &super::ReceiverSolution, right: &super::Receiv
     assert_eq!(left.position.z_m.to_bits(), right.position.z_m.to_bits());
     assert_eq!(left.geodetic, right.geodetic);
     assert_eq!(left.rx_clock_s.to_bits(), right.rx_clock_s.to_bits());
+    assert_eq!(left.rx_clock_drift_s_s, right.rx_clock_drift_s_s);
     assert_eq!(left.system_clocks_s.len(), right.system_clocks_s.len());
     for ((left_system, left_clock), (right_system, right_clock)) in left
         .system_clocks_s
@@ -179,6 +182,36 @@ fn assert_solution_bits_eq(left: &super::ReceiverSolution, right: &super::Receiv
         assert_eq!(left_clock.to_bits(), right_clock.to_bits());
     }
     assert_eq!(left.dop, right.dop);
+    assert_eq!(
+        left.position_covariance
+            .ecef_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        right
+            .position_covariance
+            .ecef_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        left.position_covariance
+            .enu_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        right
+            .position_covariance
+            .enu_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         left.residuals_m
             .iter()
@@ -2166,6 +2199,150 @@ fn huber_engages_on_outlier_and_is_off_by_default() {
         robust_err < static_err,
         "Huber did not move the outlier-corrupted fix toward the clean fix \
          (robust_err={robust_err:.3} m, static_err={static_err:.3} m)"
+    );
+}
+
+fn covariance_at_solution(
+    eph: &dyn super::EphemerisSource,
+    inputs: &SolveInputs,
+    solution: &super::ReceiverSolution,
+    weights: &[f64],
+) -> PositionCovariance {
+    let model = SppModelRecipe::reference();
+    let systems = clock_systems(&solution.used_sats);
+    let rx_ecef = solution.position.as_array();
+    let clocks_m: Vec<_> = systems
+        .iter()
+        .map(|system| {
+            let (_, clock_s) = solution
+                .system_clocks_s
+                .iter()
+                .find(|(candidate, _)| candidate == system)
+                .expect("solution carries every system clock");
+            clock_s * C_M_S
+        })
+        .collect();
+    let env = SatModelEnv {
+        eph,
+        t_rx_j2000_s: inputs.t_rx_j2000_s,
+        t_rx_second_of_day_s: inputs.t_rx_second_of_day_s,
+        day_of_year: inputs.day_of_year,
+        corrections: inputs.corrections,
+        met: &inputs.met,
+        glonass_channels: &inputs.glonass_channels,
+        model,
+    };
+    let mut los = Vec::with_capacity(solution.used_sats.len());
+    let mut clock_index = Vec::with_capacity(solution.used_sats.len());
+    for &sat in &solution.used_sats {
+        let p_meas = inputs
+            .observations
+            .iter()
+            .find(|observation| observation.satellite_id == sat)
+            .expect("used satellite has an observation")
+            .pseudorange_m;
+        let sat_clock_system = match sat.system {
+            GnssSystem::Sbas => GnssSystem::Gps,
+            system => system,
+        };
+        let idx = systems
+            .iter()
+            .position(|system| *system == sat_clock_system)
+            .expect("satellite system has a clock state");
+        let model_row = super::sat_model(
+            &env,
+            sat,
+            rx_ecef,
+            clocks_m[idx],
+            p_meas,
+            super::ionosphere_for(sat.system, inputs),
+        )
+        .expect("used satellite remains modelable");
+        let dx = model_row.sat_rot_ecef_m[0] - rx_ecef[0];
+        let dy = model_row.sat_rot_ecef_m[1] - rx_ecef[1];
+        let dz = model_row.sat_rot_ecef_m[2] - rx_ecef[2];
+        let n = (dx * dx + dy * dy + dz * dz).sqrt();
+        los.push(LineOfSight::new(dx / n, dy / n, dz / n));
+        clock_index.push(idx);
+    }
+    let receiver = super::geodetic_from_ecef(model.frame, rx_ecef);
+    super::spp_position_covariance(&los, &clock_index, systems.len(), weights, receiver)
+        .expect("full-rank covariance")
+}
+
+fn covariance_max_abs_diff(a: PositionCovariance, b: PositionCovariance) -> f64 {
+    a.ecef_m2
+        .iter()
+        .flatten()
+        .chain(a.enu_m2.iter().flatten())
+        .zip(b.ecef_m2.iter().flatten().chain(b.enu_m2.iter().flatten()))
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn robust_position_covariance_uses_final_irls_weights() {
+    let doc = read_fixture(&fixture_name("L0_minimal"));
+    let inputs = load_inputs(&doc, "L0_minimal");
+    let sp3 = sp3();
+    let base = solve_inputs(&inputs);
+    let clean = solve(&sp3, &base, false).expect("clean solve");
+
+    let outlier_sat = clean.used_sats[0];
+    let mut corrupt = base.clone();
+    let outlier_obs_idx = corrupt
+        .observations
+        .iter()
+        .position(|observation| observation.satellite_id == outlier_sat)
+        .expect("used satellite has an observation");
+    corrupt.observations[outlier_obs_idx].pseudorange_m += 75.0;
+
+    let robust_config = RobustConfig {
+        huber_k: 1.345,
+        scale_floor_m: 1.0,
+        max_outer: 2,
+        outer_tol_m: f64::MIN_POSITIVE,
+    };
+    let static_corrupt = solve(&sp3, &corrupt, false).expect("corrupt static solve");
+    let selected = super::select_sats(&sp3, &corrupt, SppModelRecipe::reference());
+    assert_eq!(selected.used, static_corrupt.used_sats);
+    let scale = mad_scale(&static_corrupt.residuals_m, robust_config.scale_floor_m)
+        .expect("valid robust residual scale");
+    let final_weights: Vec<f64> = static_corrupt
+        .residuals_m
+        .iter()
+        .zip(&selected.weights)
+        .map(|(&residual_m, &base_weight)| {
+            base_weight * huber_weight(residual_m / scale, robust_config.huber_k)
+        })
+        .collect();
+    let outlier_used_idx = selected
+        .used
+        .iter()
+        .position(|sat| *sat == outlier_sat)
+        .expect("outlier satellite stayed used");
+    let outlier_multiplier = final_weights[outlier_used_idx] / selected.weights[outlier_used_idx];
+    assert!(
+        outlier_multiplier < 1.0,
+        "injected outlier must be downweighted, got multiplier {outlier_multiplier}"
+    );
+
+    let mut robust_inputs = corrupt.clone();
+    robust_inputs.robust = Some(robust_config);
+    let robust = solve(&sp3, &robust_inputs, false).expect("robust solve");
+    assert_eq!(robust.metadata.outer_iterations, 1);
+
+    let expected_final = covariance_at_solution(&sp3, &robust_inputs, &robust, &final_weights);
+    let stale_base = covariance_at_solution(&sp3, &robust_inputs, &robust, &selected.weights);
+    let final_delta = covariance_max_abs_diff(robust.position_covariance, expected_final);
+    let stale_delta = covariance_max_abs_diff(robust.position_covariance, stale_base);
+    assert!(
+        final_delta <= 1.0e-12,
+        "reported covariance must match final IRLS weights, max delta {final_delta}"
+    );
+    assert!(
+        stale_delta > 1.0e-3,
+        "base-weight covariance should visibly differ, max delta {stale_delta}"
     );
 }
 

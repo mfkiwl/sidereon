@@ -64,6 +64,7 @@ impl Default for VelocitySolveOptions {
 
 /// Receiver velocity solve result.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct VelocitySolution {
     /// Receiver ECEF velocity in meters per second.
     pub velocity_m_s: [f64; 3],
@@ -71,6 +72,13 @@ pub struct VelocitySolution {
     pub speed_m_s: f64,
     /// Receiver clock drift in seconds per second.
     pub clock_drift_s_s: f64,
+    /// Unit-variance covariance of `[vx, vy, vz, clock_drift]`.
+    ///
+    /// The first three states are ECEF velocity in metres per second. The final
+    /// state is receiver clock drift in seconds per second. Scale this matrix by
+    /// the range-rate observation variance when all rows share a common
+    /// standard deviation.
+    pub state_covariance: [[f64; 4]; 4],
     /// Post-fit range-rate residuals in meters per second, in `used_sats` order.
     pub residuals_m_s: Vec<(GnssSatelliteId, f64)>,
     /// Satellites contributing rows, in input order after unusable geometry is
@@ -173,8 +181,8 @@ pub fn solve(
         });
     }
 
-    let x = solve_normal_equations(&rows)?;
-    assemble_solution(x, &rows)
+    let (x, normal_inverse) = solve_normal_equations(&rows)?;
+    assemble_solution(x, normal_inverse, &rows)
 }
 
 fn validate_receiver_state(
@@ -314,7 +322,7 @@ fn build_rows(
 }
 
 #[allow(clippy::needless_range_loop)] // Index loops pin the normal-equation accumulation order.
-fn solve_normal_equations(rows: &[Row]) -> Result<[f64; 4], VelocityError> {
+fn solve_normal_equations(rows: &[Row]) -> Result<([f64; 4], [[f64; 4]; 4]), VelocityError> {
     let mut aty = [0.0_f64; 4];
 
     for row in rows {
@@ -328,7 +336,7 @@ fn solve_normal_equations(rows: &[Row]) -> Result<[f64; 4], VelocityError> {
     let inv = invert_4x4_cofactor(&ata).ok_or(VelocityError::SingularGeometry)?;
     let solution = mat4_vec4(&inv, &aty);
     if solution.iter().all(|value| value.is_finite()) {
-        Ok(solution)
+        Ok((solution, inv))
     } else {
         Err(VelocityError::InvalidInput {
             field: "velocity solution",
@@ -337,10 +345,15 @@ fn solve_normal_equations(rows: &[Row]) -> Result<[f64; 4], VelocityError> {
     }
 }
 
-fn assemble_solution(x: [f64; 4], rows: &[Row]) -> Result<VelocitySolution, VelocityError> {
+fn assemble_solution(
+    x: [f64; 4],
+    normal_inverse: [[f64; 4]; 4],
+    rows: &[Row],
+) -> Result<VelocitySolution, VelocityError> {
     let velocity_m_s = [x[0], x[1], x[2]];
     let speed_m_s = vec3::norm3(velocity_m_s);
     let clock_drift_s_s = x[3] / C_M_S;
+    let state_covariance = velocity_state_covariance(normal_inverse);
     let residuals_m_s: Vec<_> = rows
         .iter()
         .map(|row| (row.sat, row.y - hx(&row.h, &x)))
@@ -348,6 +361,10 @@ fn assemble_solution(x: [f64; 4], rows: &[Row]) -> Result<VelocitySolution, Velo
     if !velocity_m_s.iter().all(|value| value.is_finite())
         || !speed_m_s.is_finite()
         || !clock_drift_s_s.is_finite()
+        || !state_covariance
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
         || !residuals_m_s
             .iter()
             .all(|(_, residual)| residual.is_finite())
@@ -362,9 +379,21 @@ fn assemble_solution(x: [f64; 4], rows: &[Row]) -> Result<VelocitySolution, Velo
         velocity_m_s,
         speed_m_s,
         clock_drift_s_s,
+        state_covariance,
         residuals_m_s,
         used_sats,
     })
+}
+
+fn velocity_state_covariance(normal_inverse: [[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let scale = [1.0, 1.0, 1.0, 1.0 / C_M_S];
+    let mut out = [[0.0_f64; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            out[i][j] = normal_inverse[i][j] * scale[i] * scale[j];
+        }
+    }
+    out
 }
 
 fn hx(h: &[f64; 4], x: &[f64; 4]) -> f64 {

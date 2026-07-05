@@ -1422,7 +1422,38 @@ mod tests {
         assert_eq!(left.position.z_m.to_bits(), right.position.z_m.to_bits());
         assert_eq!(left.geodetic, right.geodetic);
         assert_eq!(left.rx_clock_s.to_bits(), right.rx_clock_s.to_bits());
+        assert_eq!(left.rx_clock_drift_s_s, right.rx_clock_drift_s_s);
         assert_eq!(left.dop, right.dop);
+        assert_eq!(
+            left.position_covariance
+                .ecef_m2
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .position_covariance
+                .ecef_m2
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            left.position_covariance
+                .enu_m2
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .position_covariance
+                .enu_m2
+                .iter()
+                .flatten()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             left.residuals_m
                 .iter()
@@ -1634,6 +1665,7 @@ mod tests {
             position: crate::frame::ItrfPositionM::new(6_378_137.0, 0.0, 0.0).unwrap(),
             geodetic: None,
             rx_clock_s: 0.0,
+            rx_clock_drift_s_s: None,
             system_clocks_s: vec![(GnssSystem::Gps, 0.0)],
             dop: Some(crate::dop::Dop {
                 gdop: 2.5,
@@ -1644,6 +1676,10 @@ mod tests {
                 system_tdops: vec![(GnssSystem::Gps, 0.5)],
             }),
             system_tdops: vec![(GnssSystem::Gps, 0.5)],
+            position_covariance: crate::dop::PositionCovariance {
+                ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            },
             residuals_m: vec![0.1, -0.1, 0.0, 0.05, -0.05],
             used_sats: (1..=5).map(gps).collect(),
             rejected_sats: Vec::new(),

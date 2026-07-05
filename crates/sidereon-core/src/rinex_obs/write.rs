@@ -24,6 +24,10 @@ use super::{ObsEpoch, ObsEpochTime, ObsValue, RinexObs, OBS_FIELD_WIDTH, OBS_VAL
 
 /// RINEX-3 observation codes per `SYS / # / OBS TYPES` line before continuation.
 const OBS_CODES_PER_LINE: usize = 13;
+/// RINEX-3 observation codes per `SYS / SCALE FACTOR` line after its 10-column prefix.
+const SCALE_FACTOR_CODES_PER_LINE: usize = 12;
+/// RINEX-3 `PRN / # OF OBS` count fields per line after its 3-column satellite field.
+const PRN_OBS_COUNTS_PER_LINE: usize = 9;
 /// GLONASS slot/channel pairs per `GLONASS SLOT / FRQ #` line.
 const GLONASS_SLOTS_PER_LINE: usize = 8;
 
@@ -218,7 +222,19 @@ impl RinexObs {
 /// Append a header line: content padded into the first 60 columns, then the
 /// 20-column record label.
 fn push_header_line(out: &mut String, content: &str, label: &str) {
+    let content = header_content_60(content);
     let _ = writeln!(out, "{content:<60}{label}");
+}
+
+fn header_content_60(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.len() <= 60 {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let mut end = 60;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(content[..end].to_string())
 }
 
 /// Format an `F14.4` ECEF / antenna triple into the leading columns.
@@ -291,7 +307,7 @@ fn write_scale_factor(out: &mut String, factor: &super::ObsScaleFactor) {
         );
         return;
     }
-    for (chunk_index, chunk) in factor.codes.chunks(OBS_CODES_PER_LINE).enumerate() {
+    for (chunk_index, chunk) in factor.codes.chunks(SCALE_FACTOR_CODES_PER_LINE).enumerate() {
         let mut content = if chunk_index == 0 {
             format!("{} {:>4}  {:>2}", factor.system.letter(), divisor, count)
         } else {
@@ -352,16 +368,26 @@ fn write_prn_obs_counts(
     sat: crate::id::GnssSatelliteId,
     counts: &[Option<usize>],
 ) {
-    let mut content = format!("{sat:<3}");
-    for count in counts {
-        match count {
-            Some(value) => {
-                let _ = write!(content, "{value:6}");
-            }
-            None => content.push_str("      "),
-        }
+    if counts.is_empty() {
+        push_header_line(out, &format!("{sat:<3}"), "PRN / # OF OBS");
+        return;
     }
-    push_header_line(out, &content, "PRN / # OF OBS");
+    for (chunk_index, chunk) in counts.chunks(PRN_OBS_COUNTS_PER_LINE).enumerate() {
+        let mut content = if chunk_index == 0 {
+            format!("{sat:<3}")
+        } else {
+            " ".repeat(3)
+        };
+        for count in chunk {
+            match count {
+                Some(value) => {
+                    let _ = write!(content, "{value:6}");
+                }
+                None => content.push_str("      "),
+            }
+        }
+        push_header_line(out, &content, "PRN / # OF OBS");
+    }
 }
 
 /// Append one 16-column observation field: the `F14.3` value (or blanks) re-scaled

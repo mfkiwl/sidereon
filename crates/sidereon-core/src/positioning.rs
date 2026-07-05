@@ -5,13 +5,14 @@ pub use crate::quality::{
     spp_robust_fde_driver, FdeError, FdeOptions, FdeResult, FdeSppError, FdeSppOptions,
 };
 pub use crate::spp::{
-    residual_rms, solve, solve_broadcast, solve_spp_batch_parallel, solve_spp_batch_serial,
-    solve_with_fallback, solve_with_policy, solve_with_solver, BroadcastReason, Corrections,
+    residual_rms, solve, solve_broadcast, solve_doppler_velocity, solve_spp_batch_parallel,
+    solve_spp_batch_serial, solve_with_doppler_velocity, solve_with_fallback, solve_with_policy,
+    solve_with_solver, BroadcastReason, Corrections, DopplerObservation, DopplerVelocityInputs,
     EphemerisSource, FallbackError, FixSource, GalileoNequickCoeffs, KlobucharCoeffs, Observation,
     ReceiverSolution, RejectedSat, RejectionReason, RobustConfig, SolutionMetadata, SolveInputs,
-    SolvePolicy, SolvePolicyError, SourcedSolution, SppError, SurfaceMet, DEFAULT_HUBER_K,
-    DEFAULT_ROBUST_MAX_OUTER, DEFAULT_ROBUST_OUTER_TOL_M, DEFAULT_ROBUST_SCALE_FLOOR_M,
-    ELEVATION_MASK_RAD, SIGMA0_M, TRANSMIT_TIME_ITERATIONS,
+    SolvePolicy, SolvePolicyError, SourcedSolution, SppDopplerSolution, SppError, SurfaceMet,
+    DEFAULT_HUBER_K, DEFAULT_ROBUST_MAX_OUTER, DEFAULT_ROBUST_OUTER_TOL_M,
+    DEFAULT_ROBUST_SCALE_FLOOR_M, ELEVATION_MASK_RAD, SIGMA0_M, TRANSMIT_TIME_ITERATIONS,
 };
 
 /// Role-oriented alias for a solved receiver state.

@@ -748,6 +748,7 @@ fn assert_solution_bits_eq(
     assert_eq!(left.position.z_m.to_bits(), right.position.z_m.to_bits());
     assert_eq!(left.geodetic, right.geodetic);
     assert_eq!(left.rx_clock_s.to_bits(), right.rx_clock_s.to_bits());
+    assert_eq!(left.rx_clock_drift_s_s, right.rx_clock_drift_s_s);
     assert_eq!(left.system_clocks_s.len(), right.system_clocks_s.len());
     for ((left_system, left_clock), (right_system, right_clock)) in left
         .system_clocks_s
@@ -758,6 +759,36 @@ fn assert_solution_bits_eq(
         assert_eq!(left_clock.to_bits(), right_clock.to_bits());
     }
     assert_eq!(left.dop, right.dop);
+    assert_eq!(
+        left.position_covariance
+            .ecef_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        right
+            .position_covariance
+            .ecef_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        left.position_covariance
+            .enu_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        right
+            .position_covariance
+            .enu_m2
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         left.residuals_m
             .iter()
