@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21174997.svg)](https://doi.org/10.5281/zenodo.21174997)
 
-GNSS positioning and astrodynamics in Rust, with first-class interfaces in Python, C, WebAssembly, and Elixir. Reference-validated, and bit-exact to public oracles where it counts.
+GNSS positioning and astrodynamics in Rust, with first-class interfaces in [Python](https://github.com/neilberkman/sidereon-python), [C](https://github.com/neilberkman/sidereon-c), [WebAssembly](https://github.com/neilberkman/sidereon-wasm), and [Elixir](https://github.com/neilberkman/sidereon-ex). Reference-validated, and bit-exact to public oracles where it counts.
 
 sidereon is one engine: a Rust core for satellite orbit propagation, GNSS positioning, time and frame transforms, atmosphere models, and the standard exchange formats, exposed through idiomatic interfaces in five languages so the same validated math is reachable wherever you work.
 
