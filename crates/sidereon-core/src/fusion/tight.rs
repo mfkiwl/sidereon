@@ -755,14 +755,12 @@ fn pseudorange_design_row(
     lever_arm_ecef_m: [f64; 3],
 ) -> Vec<f64> {
     let mut row = vec![0.0; aug_dim];
-    for axis in 0..3 {
-        row[ERROR_POSITION_INDEX + axis] = -los_unit[axis];
-    }
+    row[ERROR_POSITION_INDEX..ERROR_POSITION_INDEX + 3].copy_from_slice(&los_unit);
     let lever_skew = skew(lever_arm_ecef_m);
     for col in 0..3 {
-        row[ERROR_ATTITUDE_INDEX + col] = los_unit[0] * lever_skew[0][col]
+        row[ERROR_ATTITUDE_INDEX + col] = -(los_unit[0] * lever_skew[0][col]
             + los_unit[1] * lever_skew[1][col]
-            + los_unit[2] * lever_skew[2][col];
+            + los_unit[2] * lever_skew[2][col]);
     }
     row[clock_bias] = 1.0;
     row
@@ -776,14 +774,12 @@ fn range_rate_design_row(
     gyro_bias_velocity_block: [[f64; 3]; 3],
 ) -> Vec<f64> {
     let mut row = vec![0.0; aug_dim];
-    for axis in 0..3 {
-        row[ERROR_VELOCITY_INDEX + axis] = -los_unit[axis];
-    }
+    row[ERROR_VELOCITY_INDEX..ERROR_VELOCITY_INDEX + 3].copy_from_slice(&los_unit);
     let lever_velocity_skew = skew(lever_velocity_ecef_mps);
     for col in 0..3 {
-        row[ERROR_ATTITUDE_INDEX + col] = los_unit[0] * lever_velocity_skew[0][col]
+        row[ERROR_ATTITUDE_INDEX + col] = -(los_unit[0] * lever_velocity_skew[0][col]
             + los_unit[1] * lever_velocity_skew[1][col]
-            + los_unit[2] * lever_velocity_skew[2][col];
+            + los_unit[2] * lever_velocity_skew[2][col]);
         row[ERROR_GYRO_BIAS_INDEX + col] = los_unit[0] * gyro_bias_velocity_block[0][col]
             + los_unit[1] * gyro_bias_velocity_block[1][col]
             + los_unit[2] * gyro_bias_velocity_block[2][col];
@@ -1223,7 +1219,7 @@ mod tests {
         for axis in 0..3 {
             assert_eq!(
                 doppler_row[ERROR_VELOCITY_INDEX + axis].to_bits(),
-                (-predicted_at_nominal.los_unit[axis]).to_bits()
+                predicted_at_nominal.los_unit[axis].to_bits()
             );
         }
         assert_eq!(
