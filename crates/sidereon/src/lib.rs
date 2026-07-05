@@ -198,15 +198,22 @@ pub use sidereon_core::quality::{
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frame_catalog,
-    frequencies, fusion, geodesic, geodetic_time_series, geometry, geometry_quality, ils, inertial,
-    navigation, nmea, observables, orbit, positioning, ppp_corrections, qc_obs, quality, rinex,
-    rtcm, rtk, sbas, sbas_pl, sidereal, signal, source_localization, ssr, staleness, terrain,
-    terrain_store, tides, velocity,
+    frequencies, fusion, geodesic, geodetic_time_series, geofence, geometry, geometry_quality, ils,
+    inertial, navigation, nmea, observables, orbit, positioning, ppp_corrections, qc_obs, quality,
+    rinex, rtcm, rtk, sbas, sbas_pl, sidereal, signal, source_localization, ssr, staleness,
+    terrain, terrain_store, tides, velocity,
 };
 pub use sidereon_core::{
     catalog, catalog_entry, propagate_position, transform, transform_from_epoch, FrameCatalogError,
     HelmertParameters, HelmertRates, HelmertTransform, TerrestrialFrame, TerrestrialPositionM,
     TerrestrialState, TerrestrialVelocityMPerYear, TERRESTRIAL_FRAME_CATALOG,
+};
+pub use sidereon_core::{
+    containment, containment_probability, containment_probability_with_options, crossing,
+    crossing_probability, crossing_probability_with_options, distance_to_boundary, CrossingEvent,
+    CrossingKind, Fence, GeofenceError, GeofencePositionEstimate, PositionUncertainty,
+    ProbabilityHysteresis, ProbabilityMethod, ProbabilityOptions, GEOFENCE_BOUNDARY_TOLERANCE_M,
+    PLANAR_FAST_PATH_MAX_RADIUS_M,
 };
 pub use sidereon_core::{
     emission_media_batch_at_j2000_s, observable_media_corrections, predict_batch_with_media,

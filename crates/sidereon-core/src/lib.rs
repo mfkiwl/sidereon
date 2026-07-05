@@ -130,6 +130,7 @@ pub mod ephemeris;
 pub mod estimation; // Phase-2 estimation substrate: named operation-order recipes
 pub mod geodesic; // WGS84 geodesic direct and inverse solvers
 pub mod geodetic_time_series; // robust station velocity, trajectory, steps, and fields
+pub mod geofence; // geodesic geofence containment and uncertainty gates
 pub mod geoid; // geoid undulation grid + bilinear interpolation (orthometric heights)
 pub mod geometry;
 pub mod geometry_quality;
@@ -205,6 +206,13 @@ pub use fusion::{
     FUSION_STATE_CODEC_VERSION,
 };
 pub use geodesic::{geodesic_direct, geodesic_inverse, GeodesicError};
+pub use geofence::{
+    containment, containment_probability, containment_probability_with_options, crossing,
+    crossing_probability, crossing_probability_with_options, distance_to_boundary, CrossingEvent,
+    CrossingKind, Fence, GeofenceError, GeofencePositionEstimate, PositionUncertainty,
+    ProbabilityHysteresis, ProbabilityMethod, ProbabilityOptions, GEOFENCE_BOUNDARY_TOLERANCE_M,
+    PLANAR_FAST_PATH_MAX_RADIUS_M,
+};
 pub use geoid::{
     egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
     geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, Egm2008GridSpacing,
