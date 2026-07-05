@@ -776,16 +776,19 @@ impl SppModelRecipe {
 /// Per-satellite model used by the solve path: the Sagnac-rotated satellite
 /// position, the topocentric az/el, and the predicted pseudorange.
 ///
-/// In test builds the struct additionally carries the named intermediate
-/// quantities (transmit time, satellite ECEF, Sagnac angle, geometric range,
-/// ionosphere, troposphere) so the 0-ULP trace-replay parity test can assert
-/// each one bit-for-bit against the reference recipe; the solve path never
-/// reads them, so they are gated out of production builds.
+/// The scenario simulator also reads the range, satellite-clock, ionosphere,
+/// and troposphere intermediates to build its ground-truth term ledger. Test
+/// builds additionally carry transmit-time and Sagnac details for the 0-ULP
+/// trace-replay parity checks.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SatModel {
     pub sat_rot_ecef_m: [f64; 3],
     pub el_rad: f64,
     pub p_hat_m: f64,
+    pub dt_sat_s: f64,
+    pub rho_m: f64,
+    pub iono_m: f64,
+    pub tropo_m: f64,
     #[cfg(all(test, sidereon_repo_tests))]
     pub az_rad: f64,
     #[cfg(all(test, sidereon_repo_tests))]
@@ -795,15 +798,7 @@ pub(crate) struct SatModel {
     #[cfg(all(test, sidereon_repo_tests))]
     pub sat_ecef_m: [f64; 3],
     #[cfg(all(test, sidereon_repo_tests))]
-    pub dt_sat_s: f64,
-    #[cfg(all(test, sidereon_repo_tests))]
     pub theta_rad: f64,
-    #[cfg(all(test, sidereon_repo_tests))]
-    pub rho_m: f64,
-    #[cfg(all(test, sidereon_repo_tests))]
-    pub iono_m: f64,
-    #[cfg(all(test, sidereon_repo_tests))]
-    pub tropo_m: f64,
 }
 
 /// The broadcast ionosphere correction a satellite's system uses.
@@ -1035,6 +1030,10 @@ pub(crate) fn sat_model(
         sat_rot_ecef_m: sat_rot,
         el_rad: g.el_rad,
         p_hat_m: p_hat,
+        dt_sat_s: dt_sat,
+        rho_m: rho,
+        iono_m,
+        tropo_m,
         #[cfg(all(test, sidereon_repo_tests))]
         az_rad: g.az_rad,
         #[cfg(all(test, sidereon_repo_tests))]
@@ -1045,15 +1044,7 @@ pub(crate) fn sat_model(
         #[cfg(all(test, sidereon_repo_tests))]
         sat_ecef_m: sat_pos,
         #[cfg(all(test, sidereon_repo_tests))]
-        dt_sat_s: dt_sat,
-        #[cfg(all(test, sidereon_repo_tests))]
         theta_rad: OMEGA_E_DOT_RAD_S * tau,
-        #[cfg(all(test, sidereon_repo_tests))]
-        rho_m: rho,
-        #[cfg(all(test, sidereon_repo_tests))]
-        iono_m,
-        #[cfg(all(test, sidereon_repo_tests))]
-        tropo_m,
     })
 }
 
