@@ -1,13 +1,106 @@
 #![cfg(sidereon_repo_tests)]
 
+//! RINEX clock product evaluation tests.
+//!
+//! Real CLK/SP3 fixtures are public IGS final products mirrored in
+//! `tests/fixtures/clk/IGS0OPSFIN_20261330000_90M_30S_CLK.CLK` and
+//! `tests/fixtures/sp3/IGS0OPSFIN_20261330000_03H_15M_ORB.SP3`.
+//! The real-product identity checks compare evaluated values against parsed
+//! record rows, and compare shared CLK/SP3 record epochs to the SP3 clock field
+//! resolution.
+
 use sidereon_core::astro::time::civil::seconds_between_splits;
-use sidereon_core::astro::time::model::TimeScale;
+use sidereon_core::astro::time::model::{Instant, TimeScale};
 use sidereon_core::constants::SECONDS_PER_DAY;
+use sidereon_core::ephemeris::Sp3;
 use sidereon_core::rinex::clock::{
     civil_to_clock_instant, civil_to_gps_seconds, ClockEpoch, RinexClock, RinexClockError,
 };
+use sidereon_core::{GnssSatelliteId, GnssSystem};
 
 const CLK: &str = include_str!("fixtures/clk/synthetic_rinex_clock.clk");
+const REAL_CLK: &str = include_str!("fixtures/clk/IGS0OPSFIN_20261330000_90M_30S_CLK.CLK");
+const REAL_SP3: &str = include_str!("fixtures/sp3/IGS0OPSFIN_20261330000_03H_15M_ORB.SP3");
+
+fn gps(prn: u8) -> GnssSatelliteId {
+    GnssSatelliteId::new(GnssSystem::Gps, prn).expect("valid GPS PRN")
+}
+
+fn real_clk_source_rows() -> Vec<(String, Instant, f64)> {
+    REAL_CLK
+        .lines()
+        .filter(|line| line.starts_with("AS "))
+        .map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            assert!(
+                fields.len() >= 10,
+                "real CLK AS row has too few fields: {line}"
+            );
+            let year = fields[2].parse::<i32>().expect("CLK source year");
+            let month = fields[3].parse::<u8>().expect("CLK source month");
+            let day = fields[4].parse::<u8>().expect("CLK source day");
+            let hour = fields[5].parse::<u8>().expect("CLK source hour");
+            let minute = fields[6].parse::<u8>().expect("CLK source minute");
+            let second = fields[7].parse::<f64>().expect("CLK source second");
+            let epoch =
+                civil_to_clock_instant(TimeScale::Gpst, year, month, day, hour, minute, second)
+                    .expect("CLK source epoch");
+            let bias_s = fields[9].parse::<f64>().expect("CLK source bias");
+            (fields[1].to_string(), epoch, bias_s)
+        })
+        .collect()
+}
+
+#[test]
+fn real_clk_record_epochs_evaluate_to_parsed_rows() {
+    let clock = RinexClock::parse(REAL_CLK).expect("real RINEX clock");
+    let mut checked = 0usize;
+
+    for (satellite, epoch, bias_s) in real_clk_source_rows() {
+        let evaluated = clock
+            .clock_s_at_instant(&satellite, epoch)
+            .expect("valid clock query")
+            .expect("clock record at source epoch");
+        assert_eq!(
+            evaluated.to_bits(),
+            bias_s.to_bits(),
+            "{satellite} source-epoch clock identity"
+        );
+        checked += 1;
+    }
+
+    assert_eq!(checked, 5_792);
+}
+
+#[test]
+fn real_clk_and_sp3_clocks_match_at_shared_record_epochs() {
+    let clock = RinexClock::parse(REAL_CLK).expect("real RINEX clock");
+    let sp3 = Sp3::parse(REAL_SP3.as_bytes()).expect("real SP3");
+    let mut checked = 0usize;
+
+    for epoch_index in [0usize, 6] {
+        let epoch = sp3.epochs[epoch_index];
+        for prn in 1..=32 {
+            let satellite = gps(prn);
+            let sp3_clock_s = sp3
+                .state(satellite, epoch_index)
+                .expect("SP3 satellite state")
+                .clock_s
+                .expect("SP3 clock record");
+            let clk_clock_s = clock
+                .clock_s_at_instant(&satellite.to_string(), epoch)
+                .expect("valid CLK query")
+                .expect("CLK clock at shared source epoch");
+            assert!(
+                (clk_clock_s - sp3_clock_s).abs() <= 5.0e-13,
+                "{satellite} epoch {epoch_index} CLK {clk_clock_s:e} SP3 {sp3_clock_s:e}"
+            );
+            checked += 1;
+        }
+    }
+
+    assert_eq!(checked, 64);
+}
 
 #[test]
 fn parses_satellite_clock_records_and_ignores_receivers() {

@@ -3,8 +3,10 @@
 //! are existing repository fixtures generated from the public DTED
 //! UHL/DSI/ACC/data-record layout. The HGT void test uses the synthetic
 //! `tests/fixtures/dted/hgt/n36_w107_reference.hgt` fixture already committed
-//! for the SRTM1-to-DTED converter. Tests compare terrain heights by
-//! `f64::to_bits()` against the crate's DTED reader over the same files.
+//! for the SRTM1-to-DTED converter. Legacy store regression cases compare
+//! terrain heights by `f64::to_bits()` against committed fixture values, and
+//! source-post checks use the public Skadi SRTM1 excerpt in
+//! `skadi_n36w107_5x5_posts.json`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,6 +24,7 @@ use sidereon_core::terrain_store::{
 };
 
 const MULTI_TILE_STORE_CHECKSUM64: u64 = 0xff51_4a67_6a94_d479;
+const SRTM1_POSTINGS_PER_AXIS: usize = 3601;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -48,22 +51,104 @@ fn f64_from_hex(input: &str) -> f64 {
     f64::from_bits(bits)
 }
 
-fn multi_tile_points() -> Vec<(f64, f64)> {
+#[derive(Clone, Copy)]
+struct TerrainFixtureCase {
+    longitude_deg: f64,
+    latitude_deg: f64,
+    nearest_m: f64,
+    bilinear_m: f64,
+}
+
+impl TerrainFixtureCase {
+    fn expected_m(self, interpolation: DtedInterpolation) -> f64 {
+        match interpolation {
+            DtedInterpolation::Bilinear => self.bilinear_m,
+            DtedInterpolation::NearestPosting => self.nearest_m,
+        }
+    }
+}
+
+struct NamedTerrainFixtureCase {
+    case_id: String,
+    case: TerrainFixtureCase,
+}
+
+fn terrain_fixture_cases() -> Vec<NamedTerrainFixtureCase> {
     let json: Value =
         serde_json::from_slice(&fs::read(fixture_path("dted_points.json")).expect("fixture json"))
             .expect("parse fixture json");
-    let points: Vec<(f64, f64)> = json["multi_tile_cases"]
+    json["multi_tile_cases"]
         .as_array()
         .expect("multi tile cases")
         .iter()
-        .map(|case| {
-            (
-                f64_from_hex(case["longitude_bits"].as_str().expect("longitude bits")),
-                f64_from_hex(case["latitude_bits"].as_str().expect("latitude bits")),
-            )
+        .map(|case| NamedTerrainFixtureCase {
+            case_id: case["case_id"].as_str().expect("case_id").to_string(),
+            case: TerrainFixtureCase {
+                longitude_deg: f64_from_hex(
+                    case["longitude_bits"].as_str().expect("longitude bits"),
+                ),
+                latitude_deg: f64_from_hex(case["latitude_bits"].as_str().expect("latitude bits")),
+                nearest_m: f64_from_hex(case["nearest_bits"].as_str().expect("nearest bits")),
+                bilinear_m: f64_from_hex(case["bilinear_bits"].as_str().expect("bilinear bits")),
+            },
         })
-        .collect();
-    points
+        .collect()
+}
+
+fn multi_tile_points() -> Vec<(f64, f64)> {
+    terrain_fixture_cases()
+        .iter()
+        .map(|named| (named.case.longitude_deg, named.case.latitude_deg))
+        .collect()
+}
+
+fn skadi_excerpt_posts_m() -> Vec<Vec<i16>> {
+    let json: Value = serde_json::from_slice(
+        &fs::read(fixture_path("skadi_n36w107_5x5_posts.json")).expect("Skadi excerpt json"),
+    )
+    .expect("parse Skadi excerpt json");
+    assert_eq!(json["schema"], "skadi-srtm1-post-excerpt-v1");
+    json["posts_m"]
+        .as_array()
+        .expect("posts_m rows")
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .expect("posts_m columns")
+                .iter()
+                .map(|value| {
+                    i16::try_from(value.as_i64().expect("Skadi post integer"))
+                        .expect("Skadi post fits i16")
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn hgt_bytes_from_skadi_excerpt(posts_lat_lon: &[Vec<i16>]) -> Vec<u8> {
+    let lat_count = posts_lat_lon.len();
+    let lon_count = posts_lat_lon
+        .first()
+        .expect("at least one latitude row")
+        .len();
+    assert!(lat_count >= 2);
+    assert!(lon_count >= 2);
+    assert!(posts_lat_lon.iter().all(|row| row.len() == lon_count));
+
+    let lat_step = (SRTM1_POSTINGS_PER_AXIS - 1) / (lat_count - 1);
+    let lon_step = (SRTM1_POSTINGS_PER_AXIS - 1) / (lon_count - 1);
+    let mut hgt = vec![0u8; SRTM1_POSTINGS_PER_AXIS * SRTM1_POSTINGS_PER_AXIS * 2];
+
+    for (lat_index, row) in posts_lat_lon.iter().enumerate() {
+        let hgt_row = SRTM1_POSTINGS_PER_AXIS - 1 - lat_index * lat_step;
+        for (lon_index, value) in row.iter().enumerate() {
+            let hgt_col = lon_index * lon_step;
+            let offset = 2 * (hgt_row * SRTM1_POSTINGS_PER_AXIS + hgt_col);
+            hgt[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    hgt
 }
 
 fn assert_height_results_match(
@@ -132,7 +217,111 @@ fn mmap_store_matches_dted_reader_over_multi_tile_fixture() {
 }
 
 #[test]
-fn mmap_store_matches_dted_reader_for_hgt_void_collapsed_to_zero() {
+fn mmap_store_matches_committed_multi_tile_fixture_bits() {
+    let root = fixture_path("tiles");
+    let bytes = dted_tree_to_mmap_store(&root).expect("convert DTED tree");
+    let mut mmap = MmapTerrain::from_bytes(&bytes).expect("parse terrain store");
+    let cases = terrain_fixture_cases();
+    let points = cases
+        .iter()
+        .map(|named| (named.case.longitude_deg, named.case.latitude_deg))
+        .collect::<Vec<_>>();
+
+    assert_eq!(mmap.vertical_datum(), VerticalDatum::Egm96MslOrthometric);
+    assert_eq!(mmap.tile_index().len(), 2);
+    assert_eq!(mmap.tile_count(), 2);
+    assert_eq!(
+        mmap.tile_ids(),
+        &[TerrainTileId::new(36, -107), TerrainTileId::new(36, -106)]
+    );
+    for tile in mmap.tile_index() {
+        assert_eq!(tile.vertical_datum, VerticalDatum::Egm96MslOrthometric);
+        assert_eq!(tile.data_offset as usize % 4096, 0);
+    }
+
+    for interpolation in [
+        DtedInterpolation::Bilinear,
+        DtedInterpolation::NearestPosting,
+    ] {
+        let options = DtedLookupOptions { interpolation };
+        let got = mmap.height_batch(&points, options);
+        assert_eq!(got.len(), cases.len(), "{interpolation:?} batch length");
+
+        for (named, got) in cases.iter().zip(got) {
+            let expected = named.case.expected_m(interpolation);
+            let got = got.expect("mmap batch height");
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "{} {interpolation:?} batch height bits",
+                named.case_id
+            );
+
+            let scalar = mmap
+                .height_m_with_options(named.case.longitude_deg, named.case.latitude_deg, options)
+                .expect("mmap scalar height");
+            assert_eq!(
+                scalar.to_bits(),
+                expected.to_bits(),
+                "{} {interpolation:?} scalar height bits",
+                named.case_id
+            );
+
+            let typed = mmap
+                .orthometric_height_m_with_options(
+                    named.case.longitude_deg,
+                    named.case.latitude_deg,
+                    options,
+                )
+                .expect("typed orthometric height");
+            assert_eq!(
+                typed.metres().to_bits(),
+                expected.to_bits(),
+                "{} {interpolation:?} typed height bits",
+                named.case_id
+            );
+        }
+    }
+}
+
+#[test]
+fn mmap_store_nearest_posting_matches_real_skadi_source_posts() {
+    let posts_m = skadi_excerpt_posts_m();
+    let root = temp_path("terrain-store-skadi-excerpt");
+    fs::create_dir_all(&root).expect("create temp DTED root");
+    let hgt = hgt_bytes_from_skadi_excerpt(&posts_m);
+    fs::write(
+        root.join("n36_w107_1arc_v3.dt2"),
+        hgt_to_dted(36, -107, &hgt).expect("convert Skadi excerpt HGT"),
+    )
+    .expect("write Skadi excerpt DTED tile");
+
+    let bytes = dted_tree_to_mmap_store(&root).expect("convert DTED tree");
+    let mut mmap = MmapTerrain::from_bytes(&bytes).expect("parse terrain store");
+    let options = DtedLookupOptions {
+        interpolation: DtedInterpolation::NearestPosting,
+    };
+
+    for (lon_index, lat_index) in [(0usize, 0usize), (0, 4), (3, 0), (3, 4), (2, 3), (4, 4)] {
+        let longitude_deg = -107.0 + lon_index as f64 / 4.0;
+        let latitude_deg = 36.0 + lat_index as f64 / 4.0;
+        let height_m = mmap
+            .height_m_with_options(longitude_deg, latitude_deg, options)
+            .expect("mmap source post height");
+        let source_height_m = f64::from(posts_m[lat_index][lon_index]);
+
+        assert_eq!(
+            height_m.to_bits(),
+            source_height_m.to_bits(),
+            "Skadi source post lon_index={lon_index} lat_index={lat_index}"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove temp DTED root");
+}
+
+#[test]
+fn mmap_store_returns_typed_zero_for_hgt_void_posting() {
     let hgt = fs::read(fixture_path("hgt/n36_w107_reference.hgt")).expect("read HGT fixture");
     let dt2 = hgt_to_dted(36, -107, &hgt).expect("convert HGT fixture");
     let root = temp_path("terrain-store-hgt-void");
@@ -154,8 +343,20 @@ fn mmap_store_matches_dted_reader_for_hgt_void_collapsed_to_zero() {
     let want = dted
         .height_m_with_options(longitude_deg, latitude_deg, options)
         .expect("DTED void height");
+    let typed = mmap
+        .orthometric_height_m_with_options(longitude_deg, latitude_deg, options)
+        .expect("typed orthometric void height");
+    let typed_batch = mmap.orthometric_height_batch(&[(longitude_deg, latitude_deg)], options);
+
     assert_eq!(got.to_bits(), want.to_bits());
+    assert_eq!(typed.metres().to_bits(), want.to_bits());
     assert_eq!(got.to_bits(), 0.0f64.to_bits());
+    assert_eq!(
+        typed_batch[0]
+            .as_ref()
+            .map(|height| height.metres().to_bits()),
+        Ok(0.0f64.to_bits())
+    );
 
     fs::remove_dir_all(root).expect("remove temp DTED root");
 }
@@ -185,7 +386,11 @@ fn absent_mmap_tile_returns_typed_error_not_zero() {
     assert_eq!(typed_err, err);
 
     let batch = mmap.height_batch(&[(missing_lon, missing_lat)], DtedLookupOptions::default());
-    assert_eq!(batch, vec![Err(err)]);
+    assert_eq!(batch, vec![Err(err.clone())]);
+
+    let typed_batch =
+        mmap.orthometric_height_batch(&[(missing_lon, missing_lat)], DtedLookupOptions::default());
+    assert_eq!(typed_batch, vec![Err(err)]);
 }
 
 #[test]

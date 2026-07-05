@@ -33,6 +33,9 @@ use super::{
     GalileoNequickEval, IonexSlantRequest, IonoModel, TecGridSamples, TecSample, TecSamplesError,
 };
 
+const REAL_IONEX_EXCERPT: &[u8] =
+    include_bytes!("../../tests/fixtures/ionex/esa_2024176_first_map_2row.inx");
+
 /// Parse a C99 / Python `float.hex()` hex-float string into the exact `f64`.
 ///
 /// Every hex frac digit is 4 mantissa bits and f64 has 52, so the reconstruction
@@ -365,6 +368,47 @@ fn ionex_slant_zero_ulp_full_branch_matrix() {
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+#[test]
+fn ionex_real_grid_nodes_evaluate_to_parsed_map_values() {
+    let ionex = Ionex::parse(REAL_IONEX_EXCERPT).expect("real IONEX excerpt");
+    assert_eq!(ionex.lat_nodes_deg(), &[0.0, -2.5]);
+    assert_eq!(ionex.lon_nodes_deg().len(), 73);
+
+    let map = &ionex.tec_maps()[0];
+    let cases = [
+        (0usize, 0usize, 0x4050_4666_6666_6667u64),
+        (0, 36, 0x4035_0000_0000_0000),
+        (0, 72, 0x4050_4666_6666_6667),
+        (1, 0, 0x4050_6000_0000_0000),
+        (1, 36, 0x4034_3333_3333_3334),
+        (1, 72, 0x4050_6000_0000_0000),
+    ];
+
+    for (lat_index, lon_index, expected_bits) in cases {
+        let lat_deg = ionex.lat_nodes_deg()[lat_index];
+        let lon_deg = ionex.lon_nodes_deg()[lon_index];
+        assert_eq!(
+            map[lat_index][lon_index].to_bits(),
+            expected_bits,
+            "IONEX parsed source node lat={lat_deg} lon={lon_deg}"
+        );
+        let evaluated = super::slant::bilinear_vtec(
+            map,
+            ionex.lat_nodes_deg(),
+            ionex.lon_nodes_deg(),
+            ionex.dlat_deg(),
+            ionex.dlon_deg(),
+            lat_deg,
+            lon_deg,
+        );
+        assert_eq!(
+            evaluated.vtec.to_bits(),
+            expected_bits,
+            "IONEX node lat={lat_deg} lon={lon_deg}"
+        );
+    }
 }
 
 #[test]
