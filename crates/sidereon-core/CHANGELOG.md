@@ -6,9 +6,13 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Fixed
 
-- Sample-backed SP3 interpolation now uses the same whole-second epoch-axis
-  construction as the parsed-product path. The parsed path was fixed in 0.16.1;
-  this closes the remaining `from_samples` record-node boundary case.
+- Sample-backed SP3 interpolation no longer relies on the earlier absolute
+  whole-second snap, which did not fire for real converted epochs that landed one
+  `f64` ULP below affected record seconds. The replacement reconstructs the
+  sample node axis from the split epoch before reducing it to continuous J2000
+  seconds, with only an epoch-ULP bound for accepting whole-second candidates,
+  and keeps the parsed-product record-epoch oracle from 0.16.1 on both
+  construction paths.
 
 ### Changed
 

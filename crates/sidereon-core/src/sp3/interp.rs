@@ -67,18 +67,16 @@
 //!   is split at each `E`-flagged epoch and the clock spline is fit on the
 //!   contiguous sub-arc containing the query epoch.
 
-use crate::astro::time::model::{Instant, InstantRepr};
+use crate::astro::time::model::{Instant, InstantRepr, JulianDateSplit};
 
 use crate::astro::time::civil::j2000_seconds_from_split;
-use crate::constants::{KM_TO_M, OMEGA_E_DOT_RAD_S, US_TO_S};
+use crate::constants::{J2000_JD, KM_TO_M, OMEGA_E_DOT_RAD_S, SECONDS_PER_DAY, US_TO_S};
 use crate::frame::ItrfPositionM;
 use crate::id::GnssSatelliteId;
 use crate::sp3::{Sp3, Sp3State};
 use crate::tolerances::WHOLE_SECOND_EPS_S;
 use crate::validate;
 use crate::{Error, Result};
-
-const NODE_AXIS_SPLIT_ROUNDOFF_EPS_S: f64 = 1.0e-11;
 
 /// Per-satellite precise node series in native fit units.
 #[derive(Debug, Clone, PartialEq)]
@@ -257,20 +255,82 @@ pub(super) fn sp3_epoch_j2000_seconds(source: &Sp3, idx: usize, epoch: &Instant)
     }
 }
 
-/// Convert an epoch expressed as J2000 seconds onto the SP3 interpolation node
-/// axis.
+/// Convert already-reduced J2000 seconds onto the SP3 interpolation node axis.
 ///
-/// SP3 record epochs are whole-second in normal products. Some split-Julian
-/// representations convert a whole-second epoch to `N - epsilon`; applying a
-/// raw `floor()` labels that node as `N - 1`. Snap values that are within the
-/// proven split-JD roundoff bound to the nearest whole second, and keep the
-/// gnssanalysis truncation policy for genuinely fractional epochs.
+/// This keeps the gnssanalysis truncation policy for genuinely fractional node
+/// epochs. Callers that still have a split-Julian instant should use
+/// [`precise_node_j2000_seconds_from_instant`] so whole-second record nodes can
+/// be reconstructed before reducing the epoch to one large `f64`.
 pub(super) fn precise_node_j2000_seconds(seconds: f64) -> f64 {
-    let nearest = seconds.round();
-    if (seconds - nearest).abs() <= NODE_AXIS_SPLIT_ROUNDOFF_EPS_S {
-        nearest
+    seconds.floor()
+}
+
+/// Convert a split-aware instant onto the SP3 interpolation node axis.
+///
+/// SP3 record epochs are whole-second in normal products. A split-Julian sample
+/// can reduce to the adjacent `f64` below an integer J2000 second when the day
+/// term is large. Recover the whole-second candidate from the day term and
+/// within-day second first, then accept it only when the residual is within two
+/// ULPs at the candidate epoch. Genuinely fractional epochs still use the
+/// truncating policy.
+pub(super) fn precise_node_j2000_seconds_from_instant(instant: &Instant) -> Option<f64> {
+    match instant.repr {
+        InstantRepr::JulianDate(split) => Some(precise_node_j2000_seconds_from_split(split)),
+        InstantRepr::Nanos(_) => instant_to_j2000_seconds(instant).map(precise_node_j2000_seconds),
+    }
+}
+
+fn precise_node_j2000_seconds_from_split(split: JulianDateSplit) -> f64 {
+    let seconds = j2000_seconds_from_split(split.jd_whole, split.fraction);
+    let day_seconds = (split.jd_whole - J2000_JD) * SECONDS_PER_DAY;
+    let within_day_seconds = split.fraction * SECONDS_PER_DAY;
+    let nearest_within_day = within_day_seconds.round();
+    let candidate = day_seconds + nearest_within_day;
+    if candidate.is_finite()
+        && (within_day_seconds - nearest_within_day).abs() <= 2.0 * epoch_ulp(candidate)
+    {
+        candidate
     } else {
-        seconds.floor()
+        precise_node_j2000_seconds(seconds)
+    }
+}
+
+fn epoch_ulp(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    (next_up(value) - value)
+        .abs()
+        .max((value - next_down(value)).abs())
+}
+
+fn next_up(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == -0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value.is_sign_negative() {
+        f64::from_bits(bits - 1)
+    } else {
+        f64::from_bits(bits + 1)
+    }
+}
+
+fn next_down(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value.is_sign_negative() {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
     }
 }
 
@@ -514,11 +574,10 @@ fn fitted_span_distance(arc: &ClockSplineArc, query: f64) -> f64 {
 /// *node axis* only:
 ///
 /// - **Node epochs** are quantized to whole seconds at the call site to mirror
-///   gnssanalysis `datetime2j2000` (`datetime64[s]` truncation), with
-///   values inside the split-JD roundoff bound snapped before truncation so
-///   split-Julian round-off does not move a record node by one second. SP3
-///   epochs are integer-second in practice, so this is a no-op on exact parsed
-///   axes and keeps the sample-backed path aligned with the parsed path.
+///   gnssanalysis `datetime2j2000` (`datetime64[s]` truncation). Parsed SP3
+///   nodes use the parser's exact civil-second axis, and sample nodes with a
+///   split-Julian representation reconstruct whole-second candidates before
+///   reducing the epoch to this continuous `f64` value.
 /// - The **query** is evaluated at this exact value, never quantized: truncating
 ///   a sub-second query epoch would discard up to ~1 s, a kilometre-scale
 ///   position error at orbital speed (this was a real bug - the node and query

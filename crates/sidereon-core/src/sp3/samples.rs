@@ -50,7 +50,7 @@ use crate::constants::{KM_TO_M, US_TO_S};
 use crate::id::GnssSatelliteId;
 use crate::observables::{ObservableEphemerisSource, ObservableState, ObservablesError};
 use crate::sp3::interp::{
-    instant_to_j2000_seconds, interpolate_precise_state, precise_node_j2000_seconds,
+    instant_to_j2000_seconds, interpolate_precise_state, precise_node_j2000_seconds_from_instant,
     PreciseSatSeries,
 };
 use crate::sp3::{Sp3, Sp3State};
@@ -281,7 +281,8 @@ impl PreciseEphemerisSamples {
             if !seconds.is_finite() {
                 return Err(PreciseSamplesError::EpochNotRepresentable(sample.sat));
             }
-            let xi = precise_node_j2000_seconds(seconds);
+            let xi = precise_node_j2000_seconds_from_instant(&sample.epoch)
+                .ok_or(PreciseSamplesError::EpochNotRepresentable(sample.sat))?;
 
             // SI -> file-native fit units. The single divide is the correctly
             // rounded inverse of the SP3 parser's `km * KM_TO_M` / `us * US_TO_S`
