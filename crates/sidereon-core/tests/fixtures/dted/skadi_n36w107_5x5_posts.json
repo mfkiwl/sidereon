@@ -1,0 +1,22 @@
+{
+  "schema": "skadi-srtm1-post-excerpt-v1",
+  "source": {
+    "url": "https://s3.amazonaws.com/elevation-tiles-prod/skadi/N36/N36W107.hgt.gz",
+    "tile_id": "N36W107",
+    "gzip_sha256": "89458adeb5e0f9f34526cbc24cef5487d1af514d9ee9acac98ee172f22f0b0cd",
+    "decompressed_sha256": "9abcc389e1bf518c40dad58e497834b698644a946755a9820c80a7c39aab5b58",
+    "decompressed_bytes": 25934402,
+    "sampling": "5 by 5 posts at source SRTM1 posting offsets 0, 900, 1800, 2700, and 3600 on each axis"
+  },
+  "lat_index": 36,
+  "lon_index": -107,
+  "lat_nodes_deg": [36.0, 36.25, 36.5, 36.75, 37.0],
+  "lon_nodes_deg": [-107.0, -106.75, -106.5, -106.25, -106.0],
+  "posts_m": [
+    [2169, 2667, 3054, 2173, 1820],
+    [2269, 2610, 1970, 2046, 1908],
+    [2265, 2230, 2288, 2794, 2334],
+    [2323, 2375, 2352, 3090, 2564],
+    [2538, 2450, 3038, 2976, 2448]
+  ]
+}
