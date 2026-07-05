@@ -272,6 +272,11 @@ impl AdjudicationStats {
     }
 }
 
+/// Held-out epochs near the decimated product's first and last nodes are
+/// evaluated outside the interpolation window's full support, so their errors
+/// (metre-scale, versus centimetre-scale in the interior) reflect boundary
+/// extrapolation, not interpolation quality. Both paths behave identically
+/// there; the aggregate bounds below include those epochs deliberately.
 fn score_decimation_holdout(fixture: &str) -> AdjudicationStats {
     let text = fixture_text(fixture);
     let full = Sp3::parse(text.as_bytes()).expect("parse full SP3 fixture");
