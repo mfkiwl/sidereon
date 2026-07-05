@@ -199,6 +199,9 @@ impl Sp3 {
     /// epoch as a J2000-second `f64` (`t_tx = t_rx - rho/c`) and must feed that
     /// exact value to the spline, with no Julian-date round-trip in the loop, so
     /// the interpolated position/clock match the reference recipe bit-for-bit.
+    /// The real-product decimation hold-out oracle pins the parsed-text versus
+    /// sample-backed 3D difference at no more than `4.020965667248365e-8` m
+    /// over interior held-out 5-minute records bracketed by 15-minute nodes.
     ///
     /// Errors:
     /// - [`Error::InvalidInput`] if `query` is NaN or infinite.
