@@ -9,7 +9,8 @@
 
 use nalgebra::{DMatrix, DVector};
 use sidereon_core::astro::constants::earth::WGS84_A_M;
-use sidereon_core::astro::math::vec3::{add3, norm3, scale3};
+use sidereon_core::astro::math::mat3::mul_vec3;
+use sidereon_core::astro::math::vec3::{add3, cross3, norm3, scale3};
 use sidereon_core::constants::C_M_S;
 use sidereon_core::fusion::{
     ErrorStateLayout, FusionUpdate, GnssFixMeasurement, InertialFilter, InertialFilterConfig,
@@ -19,7 +20,8 @@ use sidereon_core::fusion::{
 };
 use sidereon_core::inertial::{
     mechanize_ecef, simulate_imu_samples_from_increments, true_imu_increment_between,
-    CorrectedImuIncrement, ImuGrade, ImuSimulationOptions, ImuSpec, MechanizationConfig, NavState,
+    CorrectedImuIncrement, ImuBias, ImuGrade, ImuSimulationOptions, ImuSpec, MechanizationConfig,
+    NavState,
 };
 use sidereon_core::observables::{
     transmit_time_satellite_state, ObservableEphemerisSource, ObservableState, ObservablesError,
@@ -40,6 +42,17 @@ const VELOCITY_SIGMA_MPS: f64 = 0.21;
 const CODE_SIGMA_M: f64 = 5.2;
 const RANGE_RATE_SIGMA_MPS: f64 = 0.24;
 const MISMATCH_NOISE_SCALE: f64 = 4.0;
+const TURNTABLE_STEP_COUNT: usize = 10;
+const TURNTABLE_DT_S: f64 = 0.6;
+const TURNTABLE_YAW_RATE_RPS: f64 = 0.35;
+const TURNTABLE_LEVER_ARM_BODY_M: [f64; 3] = [5.0, -2.0, 1.0];
+const TURNTABLE_CODE_SIGMA_M: f64 = 12.0;
+const TURNTABLE_RANGE_RATE_SIGMA_MPS: f64 = 0.10;
+const TURNTABLE_GYRO_BIAS_NOMINAL_RPS: [f64; 3] = [0.012, -0.008, 0.018];
+const TURNTABLE_GYRO_BIAS_ERROR_RPS: [f64; 3] = [0.006, -0.004, 0.003];
+const TURNTABLE_GYRO_BIAS_ERROR_SIGMA_RPS: f64 = 0.0015;
+const TURNTABLE_SEED_TAG: u64 = 0x7e12_a11e_1e4e_a2b5;
+const TURNTABLE_NEES_DIMENSION: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 enum FilterKind {
@@ -185,6 +198,30 @@ fn mismatched_noise_campaign_drives_nees_outside_chi_square_band() {
     }
 }
 
+#[test]
+fn turntable_lever_arm_tight_campaign_keeps_nees_inside_chi_square_band() {
+    // Development check: flipping the range-rate gyro-bias lever-arm row in
+    // fusion/tight.rs from `-los * gyro_bias_velocity_block` to `+los * ...`
+    // drove this scenario's NEES above its chi-square band.
+    let result = run_turntable_lever_arm_ensemble();
+    assert!(
+        (result.nees_lower..=result.nees_upper).contains(&result.nees_average),
+        "tight turntable lever-arm NEES {:.17e} outside [{:.17e}, {:.17e}] at dof {}",
+        result.nees_average,
+        result.nees_lower,
+        result.nees_upper,
+        result.nees_dof
+    );
+    assert!(
+        (result.nis_lower..=result.nis_upper).contains(&result.nis_average),
+        "tight turntable lever-arm NIS {:.17e} outside [{:.17e}, {:.17e}] at dof {}",
+        result.nis_average,
+        result.nis_lower,
+        result.nis_upper,
+        result.nis_dof
+    );
+}
+
 fn run_ensemble(
     filter_kind: FilterKind,
     profile: ImuProfile,
@@ -252,16 +289,112 @@ fn run_ensemble(
     }
 }
 
+fn run_turntable_lever_arm_ensemble() -> EnsembleResult {
+    let trajectory = turntable_truth_trajectory();
+    let increments = truth_increments(&trajectory);
+    let truth = *trajectory.last().expect("final truth");
+    let body_rate_wrt_ecef_rps = turntable_body_rate_wrt_ecef_rps();
+    let final_antenna =
+        antenna_truth_kinematics(&truth, TURNTABLE_LEVER_ARM_BODY_M, body_rate_wrt_ecef_rps);
+    let source = LinearSource::from_receiver(final_antenna.position_ecef_m);
+    let spec = turntable_imu_spec();
+    let covariance_diagonal = turntable_initial_covariance_diagonal();
+    let mut nees_sum = 0.0;
+    let mut nis_sum = 0.0;
+    let mut nis_dof = 0usize;
+
+    for run in 0..RUNS_PER_SCENARIO {
+        let seed = turntable_seed(run);
+        let mut rng = SplitMix64::new(seed);
+        let initial = trajectory[0];
+        let nominal = initial_nominal(initial, &mut rng)
+            .with_biases([0.0; 3], TURNTABLE_GYRO_BIAS_NOMINAL_RPS)
+            .expect("nominal bias");
+        let true_initial_gyro_bias = add3(
+            TURNTABLE_GYRO_BIAS_NOMINAL_RPS,
+            TURNTABLE_GYRO_BIAS_ERROR_RPS,
+        );
+        let mut filter = make_filter_with_tight_config(
+            nominal,
+            spec,
+            TURNTABLE_LEVER_ARM_BODY_M,
+            &covariance_diagonal,
+        );
+        let sequence = simulate_imu_samples_from_increments(
+            &increments,
+            spec,
+            ImuSimulationOptions {
+                seed: seed ^ 0xa95c_7d63_0f5a_19b3,
+                initial_bias: ImuBias {
+                    accel_mps2: [0.0; 3],
+                    gyro_rps: true_initial_gyro_bias,
+                },
+                ..ImuSimulationOptions::default()
+            },
+        )
+        .expect("IMU sequence");
+
+        for (idx, (sample, truth_step)) in sequence
+            .samples
+            .into_iter()
+            .zip(trajectory.iter().skip(1))
+            .enumerate()
+        {
+            filter.propagate(sample).expect("propagate");
+            if idx + 1 != TURNTABLE_STEP_COUNT {
+                continue;
+            }
+            let epoch = tight_epoch_with_kinematics(
+                &source,
+                truth_step,
+                TURNTABLE_LEVER_ARM_BODY_M,
+                body_rate_wrt_ecef_rps,
+                TURNTABLE_CODE_SIGMA_M,
+                TURNTABLE_RANGE_RATE_SIGMA_MPS,
+                &mut rng,
+                1.0,
+            );
+            let update = filter.update_tight(&source, &epoch).expect("tight update");
+            nis_sum += update.nis;
+            nis_dof += update.rows;
+            assert_update_shape(update, FilterKind::Tight);
+        }
+
+        nees_sum += nees_position_velocity(&filter, &truth);
+    }
+
+    let nees_dof = RUNS_PER_SCENARIO * TURNTABLE_NEES_DIMENSION;
+    let (nees_lower, nees_upper) = chi_square_average_band(nees_dof);
+    let (nis_lower, nis_upper) = chi_square_average_band(nis_dof);
+    EnsembleResult {
+        nees_average: nees_sum / RUNS_PER_SCENARIO as f64,
+        nis_average: nis_sum / RUNS_PER_SCENARIO as f64,
+        nees_lower,
+        nees_upper,
+        nis_lower,
+        nis_upper,
+        nees_dof,
+        nis_dof,
+    }
+}
+
 fn make_filter(nominal: NavState, spec: ImuSpec) -> InertialFilter {
-    let state = InsFilterState::from_diagonal(
-        nominal,
-        ErrorStateLayout::Fifteen,
-        &initial_covariance_diagonal(),
-    )
-    .expect("filter state");
+    let covariance_diagonal = initial_covariance_diagonal();
+    make_filter_with_tight_config(nominal, spec, [0.0; 3], &covariance_diagonal)
+}
+
+fn make_filter_with_tight_config(
+    nominal: NavState,
+    spec: ImuSpec,
+    lever_arm_body_m: [f64; 3],
+    covariance_diagonal: &[f64; ERROR_STATE_DIMENSION_15],
+) -> InertialFilter {
+    let state =
+        InsFilterState::from_diagonal(nominal, ErrorStateLayout::Fifteen, covariance_diagonal)
+            .expect("filter state");
     let mut config = InertialFilterConfig::new(spec).expect("filter config");
     config.tight = TightCouplingConfig {
-        lever_arm_body_m: [0.0; 3],
+        lever_arm_body_m,
         light_time: false,
         sagnac: false,
         initial_clock_bias_variance_m2: 1.0e-6,
@@ -283,6 +416,21 @@ fn initial_covariance_diagonal() -> [f64; ERROR_STATE_DIMENSION_15] {
         diagonal[ERROR_GYRO_BIAS_INDEX + axis] = 0.0;
     }
     diagonal
+}
+
+fn turntable_initial_covariance_diagonal() -> [f64; ERROR_STATE_DIMENSION_15] {
+    let mut diagonal = initial_covariance_diagonal();
+    for axis in 0..3 {
+        diagonal[ERROR_ATTITUDE_INDEX + axis] = 1.0e-10;
+        diagonal[ERROR_ACCEL_BIAS_INDEX + axis] = 1.0e-12;
+        diagonal[ERROR_GYRO_BIAS_INDEX + axis] =
+            TURNTABLE_GYRO_BIAS_ERROR_SIGMA_RPS * TURNTABLE_GYRO_BIAS_ERROR_SIGMA_RPS;
+    }
+    diagonal
+}
+
+fn turntable_imu_spec() -> ImuSpec {
+    ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, f64::INFINITY, f64::INFINITY, None, None)
 }
 
 fn initial_nominal(truth: NavState, rng: &mut SplitMix64) -> NavState {
@@ -372,6 +520,28 @@ fn truth_trajectory(scenario: MotionScenario) -> Vec<NavState> {
     states
 }
 
+fn turntable_truth_trajectory() -> Vec<NavState> {
+    let mut states = Vec::with_capacity(TURNTABLE_STEP_COUNT + 1);
+    let position = [WGS84_A_M + 17.25, -23.5, 41.75];
+    for step in 0..=TURNTABLE_STEP_COUNT {
+        let t = step as f64 * TURNTABLE_DT_S;
+        states.push(
+            NavState::new(
+                T0_J2000_S + t,
+                position,
+                [0.0; 3],
+                yaw_body_to_ecef(TURNTABLE_YAW_RATE_RPS * t),
+            )
+            .expect("turntable truth"),
+        );
+    }
+    states
+}
+
+fn turntable_body_rate_wrt_ecef_rps() -> [f64; 3] {
+    [0.0, 0.0, TURNTABLE_YAW_RATE_RPS]
+}
+
 fn aggressive_velocity(t_s: f64) -> [f64; 3] {
     [
         14.0 * (1.7 * t_s).sin() + 3.25,
@@ -424,12 +594,36 @@ fn tight_epoch(
     rng: &mut SplitMix64,
     actual_noise_scale: f64,
 ) -> TightGnssEpoch {
+    tight_epoch_with_kinematics(
+        source,
+        truth,
+        [0.0; 3],
+        [0.0; 3],
+        CODE_SIGMA_M,
+        RANGE_RATE_SIGMA_MPS,
+        rng,
+        actual_noise_scale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tight_epoch_with_kinematics(
+    source: &LinearSource,
+    truth: &NavState,
+    lever_arm_body_m: [f64; 3],
+    body_rate_wrt_ecef_rps: [f64; 3],
+    code_sigma_m: f64,
+    range_rate_sigma_mps: f64,
+    rng: &mut SplitMix64,
+    actual_noise_scale: f64,
+) -> TightGnssEpoch {
     let options = TransmitTimeOptions {
         light_time: false,
         sagnac: false,
     };
-    let code_noise_sigma = CODE_SIGMA_M * actual_noise_scale;
-    let range_rate_noise_sigma = RANGE_RATE_SIGMA_MPS * actual_noise_scale;
+    let antenna = antenna_truth_kinematics(truth, lever_arm_body_m, body_rate_wrt_ecef_rps);
+    let code_noise_sigma = code_sigma_m * actual_noise_scale;
+    let range_rate_noise_sigma = range_rate_sigma_mps * actual_noise_scale;
     let observations = source
         .states
         .iter()
@@ -437,7 +631,7 @@ fn tight_epoch(
             let satellite = transmit_time_satellite_state(
                 source,
                 state.satellite_id,
-                truth.position_ecef_m,
+                antenna.position_ecef_m,
                 truth.t_j2000_s,
                 options,
             )
@@ -448,12 +642,12 @@ fn tight_epoch(
                     satellite_position_m: satellite.position_ecef_m,
                     satellite_velocity_m_s: satellite.velocity_m_s,
                     measured_range_rate_m_s: 0.0,
-                    sigma_m_s: RANGE_RATE_SIGMA_MPS,
+                    sigma_m_s: range_rate_sigma_mps,
                     satellite_clock_drift_m_s: 0.0,
                 },
                 ReceiverVelocityState {
-                    position_m: truth.position_ecef_m,
-                    velocity_m_s: truth.velocity_ecef_mps,
+                    position_m: antenna.position_ecef_m,
+                    velocity_m_s: antenna.velocity_ecef_mps,
                     clock_drift_m_s: 0.0,
                 },
             )
@@ -462,11 +656,11 @@ fn tight_epoch(
                 satellite_id: state.satellite_id,
                 pseudorange_m: satellite.geometric_range_m - C_M_S * state.clock_s
                     + code_noise_sigma * rng.standard_normal(),
-                pseudorange_sigma_m: CODE_SIGMA_M,
+                pseudorange_sigma_m: code_sigma_m,
                 range_rate: Some(TightRangeRateObservation {
                     measured_range_rate_m_s: range_rate.range_rate_m_s
                         + range_rate_noise_sigma * rng.standard_normal(),
-                    sigma_m_s: RANGE_RATE_SIGMA_MPS,
+                    sigma_m_s: range_rate_sigma_mps,
                     satellite_clock_drift_m_s: 0.0,
                 }),
                 carrier_phase: None,
@@ -544,6 +738,35 @@ fn identity_dcm() -> [[f64; 3]; 3] {
     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 }
 
+fn yaw_body_to_ecef(yaw_rad: f64) -> [[f64; 3]; 3] {
+    let (sin_yaw, cos_yaw) = yaw_rad.sin_cos();
+    [
+        [cos_yaw, -sin_yaw, 0.0],
+        [sin_yaw, cos_yaw, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AntennaTruthKinematics {
+    position_ecef_m: [f64; 3],
+    velocity_ecef_mps: [f64; 3],
+}
+
+fn antenna_truth_kinematics(
+    truth: &NavState,
+    lever_arm_body_m: [f64; 3],
+    body_rate_wrt_ecef_rps: [f64; 3],
+) -> AntennaTruthKinematics {
+    let lever_arm_ecef_m = mul_vec3(&truth.attitude_body_to_ecef, lever_arm_body_m);
+    let lever_velocity_body_mps = cross3(body_rate_wrt_ecef_rps, lever_arm_body_m);
+    let lever_velocity_ecef_mps = mul_vec3(&truth.attitude_body_to_ecef, lever_velocity_body_mps);
+    AntennaTruthKinematics {
+        position_ecef_m: add3(truth.position_ecef_m, lever_arm_ecef_m),
+        velocity_ecef_mps: add3(truth.velocity_ecef_mps, lever_velocity_ecef_mps),
+    }
+}
+
 fn assert_state_close(actual: &NavState, expected: &NavState, tolerance: f64) {
     for axis in 0..3 {
         assert!(
@@ -574,6 +797,10 @@ fn ensemble_seed(
     kind ^ profile.seed_tag
         ^ scenario.seed_tag()
         ^ (run as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn turntable_seed(run: usize) -> u64 {
+    TURNTABLE_SEED_TAG ^ (run as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 #[derive(Debug, Clone)]
