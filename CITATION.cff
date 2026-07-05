@@ -8,7 +8,7 @@ authors:
     given-names: "Neil"
 identifiers:
   - type: doi
-    value: "10.5281/zenodo.21174997"
+    value: "10.5281/zenodo.21174996"
     description: "Zenodo archive of sidereon 0.11.1"
 repository-code: "https://github.com/neilberkman/sidereon"
 url: "https://sidereon.dev"
