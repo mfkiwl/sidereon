@@ -70,6 +70,9 @@ impl PreciseEphemerisInterpolant {
     ///
     /// Nodes are copied from the product's native SP3 kilometer and microsecond
     /// values, matching the scalar [`Sp3::position_at_j2000_seconds`] gather.
+    /// The real-product decimation hold-out oracle pins the parsed-text versus
+    /// sample-backed 3D difference at no more than `4.020965667248365e-8` m
+    /// over interior held-out 5-minute records bracketed by 15-minute nodes.
     pub fn from_sp3(source: &Sp3) -> Self {
         let mut nodes = BTreeMap::new();
         for &sat in source.satellites() {
@@ -88,6 +91,9 @@ impl PreciseEphemerisInterpolant {
     ///
     /// This validates samples through [`PreciseEphemerisSamples::from_samples`]
     /// and then copies the prepared native-unit node series into this handle.
+    /// The real-product decimation hold-out oracle pins the sample-backed versus
+    /// parsed-text 3D difference at no more than `4.020965667248365e-8` m over
+    /// interior held-out 5-minute records bracketed by 15-minute nodes.
     pub fn from_samples(
         samples: impl IntoIterator<Item = PreciseEphemerisSample>,
     ) -> core::result::Result<Self, PreciseInterpolantError> {
