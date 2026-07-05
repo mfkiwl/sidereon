@@ -7,8 +7,13 @@
 //! and clocks are not taken from `Sp3::state`, `Sp3::position_at_j2000_seconds`,
 //! or the cached interpolant.
 
-use sidereon_core::astro::time::civil::j2000_seconds;
-use sidereon_core::ephemeris::{observable_states_at_j2000_s, PreciseEphemerisInterpolant, Sp3};
+use sidereon_core::astro::time::civil::{j2000_seconds, j2000_seconds_from_split};
+use sidereon_core::astro::time::model::{Instant, JulianDateSplit, TimeScale};
+use sidereon_core::constants::{J2000_JD, SECONDS_PER_DAY};
+use sidereon_core::ephemeris::{
+    observable_states_at_j2000_s, PreciseEphemerisInterpolant, PreciseEphemerisSample,
+    PreciseEphemerisSamples, Sp3,
+};
 use sidereon_core::{GnssSatelliteId, GnssSystem};
 
 const COD_5M_FIXTURE: &str = "tests/fixtures/sp3/COD0MGXFIN_20201770000_01D_05M_ORB.SP3";
@@ -121,6 +126,56 @@ fn floor_sensitive_45m_fixture_text() -> String {
     text
 }
 
+fn converted_epoch_one_ulp_low(scale: TimeScale, exact_j2000_s: f64) -> Instant {
+    assert!(exact_j2000_s.is_sign_positive());
+    assert_eq!(
+        (exact_j2000_s as i64).rem_euclid(2700),
+        1800,
+        "fixture epoch must be on the affected 45-minute boundary"
+    );
+    let converted = f64::from_bits(exact_j2000_s.to_bits() - 1);
+    assert_eq!(
+        (converted + 2f64.powi(-24)).to_bits(),
+        exact_j2000_s.to_bits(),
+        "reported bisection should flip the converted epoch onto the node"
+    );
+
+    let day = (converted / SECONDS_PER_DAY).floor();
+    let fraction = (converted - day * SECONDS_PER_DAY) / SECONDS_PER_DAY;
+    let split =
+        JulianDateSplit::new(J2000_JD + day, fraction).expect("valid converted split epoch");
+    assert_eq!(
+        j2000_seconds_from_split(split.jd_whole, split.fraction).to_bits(),
+        converted.to_bits(),
+        "test helper must exercise the same split-to-J2000 conversion as sample ingestion"
+    );
+    Instant::from_julian_date(scale, split)
+}
+
+fn converted_epoch_samples(records: &[TextRecord]) -> Vec<PreciseEphemerisSample> {
+    records
+        .iter()
+        .map(|record| {
+            PreciseEphemerisSample::new(
+                record.sat,
+                if record.epoch.is_boundary_node {
+                    converted_epoch_one_ulp_low(TimeScale::Gpst, record.epoch.j2000_s)
+                } else {
+                    let day = (record.epoch.j2000_s / SECONDS_PER_DAY).floor();
+                    let fraction = (record.epoch.j2000_s - day * SECONDS_PER_DAY) / SECONDS_PER_DAY;
+                    Instant::from_julian_date(
+                        TimeScale::Gpst,
+                        JulianDateSplit::new(J2000_JD + day, fraction)
+                            .expect("valid exact split epoch"),
+                    )
+                },
+                record.position_m,
+                record.clock_s,
+            )
+        })
+        .collect()
+}
+
 fn assert_record_matches(
     record: TextRecord,
     state_position_m: [f64; 3],
@@ -151,6 +206,22 @@ fn assert_record_matches(
     }
 }
 
+fn assert_record_matches_all_sample_paths(
+    record: TextRecord,
+    direct_samples: &PreciseEphemerisSamples,
+    cached_samples: &PreciseEphemerisInterpolant,
+) {
+    let direct = direct_samples
+        .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
+        .expect("direct sample-backed state at record epoch");
+    assert_record_matches(record, direct.position.as_array(), direct.clock_s);
+
+    let cached = cached_samples
+        .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
+        .expect("cached sample-backed state at record epoch");
+    assert_record_matches(record, cached.position.as_array(), cached.clock_s);
+}
+
 fn assert_state_bits_eq(
     sat: GnssSatelliteId,
     epoch_j2000_s: f64,
@@ -167,6 +238,36 @@ fn assert_state_bits_eq(
         from_samples.clock_s.map(f64::to_bits),
         "{sat} clock bits differ at {epoch_j2000_s}"
     );
+}
+
+#[test]
+fn converted_sample_epochs_match_sp3_text_oracle_at_45m_boundaries() {
+    let text = fixture_text(COD_5M_FIXTURE);
+    let sp3 = Sp3::parse(text.as_bytes()).expect("parse SP3 fixture");
+    let sat = gps(1);
+    let records: Vec<_> = text_records(&text, sat).into_iter().take(144).collect();
+    let boundary_count = records
+        .iter()
+        .filter(|record| record.epoch.is_boundary_node)
+        .count();
+    assert_eq!(
+        boundary_count, 16,
+        "fixture must retain the affected 16/144 boundary-node coverage"
+    );
+
+    let direct_samples =
+        PreciseEphemerisSamples::from_samples(converted_epoch_samples(&records)).expect("source");
+    let cached_samples =
+        PreciseEphemerisInterpolant::from_samples(converted_epoch_samples(&records))
+            .expect("sample-backed interpolant");
+
+    for record in records {
+        let parsed = sp3
+            .position_at_j2000_seconds(record.sat, record.epoch.j2000_s)
+            .expect("parsed state at record epoch");
+        assert_record_matches(record, parsed.position.as_array(), parsed.clock_s);
+        assert_record_matches_all_sample_paths(record, &direct_samples, &cached_samples);
+    }
 }
 
 #[test]

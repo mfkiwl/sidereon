@@ -19,11 +19,12 @@
 use super::{
     eval_cubic_spline_for_test as eval_spline, instant_to_j2000_seconds,
     interpolate_position_neville, precise_node_j2000_seconds,
+    precise_node_j2000_seconds_from_instant,
 };
 use crate::astro::constants::time::SECONDS_PER_DAY_I64;
 use crate::astro::time::civil::{J2000_JULIAN_DAY_NUMBER, J2000_NOON_OFFSET_S};
 use crate::astro::time::j2000_seconds_from_split;
-use crate::astro::time::model::{Instant, TimeScale};
+use crate::astro::time::model::{Instant, JulianDateSplit, TimeScale};
 use crate::astro::time::scales::julian_day_number;
 use crate::constants::{J2000_JD, SECONDS_PER_DAY};
 use crate::tolerances::WHOLE_SECOND_EPS_S;
@@ -78,9 +79,39 @@ fn small_node_count_special_cases() {
 
 #[test]
 fn node_axis_snaps_split_roundoff_but_truncates_real_fraction() {
-    assert_eq!(precise_node_j2000_seconds(-21593.000000000004), -21593.0);
+    let instant_from_j2000_seconds = |seconds: f64| {
+        let day = (seconds / SECONDS_PER_DAY).floor();
+        let fraction = (seconds - day * SECONDS_PER_DAY) / SECONDS_PER_DAY;
+        Instant::from_julian_date(
+            TimeScale::Gpst,
+            JulianDateSplit::new(J2000_JD + day, fraction).expect("valid split"),
+        )
+    };
+
+    assert_eq!(
+        precise_node_j2000_seconds_from_instant(&instant_from_j2000_seconds(-21593.000000000004))
+            .expect("split node"),
+        -21593.0
+    );
+    assert_eq!(
+        precise_node_j2000_seconds_from_instant(&instant_from_j2000_seconds(f64::from_bits(
+            830_781_000.0f64.to_bits() - 1
+        )))
+        .expect("split node"),
+        830_781_000.0
+    );
     assert_eq!(precise_node_j2000_seconds(10.99999950), 10.0);
     assert_eq!(precise_node_j2000_seconds(-10.00000050), -11.0);
+    assert_eq!(
+        precise_node_j2000_seconds_from_instant(&instant_from_j2000_seconds(10.99999950))
+            .expect("fractional split node"),
+        10.0
+    );
+    assert_eq!(
+        precise_node_j2000_seconds_from_instant(&instant_from_j2000_seconds(-10.00000050))
+            .expect("fractional split node"),
+        -11.0
+    );
 }
 
 // --- RTKLIB position parity (interior + day-boundary) ---

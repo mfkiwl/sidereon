@@ -10,9 +10,12 @@ All notable changes to `sidereon-core` are documented here.
   measured-pseudorange transmit-time model as SPP, removing centimetre-level
   frozen-state residual differences from the prior observable transmit-time
   approximation.
-- Sample-backed SP3 interpolation now uses the same whole-second epoch-axis
-  construction as the parsed-product path. The parsed path was fixed in 0.16.1;
-  this closes the remaining `from_samples` record-node boundary case.
+- Sample-backed SP3 interpolation now reconstructs the whole-second node axis
+  from the split epoch before reducing it to continuous J2000 seconds, with
+  only an epoch-ULP bound for accepting whole-second candidates. An earlier
+  attempt used an absolute snap that did not fire for real converted epochs,
+  which land one `f64` ULP below affected record seconds; the record-epoch
+  oracle now runs a conversion-path fixture on both construction paths.
 
 ### Changed
 
