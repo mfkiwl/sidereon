@@ -10,7 +10,10 @@ pub use crate::fusion::{
     TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
 };
 pub use crate::id::{GnssSatelliteId, GnssSystem};
-pub use crate::positioning::{solve, Corrections, Observation, Solution, SolveInputs};
+pub use crate::positioning::{
+    solve, solve_static, Corrections, Observation, Solution, SolveInputs, StaticEpoch,
+    StaticSolution, StaticSolveOptions,
+};
 pub use crate::sidereal::{
     orbit_repeat_lag, repeat_period, sidereal_filter, SiderealFilterOptions, SiderealFilterOutput,
     SiderealTemplateMethod,

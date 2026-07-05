@@ -747,7 +747,7 @@ pub(crate) enum SppIonosphere<'a> {
 /// `beidou_klobuchar` (`BDSA`/`BDSB`) set when present; all missing
 /// constellation-specific sets fall back to the shared GPS Klobuchar values to
 /// preserve existing callers.
-fn ionosphere_for<'a>(system: GnssSystem, inputs: &'a SolveInputs) -> SppIonosphere<'a> {
+pub(crate) fn ionosphere_for<'a>(system: GnssSystem, inputs: &'a SolveInputs) -> SppIonosphere<'a> {
     if let Some(grid) = inputs
         .sbas_iono
         .as_ref()
@@ -1750,7 +1750,7 @@ fn redundancy(systems: &[GnssSystem], used_count: usize) -> isize {
     used_count as isize - (3 + systems.len() as isize)
 }
 
-fn validate_solve_inputs(inputs: &SolveInputs) -> Result<(), SppError> {
+pub(crate) fn validate_solve_inputs(inputs: &SolveInputs) -> Result<(), SppError> {
     validate::finite(inputs.t_rx_j2000_s, "t_rx_j2000_s").map_err(map_input_error)?;
     validate::second_of_day(inputs.t_rx_second_of_day_s, "t_rx_second_of_day_s")
         .map_err(map_input_error)?;
