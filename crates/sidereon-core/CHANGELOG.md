@@ -2,6 +2,20 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [0.15.1]
+
+### Fixed
+
+- SP3 precise-ephemeris evaluation now keeps satellite clocks at the full SP3
+  text precision through parser, interpolant, and batched observable-state paths.
+  The 0.15.0 wheel could return clocks quantized to whole microseconds, up to
+  just under one microsecond, about 300 meters of range per satellite. Any
+  consumer using SP3 clock or state evaluation should update.
+- SP3 interpolation now uses an exact parsed J2000-second epoch axis for record
+  nodes, preventing one-second node bucketing errors at affected 45-minute
+  cadence boundaries. Record-epoch positions and clocks are now gated directly
+  against public SP3 text records, including the cached batch path.
+
 ## [0.11.1]
 
 ### Added

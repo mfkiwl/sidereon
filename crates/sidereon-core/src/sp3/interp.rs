@@ -37,12 +37,14 @@
 //! own time scale), exactly as gnssanalysis builds them in `datetime2j2000`
 //! (`gn_datetime.py:286-288`): epochs floored to whole seconds, differenced
 //! against the J2000 origin, kept as `i64`, then promoted to `f64` on entry to
-//! the spline. This module reconstructs the same `i64`-seconds axis from the
-//! parser's [`Instant`] epochs (NOT fractional JD, NOT nanoseconds), so the
-//! spline coefficients are bit-identical.
+//! the spline. The parser stores that seconds axis from the epoch record's civil
+//! fields with integer whole-second arithmetic, so node bucketing does not
+//! depend on a split-Julian floating round trip. If a caller mutates the public
+//! [`Sp3::epochs`] vector, interpolation falls back to the public epoch when it
+//! no longer matches the parsed axis within the shared whole-second tolerance.
 //!
-//! J2000 = JD 2451545.0. Seconds-since-J2000 for a split JD `(whole, frac)` is
-//! computed in a cancellation-safe way and floored to whole seconds.
+//! J2000 = JD 2451545.0. Query seconds from [`Sp3::position`] are computed from
+//! the supplied [`Instant`] in a cancellation-safe way and are never floored.
 //!
 //! # Units
 //!
@@ -72,6 +74,7 @@ use crate::constants::{KM_TO_M, OMEGA_E_DOT_RAD_S, US_TO_S};
 use crate::frame::ItrfPositionM;
 use crate::id::GnssSatelliteId;
 use crate::sp3::{Sp3, Sp3State};
+use crate::tolerances::WHOLE_SECOND_EPS_S;
 use crate::validate;
 use crate::{Error, Result};
 
@@ -106,17 +109,15 @@ impl Sp3 {
     /// The product's parsed epochs as seconds since J2000, in the file's own time
     /// scale, ascending.
     ///
-    /// This is the exact query axis [`Sp3::position_at_j2000_seconds`] interpolates
-    /// against (each epoch converted by the same [`instant_to_j2000_seconds`] used
-    /// for the spline nodes, NOT floored), so a caller can read the grid here, form
-    /// query times on it, and feed them straight back without a Julian-date
-    /// round-trip. An epoch whose representation cannot be mapped to J2000 seconds
-    /// is skipped (SP3 epochs are always Julian-date, so on real data this returns
-    /// one value per epoch).
+    /// This is the exact query axis [`Sp3::position_at_j2000_seconds`] uses for
+    /// parsed record nodes, so a caller can read the grid here, form query times
+    /// on it, and feed them straight back without a Julian-date round trip. An
+    /// unmodified parsed product returns one value per epoch.
     pub fn epochs_j2000_seconds(&self) -> Vec<f64> {
         self.epochs
             .iter()
-            .filter_map(instant_to_j2000_seconds)
+            .enumerate()
+            .filter_map(|(idx, epoch)| sp3_epoch_j2000_seconds(self, idx, epoch))
             .collect()
     }
 
@@ -187,7 +188,7 @@ pub(super) fn gather_sp3_precise_series(source: &Sp3, sat: GnssSatelliteId) -> P
     for (idx, ep) in source.epochs.iter().enumerate() {
         // Node axis: floored to whole seconds to match gnssanalysis
         // datetime2j2000. The query is never floored.
-        let xi = match instant_to_j2000_seconds(ep) {
+        let xi = match sp3_epoch_j2000_seconds(source, idx, ep) {
             Some(v) => v.floor(),
             None => continue,
         };
@@ -207,6 +208,16 @@ pub(super) fn gather_sp3_precise_series(source: &Sp3, sat: GnssSatelliteId) -> P
     }
 
     series
+}
+
+pub(super) fn sp3_epoch_j2000_seconds(source: &Sp3, idx: usize, epoch: &Instant) -> Option<f64> {
+    let public_seconds = instant_to_j2000_seconds(epoch)?;
+    let parsed_seconds = *source.epoch_j2000_s.get(idx)?;
+    if (public_seconds - parsed_seconds).abs() <= WHOLE_SECOND_EPS_S {
+        Some(parsed_seconds)
+    } else {
+        Some(public_seconds)
+    }
 }
 
 /// Interpolate a satellite state from already-gathered native-unit nodes.
