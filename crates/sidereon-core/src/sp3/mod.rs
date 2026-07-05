@@ -47,7 +47,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::astro::time::civil::split_julian_date;
+use crate::astro::time::civil::{j2000_seconds, split_julian_date};
 use crate::astro::time::model::{Instant, InstantRepr, JulianDateSplit, TimeScale};
 
 use crate::constants::{KM_TO_M, US_TO_S};
@@ -295,6 +295,10 @@ pub struct Sp3 {
     pub header: Sp3Header,
     /// Epochs in ascending time order, tagged with the header time scale.
     pub epochs: Vec<Instant>,
+    /// Exact seconds since J2000 for each parsed epoch, in the product time
+    /// scale, formed from the epoch record's civil fields with integer
+    /// whole-second arithmetic.
+    epoch_j2000_s: Vec<f64>,
     /// `epoch_index -> (satellite -> state)`. Parallel to [`Sp3::epochs`].
     states: Vec<BTreeMap<GnssSatelliteId, Sp3State>>,
     /// `epoch_index -> (satellite -> native-unit node)`. Parallel to
@@ -489,6 +493,7 @@ struct Parser {
     /// Epoch currently being filled.
     current_epoch: Option<Instant>,
     epochs: Vec<Instant>,
+    epoch_j2000_s: Vec<f64>,
     states: Vec<BTreeMap<GnssSatelliteId, Sp3State>>,
     interp_raw: Vec<BTreeMap<GnssSatelliteId, RawNode>>,
     comments: Vec<String>,
@@ -521,6 +526,7 @@ impl Parser {
             have_line2: false,
             current_epoch: None,
             epochs: Vec::new(),
+            epoch_j2000_s: Vec::new(),
             states: Vec::new(),
             interp_raw: Vec::new(),
             comments: Vec::new(),
@@ -779,11 +785,20 @@ impl Parser {
         )
         .map_err(|error| map_field_error(error, line))?;
         let split = civil_to_julian_split(civil)?;
+        let epoch_j2000_s = j2000_seconds(
+            civil.year as i32,
+            civil.month as i32,
+            civil.day as i32,
+            civil.hour as i32,
+            civil.minute as i32,
+            civil.second,
+        );
         let epoch = Instant {
             scale,
             repr: InstantRepr::JulianDate(split),
         };
         self.epochs.push(epoch);
+        self.epoch_j2000_s.push(epoch_j2000_s);
         self.states.push(BTreeMap::new());
         self.interp_raw.push(BTreeMap::new());
         self.current_epoch = Some(epoch);
@@ -980,6 +995,7 @@ impl Parser {
         Ok(Sp3 {
             header,
             epochs: self.epochs,
+            epoch_j2000_s: self.epoch_j2000_s,
             states: self.states,
             interp_raw: self.interp_raw,
             comments: self.comments,

@@ -20,7 +20,7 @@ use crate::astro::time::civil::mjd_from_jd;
 use crate::astro::time::gnss;
 use crate::astro::time::model::Instant;
 
-use super::interp::instant_to_j2000_seconds;
+use super::interp::{instant_to_j2000_seconds, sp3_epoch_j2000_seconds};
 use super::{RawNode, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State};
 use crate::constants::{GPS_EPOCH_TO_J2000_S, KM_TO_M};
 use crate::frame::ItrfPositionM;
@@ -76,7 +76,7 @@ pub fn clock_reference_offset(
 ) -> Vec<ClockReferenceOffset> {
     let mut other_index: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
     for (idx, epoch) in other.epochs.iter().enumerate() {
-        if let Some(seconds) = instant_to_j2000_seconds(epoch) {
+        if let Some(seconds) = sp3_epoch_j2000_seconds(other, idx, epoch) {
             other_index.insert(seconds.floor() as i64, idx);
         }
     }
@@ -84,7 +84,7 @@ pub fn clock_reference_offset(
     let mut offsets = Vec::new();
 
     for (ref_idx, epoch) in reference.epochs.iter().enumerate() {
-        let Some(ref_seconds) = instant_to_j2000_seconds(epoch) else {
+        let Some(ref_seconds) = sp3_epoch_j2000_seconds(reference, ref_idx, epoch) else {
             continue;
         };
         let Some(&other_idx) = other_index.get(&(ref_seconds.floor() as i64)) else {
@@ -510,7 +510,7 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
                 .iter()
                 .enumerate()
                 .filter_map(|(i, ep)| {
-                    instant_to_j2000_seconds(ep).map(|sec| (sec.floor() as i64, i))
+                    sp3_epoch_j2000_seconds(s, i, ep).map(|sec| (sec.floor() as i64, i))
                 })
                 .collect()
         })
@@ -545,7 +545,10 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
     let mut epoch_keys: BTreeMap<i64, Instant> = sources[0]
         .epochs
         .iter()
-        .filter_map(|ep| instant_to_j2000_seconds(ep).map(|sec| (sec.floor() as i64, *ep)))
+        .enumerate()
+        .filter_map(|(idx, ep)| {
+            sp3_epoch_j2000_seconds(&sources[0], idx, ep).map(|sec| (sec.floor() as i64, *ep))
+        })
         .collect();
 
     for index in epoch_index.iter().skip(1) {
@@ -596,6 +599,7 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
     }
 
     let mut out_epochs: Vec<Instant> = Vec::with_capacity(epoch_keys.len());
+    let mut out_epoch_j2000_s: Vec<f64> = Vec::with_capacity(epoch_keys.len());
     let mut out_states: Vec<BTreeMap<GnssSatelliteId, Sp3State>> =
         Vec::with_capacity(epoch_keys.len());
     let mut out_raw: Vec<BTreeMap<GnssSatelliteId, RawNode>> = Vec::with_capacity(epoch_keys.len());
@@ -604,6 +608,7 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
 
     for (&key, &epoch) in &epoch_keys {
         out_epochs.push(epoch);
+        out_epoch_j2000_s.push(key as f64);
         let mut states: BTreeMap<GnssSatelliteId, Sp3State> = BTreeMap::new();
         let mut raws: BTreeMap<GnssSatelliteId, RawNode> = BTreeMap::new();
 
@@ -830,14 +835,14 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
     // header fields from the merged grid itself. Mixed cadence / coverage can make
     // the merged first epoch later than every input's first epoch, so cloning
     // those fields from any input would make the `##` line stale.
-    let first_key = instant_to_j2000_seconds(&out_epochs[0]).map(|s| s.floor() as i64);
+    let first_key = Some(out_epoch_j2000_s[0].floor() as i64);
     let base_idx = sources
         .iter()
         .position(|s| {
             s.epochs
                 .first()
-                .and_then(instant_to_j2000_seconds)
-                .map(|s| s.floor() as i64)
+                .and_then(|ep| sp3_epoch_j2000_seconds(s, 0, ep))
+                .map(|sec| sec.floor() as i64)
                 == first_key
         })
         .or_else(|| {
@@ -847,7 +852,7 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
                 .filter_map(|(i, s)| {
                     s.epochs
                         .first()
-                        .and_then(instant_to_j2000_seconds)
+                        .and_then(|ep| sp3_epoch_j2000_seconds(s, 0, ep))
                         .map(|sec| (sec, i))
                 })
                 .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
@@ -894,6 +899,7 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
     let merged = Sp3 {
         header,
         epochs: out_epochs,
+        epoch_j2000_s: out_epoch_j2000_s,
         states: out_states,
         interp_raw: out_raw,
         comments: vec![format!("MERGED from {} SP3 products", sources.len())],
@@ -1272,7 +1278,7 @@ pub fn align_clock_reference(reference: &Sp3, other: &Sp3, min_common: usize) ->
 
     let mut aligned = other.clone();
     for ei in 0..aligned.epochs.len() {
-        let Some(sec) = instant_to_j2000_seconds(&aligned.epochs[ei]) else {
+        let Some(sec) = sp3_epoch_j2000_seconds(&aligned, ei, &aligned.epochs[ei]) else {
             continue;
         };
         let Some(&off) = offsets.get(&(sec.floor() as i64)) else {

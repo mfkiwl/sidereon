@@ -25,7 +25,8 @@ use crate::astro::time::civil::{J2000_JULIAN_DAY_NUMBER, J2000_NOON_OFFSET_S};
 use crate::astro::time::j2000_seconds_from_split;
 use crate::astro::time::model::{Instant, TimeScale};
 use crate::astro::time::scales::julian_day_number;
-use crate::constants::J2000_JD;
+use crate::constants::{J2000_JD, SECONDS_PER_DAY};
+use crate::tolerances::WHOLE_SECOND_EPS_S;
 use crate::Error;
 
 /// Sub-centimetre agreement bound for the RTKLIB position parity (3D component
@@ -340,6 +341,50 @@ fn position_same_scale_matches_direct_j2000_query() {
         .expect("direct J2000 query succeeds");
 
     assert_eq!(via_instant, via_seconds);
+}
+
+#[test]
+fn parsed_epoch_axis_ignores_tiny_split_jd_roundoff() {
+    use super::super::Sp3;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sp3/COD0MGXFIN_20201770000_01D_05M_ORB.SP3"
+    );
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read IGS SP3 fixture {path}: {e}"));
+    let mut sp3 = Sp3::parse(&bytes).expect("parse IGS SP3");
+    let sat = id_for("G01");
+    let epoch_index = 6usize;
+    let query = sp3.epochs_j2000_seconds()[epoch_index];
+    let record = sp3
+        .state(sat, epoch_index)
+        .expect("record state before epoch perturbation");
+
+    let split = sp3.epochs[epoch_index]
+        .julian_date()
+        .expect("SP3 epochs are Julian-date");
+    let perturbed_fraction = split.fraction - 0.25 * WHOLE_SECOND_EPS_S / SECONDS_PER_DAY;
+    sp3.epochs[epoch_index] = Instant::from_julian_date(
+        TimeScale::Gpst,
+        crate::astro::time::model::JulianDateSplit::new(split.jd_whole, perturbed_fraction)
+            .expect("valid perturbed split"),
+    );
+
+    let got = sp3
+        .position_at_j2000_seconds(sat, query)
+        .expect("record-epoch interpolation");
+    for axis in 0..3 {
+        let delta_m = (got.position.as_array()[axis] - record.position.as_array()[axis]).abs();
+        assert!(
+            delta_m <= 5.0e-4,
+            "axis {axis} differs from record by {delta_m:e} m"
+        );
+    }
+    let clock_delta_s = (got.clock_s.expect("clock") - record.clock_s.expect("clock")).abs();
+    assert!(
+        clock_delta_s <= 5.0e-13,
+        "clock differs from record by {clock_delta_s:e} s"
+    );
 }
 
 /// Near-gap: the crate restricts the Lagrange window to the contiguous run and
