@@ -1,4 +1,7 @@
-use sidereon::ephemeris::{sample, EphemerisSampleStatus, Sp3};
+use sidereon::ephemeris::{
+    sample, EphemerisSampleStatus, MmapPreciseEphemerisInterpolant, PreciseEphemerisInterpolant,
+    Sp3,
+};
 use sidereon::{
     emission_media_batch_at_j2000_s, EmissionMediaBatchOptions, EmissionMediaStatus,
     GnssSatelliteId, GnssSystem,
@@ -43,4 +46,37 @@ fn facade_reexports_emission_media_batch() {
     assert_eq!(batch.clocks_s[0], Some(0.0));
     assert_eq!(batch.ionosphere_slant_delays_m[0], Some(0.0));
     assert_eq!(batch.troposphere_delays_m[0], Some(0.0));
+}
+
+#[test]
+fn facade_reexports_precise_interpolant_store() {
+    let sp3 = Sp3::parse(DEGENERATE_SP3).expect("parse SP3 fixture");
+    let memory = PreciseEphemerisInterpolant::from_sp3(&sp3);
+    let store_bytes = memory
+        .to_mmap_store_bytes()
+        .expect("build precise interpolant store");
+    let mapped =
+        MmapPreciseEphemerisInterpolant::from_bytes(&store_bytes).expect("open mapped store");
+    let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid G01");
+    let epoch = sp3.epochs_j2000_seconds()[0];
+
+    let got = mapped
+        .position_at_j2000_seconds(sat, epoch)
+        .expect("mapped facade evaluation");
+    let want = memory
+        .position_at_j2000_seconds(sat, epoch)
+        .expect("in-memory facade evaluation");
+
+    assert_eq!(
+        got.position.as_array().map(f64::to_bits),
+        want.position.as_array().map(f64::to_bits)
+    );
+    assert_eq!(
+        got.clock_s.map(f64::to_bits),
+        want.clock_s.map(f64::to_bits)
+    );
+    assert_eq!(
+        sidereon::precise_interpolant_store_checksum64(&store_bytes),
+        mapped.checksum64()
+    );
 }

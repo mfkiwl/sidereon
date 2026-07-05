@@ -8,7 +8,8 @@ use crate::observables::{
     ObservableEphemerisSource, ObservableState, ObservableStateBatch, ObservablesError,
 };
 use crate::sp3::interp::{
-    gather_sp3_precise_series, instant_to_j2000_seconds, interpolate_precise_state,
+    fit_clock_spline_arcs, gather_sp3_precise_series, instant_to_j2000_seconds,
+    interpolate_precise_state, interpolate_precise_state_with_clock_arcs, ClockSplineArc,
     PreciseSatSeries,
 };
 use crate::sp3::{
@@ -48,7 +49,20 @@ impl From<PreciseSamplesError> for PreciseInterpolantError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreciseEphemerisInterpolant {
     time_scale: TimeScale,
-    nodes: BTreeMap<GnssSatelliteId, PreciseSatSeries>,
+    pub(super) nodes: BTreeMap<GnssSatelliteId, FittedPreciseSatSeries>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct FittedPreciseSatSeries {
+    pub(super) series: PreciseSatSeries,
+    pub(super) clock_arcs: Vec<ClockSplineArc>,
+}
+
+impl FittedPreciseSatSeries {
+    pub(super) fn new(series: PreciseSatSeries) -> Self {
+        let clock_arcs = fit_clock_spline_arcs(&series.clk);
+        Self { series, clock_arcs }
+    }
 }
 
 impl PreciseEphemerisInterpolant {
@@ -61,7 +75,7 @@ impl PreciseEphemerisInterpolant {
         for &sat in source.satellites() {
             let series = gather_sp3_precise_series(source, sat);
             if !series.x.is_empty() {
-                nodes.insert(sat, series);
+                nodes.insert(sat, FittedPreciseSatSeries::new(series));
             }
         }
         Self {
@@ -85,13 +99,21 @@ impl PreciseEphemerisInterpolant {
     pub fn from_precise_ephemeris_samples(source: &PreciseEphemerisSamples) -> Self {
         Self {
             time_scale: source.time_scale(),
-            nodes: source.node_series().clone(),
+            nodes: source
+                .node_series()
+                .iter()
+                .map(|(&sat, series)| (sat, FittedPreciseSatSeries::new(series.clone())))
+                .collect(),
         }
     }
 
     /// The time scale of the source epochs used to build this handle.
     pub fn time_scale(&self) -> TimeScale {
         self.time_scale
+    }
+
+    pub(super) fn node_series(&self) -> &BTreeMap<GnssSatelliteId, FittedPreciseSatSeries> {
+        &self.nodes
     }
 
     /// The satellites this handle can interpolate, in ascending order.
@@ -109,13 +131,13 @@ impl PreciseEphemerisInterpolant {
         static EMPTY_F64: [f64; 0] = [];
         static EMPTY_CLK: [(f64, f64, bool); 0] = [];
         match self.nodes.get(&sat) {
-            Some(series) => interpolate_precise_state(
+            Some(fitted) => interpolate_precise_state_with_clock_arcs(
                 sat,
-                &series.x,
-                &series.kx,
-                &series.ky,
-                &series.kz,
-                &series.clk,
+                &fitted.series.x,
+                &fitted.series.kx,
+                &fitted.series.ky,
+                &fitted.series.kz,
+                &fitted.clock_arcs,
                 query,
             ),
             None => interpolate_precise_state(
