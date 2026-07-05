@@ -73,6 +73,66 @@ pub struct ObservableStateBatch {
     pub element_results: Vec<Result<(), ObservablesError>>,
 }
 
+/// Per-satellite status for an emission-epoch state/media batch row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmissionMediaStatus {
+    /// The row contains state, clock, ionosphere, and troposphere outputs.
+    Valid,
+    /// The ephemeris product has no usable state for this satellite and epoch.
+    Gap,
+    /// The row had a state, but its elevation was below the requested cutoff.
+    BelowElevationCutoff,
+    /// The scalar evaluator returned a non-gap error.
+    Error,
+}
+
+/// Options for [`emission_media_batch_at_j2000_s`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmissionMediaBatchOptions<'a> {
+    /// Carrier frequency used for ionospheric group delay, hertz.
+    pub carrier_hz: f64,
+    /// Troposphere and ionosphere correction options.
+    pub media: ObservableMediaOptions<'a>,
+    /// Optional minimum topocentric elevation, radians.
+    ///
+    /// Rows below this cutoff keep the satellite state and clock, set both media
+    /// delays to `None`, and receive [`EmissionMediaStatus::BelowElevationCutoff`].
+    pub min_elevation_rad: Option<f64>,
+}
+
+impl Default for EmissionMediaBatchOptions<'_> {
+    fn default() -> Self {
+        Self {
+            carrier_hz: F_L1_HZ,
+            media: ObservableMediaOptions::default(),
+            min_elevation_rad: None,
+        }
+    }
+}
+
+/// Contiguous per-satellite outputs for emission-epoch state and media lookup.
+///
+/// Element `i` of every vector belongs to input satellite `i`. Missing product
+/// coverage is represented loudly: the status is [`EmissionMediaStatus::Gap`],
+/// the error is retained, and every value field is `None`. No missing row is
+/// written as zero. A valid zero can still appear inside `Some(0.0)` when the
+/// selected scalar model genuinely returns zero or a correction is disabled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmissionMediaBatch {
+    /// Satellite ECEF positions in meters, one entry per input element.
+    pub positions_ecef_m: Vec<Option<[f64; 3]>>,
+    /// Satellite clock offsets in seconds, one entry per input element.
+    pub clocks_s: Vec<Option<f64>>,
+    /// Ionospheric slant group delays in meters, one entry per input element.
+    pub ionosphere_slant_delays_m: Vec<Option<f64>>,
+    /// Tropospheric slant delays in meters, one entry per input element.
+    pub troposphere_delays_m: Vec<Option<f64>>,
+    /// Per-element typed status.
+    pub statuses: Vec<EmissionMediaStatus>,
+    /// Per-element non-success error, if any.
+    pub element_errors: Vec<Option<ObservablesError>>,
+}
+
 /// An ephemeris product usable by [`predict`].
 pub trait ObservableEphemerisSource {
     /// ECEF position and optional satellite clock at seconds since J2000.
@@ -302,6 +362,76 @@ impl ObservableStateBatch {
                 self.element_results.push(Err(error));
             }
         }
+    }
+}
+
+impl EmissionMediaBatch {
+    /// Build an empty batch with capacity for `capacity` elements.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            positions_ecef_m: Vec::with_capacity(capacity),
+            clocks_s: Vec::with_capacity(capacity),
+            ionosphere_slant_delays_m: Vec::with_capacity(capacity),
+            troposphere_delays_m: Vec::with_capacity(capacity),
+            statuses: Vec::with_capacity(capacity),
+            element_errors: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Number of elements in the batch.
+    pub fn len(&self) -> usize {
+        self.statuses.len()
+    }
+
+    /// Whether the batch contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.statuses.is_empty()
+    }
+
+    /// Status category for element `index`.
+    ///
+    /// Returns `None` when `index` is out of range.
+    pub fn element_status(&self, index: usize) -> Option<EmissionMediaStatus> {
+        self.statuses.get(index).copied()
+    }
+
+    fn push_valid(&mut self, state: ObservableState, media: AppliedMediaCorrections) {
+        self.positions_ecef_m.push(Some(state.position_ecef_m));
+        self.clocks_s.push(state.clock_s);
+        self.ionosphere_slant_delays_m
+            .push(Some(media.ionosphere_m));
+        self.troposphere_delays_m.push(Some(media.troposphere_m));
+        self.statuses.push(EmissionMediaStatus::Valid);
+        self.element_errors.push(None);
+    }
+
+    fn push_gap(&mut self, error: ObservablesError) {
+        self.positions_ecef_m.push(None);
+        self.clocks_s.push(None);
+        self.ionosphere_slant_delays_m.push(None);
+        self.troposphere_delays_m.push(None);
+        self.statuses.push(EmissionMediaStatus::Gap);
+        self.element_errors.push(Some(error));
+    }
+
+    fn push_below_cutoff(&mut self, state: ObservableState) {
+        self.positions_ecef_m.push(Some(state.position_ecef_m));
+        self.clocks_s.push(state.clock_s);
+        self.ionosphere_slant_delays_m.push(None);
+        self.troposphere_delays_m.push(None);
+        self.statuses
+            .push(EmissionMediaStatus::BelowElevationCutoff);
+        self.element_errors.push(None);
+    }
+
+    fn push_error(&mut self, state: Option<ObservableState>, error: ObservablesError) {
+        self.positions_ecef_m
+            .push(state.map(|state| state.position_ecef_m));
+        self.clocks_s.push(state.and_then(|state| state.clock_s));
+        self.ionosphere_slant_delays_m.push(None);
+        self.troposphere_delays_m.push(None);
+        self.statuses.push(EmissionMediaStatus::Error);
+        self.element_errors.push(Some(error));
     }
 }
 
@@ -643,6 +773,98 @@ pub fn observable_states_at_shared_j2000_s(
     epoch_j2000_s: f64,
 ) -> ObservableStateBatch {
     source.observable_states_at_shared_j2000_s(satellites, epoch_j2000_s)
+}
+
+/// Evaluate satellite emission-epoch states, clocks, and media delays in one call.
+///
+/// `satellites[i]` is evaluated at `emission_epochs_j2000_s[i]`. For each row,
+/// the function first calls the same scalar
+/// [`ObservableEphemerisSource::observable_state_at_j2000_s`] path used by the
+/// public state APIs. When a state is available, it derives topocentric geometry
+/// from `receiver_ecef_m` and delegates the ionosphere/troposphere work to
+/// [`observable_media_corrections`]. The output vectors are index-aligned with
+/// the inputs.
+///
+/// Missing ephemeris coverage is not zero-filled: it is returned as
+/// [`EmissionMediaStatus::Gap`] with all value fields set to `None` and the
+/// scalar gap error retained in [`EmissionMediaBatch::element_errors`]. A length
+/// mismatch is the only shape-level error.
+pub fn emission_media_batch_at_j2000_s(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    receiver_ecef_m: [f64; 3],
+    options: EmissionMediaBatchOptions<'_>,
+) -> Result<EmissionMediaBatch, ObservablesError> {
+    if satellites.len() != emission_epochs_j2000_s.len() {
+        return Err(ObservablesError::InvalidInput {
+            field: "emission_epochs_j2000_s",
+            kind: ObservablesInputErrorKind::OutOfRange,
+        });
+    }
+    validate::finite_vec3(receiver_ecef_m, "receiver_ecef_m").map_err(map_input_error)?;
+    validate_emission_media_batch_options(options)?;
+
+    let mut batch = EmissionMediaBatch::with_capacity(satellites.len());
+    for (&sat, &emission_epoch_j2000_s) in satellites.iter().zip(emission_epochs_j2000_s.iter()) {
+        let state = match source.observable_state_at_j2000_s(sat, emission_epoch_j2000_s) {
+            Ok(state) => state,
+            Err(error) if is_observable_state_gap(&error) => {
+                batch.push_gap(error);
+                continue;
+            }
+            Err(error) => {
+                batch.push_error(None, error);
+                continue;
+            }
+        };
+
+        if let Err(error) = validate_observable_state(&state) {
+            batch.push_error(Some(state), error);
+            continue;
+        }
+
+        let dx = state.position_ecef_m[0] - receiver_ecef_m[0];
+        let dy = state.position_ecef_m[1] - receiver_ecef_m[1];
+        let dz = state.position_ecef_m[2] - receiver_ecef_m[2];
+        let line_of_sight_m = [dx, dy, dz];
+        let range = match geometric_range_m(line_of_sight_m) {
+            Ok(range) => range,
+            Err(error) => {
+                batch.push_error(Some(state), error);
+                continue;
+            }
+        };
+        let topocentric = match topocentric(receiver_ecef_m, line_of_sight_m, range) {
+            Ok(topocentric) => topocentric,
+            Err(error) => {
+                batch.push_error(Some(state), error);
+                continue;
+            }
+        };
+
+        if options
+            .min_elevation_rad
+            .is_some_and(|cutoff| topocentric.elevation_rad < cutoff)
+        {
+            batch.push_below_cutoff(state);
+            continue;
+        }
+
+        let media = observable_media_corrections(
+            topocentric.receiver,
+            topocentric.elevation_rad,
+            topocentric.azimuth_rad,
+            emission_epoch_j2000_s,
+            options.carrier_hz,
+            options.media,
+        );
+        match media {
+            Ok(media) => batch.push_valid(state, media),
+            Err(error) => batch.push_error(Some(state), error),
+        }
+    }
+    Ok(batch)
 }
 
 /// Evaluate a satellite's transmit-time ECEF state for one static receiver.
@@ -1190,6 +1412,25 @@ fn validate_transmit_time_inputs(
 ) -> Result<(), ObservablesError> {
     validate::finite_vec3(receiver_ecef_m, "receiver_ecef_m").map_err(map_input_error)?;
     validate::finite(t_rx_j2000_s, "t_rx_j2000_s").map_err(map_input_error)?;
+    Ok(())
+}
+
+fn validate_emission_media_batch_options(
+    options: EmissionMediaBatchOptions<'_>,
+) -> Result<(), ObservablesError> {
+    if options.media.needs_carrier() {
+        validate::finite_positive(options.carrier_hz, "options.carrier_hz")
+            .map_err(map_input_error)?;
+    }
+    if let Some(cutoff) = options.min_elevation_rad {
+        validate::finite(cutoff, "options.min_elevation_rad").map_err(map_input_error)?;
+        if !(0.0..=core::f64::consts::FRAC_PI_2).contains(&cutoff) {
+            return Err(invalid_observable_input(
+                "options.min_elevation_rad",
+                ObservablesInputErrorKind::OutOfRange,
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -211,10 +211,11 @@ pub use inertial::{
     WGS84_NORMAL_GRAVITY_POLE_MPS2, WGS84_SOMIGLIANA_K,
 };
 pub use observables::{
-    observable_media_corrections, predict_batch_with_media, predict_batch_with_media_parallel,
-    predict_ranges_with_media, predict_with_media, AppliedMediaCorrections, MediaPredictOptions,
-    MediaPredictedObservables, MediaRangePrediction, ObservableIonosphereCorrection,
-    ObservableMediaOptions, ObservableTroposphereCorrection,
+    emission_media_batch_at_j2000_s, observable_media_corrections, predict_batch_with_media,
+    predict_batch_with_media_parallel, predict_ranges_with_media, predict_with_media,
+    AppliedMediaCorrections, EmissionMediaBatch, EmissionMediaBatchOptions, EmissionMediaStatus,
+    MediaPredictOptions, MediaPredictedObservables, MediaRangePrediction,
+    ObservableIonosphereCorrection, ObservableMediaOptions, ObservableTroposphereCorrection,
 };
 pub use sbas_pl::{
     sbas_protection_levels, AirborneModel, DegradationParams, ProtectionGeometry, ProtectionRow,
