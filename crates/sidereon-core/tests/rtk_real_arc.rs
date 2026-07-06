@@ -22,10 +22,12 @@ use sidereon_core::rtk::{
     ElevationMaskEpoch, IonosphereFreeBaselineResult, Observation, WideLaneOptions,
 };
 use sidereon_core::rtk_filter::{
-    solve_fixed_baseline, solve_float_baseline, update_epoch, AmbiguityScale, AmbiguitySet,
-    DynamicsModel, Epoch, EpochUpdate, FilterState, FixedSolveOpts, FloatPrior, FloatSolveOpts,
-    MeasModel, ReceiverAntennaCalibration, ReceiverAntennaCorrections, SatMeas, SearchOpts,
-    StochasticModel, UpdateOpts,
+    build_dual_frequency_rinex_rtk_arc, build_rinex_rtk_arc, solve_fixed_baseline,
+    solve_float_baseline, update_epoch, AmbiguityScale, AmbiguitySet, DynamicsModel, Epoch,
+    EpochUpdate, FilterState, FixedSolveOpts, FloatPrior, FloatSolveOpts, MeasModel,
+    ReceiverAntennaCalibration, ReceiverAntennaCorrections, RtkArcEpoch, RtkArcObservation,
+    RtkDualFrequencyArcEpoch, RtkDualFrequencyObservation, RtkDualFrequencySatelliteObservation,
+    RtkRinexArcOptions, RtkRinexDualArcOptions, SatMeas, SearchOpts, StochasticModel, UpdateOpts,
 };
 use sidereon_core::{GnssSatelliteId, GnssSystem};
 use std::collections::{BTreeMap, BTreeSet};
@@ -587,6 +589,106 @@ fn real_gps_l1_l2_epochs(
     }
 
     out
+}
+
+fn raw_epochs_to_rtk_arc_epochs(epochs: &[RawEpoch]) -> Vec<RtkArcEpoch> {
+    epochs
+        .iter()
+        .map(|epoch| RtkArcEpoch {
+            base: epoch
+                .base_observations
+                .iter()
+                .map(|(sat, obs)| RtkArcObservation {
+                    satellite_id: sat.clone(),
+                    ambiguity_id: obs.ambiguity_id.clone(),
+                    code_m: obs.code_m,
+                    phase_m: obs.phase_m,
+                    lli: obs.lli,
+                })
+                .collect(),
+            rover: epoch
+                .rover_observations
+                .iter()
+                .map(|(sat, obs)| RtkArcObservation {
+                    satellite_id: sat.clone(),
+                    ambiguity_id: obs.ambiguity_id.clone(),
+                    code_m: obs.code_m,
+                    phase_m: obs.phase_m,
+                    lli: obs.lli,
+                })
+                .collect(),
+            satellite_positions_m: epoch.satellite_positions_m.clone(),
+            base_satellite_positions_m: epoch.base_satellite_positions_m.clone(),
+            rover_satellite_positions_m: epoch.rover_satellite_positions_m.clone(),
+            velocity_mps: None,
+            prediction_time_s: None,
+        })
+        .collect()
+}
+
+fn raw_dual_epochs_to_rtk_dual_frequency_arc_epochs(
+    epochs: &[RawDualEpoch],
+) -> Vec<RtkDualFrequencyArcEpoch> {
+    epochs
+        .iter()
+        .map(|epoch| {
+            let split = civil_to_julian_split(epoch.epoch);
+            let observations = epoch
+                .base_observations
+                .keys()
+                .filter(|sat| epoch.rover_observations.contains_key(*sat))
+                .map(|sat| {
+                    let base = &epoch.base_observations[sat];
+                    let rover = &epoch.rover_observations[sat];
+                    RtkDualFrequencySatelliteObservation {
+                        satellite_id: sat.clone(),
+                        base: RtkDualFrequencyObservation {
+                            ambiguity_id: base.ambiguity_id.clone(),
+                            p1_m: base.p1_m,
+                            p2_m: base.p2_m,
+                            phi1_cycles: base.phi1_cycles,
+                            phi2_cycles: base.phi2_cycles,
+                            f1_hz: base.f1_hz,
+                            f2_hz: base.f2_hz,
+                            lli1: base.lli1,
+                            lli2: base.lli2,
+                        },
+                        rover: RtkDualFrequencyObservation {
+                            ambiguity_id: rover.ambiguity_id.clone(),
+                            p1_m: rover.p1_m,
+                            p2_m: rover.p2_m,
+                            phi1_cycles: rover.phi1_cycles,
+                            phi2_cycles: rover.phi2_cycles,
+                            f1_hz: rover.f1_hz,
+                            f2_hz: rover.f2_hz,
+                            lli1: rover.lli1,
+                            lli2: rover.lli2,
+                        },
+                    }
+                })
+                .collect();
+            RtkDualFrequencyArcEpoch {
+                jd_whole: split.jd_whole,
+                jd_fraction: split.fraction,
+                epoch_sort_key: Some(format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:.9}",
+                    epoch.epoch.year,
+                    epoch.epoch.month,
+                    epoch.epoch.day,
+                    epoch.epoch.hour,
+                    epoch.epoch.minute,
+                    epoch.epoch.second
+                )),
+                gap_time_s: Some(j2000_seconds(epoch.epoch)),
+                observations,
+                satellite_positions_m: epoch.satellite_positions_m.clone(),
+                base_satellite_positions_m: epoch.base_satellite_positions_m.clone(),
+                rover_satellite_positions_m: epoch.rover_satellite_positions_m.clone(),
+                velocity_mps: None,
+                prediction_time_s: None,
+            }
+        })
+        .collect()
 }
 
 fn apply_mask(
@@ -1300,6 +1402,44 @@ fn sequential_updates_with_options(
         updates.push(update);
     }
     updates
+}
+
+#[test]
+fn wettzell_rinex_arc_builders_match_real_arc_scaffolding() {
+    let sp3 = load_sp3(&["sp3", "GBM0MGXRAP_20201770000_01D_05M_ORB_120epoch.sp3"]);
+    let base_obs = load_obs(&["obs", "WTZR00DEU_R_20201770000_01D_30S_MO_120epoch.rnx"]);
+    let rover_obs = load_obs(&["obs", "WTZZ00DEU_R_20201770000_01D_30S_MO_120epoch.rnx"]);
+
+    let single_options = RtkRinexArcOptions {
+        max_epochs: Some(120),
+        include_prediction_time: false,
+        ..RtkRinexArcOptions::gps_l1_c()
+    };
+    let single = build_rinex_rtk_arc(&sp3, &base_obs, &rover_obs, &single_options)
+        .expect("single-frequency RINEX RTK arc");
+    let raw_single = real_gps_l1_epochs(&sp3, &base_obs, &rover_obs, 120);
+    assert_eq!(single.epochs, raw_epochs_to_rtk_arc_epochs(&raw_single));
+    let (_frequency_hz, l1_wavelength_m) = gps_l1_constants(&base_obs);
+    assert!(single
+        .wavelengths_m
+        .values()
+        .all(|value| value.to_bits() == l1_wavelength_m.to_bits()));
+    assert!(single.offsets_m.values().all(|value| *value == 0.0));
+    assert_eq!(single.skipped_epoch_count, 0);
+
+    let dual_options = RtkRinexDualArcOptions {
+        max_epochs: Some(120),
+        include_prediction_time: false,
+        ..RtkRinexDualArcOptions::gps_l1_l2_cw()
+    };
+    let dual = build_dual_frequency_rinex_rtk_arc(&sp3, &base_obs, &rover_obs, &dual_options)
+        .expect("dual-frequency RINEX RTK arc");
+    let raw_dual = real_gps_l1_l2_epochs(&sp3, &base_obs, &rover_obs, 120);
+    assert_eq!(
+        dual.epochs,
+        raw_dual_epochs_to_rtk_dual_frequency_arc_epochs(&raw_dual)
+    );
+    assert_eq!(dual.skipped_epoch_count, 0);
 }
 
 #[test]

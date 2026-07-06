@@ -25,6 +25,7 @@ mod float;
 mod model;
 mod moving_baseline;
 mod normal;
+mod rinex_arc;
 mod rows;
 mod search;
 mod state;
@@ -84,6 +85,11 @@ use normal::fold_measurement_block_indices;
 #[cfg(test)]
 use normal::{
     double_difference_inverse_covariance, fold_measurement, fold_measurement_block, solve_normal,
+};
+pub use rinex_arc::{
+    build_dual_frequency_rinex_rtk_arc, build_rinex_rtk_arc, RtkRinexArc, RtkRinexArcError,
+    RtkRinexArcOptions, RtkRinexDualArcOptions, RtkRinexDualFrequencyArc, RtkRinexDualSignalPair,
+    RtkRinexSignalPair,
 };
 #[cfg(test)]
 use rows::DdRow;
