@@ -134,7 +134,7 @@ pub(super) fn range_corrections_m(
     let ocean_loading_m = ocean_loading_correction_m(pred, obs, epoch_idx, &corrections.ppp)?;
     let satellite_antenna_m =
         satellite_antenna_correction_m(pred, obs, epoch_idx, &corrections.ppp)?;
-    let code_bias_m = code_bias_correction_m(obs, epoch_idx, &corrections.ppp)?;
+    let code_bias_m = clock_datum_code_bias_m(obs, epoch_idx, &corrections.ppp)?;
     Ok(applied_troposphere_m(tropo_model, state)
         + receiver_antenna_m
         + sat_clock_relativity_correction_m(pred, corrections.sat_clock_relativity)
@@ -233,7 +233,7 @@ fn satellite_antenna_correction_m(
     Ok(dot3(*pco, pred.los_unit) + pcv_m)
 }
 
-fn code_bias_correction_m(
+fn clock_datum_code_bias_m(
     obs: &FloatObservation,
     epoch_idx: usize,
     corrections: &PppCorrectionLookup,
@@ -246,6 +246,21 @@ fn code_bias_correction_m(
         .get(&(obs.sat, epoch_idx))
         .copied()
         .ok_or_else(|| missing_correction(obs, MissingCorrection::CodeBias))
+}
+
+pub(super) fn ssr_code_bias_m(
+    obs: &FloatObservation,
+    epoch_idx: usize,
+    corrections: &PppCorrectionLookup,
+) -> Result<f64, FloatSolveError> {
+    if !corrections.ssr_code_bias_enabled {
+        return Ok(0.0);
+    }
+    corrections
+        .ssr_code_bias_m
+        .get(&(obs.sat, epoch_idx))
+        .copied()
+        .ok_or_else(|| missing_correction(obs, MissingCorrection::SsrCodeBias))
 }
 
 pub(super) fn phase_windup_m(
@@ -262,6 +277,22 @@ pub(super) fn phase_windup_m(
         .get(&(obs.sat, epoch_idx))
         .copied()
         .ok_or_else(|| missing_correction(obs, MissingCorrection::PhaseWindup))
+}
+
+pub(super) fn phase_bias_m(
+    obs: &FloatObservation,
+    epoch_idx: usize,
+    corrections: &RangeCorrections,
+) -> Result<f64, FloatSolveError> {
+    if !corrections.ppp.phase_bias_enabled {
+        return Ok(0.0);
+    }
+    corrections
+        .ppp
+        .phase_bias_m
+        .get(&(obs.sat, epoch_idx))
+        .copied()
+        .ok_or_else(|| missing_correction(obs, MissingCorrection::PhaseBias))
 }
 
 fn satellite_clock_correction_m(

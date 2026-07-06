@@ -626,6 +626,15 @@ fn validate_range_corrections(corrections: &RangeCorrections) -> Result<(), Floa
     for value in corrections.ppp.sat_pcv_m.values() {
         validate::finite(*value, "ppp correction sat_pcv_m").map_err(invalid_input)?;
     }
+    for value in corrections.ppp.code_bias_m.values() {
+        validate::finite(*value, "ppp correction code_bias_m").map_err(invalid_input)?;
+    }
+    for value in corrections.ppp.ssr_code_bias_m.values() {
+        validate::finite(*value, "ppp correction ssr_code_bias_m").map_err(invalid_input)?;
+    }
+    for value in corrections.ppp.phase_bias_m.values() {
+        validate::finite(*value, "ppp correction phase_bias_m").map_err(invalid_input)?;
+    }
     Ok(())
 }
 

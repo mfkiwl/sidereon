@@ -2,9 +2,14 @@ use super::*;
 use crate::ambiguity::AmbiguityId;
 use crate::astro::math::vec3::{norm3, sub3};
 use crate::carrier_phase::{CycleSlipOptions, SlipReason};
-use crate::constants::C_M_S;
+use crate::constants::{C_M_S, F_L1_HZ, F_L2_HZ};
+use crate::has::{
+    HasCodeBias, HasCodeBiasBlock, HasGnssMask, HasMaskBlock, HasMt1Header, HasMt1Message,
+    HasPhaseBias, HasPhaseBiasBlock,
+};
 use crate::observables::{predict, ObservableState, ObservablesError};
 use crate::ppp_corrections::{CivilDateTime, CodeBiasOptions, PppCorrectionsOptions};
+use crate::ssr::SsrCorrectionStore;
 use crate::{GnssSatelliteId, GnssSystem};
 
 const REAL_CODE_BIA: &[u8] = include_bytes!(concat!(
@@ -1365,6 +1370,148 @@ fn static_float_design_rows_keep_enabled_ztd_estimation_column() {
     let ztd_column = 3 + epochs.len();
     assert_eq!(rows[0].h.len(), 3 + epochs.len() + 1 + ambiguity_ids.len());
     assert!(rows.iter().any(|row| row.h[ztd_column] > 0.0));
+}
+
+#[test]
+fn static_float_rows_apply_ssr_code_and_phase_biases_with_expected_signs() {
+    let (source, mut epochs, mut state, _ambiguity_ids) = ppp_row_trace_arc();
+    epochs[0].observations.truncate(1);
+    epochs.truncate(1);
+    state.clocks_m.truncate(1);
+    state.ambiguities_m = initial_ambiguities(&epochs);
+    let obs = &epochs[0].observations[0];
+    let sat = obs.sat;
+    let ambiguity_ids = vec![AmbiguityId::new(obs.ambiguity_id.clone())];
+
+    let base_corrections = RangeCorrections::disabled();
+    let base_ctx = ModelContext {
+        source: &source,
+        weights: ppp_row_trace_weights(),
+        tropo: TroposphereOptions::disabled(),
+        corrections: &base_corrections,
+        normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+    };
+    let binding = super::rows::AmbiguityBinding::Estimated {
+        ids: &ambiguity_ids,
+        values: &state.ambiguities_m,
+    };
+    let base_rows = super::rows::build_rows(base_ctx, &epochs, &binding, &state).unwrap();
+
+    let code_l1_m = 0.24;
+    let code_l2_m = -0.46;
+    let phase_l1_cycles = 1.25;
+    let phase_l2_cycles = -2.5;
+    let phase_l1_m = phase_l1_cycles * C_M_S / F_L1_HZ;
+    let phase_l2_m = phase_l2_cycles * C_M_S / F_L2_HZ;
+    let has = HasMt1Message {
+        header: HasMt1Header {
+            toh_s: 0,
+            mask: true,
+            orbit: false,
+            clock_full_set: false,
+            clock_subset: false,
+            code_bias: true,
+            phase_bias: true,
+            reserved: 0,
+            mask_id: 1,
+            iod_set_id: 1,
+        },
+        mask: Some(HasMaskBlock {
+            systems: vec![HasGnssMask {
+                system: sat.system,
+                satellites: vec![sat.prn],
+                signals: vec![0, 9],
+                cell_mask: None,
+                nav_message: 0,
+            }],
+        }),
+        orbit: None,
+        clock_full_set: None,
+        clock_subset: None,
+        code_bias: Some(HasCodeBiasBlock {
+            validity_interval: 5,
+            records: vec![
+                HasCodeBias {
+                    sat,
+                    signal_id: 0,
+                    bias_m: code_l1_m,
+                },
+                HasCodeBias {
+                    sat,
+                    signal_id: 9,
+                    bias_m: code_l2_m,
+                },
+            ],
+        }),
+        phase_bias: Some(HasPhaseBiasBlock {
+            validity_interval: 5,
+            records: vec![
+                HasPhaseBias {
+                    sat,
+                    signal_id: 0,
+                    bias_cycles: phase_l1_cycles,
+                    bias_m: phase_l1_m,
+                    discontinuity_indicator: 0,
+                },
+                HasPhaseBias {
+                    sat,
+                    signal_id: 9,
+                    bias_cycles: phase_l2_cycles,
+                    bias_m: phase_l2_m,
+                    discontinuity_indicator: 0,
+                },
+            ],
+        }),
+        padding_bits: Vec::new(),
+    };
+    let decoded = HasMt1Message::decode(&has.encode()).expect("decode HAS MT1");
+    let mut store = SsrCorrectionStore::new();
+    let reception = crate::astro::time::model::GnssWeekTow::new(
+        crate::astro::time::model::TimeScale::Gst,
+        1,
+        0.0,
+    )
+    .unwrap();
+    store.ingest_has_mt1(&decoded, reception).unwrap();
+    let mut options = SsrPppBiasOptions::default();
+    options.per_system.insert(
+        sat.system,
+        SsrPppBiasSignalPair {
+            code1_signal: 0,
+            code2_signal: 9,
+            phase1_signal: 0,
+            phase2_signal: 9,
+            freq1_hz: F_L1_HZ,
+            freq2_hz: F_L2_HZ,
+        },
+    );
+    let biased_lookup = PppCorrectionLookup::default().with_ssr_biases(&store, &epochs, &options);
+    let biased_corrections = RangeCorrections {
+        ppp: biased_lookup,
+        ..RangeCorrections::disabled()
+    };
+    let biased_ctx = ModelContext {
+        source: &source,
+        weights: ppp_row_trace_weights(),
+        tropo: TroposphereOptions::disabled(),
+        corrections: &biased_corrections,
+        normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+    };
+    let biased_rows = super::rows::build_rows(biased_ctx, &epochs, &binding, &state).unwrap();
+
+    let gamma = F_L1_HZ * F_L1_HZ / (F_L1_HZ * F_L1_HZ - F_L2_HZ * F_L2_HZ);
+    let expected_code_if = gamma * code_l1_m - (gamma - 1.0) * code_l2_m;
+    let expected_phase_if = gamma * phase_l1_m - (gamma - 1.0) * phase_l2_m;
+    let code_delta = biased_rows[0].y - base_rows[0].y;
+    let phase_delta = biased_rows[1].y - base_rows[1].y;
+    assert!(
+        (code_delta - expected_code_if).abs() < 1.0e-8,
+        "code delta {code_delta}, expected {expected_code_if}"
+    );
+    assert!(
+        (phase_delta - expected_phase_if).abs() < 1.0e-8,
+        "phase delta {phase_delta}, expected {expected_phase_if}"
+    );
 }
 
 #[test]

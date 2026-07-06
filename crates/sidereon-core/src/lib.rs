@@ -91,6 +91,7 @@ pub mod dop; // dilution-of-precision geometry (GDOP/PDOP/HDOP/VDOP/TDOP)
 pub mod error_metrics; // covariance-derived CEP, radial, and ellipse metrics
 pub mod frequencies; // canonical GNSS carrier-frequency table
 mod glonass; // GLONASS PZ-90.11 state-vector RK4 propagation
+pub mod has; // Galileo HAS MT1 correction payload decode/encode
 mod ionex; // Klobuchar broadcast model + IONEX ionospheric maps
 pub mod navigation; // navigation-message bit-level codecs (GPS LNAV)
 pub mod nmea; // NMEA 0183 sentence parsing, stream grouping, and GGA writing

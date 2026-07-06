@@ -157,14 +157,18 @@ pub(crate) fn ssr_kind(message_number: u16) -> Option<(GnssSystem, SsrKind)> {
     match message_number {
         1057 => Some((GnssSystem::Gps, SsrKind::Orbit)),
         1058 => Some((GnssSystem::Gps, SsrKind::Clock)),
+        1059 => Some((GnssSystem::Gps, SsrKind::CodeBias)),
         1060 => Some((GnssSystem::Gps, SsrKind::CombinedOrbitClock)),
         1061 => Some((GnssSystem::Gps, SsrKind::Ura)),
         1062 => Some((GnssSystem::Gps, SsrKind::HighRateClock)),
+        1265 => Some((GnssSystem::Gps, SsrKind::PhaseBias)),
         1240 => Some((GnssSystem::Galileo, SsrKind::Orbit)),
         1241 => Some((GnssSystem::Galileo, SsrKind::Clock)),
+        1242 => Some((GnssSystem::Galileo, SsrKind::CodeBias)),
         1243 => Some((GnssSystem::Galileo, SsrKind::CombinedOrbitClock)),
         1244 => Some((GnssSystem::Galileo, SsrKind::Ura)),
         1245 => Some((GnssSystem::Galileo, SsrKind::HighRateClock)),
+        1267 => Some((GnssSystem::Galileo, SsrKind::PhaseBias)),
         _ => None,
     }
 }
@@ -192,6 +196,8 @@ impl SsrMessage {
         let count = usize::from(header.satellite_count);
         let mut orbit = Vec::new();
         let mut clock = Vec::new();
+        let mut code_bias = Vec::new();
+        let mut phase_bias = Vec::new();
         let mut ura = Vec::new();
 
         match kind {
@@ -241,7 +247,19 @@ impl SsrMessage {
                     });
                 }
             }
-            SsrKind::CodeBias | SsrKind::PhaseBias | SsrKind::Vtec => {
+            SsrKind::CodeBias => {
+                code_bias.reserve(count);
+                for _ in 0..count {
+                    code_bias.push(read_code_bias_record(&mut r, system)?);
+                }
+            }
+            SsrKind::PhaseBias => {
+                phase_bias.reserve(count);
+                for _ in 0..count {
+                    phase_bias.push(read_phase_bias_record(&mut r, system)?);
+                }
+            }
+            SsrKind::Vtec => {
                 return Err(Error::Parse(format!(
                     "message {message_number} is not enabled in RTCM SSR Phase A"
                 ))
@@ -261,8 +279,8 @@ impl SsrMessage {
             header,
             orbit,
             clock,
-            code_bias: Vec::new(),
-            phase_bias: Vec::new(),
+            code_bias,
+            phase_bias,
             ura,
             padding_bits,
         })
@@ -305,7 +323,17 @@ impl SsrMessage {
                     w.push_i(i64::from(rec.c0), 22);
                 }
             }
-            SsrKind::CodeBias | SsrKind::PhaseBias | SsrKind::Vtec => {}
+            SsrKind::CodeBias => {
+                for rec in &self.code_bias {
+                    write_code_bias_record(&mut w, self.system, rec);
+                }
+            }
+            SsrKind::PhaseBias => {
+                for rec in &self.phase_bias {
+                    write_phase_bias_record(&mut w, self.system, rec);
+                }
+            }
+            SsrKind::Vtec => {}
         }
 
         for &bit in &self.padding_bits {
@@ -328,6 +356,16 @@ fn read_header(r: &mut BitReader<'_>, kind: SsrKind) -> DecodeResult<SsrHeader> 
     let iod_ssr = r.u(4)? as u8;
     let provider_id = r.u(16)? as u16;
     let solution_id = r.u(4)? as u8;
+    let dispersive_bias_consistency = if kind == SsrKind::PhaseBias {
+        Some(r.flag()?)
+    } else {
+        None
+    };
+    let mw_consistency = if kind == SsrKind::PhaseBias {
+        Some(r.flag()?)
+    } else {
+        None
+    };
     let satellite_count = r.u(6)? as u8;
     Ok(SsrHeader {
         epoch_time_s,
@@ -337,8 +375,8 @@ fn read_header(r: &mut BitReader<'_>, kind: SsrKind) -> DecodeResult<SsrHeader> 
         provider_id,
         solution_id,
         satellite_reference_datum,
-        dispersive_bias_consistency: None,
-        mw_consistency: None,
+        dispersive_bias_consistency,
+        mw_consistency,
         satellite_count,
     })
 }
@@ -353,6 +391,10 @@ fn write_header(w: &mut BitWriter, header: &SsrHeader, kind: SsrKind) {
     w.push_u(u64::from(header.iod_ssr), 4);
     w.push_u(u64::from(header.provider_id), 16);
     w.push_u(u64::from(header.solution_id), 4);
+    if kind == SsrKind::PhaseBias {
+        w.push_flag(header.dispersive_bias_consistency.unwrap_or(false));
+        w.push_flag(header.mw_consistency.unwrap_or(false));
+    }
     w.push_u(u64::from(header.satellite_count), 6);
 }
 
@@ -394,6 +436,73 @@ fn write_clock_record(w: &mut BitWriter, system: GnssSystem, rec: &SsrClockRecor
     w.push_i(i64::from(rec.c0), 22);
     w.push_i(i64::from(rec.c1), 21);
     w.push_i(i64::from(rec.c2), 27);
+}
+
+fn read_code_bias_record(
+    r: &mut BitReader<'_>,
+    system: GnssSystem,
+) -> DecodeResult<SsrCodeBiasRecord> {
+    let satellite_id = r.u(satellite_id_bits(system))? as u8;
+    let count = r.u(5)? as usize;
+    let mut biases = Vec::with_capacity(count);
+    for _ in 0..count {
+        let signal_id = r.u(5)? as u8;
+        let bias = r.i(14)? as i16;
+        biases.push((signal_id, bias));
+    }
+    Ok(SsrCodeBiasRecord {
+        satellite_id,
+        biases,
+    })
+}
+
+fn write_code_bias_record(w: &mut BitWriter, system: GnssSystem, rec: &SsrCodeBiasRecord) {
+    w.push_u(u64::from(rec.satellite_id), satellite_id_bits(system));
+    w.push_u(rec.biases.len() as u64, 5);
+    for &(signal_id, bias) in &rec.biases {
+        w.push_u(u64::from(signal_id), 5);
+        w.push_i(i64::from(bias), 14);
+    }
+}
+
+fn read_phase_bias_record(
+    r: &mut BitReader<'_>,
+    system: GnssSystem,
+) -> DecodeResult<SsrPhaseBiasRecord> {
+    let satellite_id = r.u(satellite_id_bits(system))? as u8;
+    let count = r.u(5)? as usize;
+    let yaw_angle = r.u(9)? as u16;
+    let yaw_rate = r.i(8)? as i8;
+    let mut biases = Vec::with_capacity(count);
+    for _ in 0..count {
+        biases.push(SsrPhaseBiasSignal {
+            signal_id: r.u(5)? as u8,
+            integer_indicator: r.u(1)? as u8,
+            wide_lane_integer_indicator: r.u(2)? as u8,
+            discontinuity_counter: r.u(4)? as u8,
+            bias: r.i(20)? as i32,
+        });
+    }
+    Ok(SsrPhaseBiasRecord {
+        satellite_id,
+        yaw_angle,
+        yaw_rate,
+        biases,
+    })
+}
+
+fn write_phase_bias_record(w: &mut BitWriter, system: GnssSystem, rec: &SsrPhaseBiasRecord) {
+    w.push_u(u64::from(rec.satellite_id), satellite_id_bits(system));
+    w.push_u(rec.biases.len() as u64, 5);
+    w.push_u(u64::from(rec.yaw_angle), 9);
+    w.push_i(i64::from(rec.yaw_rate), 8);
+    for bias in &rec.biases {
+        w.push_u(u64::from(bias.signal_id), 5);
+        w.push_u(u64::from(bias.integer_indicator), 1);
+        w.push_u(u64::from(bias.wide_lane_integer_indicator), 2);
+        w.push_u(u64::from(bias.discontinuity_counter), 4);
+        w.push_i(i64::from(bias.bias), 20);
+    }
 }
 
 fn satellite_id_bits(system: GnssSystem) -> usize {
@@ -472,8 +581,8 @@ mod tests {
             solution_id: 4,
             satellite_reference_datum: matches!(kind, SsrKind::Orbit | SsrKind::CombinedOrbitClock)
                 .then_some(false),
-            dispersive_bias_consistency: None,
-            mw_consistency: None,
+            dispersive_bias_consistency: (kind == SsrKind::PhaseBias).then_some(true),
+            mw_consistency: (kind == SsrKind::PhaseBias).then_some(false),
             satellite_count: count,
         }
     }
@@ -508,6 +617,7 @@ mod tests {
         let mut orbit = Vec::new();
         let mut clock = Vec::new();
         let mut ura = Vec::new();
+        let mut phase_bias = Vec::new();
         match kind {
             SsrKind::Orbit => orbit.push(orbit_record(system)),
             SsrKind::Clock => clock.push(clock_record()),
@@ -522,8 +632,40 @@ mod tests {
                 c1: 0,
                 c2: 0,
             }),
-            SsrKind::CodeBias | SsrKind::PhaseBias | SsrKind::Vtec => {}
+            SsrKind::CodeBias => {
+                // RTCM SSR code bias: 5-bit signal id, int14 bias at 0.01 m.
+            }
+            SsrKind::PhaseBias => phase_bias.push(SsrPhaseBiasRecord {
+                satellite_id: 3,
+                yaw_angle: 127,
+                yaw_rate: -12,
+                biases: vec![
+                    SsrPhaseBiasSignal {
+                        signal_id: 1,
+                        integer_indicator: 1,
+                        wide_lane_integer_indicator: 2,
+                        discontinuity_counter: 3,
+                        bias: -123_456,
+                    },
+                    SsrPhaseBiasSignal {
+                        signal_id: 9,
+                        integer_indicator: 0,
+                        wide_lane_integer_indicator: 1,
+                        discontinuity_counter: 4,
+                        bias: 234_567,
+                    },
+                ],
+            }),
+            SsrKind::Vtec => {}
         }
+        let code_bias = if kind == SsrKind::CodeBias {
+            vec![SsrCodeBiasRecord {
+                satellite_id: 3,
+                biases: vec![(1, -1234), (9, 2345)],
+            }]
+        } else {
+            Vec::new()
+        };
         SsrMessage {
             message_number,
             system,
@@ -531,8 +673,8 @@ mod tests {
             header: header(kind, 1),
             orbit,
             clock,
-            code_bias: Vec::new(),
-            phase_bias: Vec::new(),
+            code_bias,
+            phase_bias,
             ura,
             padding_bits: Vec::new(),
         }
@@ -557,14 +699,18 @@ mod tests {
         for (number, system, kind) in [
             (1057, GnssSystem::Gps, SsrKind::Orbit),
             (1058, GnssSystem::Gps, SsrKind::Clock),
+            (1059, GnssSystem::Gps, SsrKind::CodeBias),
             (1060, GnssSystem::Gps, SsrKind::CombinedOrbitClock),
             (1061, GnssSystem::Gps, SsrKind::Ura),
             (1062, GnssSystem::Gps, SsrKind::HighRateClock),
+            (1265, GnssSystem::Gps, SsrKind::PhaseBias),
             (1240, GnssSystem::Galileo, SsrKind::Orbit),
             (1241, GnssSystem::Galileo, SsrKind::Clock),
+            (1242, GnssSystem::Galileo, SsrKind::CodeBias),
             (1243, GnssSystem::Galileo, SsrKind::CombinedOrbitClock),
             (1244, GnssSystem::Galileo, SsrKind::Ura),
             (1245, GnssSystem::Galileo, SsrKind::HighRateClock),
+            (1267, GnssSystem::Galileo, SsrKind::PhaseBias),
         ] {
             let expected = message(number, system, kind);
             let body = expected.encode();
@@ -578,6 +724,8 @@ mod tests {
             assert_eq!(decoded.header, expected.header, "message {number}");
             assert_eq!(decoded.orbit, expected.orbit, "message {number}");
             assert_eq!(decoded.clock, expected.clock, "message {number}");
+            assert_eq!(decoded.code_bias, expected.code_bias, "message {number}");
+            assert_eq!(decoded.phase_bias, expected.phase_bias, "message {number}");
             assert_eq!(decoded.ura, expected.ura, "message {number}");
             assert_eq!(decoded.encode(), body, "message {number} round trip");
             assert!(matches!(Message::decode(&body).unwrap(), Message::Ssr(_)));
@@ -681,13 +829,13 @@ mod tests {
     #[test]
     fn unsupported_ssr_bias_message_stays_unsupported() {
         let mut w = BitWriter::new();
-        w.push_u(1059, 12);
+        w.push_u(1063, 12);
         let body = w.into_bytes();
         let decoded = Message::decode(&body).unwrap();
         assert_eq!(
             decoded,
             Message::Unsupported(UnsupportedMessage {
-                message_number: 1059,
+                message_number: 1063,
                 body
             })
         );

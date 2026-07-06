@@ -25,7 +25,8 @@ use crate::observables::{predict, PredictedObservables};
 use crate::validate::{self, FieldError};
 
 use super::model::{
-    measurement_weight, model_troposphere, phase_windup_m, range_corrections_m, satellite_clock_m,
+    measurement_weight, model_troposphere, phase_bias_m, phase_windup_m, range_corrections_m,
+    satellite_clock_m, ssr_code_bias_m,
 };
 use super::normal::Row;
 use super::{
@@ -173,14 +174,21 @@ fn undifferenced_model(
     )
     .map_err(PppRowError::Model)?;
     validate::finite(corrections_m, "ppp row corrections_m").map_err(row_invalid)?;
+    let ssr_code_bias_m =
+        ssr_code_bias_m(obs, epoch_idx, &ctx.corrections.ppp).map_err(PppRowError::Model)?;
+    validate::finite(ssr_code_bias_m, "ppp row ssr_code_bias_m").map_err(row_invalid)?;
     let phase_windup_m =
         phase_windup_m(obs, epoch_idx, ctx.corrections).map_err(PppRowError::Model)?;
     validate::finite(phase_windup_m, "ppp row phase_windup_m").map_err(row_invalid)?;
-    let model_code = pred.geometric_range_m + clock_m - sat_clock_m + corrections_m;
+    let phase_bias_m = phase_bias_m(obs, epoch_idx, ctx.corrections).map_err(PppRowError::Model)?;
+    validate::finite(phase_bias_m, "ppp row phase_bias_m").map_err(row_invalid)?;
+    let model_range = pred.geometric_range_m + clock_m - sat_clock_m + corrections_m;
+    let model_code = model_range + ssr_code_bias_m;
     validate::finite(model_code, "ppp row model_code_m").map_err(row_invalid)?;
+    validate::finite(model_range, "ppp row model_range_m").map_err(row_invalid)?;
     let model = UndiffModel {
         code_prefit: obs.code_m - model_code,
-        phase_prefit: obs.phase_m - phase_windup_m - (model_code + ambiguity_m),
+        phase_prefit: obs.phase_m + phase_bias_m - phase_windup_m - (model_range + ambiguity_m),
         code_weight: measurement_weight(ctx.weights, true, pred.elevation_deg),
         phase_weight: measurement_weight(ctx.weights, false, pred.elevation_deg),
         los_base: [-pred.los_unit[0], -pred.los_unit[1], -pred.los_unit[2]],
