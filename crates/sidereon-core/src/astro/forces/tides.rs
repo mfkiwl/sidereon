@@ -17,7 +17,7 @@
 //! body-fixed frame provider in [`PropagationContext`] because the coefficients
 //! are evaluated in the terrestrial frame and then rotated back to GCRF.
 
-use crate::astro::bodies::sun_moon::sun_moon_eci_at;
+use crate::astro::bodies::sun_moon::sun_moon_ecef_with_polar_motion;
 use crate::astro::constants::astro::{GM_MOON_KM3_S2, GM_SUN_KM3_S2};
 use crate::astro::constants::time::J2000_JD;
 use crate::astro::constants::units::{ARCSEC_TO_RAD, M_PER_KM};
@@ -28,9 +28,7 @@ use crate::astro::forces::geopotential::{
 };
 use crate::astro::forces::r#trait::ForceModel;
 use crate::astro::frames::orientation::EarthOrientation;
-use crate::astro::frames::transforms::{
-    mat3_vec3_mul, mean_of_date_to_itrs_matrix_with_polar_motion, PolarMotion,
-};
+use crate::astro::frames::transforms::PolarMotion;
 use crate::astro::propagator::api::PropagationContext;
 use crate::astro::state::CartesianState;
 use crate::astro::time::scales::TimeScales;
@@ -355,31 +353,11 @@ fn orientation_at_state(
 
 fn sun_moon_itrf_km(orientation: &EarthOrientation) -> Result<SunMoonItrfKm, PropagationError> {
     let ts = orientation.time_scales();
-    let bodies = sun_moon_eci_at(&ts)
+    let bodies = sun_moon_ecef_with_polar_motion(&ts, orientation.polar_motion())
         .map_err(|error| PropagationError::ForceModelFailure(format!("Sun/Moon: {error}")))?;
-    let mean_of_date_to_itrf =
-        mean_of_date_to_itrs_matrix_with_polar_motion(&ts, orientation.polar_motion()).map_err(
-            |error| {
-                PropagationError::ForceModelFailure(format!(
-                    "Sun/Moon body-fixed frame rotation failed: {error}"
-                ))
-            },
-        )?;
     Ok(SunMoonItrfKm {
-        sun_itrf_km: mat3_vec3_mul(&mean_of_date_to_itrf, &meters_to_km(bodies.sun)).map_err(
-            |error| {
-                PropagationError::ForceModelFailure(format!(
-                    "Sun body-fixed position rotation failed: {error}"
-                ))
-            },
-        )?,
-        moon_itrf_km: mat3_vec3_mul(&mean_of_date_to_itrf, &meters_to_km(bodies.moon)).map_err(
-            |error| {
-                PropagationError::ForceModelFailure(format!(
-                    "Moon body-fixed position rotation failed: {error}"
-                ))
-            },
-        )?,
+        sun_itrf_km: meters_to_km(bodies.sun),
+        moon_itrf_km: meters_to_km(bodies.moon),
     })
 }
 

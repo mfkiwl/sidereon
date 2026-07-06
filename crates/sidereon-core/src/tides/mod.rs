@@ -34,15 +34,23 @@ mod tests;
 
 mod ocean;
 mod pole;
-pub use ocean::{ocean_tide_loading, OceanLoadingBlq, NUM_OCEAN_CONSTITUENTS};
+pub use ocean::{
+    ocean_tide_loading, parse_ocean_loading_blq_block, parse_ocean_loading_blq_blocks,
+    OceanLoadingBlq, OceanLoadingBlqBlock, OceanTideConstituent, NUM_OCEAN_CONSTITUENTS,
+    OCEAN_LOADING_CONSTITUENTS,
+};
 pub use pole::solid_earth_pole_tide;
 
+use crate::astro::bodies::{sun_moon_ecef_with_polar_motion, SunMoonError};
 use crate::astro::constants::models::iers::SOLID_TIDE_EARTH_RADIUS_M;
 use crate::astro::constants::time::{
     DAYS_PER_JULIAN_CENTURY, J2000_JD, SECONDS_PER_DAY, TT_MINUS_TAI_S,
 };
-use crate::astro::constants::units::{DEG_TO_RAD, KM_TO_M};
+use crate::astro::constants::units::{ARCSEC_TO_RAD, DEG_TO_RAD, KM_TO_M};
+use crate::astro::frames::transforms::{FrameTransformError, PolarMotion};
 use crate::astro::math::vec3::{dot3_ref as dot, norm3_ref as norm8};
+use crate::astro::time::{CoverageError, TimeScaleInputErrorKind, TimeScales};
+use crate::frame::{geodetic_to_itrf, ItrfPositionM, Wgs84Geodetic};
 use crate::validate::{self, FieldError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +64,76 @@ pub enum TideInputErrorKind {
     IntParse,
     InvalidCivilDate,
     InvalidCivilTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlqParseErrorKind {
+    Empty,
+    MissingStation,
+    MissingCoefficientRows {
+        station: String,
+        expected: usize,
+        found: usize,
+    },
+    TooManyCoefficientRows {
+        station: String,
+    },
+    WrongColumnCount {
+        expected: usize,
+        found: usize,
+    },
+    InvalidNumber {
+        token: String,
+    },
+    NonFiniteNumber {
+        token: String,
+    },
+    UnsupportedConstituent {
+        constituent: String,
+    },
+    DuplicateConstituent {
+        constituent: String,
+    },
+    MultipleBlocks {
+        found: usize,
+    },
+}
+
+impl core::fmt::Display for BlqParseErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("empty BLQ block"),
+            Self::MissingStation => f.write_str("missing station identifier"),
+            Self::MissingCoefficientRows {
+                station,
+                expected,
+                found,
+            } => write!(
+                f,
+                "station {station} has {found} coefficient rows, expected {expected}"
+            ),
+            Self::TooManyCoefficientRows { station } => {
+                write!(f, "station {station} has more than 6 coefficient rows")
+            }
+            Self::WrongColumnCount { expected, found } => {
+                write!(
+                    f,
+                    "coefficient row has {found} columns, expected {expected}"
+                )
+            }
+            Self::InvalidNumber { token } => write!(f, "invalid number {token:?}"),
+            Self::NonFiniteNumber { token } => write!(f, "non-finite number {token:?}"),
+            Self::UnsupportedConstituent { constituent } => {
+                write!(f, "unsupported constituent {constituent}")
+            }
+            Self::DuplicateConstituent { constituent } => {
+                write!(f, "duplicate constituent {constituent}")
+            }
+            Self::MultipleBlocks { found } => {
+                write!(f, "expected one BLQ station block, found {found}")
+            }
+        }
+    }
 }
 
 impl core::fmt::Display for TideInputErrorKind {
@@ -97,6 +175,19 @@ pub enum TideError {
         field: &'static str,
         kind: TideInputErrorKind,
     },
+    #[error("station displacement time-scale conversion failed: {0}")]
+    TimeScale(#[from] CoverageError),
+    #[error("station displacement frame transform failed: {0}")]
+    FrameTransform(#[from] FrameTransformError),
+    #[error("station displacement Sun/Moon evaluation failed: {0}")]
+    SunMoon(#[from] SunMoonError),
+    #[error("missing station displacement input {field}")]
+    MissingInput { field: &'static str },
+    #[error("invalid BLQ block at line {line}: {kind}")]
+    BlqParse {
+        line: usize,
+        kind: BlqParseErrorKind,
+    },
 }
 
 fn invalid_tide_input(error: FieldError) -> TideError {
@@ -104,6 +195,309 @@ fn invalid_tide_input(error: FieldError) -> TideError {
         field: error.field(),
         kind: (&error).into(),
     }
+}
+
+fn map_time_input(error: CoverageError) -> TideError {
+    match error {
+        CoverageError::InvalidInput { field, kind } => TideError::InvalidInput {
+            field,
+            kind: tide_kind_from_time_kind(kind),
+        },
+        other => TideError::TimeScale(other),
+    }
+}
+
+fn tide_kind_from_time_kind(kind: TimeScaleInputErrorKind) -> TideInputErrorKind {
+    match kind {
+        TimeScaleInputErrorKind::Missing => TideInputErrorKind::Missing,
+        TimeScaleInputErrorKind::NonFinite => TideInputErrorKind::NonFinite,
+        TimeScaleInputErrorKind::NotPositive => TideInputErrorKind::NotPositive,
+        TimeScaleInputErrorKind::Negative => TideInputErrorKind::Negative,
+        TimeScaleInputErrorKind::OutOfRange => TideInputErrorKind::OutOfRange,
+        TimeScaleInputErrorKind::FloatParse => TideInputErrorKind::FloatParse,
+        TimeScaleInputErrorKind::IntParse => TideInputErrorKind::IntParse,
+        TimeScaleInputErrorKind::InvalidCivilDate => TideInputErrorKind::InvalidCivilDate,
+        TimeScaleInputErrorKind::InvalidCivilTime => TideInputErrorKind::InvalidCivilTime,
+    }
+}
+
+/// Station position accepted by the high-level displacement API.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StationDisplacementPosition {
+    /// ITRF/ECEF metres.
+    Ecef(ItrfPositionM),
+    /// WGS84 geodetic radians/metres. Converted to ITRF through the public
+    /// frame conversion path before any tide model is evaluated.
+    Geodetic(Wgs84Geodetic),
+}
+
+impl From<ItrfPositionM> for StationDisplacementPosition {
+    fn from(value: ItrfPositionM) -> Self {
+        Self::Ecef(value)
+    }
+}
+
+impl From<Wgs84Geodetic> for StationDisplacementPosition {
+    fn from(value: Wgs84Geodetic) -> Self {
+        Self::Geodetic(value)
+    }
+}
+
+impl StationDisplacementPosition {
+    /// Construct from raw ITRF/ECEF metre components.
+    pub fn from_ecef_m(position_m: [f64; 3]) -> Result<Self, TideError> {
+        let position =
+            ItrfPositionM::new(position_m[0], position_m[1], position_m[2]).map_err(|error| {
+                match error {
+                    crate::frame::FrameValueError::InvalidInput { field, reason: _ } => {
+                        TideError::InvalidInput {
+                            field,
+                            kind: TideInputErrorKind::NonFinite,
+                        }
+                    }
+                }
+            })?;
+        Ok(Self::Ecef(position))
+    }
+
+    fn ecef_m(self) -> Result<[f64; 3], TideError> {
+        match self {
+            Self::Ecef(position) => Ok(position.as_array()),
+            Self::Geodetic(position) => Ok(geodetic_to_itrf(position)?.as_array()),
+        }
+    }
+}
+
+/// IERS polar-motion coordinates of the epoch, in arcseconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationPolarMotion {
+    pub xp_arcsec: f64,
+    pub yp_arcsec: f64,
+}
+
+impl StationPolarMotion {
+    pub const fn from_arcseconds(xp_arcsec: f64, yp_arcsec: f64) -> Self {
+        Self {
+            xp_arcsec,
+            yp_arcsec,
+        }
+    }
+
+    fn polar_motion(self) -> Result<PolarMotion, TideError> {
+        Ok(PolarMotion::from_radians(
+            self.xp_arcsec * ARCSEC_TO_RAD,
+            self.yp_arcsec * ARCSEC_TO_RAD,
+        )?)
+    }
+}
+
+/// UTC epoch for station displacement evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationDisplacementEpoch {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: f64,
+    /// Optional IERS polar motion for pole tide and polar-motion-aware Sun/Moon
+    /// rotation.
+    pub polar_motion: Option<StationPolarMotion>,
+}
+
+impl StationDisplacementEpoch {
+    pub const fn from_utc(
+        year: i32,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: f64,
+    ) -> Self {
+        Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            polar_motion: None,
+        }
+    }
+
+    pub const fn with_polar_motion_arcsec(mut self, xp_arcsec: f64, yp_arcsec: f64) -> Self {
+        self.polar_motion = Some(StationPolarMotion::from_arcseconds(xp_arcsec, yp_arcsec));
+        self
+    }
+
+    fn time_scales(self) -> Result<TimeScales, TideError> {
+        TimeScales::from_utc(
+            self.year,
+            i32::from(self.month),
+            i32::from(self.day),
+            i32::from(self.hour),
+            i32::from(self.minute),
+            self.second,
+        )
+        .map_err(map_time_input)
+    }
+
+    fn validate_utc(self) -> Result<(), TideError> {
+        validate::civil_datetime_with_second_policy(
+            i64::from(self.year),
+            i64::from(self.month),
+            i64::from(self.day),
+            i64::from(self.hour),
+            i64::from(self.minute),
+            self.second,
+            validate::CivilSecondPolicy::Continuous,
+        )
+        .map(|_| ())
+        .map_err(invalid_tide_input)
+    }
+
+    fn fractional_hour(self) -> f64 {
+        f64::from(self.hour) + f64::from(self.minute) / 60.0 + self.second / 3600.0
+    }
+}
+
+/// Switches for the high-level station displacement entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationDisplacementOptions<'a> {
+    /// Apply the IERS solid Earth tide station displacement.
+    pub solid_earth_tide: bool,
+    /// Apply the IERS pole tide station displacement. Each epoch must carry
+    /// polar motion when this is true.
+    pub pole_tide: bool,
+    /// Optional ocean-loading BLQ coefficients supplied by the caller.
+    pub ocean_loading: Option<&'a OceanLoadingBlq>,
+}
+
+impl Default for StationDisplacementOptions<'_> {
+    fn default() -> Self {
+        Self {
+            solid_earth_tide: true,
+            pole_tide: false,
+            ocean_loading: None,
+        }
+    }
+}
+
+/// Component-resolved station displacement in ITRF/ECEF metres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationDisplacement {
+    /// Sum of all enabled component displacements, in ITRF/ECEF metres.
+    pub ecef_m: [f64; 3],
+    pub solid_earth_tide_ecef_m: Option<[f64; 3]>,
+    pub pole_tide_ecef_m: Option<[f64; 3]>,
+    pub ocean_loading_ecef_m: Option<[f64; 3]>,
+}
+
+impl StationDisplacement {
+    fn zero() -> Self {
+        Self {
+            ecef_m: [0.0; 3],
+            solid_earth_tide_ecef_m: None,
+            pole_tide_ecef_m: None,
+            ocean_loading_ecef_m: None,
+        }
+    }
+
+    fn add_component(total: &mut [f64; 3], component: [f64; 3]) {
+        for i in 0..3 {
+            total[i] += component[i];
+        }
+    }
+}
+
+/// Evaluate the enabled station displacement corrections, returning ITRF/ECEF
+/// metre components.
+///
+/// The solid Earth tide path uses IERS Conventions (2010), Chapter 7 station
+/// displacement with the permanent tide retained. The low-level
+/// [`solid_earth_tide`] routine ships the in-phase degree-2 and degree-3
+/// displacement, the step-1 out-of-phase and latitude-dependence corrections,
+/// and the step-2 diurnal/long-period frequency corrections; it leaves the
+/// optional step-3 permanent-tide removal disabled for ITRF/IGS use. Sun/Moon
+/// positions are generated through the same Earth-fixed analytic ephemeris path
+/// used by the tide-force lane, including caller-supplied polar motion when the
+/// epoch carries it.
+pub fn station_displacement_ecef_m(
+    position: StationDisplacementPosition,
+    epoch: StationDisplacementEpoch,
+    options: StationDisplacementOptions<'_>,
+) -> Result<StationDisplacement, TideError> {
+    let receiver_ecef_m = position.ecef_m()?;
+    epoch.validate_utc()?;
+    let fhr = epoch.fractional_hour();
+    let mut displacement = StationDisplacement::zero();
+
+    if options.solid_earth_tide {
+        let ts = epoch.time_scales()?;
+        let polar_motion = epoch
+            .polar_motion
+            .map(StationPolarMotion::polar_motion)
+            .transpose()?
+            .unwrap_or_default();
+        let sun_moon = sun_moon_ecef_with_polar_motion(&ts, polar_motion)?;
+        let solid = solid_earth_tide(
+            &receiver_ecef_m,
+            epoch.year,
+            i32::from(epoch.month),
+            i32::from(epoch.day),
+            fhr,
+            &sun_moon.sun,
+            &sun_moon.moon,
+        )?;
+        StationDisplacement::add_component(&mut displacement.ecef_m, solid);
+        displacement.solid_earth_tide_ecef_m = Some(solid);
+    }
+
+    if options.pole_tide {
+        let polar = epoch.polar_motion.ok_or(TideError::MissingInput {
+            field: "polar motion",
+        })?;
+        let pole = solid_earth_pole_tide(
+            &receiver_ecef_m,
+            epoch.year,
+            i32::from(epoch.month),
+            i32::from(epoch.day),
+            fhr,
+            polar.xp_arcsec,
+            polar.yp_arcsec,
+        )?;
+        StationDisplacement::add_component(&mut displacement.ecef_m, pole);
+        displacement.pole_tide_ecef_m = Some(pole);
+    }
+
+    if let Some(blq) = options.ocean_loading {
+        let ocean = ocean_tide_loading(
+            &receiver_ecef_m,
+            epoch.year,
+            i32::from(epoch.month),
+            i32::from(epoch.day),
+            fhr,
+            blq,
+        )?;
+        StationDisplacement::add_component(&mut displacement.ecef_m, ocean);
+        displacement.ocean_loading_ecef_m = Some(ocean);
+    }
+
+    Ok(displacement)
+}
+
+/// Evaluate station displacement for many epochs. Each element is equivalent to
+/// a scalar [`station_displacement_ecef_m`] call for the same position, epoch,
+/// and options, so per-epoch failures stay local to their output row.
+pub fn station_displacement_ecef_m_batch(
+    position: StationDisplacementPosition,
+    epochs: &[StationDisplacementEpoch],
+    options: StationDisplacementOptions<'_>,
+) -> Vec<Result<StationDisplacement, TideError>> {
+    epochs
+        .iter()
+        .map(|&epoch| station_displacement_ecef_m(position, epoch, options))
+        .collect()
 }
 
 /// Solid-earth tide displacement of an ITRF station, in metres (ECEF).

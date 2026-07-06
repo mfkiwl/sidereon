@@ -32,7 +32,10 @@ pub use rise_set::{
     MoonElevationOptions, MoonTransit, MoonTransitKind, SunElevationCrossing,
     SunElevationCrossingKind, SunElevationOptions,
 };
-pub use sun_moon::{sun_moon_ecef, sun_moon_eci, sun_moon_eci_at, SunMoon, SunMoonError};
+pub use sun_moon::{
+    sun_moon_ecef, sun_moon_ecef_with_polar_motion, sun_moon_eci, sun_moon_eci_at, SunMoon,
+    SunMoonError,
+};
 
 #[cfg(all(test, sidereon_repo_tests))]
 mod tests;

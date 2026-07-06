@@ -1,16 +1,13 @@
 {
   "_source": {
-    "note": "Oracle-only solid-earth-tide reference cases transcribed from comments in IERS DEHANTTIDEINEL.F; no tide model is implemented in this change.",
+    "note": "Oracle-only solid-earth-tide reference cases transcribed from comments in IERS DEHANTTIDEINEL.F.",
     "source_url": "https://iers-conventions.obspm.fr/content/chapter7/software/dehanttideinel/DEHANTTIDEINEL.F",
     "source_file": "DEHANTTIDEINEL.F",
-    "source_sha256": "bc6039a1704761881bb785ce44ce084ea82783107ff64c576e69155a4914e2cb",
-    "source_bytes": 19810,
     "source_comment_lines": [
       84,
       165
     ],
-    "routine_status": "Class 1 model per DEHANTTIDEINEL.F header.",
-    "revision_note": "Header revisions include the 2016-12-19 DAT update for the 2017 leap second and an added test case."
+    "routine_status": "Class 1 model per DEHANTTIDEINEL.F header."
   },
   "_counts": {
     "cases": 4,
@@ -20,6 +17,7 @@
   "cases": [
     {
       "id": "case_1_2009_04_13",
+      "source": "IERS Conventions Chapter 7 reference routine DEHANTTIDEINEL.F header test case 1, source_url in _source.",
       "source_test_case_number": 1,
       "inputs": {
         "xsta_m": {
@@ -85,6 +83,7 @@
     },
     {
       "id": "case_2_2012_07_13",
+      "source": "IERS Conventions Chapter 7 reference routine DEHANTTIDEINEL.F header test case 2, source_url in _source.",
       "source_test_case_number": 2,
       "inputs": {
         "xsta_m": {
@@ -150,6 +149,7 @@
     },
     {
       "id": "case_3_2015_07_15",
+      "source": "IERS Conventions Chapter 7 reference routine DEHANTTIDEINEL.F header test case 3, source_url in _source.",
       "source_test_case_number": 3,
       "inputs": {
         "xsta_m": {
@@ -215,6 +215,7 @@
     },
     {
       "id": "case_4_2017_01_15",
+      "source": "IERS Conventions Chapter 7 reference routine DEHANTTIDEINEL.F header test case 4, source_url in _source.",
       "source_test_case_number": 4,
       "inputs": {
         "xsta_m": {

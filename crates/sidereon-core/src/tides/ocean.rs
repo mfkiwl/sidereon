@@ -73,14 +73,98 @@ use crate::astro::constants::{
 use crate::astro::frames::transforms::itrs_to_geodetic_compute;
 use crate::astro::math::vec3::norm3_ref as norm;
 use crate::validate;
+use std::fmt::Write as _;
 
-use super::{cal2jd, invalid_tide_input, TideError};
+use super::{cal2jd, invalid_tide_input, BlqParseErrorKind, TideError};
 
 /// Number of BLQ tidal constituents (M2 S2 N2 K2 K1 O1 P1 Q1 Mf Mm Ssa).
 pub const NUM_OCEAN_CONSTITUENTS: usize = 11;
 
 /// Two pi (cycle of an astronomical argument).
 const TWO_PI: f64 = 2.0 * std::f64::consts::PI;
+
+/// BLQ tidal constituents supported by the ARG2 evaluator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OceanTideConstituent {
+    M2,
+    S2,
+    N2,
+    K2,
+    K1,
+    O1,
+    P1,
+    Q1,
+    Mf,
+    Mm,
+    Ssa,
+}
+
+impl OceanTideConstituent {
+    /// Standard BLQ constituent label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::M2 => "M2",
+            Self::S2 => "S2",
+            Self::N2 => "N2",
+            Self::K2 => "K2",
+            Self::K1 => "K1",
+            Self::O1 => "O1",
+            Self::P1 => "P1",
+            Self::Q1 => "Q1",
+            Self::Mf => "Mf",
+            Self::Mm => "Mm",
+            Self::Ssa => "Ssa",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::M2 => 0,
+            Self::S2 => 1,
+            Self::N2 => 2,
+            Self::K2 => 3,
+            Self::K1 => 4,
+            Self::O1 => 5,
+            Self::P1 => 6,
+            Self::Q1 => 7,
+            Self::Mf => 8,
+            Self::Mm => 9,
+            Self::Ssa => 10,
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "M2" => Some(Self::M2),
+            "S2" => Some(Self::S2),
+            "N2" => Some(Self::N2),
+            "K2" => Some(Self::K2),
+            "K1" => Some(Self::K1),
+            "O1" => Some(Self::O1),
+            "P1" => Some(Self::P1),
+            "Q1" => Some(Self::Q1),
+            "MF" => Some(Self::Mf),
+            "MM" => Some(Self::Mm),
+            "SSA" => Some(Self::Ssa),
+            _ => None,
+        }
+    }
+}
+
+/// Standard BLQ column order.
+pub const OCEAN_LOADING_CONSTITUENTS: [OceanTideConstituent; NUM_OCEAN_CONSTITUENTS] = [
+    OceanTideConstituent::M2,
+    OceanTideConstituent::S2,
+    OceanTideConstituent::N2,
+    OceanTideConstituent::K2,
+    OceanTideConstituent::K1,
+    OceanTideConstituent::O1,
+    OceanTideConstituent::P1,
+    OceanTideConstituent::Q1,
+    OceanTideConstituent::Mf,
+    OceanTideConstituent::Mm,
+    OceanTideConstituent::Ssa,
+];
 
 /// IERS `ARG2.F` constituent angular speeds (rad/s), BLQ column order
 /// M2 S2 N2 K2 K1 O1 P1 Q1 Mf Mm Ssa.
@@ -127,6 +211,319 @@ pub struct OceanLoadingBlq {
     pub amplitude_m: [[f64; NUM_OCEAN_CONSTITUENTS]; 3],
     /// Constituent Greenwich phase lags (degrees, positive lag).
     pub phase_deg: [[f64; NUM_OCEAN_CONSTITUENTS]; 3],
+}
+
+/// One parsed standard BLQ station block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OceanLoadingBlqBlock {
+    /// Station identifier line from the BLQ block.
+    pub station: String,
+    /// Parsed and reordered BLQ coefficients.
+    pub coefficients: OceanLoadingBlq,
+}
+
+impl OceanLoadingBlqBlock {
+    /// Format as a standard six-row BLQ block in the supported constituent order.
+    #[must_use]
+    pub fn to_blq_block(&self) -> String {
+        let mut out = String::new();
+        let labels = OCEAN_LOADING_CONSTITUENTS
+            .iter()
+            .map(|constituent| constituent.label())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(out, "$$ Column order: {labels}");
+        let _ = writeln!(out, "{}", self.station);
+        for row in self.coefficients.amplitude_m {
+            write_blq_row(&mut out, row);
+        }
+        for row in self.coefficients.phase_deg {
+            write_blq_row(&mut out, row);
+        }
+        out
+    }
+}
+
+impl OceanLoadingBlq {
+    /// Parse a single standard BLQ station block.
+    pub fn from_blq_block(text: &str) -> Result<OceanLoadingBlqBlock, TideError> {
+        parse_ocean_loading_blq_block(text)
+    }
+}
+
+/// Parse one standard Bos-Scherneck/HARDISP BLQ station block.
+pub fn parse_ocean_loading_blq_block(text: &str) -> Result<OceanLoadingBlqBlock, TideError> {
+    let mut blocks = parse_ocean_loading_blq_blocks(text)?;
+    match blocks.len() {
+        1 => Ok(blocks.remove(0)),
+        0 => Err(TideError::BlqParse {
+            line: 0,
+            kind: BlqParseErrorKind::Empty,
+        }),
+        _ => Err(TideError::BlqParse {
+            line: 0,
+            kind: BlqParseErrorKind::MultipleBlocks {
+                found: blocks.len(),
+            },
+        }),
+    }
+}
+
+/// Parse all standard station blocks in a BLQ file.
+pub fn parse_ocean_loading_blq_blocks(text: &str) -> Result<Vec<OceanLoadingBlqBlock>, TideError> {
+    let mut blocks = Vec::new();
+    let mut station: Option<(usize, String)> = None;
+    let mut rows: Vec<[f64; NUM_OCEAN_CONSTITUENTS]> = Vec::new();
+    let mut column_order = OCEAN_LOADING_CONSTITUENTS;
+    let mut saw_content = false;
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_content = true;
+
+        if let Some(order) = parse_constituent_header(trimmed, line_no)? {
+            column_order = order;
+            continue;
+        }
+        if is_blq_comment(trimmed) {
+            continue;
+        }
+
+        if station.is_none() {
+            if looks_like_numeric_row(trimmed) {
+                return Err(TideError::BlqParse {
+                    line: line_no,
+                    kind: BlqParseErrorKind::MissingStation,
+                });
+            }
+            station = Some((line_no, trimmed.to_string()));
+            rows.clear();
+            continue;
+        }
+
+        if !looks_like_numeric_row(trimmed) {
+            return Err(TideError::BlqParse {
+                line: line_no,
+                kind: BlqParseErrorKind::InvalidNumber {
+                    token: trimmed.to_string(),
+                },
+            });
+        }
+
+        let row = parse_blq_numeric_row(trimmed, line_no, column_order)?;
+        rows.push(row);
+        if rows.len() > 6 {
+            let station_name = station
+                .as_ref()
+                .map(|(_, name)| name.clone())
+                .unwrap_or_default();
+            return Err(TideError::BlqParse {
+                line: line_no,
+                kind: BlqParseErrorKind::TooManyCoefficientRows {
+                    station: station_name,
+                },
+            });
+        }
+        if rows.len() == 6 {
+            let (_, station_name) = station.take().expect("station present");
+            blocks.push(block_from_rows(station_name, &rows));
+            rows.clear();
+        }
+    }
+
+    if !saw_content {
+        return Err(TideError::BlqParse {
+            line: 0,
+            kind: BlqParseErrorKind::Empty,
+        });
+    }
+    if let Some((line, station_name)) = station {
+        return Err(TideError::BlqParse {
+            line,
+            kind: BlqParseErrorKind::MissingCoefficientRows {
+                station: station_name,
+                expected: 6,
+                found: rows.len(),
+            },
+        });
+    }
+
+    Ok(blocks)
+}
+
+fn block_from_rows(
+    station: String,
+    rows: &[[f64; NUM_OCEAN_CONSTITUENTS]],
+) -> OceanLoadingBlqBlock {
+    let mut amplitude_m = [[0.0_f64; NUM_OCEAN_CONSTITUENTS]; 3];
+    let mut phase_deg = [[0.0_f64; NUM_OCEAN_CONSTITUENTS]; 3];
+    amplitude_m.copy_from_slice(&rows[0..3]);
+    phase_deg.copy_from_slice(&rows[3..6]);
+    OceanLoadingBlqBlock {
+        station,
+        coefficients: OceanLoadingBlq {
+            amplitude_m,
+            phase_deg,
+        },
+    }
+}
+
+fn write_blq_row(out: &mut String, row: [f64; NUM_OCEAN_CONSTITUENTS]) {
+    for value in row {
+        let _ = write!(out, " {value:>16}");
+    }
+    out.push('\n');
+}
+
+fn is_blq_comment(line: &str) -> bool {
+    line.starts_with('$') || line.starts_with('#') || line.starts_with('!')
+}
+
+fn looks_like_numeric_row(line: &str) -> bool {
+    line.split_whitespace().next().is_some_and(|token| {
+        parse_blq_float_token(token).is_ok()
+            || token
+                .chars()
+                .next()
+                .is_some_and(|c| c == '+' || c == '-' || c == '.')
+    })
+}
+
+fn parse_blq_numeric_row(
+    line: &str,
+    line_no: usize,
+    column_order: [OceanTideConstituent; NUM_OCEAN_CONSTITUENTS],
+) -> Result<[f64; NUM_OCEAN_CONSTITUENTS], TideError> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() != NUM_OCEAN_CONSTITUENTS {
+        return Err(TideError::BlqParse {
+            line: line_no,
+            kind: BlqParseErrorKind::WrongColumnCount {
+                expected: NUM_OCEAN_CONSTITUENTS,
+                found: tokens.len(),
+            },
+        });
+    }
+
+    let mut row = [0.0_f64; NUM_OCEAN_CONSTITUENTS];
+    for (source_index, token) in tokens.iter().enumerate() {
+        let value = parse_blq_float_token(token).map_err(|kind| TideError::BlqParse {
+            line: line_no,
+            kind,
+        })?;
+        row[column_order[source_index].index()] = value;
+    }
+    Ok(row)
+}
+
+fn parse_blq_float_token(token: &str) -> Result<f64, BlqParseErrorKind> {
+    let normalized = token.replace('D', "E").replace('d', "e");
+    let value = normalized
+        .parse::<f64>()
+        .map_err(|_| BlqParseErrorKind::InvalidNumber {
+            token: token.to_string(),
+        })?;
+    if !value.is_finite() {
+        return Err(BlqParseErrorKind::NonFiniteNumber {
+            token: token.to_string(),
+        });
+    }
+    Ok(value)
+}
+
+fn parse_constituent_header(
+    line: &str,
+    line_no: usize,
+) -> Result<Option<[OceanTideConstituent; NUM_OCEAN_CONSTITUENTS]>, TideError> {
+    if line
+        .split_whitespace()
+        .all(|token| parse_blq_float_token(token).is_ok())
+    {
+        return Ok(None);
+    }
+
+    let upper = line.to_ascii_uppercase();
+    let header_hint = upper.contains("COLUMN") || upper.contains("CONSTITUENT");
+    let labels = line
+        .split_whitespace()
+        .map(normalize_constituent_token)
+        .filter(|token| is_constituent_like(token))
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return Ok(None);
+    }
+    if labels.len() != NUM_OCEAN_CONSTITUENTS && !header_hint {
+        return Ok(None);
+    }
+    if labels.len() != NUM_OCEAN_CONSTITUENTS {
+        return Err(TideError::BlqParse {
+            line: line_no,
+            kind: BlqParseErrorKind::WrongColumnCount {
+                expected: NUM_OCEAN_CONSTITUENTS,
+                found: labels.len(),
+            },
+        });
+    }
+
+    let mut order = [OceanTideConstituent::M2; NUM_OCEAN_CONSTITUENTS];
+    let mut seen = [false; NUM_OCEAN_CONSTITUENTS];
+    for (idx, label) in labels.iter().enumerate() {
+        let Some(constituent) = OceanTideConstituent::from_label(label) else {
+            return Err(TideError::BlqParse {
+                line: line_no,
+                kind: BlqParseErrorKind::UnsupportedConstituent {
+                    constituent: label.clone(),
+                },
+            });
+        };
+        let constituent_index = constituent.index();
+        if seen[constituent_index] {
+            return Err(TideError::BlqParse {
+                line: line_no,
+                kind: BlqParseErrorKind::DuplicateConstituent {
+                    constituent: constituent.label().to_string(),
+                },
+            });
+        }
+        seen[constituent_index] = true;
+        order[idx] = constituent;
+    }
+    Ok(Some(order))
+}
+
+fn normalize_constituent_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| {
+            c == '$'
+                || c == '#'
+                || c == '!'
+                || c == ':'
+                || c == ';'
+                || c == ','
+                || c == '('
+                || c == ')'
+                || c == '['
+                || c == ']'
+        })
+        .to_ascii_uppercase()
+}
+
+fn is_constituent_like(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    OceanTideConstituent::from_label(token).is_some()
+        || matches!(
+            token,
+            "MSF" | "M4" | "MS4" | "MN4" | "SA" | "2N2" | "L2" | "T2"
+        )
+        || (token.len() <= 4
+            && token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// Ocean tide loading displacement of an ITRF station, in metres (ECEF).
