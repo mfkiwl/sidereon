@@ -22,6 +22,7 @@ pub mod primitives;
 pub mod recipe;
 pub mod strategies;
 pub(crate) mod substrate;
+pub mod track;
 
 pub use primitives::{
     alpha_beta_apply_measurement, alpha_beta_filter_step, alpha_beta_predict,
@@ -38,4 +39,9 @@ pub use recipe::{
 };
 pub use strategies::{
     estimate, EstimateError, EstimateInput, EstimateOptions, EstimateOutput, ResolvedStrategy,
+};
+pub use track::{
+    rts_smooth, smooth_track_rts, SmoothedTrack, SmoothedTrackEpoch, TrackCoordinateFrame,
+    TrackError, TrackFilter, TrackFilterConfig, TrackGatedUpdate, TrackInnovation, TrackPrediction,
+    TrackRtsEpoch, TrackRtsHistory, TrackRtsHistoryBuilder, TrackState, TrackUpdate,
 };
