@@ -216,6 +216,121 @@ pub struct TdbEarthOrientationProvider {
     polar_motion: PolarMotion,
 }
 
+/// One polar-motion series sample for [`PolarMotionSeriesEarthOrientationProvider`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolarMotionSample {
+    /// Sample epoch, TDB seconds since J2000.
+    pub epoch_tdb_seconds: f64,
+    /// Polar-motion coordinates at the sample epoch.
+    pub polar_motion: PolarMotion,
+}
+
+impl PolarMotionSample {
+    /// Construct a sample from polar-motion coordinates in radians.
+    pub fn from_radians(
+        epoch_tdb_seconds: f64,
+        xp_rad: f64,
+        yp_rad: f64,
+    ) -> Result<Self, FrameTransformError> {
+        if !epoch_tdb_seconds.is_finite() {
+            return Err(invalid_input("epoch_tdb_seconds", "must be finite"));
+        }
+        Ok(Self {
+            epoch_tdb_seconds,
+            polar_motion: PolarMotion::from_radians(xp_rad, yp_rad)?,
+        })
+    }
+
+    /// Construct a sample from polar-motion coordinates in arcseconds.
+    pub fn from_arcseconds(
+        epoch_tdb_seconds: f64,
+        xp_arcsec: f64,
+        yp_arcsec: f64,
+    ) -> Result<Self, FrameTransformError> {
+        if !epoch_tdb_seconds.is_finite() {
+            return Err(invalid_input("epoch_tdb_seconds", "must be finite"));
+        }
+        Ok(Self {
+            epoch_tdb_seconds,
+            polar_motion: PolarMotion::from_arcseconds(xp_arcsec, yp_arcsec)?,
+        })
+    }
+}
+
+/// Earth-orientation provider backed by a time-ordered polar-motion series.
+///
+/// The embedded UT1 table supplies Earth-rotation timing. This provider adds
+/// caller-supplied `xp`/`yp` EOP samples and linearly interpolates polar motion
+/// at propagation epochs. Queries outside the sample coverage return an error
+/// instead of silently clamping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolarMotionSeriesEarthOrientationProvider {
+    samples: Box<[PolarMotionSample]>,
+}
+
+impl PolarMotionSeriesEarthOrientationProvider {
+    /// Build a provider from at least two strictly increasing samples.
+    pub fn new(samples: Vec<PolarMotionSample>) -> Result<Self, FrameTransformError> {
+        if samples.len() < 2 {
+            return Err(invalid_input(
+                "samples",
+                "must contain at least two polar-motion samples",
+            ));
+        }
+        for window in samples.windows(2) {
+            if window[0].epoch_tdb_seconds >= window[1].epoch_tdb_seconds {
+                return Err(invalid_input(
+                    "samples",
+                    "epochs must be strictly increasing",
+                ));
+            }
+        }
+        Ok(Self {
+            samples: samples.into_boxed_slice(),
+        })
+    }
+
+    /// Interpolate polar motion at a TDB epoch.
+    pub fn polar_motion_at_tdb_seconds(
+        &self,
+        epoch_tdb_seconds: f64,
+    ) -> Result<PolarMotion, FrameTransformError> {
+        if !epoch_tdb_seconds.is_finite() {
+            return Err(invalid_input("epoch_tdb_seconds", "must be finite"));
+        }
+        let first = self.samples.first().expect("validated non-empty samples");
+        let last = self.samples.last().expect("validated non-empty samples");
+        if epoch_tdb_seconds < first.epoch_tdb_seconds || epoch_tdb_seconds > last.epoch_tdb_seconds
+        {
+            return Err(invalid_input(
+                "epoch_tdb_seconds",
+                "outside polar-motion series coverage",
+            ));
+        }
+
+        match self.samples.binary_search_by(|sample| {
+            sample
+                .epoch_tdb_seconds
+                .partial_cmp(&epoch_tdb_seconds)
+                .expect("validated finite epoch")
+        }) {
+            Ok(index) => Ok(self.samples[index].polar_motion),
+            Err(index) => {
+                let before = self.samples[index - 1];
+                let after = self.samples[index];
+                let span = after.epoch_tdb_seconds - before.epoch_tdb_seconds;
+                let alpha = (epoch_tdb_seconds - before.epoch_tdb_seconds) / span;
+                PolarMotion::from_radians(
+                    before.polar_motion.xp_rad
+                        + alpha * (after.polar_motion.xp_rad - before.polar_motion.xp_rad),
+                    before.polar_motion.yp_rad
+                        + alpha * (after.polar_motion.yp_rad - before.polar_motion.yp_rad),
+                )
+            }
+        }
+    }
+}
+
 impl TdbEarthOrientationProvider {
     /// Build a provider with zero polar motion.
     pub const fn new() -> Self {
@@ -248,6 +363,17 @@ impl EarthOrientationProvider for TdbEarthOrientationProvider {
     ) -> Result<EarthOrientation, FrameTransformError> {
         let ts = time_scales_from_scale_j2000_seconds(TimeScale::Tdb, epoch_tdb_seconds)?;
         EarthOrientation::from_time_scales_with_polar_motion(&ts, self.polar_motion)
+    }
+}
+
+impl EarthOrientationProvider for PolarMotionSeriesEarthOrientationProvider {
+    fn orientation_at_tdb_seconds(
+        &self,
+        epoch_tdb_seconds: f64,
+    ) -> Result<EarthOrientation, FrameTransformError> {
+        let ts = time_scales_from_scale_j2000_seconds(TimeScale::Tdb, epoch_tdb_seconds)?;
+        let polar_motion = self.polar_motion_at_tdb_seconds(epoch_tdb_seconds)?;
+        EarthOrientation::from_time_scales_with_polar_motion(&ts, polar_motion)
     }
 }
 
@@ -331,4 +457,48 @@ fn neg_skew_matrix(omega: [f64; 3]) -> Mat3 {
         [-omega[2], 0.0, omega[0]],
         [omega[1], -omega[0], 0.0],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polar_motion_series_interpolates_and_builds_orientation() {
+        let provider = PolarMotionSeriesEarthOrientationProvider::new(vec![
+            PolarMotionSample::from_arcseconds(0.0, 0.10, -0.20).expect("sample"),
+            PolarMotionSample::from_arcseconds(10.0, 0.30, -0.10).expect("sample"),
+        ])
+        .expect("series provider");
+
+        let interpolated = provider
+            .polar_motion_at_tdb_seconds(5.0)
+            .expect("interpolated pole");
+        let expected = PolarMotion::from_arcseconds(0.20, -0.15).expect("expected pole");
+        assert!((interpolated.xp_rad - expected.xp_rad).abs() <= 1.0e-21);
+        assert!((interpolated.yp_rad - expected.yp_rad).abs() <= 1.0e-21);
+
+        let orientation = provider
+            .orientation_at_tdb_seconds(5.0)
+            .expect("series-backed orientation");
+        assert!((orientation.polar_motion().xp_rad - expected.xp_rad).abs() <= 1.0e-21);
+        assert!((orientation.polar_motion().yp_rad - expected.yp_rad).abs() <= 1.0e-21);
+    }
+
+    #[test]
+    fn polar_motion_series_rejects_bad_order_and_coverage() {
+        let unordered = PolarMotionSeriesEarthOrientationProvider::new(vec![
+            PolarMotionSample::from_arcseconds(10.0, 0.10, 0.20).expect("sample"),
+            PolarMotionSample::from_arcseconds(10.0, 0.20, 0.30).expect("sample"),
+        ]);
+        assert!(unordered.is_err());
+
+        let provider = PolarMotionSeriesEarthOrientationProvider::new(vec![
+            PolarMotionSample::from_arcseconds(0.0, 0.10, 0.20).expect("sample"),
+            PolarMotionSample::from_arcseconds(10.0, 0.20, 0.30).expect("sample"),
+        ])
+        .expect("series provider");
+        assert!(provider.polar_motion_at_tdb_seconds(-1.0).is_err());
+        assert!(provider.polar_motion_at_tdb_seconds(11.0).is_err());
+    }
 }

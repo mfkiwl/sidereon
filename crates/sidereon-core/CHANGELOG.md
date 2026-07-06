@@ -2,6 +2,19 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Solid Earth tide and solid Earth pole tide propagation forces. The solid
+  Earth tide force ships the IERS 2010 Chapter 6 Step 1 frequency-independent
+  anelastic Love-number `Cnm`/`Snm` corrections from Sun and Moon positions,
+  including degree 3 terms and degree 4 `k+` terms from degree-2 tides. Step 2
+  frequency-dependent constituent corrections are documented as a follow-up.
+  The pole tide force uses polar-motion samples from a series-backed
+  body-fixed provider and the IERS 2010 mean pole model, and both forces are
+  opt-in builder components.
+
 ## [0.18.0]
 
 ### Added
