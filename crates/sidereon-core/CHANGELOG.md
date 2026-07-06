@@ -4,6 +4,19 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- The fusion smoother's transition-combination step uses a specialized square
+  matrix product, making fixed-interval smoothing tractable over histories
+  recorded at inertial sample rates (found during the deep-urban field
+  rematch).
+- Evaluation bits change at the last unit in place for satellite-state and
+  media-correction paths that traverse the Earth-orientation chain (observed:
+  one ULP in troposphere delays), a side effect of wiring the tide forces
+  through the frame provider. Consumers regression-pinning absolute bits on
+  those surfaces should re-pin; record-identity against product text is
+  unaffected.
+
 ### Added
 
 - Solid Earth tide and solid Earth pole tide propagation forces. The solid

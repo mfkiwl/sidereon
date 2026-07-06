@@ -169,7 +169,7 @@ impl FusionRtsHistoryBuilder {
         let dimension = transition.len();
         validate_square_matrix(&transition, dimension, "transition")?;
         let combined = if let Some(previous) = &self.pending_transition {
-            matmul(&transition, previous)?
+            matmul_square_transition(&transition, previous)?
         } else {
             transition
         };
@@ -219,6 +219,47 @@ impl FusionRtsHistoryBuilder {
             Err(invalid_input("transition", "missing propagated interval"))
         }
     }
+}
+
+fn matmul_square_transition(
+    left: &[Vec<f64>],
+    right: &[Vec<f64>],
+) -> Result<Vec<Vec<f64>>, FusionError> {
+    let dimension = left.len();
+    if right.len() != dimension {
+        return Err(FusionError::DimensionMismatch {
+            field: "transition",
+            expected: dimension,
+            actual: right.len(),
+        });
+    }
+    let mut out = vec![vec![0.0; dimension]; dimension];
+    for row in 0..dimension {
+        if left[row].len() != dimension {
+            return Err(FusionError::DimensionMismatch {
+                field: "transition",
+                expected: dimension,
+                actual: left[row].len(),
+            });
+        }
+        for k in 0..dimension {
+            let lhs = left[row][k];
+            if lhs == 0.0 {
+                continue;
+            }
+            if right[k].len() != dimension {
+                return Err(FusionError::DimensionMismatch {
+                    field: "transition",
+                    expected: dimension,
+                    actual: right[k].len(),
+                });
+            }
+            for col in 0..dimension {
+                out[row][col] += lhs * right[k][col];
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One epoch in a smoothed fusion trajectory.
