@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use crate::astro::math::interp::lerp;
 use crate::ils::IlsError;
 use crate::ppp_corrections::{CivilDateTime, PppCorrections, PppCorrectionsOptions};
+use crate::ssr::SsrCorrectionStore;
 use crate::tropo::Met;
-use crate::GnssSatelliteId;
+use crate::{GnssSatelliteId, GnssSystem};
 
 /// One ionosphere-free code/phase observation in a static PPP epoch.
 #[derive(Debug, Clone, PartialEq)]
@@ -345,12 +346,43 @@ pub struct PppCorrectionLookup {
     pub sat_pco_ecef: BTreeMap<(GnssSatelliteId, usize), [f64; 3]>,
     pub sat_pcv_m: BTreeMap<(GnssSatelliteId, usize), f64>,
     pub code_bias_m: BTreeMap<(GnssSatelliteId, usize), f64>,
+    pub ssr_code_bias_m: BTreeMap<(GnssSatelliteId, usize), f64>,
+    pub phase_bias_m: BTreeMap<(GnssSatelliteId, usize), f64>,
     pub tide_enabled: bool,
     pub pole_tide_enabled: bool,
     pub ocean_loading_enabled: bool,
     pub windup_enabled: bool,
     pub satellite_antenna_enabled: bool,
     pub code_bias_enabled: bool,
+    pub ssr_code_bias_enabled: bool,
+    pub phase_bias_enabled: bool,
+}
+
+/// SSR/HAS signal ids used to apply parsed per-signal biases to an IF PPP row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsrPppBiasSignalPair {
+    pub code1_signal: u8,
+    pub code2_signal: u8,
+    pub phase1_signal: u8,
+    pub phase2_signal: u8,
+    pub freq1_hz: f64,
+    pub freq2_hz: f64,
+}
+
+/// Per-satellite and per-system default signal mapping for SSR/HAS PPP biases.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SsrPppBiasOptions {
+    pub per_satellite: BTreeMap<GnssSatelliteId, SsrPppBiasSignalPair>,
+    pub per_system: BTreeMap<GnssSystem, SsrPppBiasSignalPair>,
+}
+
+impl SsrPppBiasOptions {
+    pub fn signal_pair(&self, sat: GnssSatelliteId) -> Option<SsrPppBiasSignalPair> {
+        self.per_satellite
+            .get(&sat)
+            .copied()
+            .or_else(|| self.per_system.get(&sat.system).copied())
+    }
 }
 
 impl PppCorrectionLookup {
@@ -411,13 +443,58 @@ impl PppCorrectionLookup {
                 .into_iter()
                 .map(|c| ((c.sat, c.epoch_index), c.value_m))
                 .collect(),
+            ssr_code_bias_m: BTreeMap::new(),
+            phase_bias_m: BTreeMap::new(),
             tide_enabled,
             pole_tide_enabled,
             ocean_loading_enabled,
             windup_enabled,
             satellite_antenna_enabled,
             code_bias_enabled,
+            ssr_code_bias_enabled: false,
+            phase_bias_enabled: false,
         }
+    }
+
+    /// Merge parsed SSR/HAS signal biases into this lookup for the given epochs.
+    ///
+    /// SSR/HAS code biases are stored as code-only model-side corrections, so an
+    /// observation-side HAS/SSR bias uses the opposite sign. Phase biases are
+    /// stored as observation-side corrections and are added directly to the
+    /// phase residual.
+    pub fn with_ssr_biases(
+        mut self,
+        store: &SsrCorrectionStore,
+        epochs: &[FloatEpoch],
+        options: &SsrPppBiasOptions,
+    ) -> Self {
+        for (epoch_index, epoch) in epochs.iter().enumerate() {
+            for obs in &epoch.observations {
+                let Some(signals) = options.signal_pair(obs.sat) else {
+                    continue;
+                };
+                if let (Some(b1), Some(b2)) = (
+                    store.code_bias(obs.sat, signals.code1_signal),
+                    store.code_bias(obs.sat, signals.code2_signal),
+                ) {
+                    let code_if_m =
+                        ionosphere_free_bias_m(b1, b2, signals.freq1_hz, signals.freq2_hz);
+                    self.ssr_code_bias_m
+                        .insert((obs.sat, epoch_index), -code_if_m);
+                    self.ssr_code_bias_enabled = true;
+                }
+                if let (Some(b1), Some(b2)) = (
+                    store.phase_bias(obs.sat, signals.phase1_signal),
+                    store.phase_bias(obs.sat, signals.phase2_signal),
+                ) {
+                    let phase_if_m =
+                        ionosphere_free_bias_m(b1, b2, signals.freq1_hz, signals.freq2_hz);
+                    self.phase_bias_m.insert((obs.sat, epoch_index), phase_if_m);
+                    self.phase_bias_enabled = true;
+                }
+            }
+        }
+        self
     }
 }
 
@@ -430,6 +507,7 @@ impl From<PppCorrections> for PppCorrectionLookup {
         let satellite_antenna_enabled =
             !value.sat_pco_ecef.is_empty() || !value.sat_pcv_m.is_empty();
         let code_bias_enabled = !value.code_bias_m.is_empty();
+        let phase_bias_enabled = false;
         Self::from_parts(
             value,
             tide_enabled,
@@ -439,7 +517,20 @@ impl From<PppCorrections> for PppCorrectionLookup {
             satellite_antenna_enabled,
             code_bias_enabled,
         )
+        .with_phase_bias_enabled(phase_bias_enabled)
     }
+}
+
+impl PppCorrectionLookup {
+    fn with_phase_bias_enabled(mut self, phase_bias_enabled: bool) -> Self {
+        self.phase_bias_enabled = phase_bias_enabled;
+        self
+    }
+}
+
+fn ionosphere_free_bias_m(b1_m: f64, b2_m: f64, f1_hz: f64, f2_hz: f64) -> f64 {
+    let gamma = f1_hz * f1_hz / (f1_hz * f1_hz - f2_hz * f2_hz);
+    gamma * b1_m - (gamma - 1.0) * b2_m
 }
 
 /// Per-satellite residual row in the returned public solution.
@@ -548,6 +639,8 @@ pub enum MissingCorrection {
     SatelliteAntennaPco,
     SatelliteAntennaPcv,
     CodeBias,
+    SsrCodeBias,
+    PhaseBias,
     ReceiverAntennaFrequency(String),
     ReceiverAntennaPcv(String),
     ReceiverAntennaGeometry,
@@ -563,6 +656,8 @@ impl core::fmt::Display for MissingCorrection {
             Self::SatelliteAntennaPco => write!(f, "satellite antenna PCO"),
             Self::SatelliteAntennaPcv => write!(f, "satellite antenna PCV"),
             Self::CodeBias => write!(f, "code-bias correction"),
+            Self::SsrCodeBias => write!(f, "SSR/HAS code-bias correction"),
+            Self::PhaseBias => write!(f, "phase-bias correction"),
             Self::ReceiverAntennaFrequency(label) => {
                 write!(f, "receiver antenna frequency {label}")
             }
