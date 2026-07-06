@@ -39,7 +39,8 @@ jobs:
             git switch --track origin/validation
           else
             git switch --orphan validation
-            git rm -rf .
+            git rm -rf --ignore-unmatch . >/dev/null
+            git clean -fdx >/dev/null
           fi
           cp "$RUNNER_TEMP/scoreboard/latest.json" latest.json
           cp "$RUNNER_TEMP/scoreboard/history.jsonl" history.jsonl
