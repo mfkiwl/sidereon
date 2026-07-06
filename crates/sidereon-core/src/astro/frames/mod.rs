@@ -30,4 +30,7 @@ pub mod orientation;
 pub mod precession;
 pub mod transforms;
 
-pub use orientation::{EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider};
+pub use orientation::{
+    EarthOrientation, EarthOrientationProvider, PolarMotionSample,
+    PolarMotionSeriesEarthOrientationProvider, TdbEarthOrientationProvider,
+};

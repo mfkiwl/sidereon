@@ -18,8 +18,9 @@ use crate::astro::covariance::{Covariance6, Covariance6Error};
 use crate::astro::error::PropagationError;
 use crate::astro::forces::{
     CompositeForceModel, DragParameters, EarthRadiationPressure, ForceModel, J2Gravity,
-    SchwarzschildRelativity, SolarRadiationPressure, SourcedDragForce, SpaceWeatherSource,
-    SphericalHarmonicGravityConfig, ThirdBodyGravity, TwoBodyGravity, ZonalGravity,
+    SchwarzschildRelativity, SolarRadiationPressure, SolidEarthPoleTideGravity,
+    SolidEarthTideGravity, SourcedDragForce, SpaceWeatherSource, SphericalHarmonicGravityConfig,
+    ThirdBodyGravity, TwoBodyGravity, ZonalGravity,
 };
 use crate::astro::integrators::{Integrator, DP54, RK4};
 use crate::astro::propagator::api::{IntegratorOptions, PropagationContext};
@@ -58,6 +59,7 @@ pub enum IntegratorKind {
 /// in the canonical Earth values from [`crate::astro::constants`]. The
 /// [`Self::Composite`] variant adds optional force components without changing
 /// those legacy branches.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ForceModelKind {
     /// Pure two-body (Keplerian) gravity.
@@ -92,6 +94,10 @@ pub struct ForceModelComponents {
     pub spherical_harmonic: Option<SphericalHarmonicGravityConfig>,
     /// Optional Sun and Moon third-body perturbation.
     pub third_body: Option<ThirdBodyGravity>,
+    /// Optional solid Earth tide geopotential perturbation.
+    pub solid_earth_tide: Option<SolidEarthTideGravity>,
+    /// Optional solid Earth pole tide geopotential perturbation.
+    pub solid_earth_pole_tide: Option<SolidEarthPoleTideGravity>,
     /// Optional cannonball solar radiation pressure perturbation.
     pub solar_radiation_pressure: Option<SolarRadiationPressure>,
     /// Optional cannonball Earth albedo and infrared radiation pressure perturbation.
@@ -113,6 +119,8 @@ impl ForceModelComponents {
         zonal: None,
         spherical_harmonic: None,
         third_body: None,
+        solid_earth_tide: None,
+        solid_earth_pole_tide: None,
         solar_radiation_pressure: None,
         earth_radiation_pressure: None,
         relativity: None,
@@ -133,6 +141,8 @@ impl ForceModelComponents {
             zonal: Some(ZonalGravity::earth_j2_through_j6()),
             spherical_harmonic: None,
             third_body: Some(ThirdBodyGravity::default()),
+            solid_earth_tide: None,
+            solid_earth_pole_tide: None,
             solar_radiation_pressure,
             earth_radiation_pressure: None,
             relativity: Some(SchwarzschildRelativity::default()),
@@ -152,6 +162,8 @@ impl ForceModelComponents {
                 max_degree, max_order,
             )?),
             third_body: Some(ThirdBodyGravity::default()),
+            solid_earth_tide: None,
+            solid_earth_pole_tide: None,
             solar_radiation_pressure,
             earth_radiation_pressure: None,
             relativity: Some(SchwarzschildRelativity::default()),
@@ -179,6 +191,18 @@ impl ForceModelComponents {
     /// Set or replace third-body gravity.
     pub fn with_third_body(mut self, third_body: ThirdBodyGravity) -> Self {
         self.third_body = Some(third_body);
+        self
+    }
+
+    /// Set or replace solid Earth tide geopotential perturbation.
+    pub fn with_solid_earth_tide(mut self, tide: SolidEarthTideGravity) -> Self {
+        self.solid_earth_tide = Some(tide);
+        self
+    }
+
+    /// Set or replace solid Earth pole tide geopotential perturbation.
+    pub fn with_solid_earth_pole_tide(mut self, tide: SolidEarthPoleTideGravity) -> Self {
+        self.solid_earth_pole_tide = Some(tide);
         self
     }
 
@@ -283,6 +307,12 @@ impl ForceModelKind {
                 }
                 if let Some(third_body) = components.third_body {
                     composite.add(Box::new(third_body));
+                }
+                if let Some(tide) = components.solid_earth_tide {
+                    composite.add(Box::new(tide));
+                }
+                if let Some(tide) = components.solid_earth_pole_tide {
+                    composite.add(Box::new(tide));
                 }
                 if let Some(srp) = components.solar_radiation_pressure {
                     composite.add(Box::new(srp));
@@ -904,11 +934,27 @@ mod tests {
     fn earth_radiation_pressure_component_is_opt_in() {
         let components = ForceModelComponents::earth_phase_a(None);
         assert_eq!(components.earth_radiation_pressure, None);
+        assert_eq!(components.solid_earth_tide, None);
+        assert_eq!(components.solid_earth_pole_tide, None);
 
         let pressure = EarthRadiationPressure::new(1.2, 0.011).expect("valid model");
         let with_pressure = components.with_earth_radiation_pressure(pressure);
         assert_eq!(components.earth_radiation_pressure, None);
         assert_eq!(with_pressure.earth_radiation_pressure, Some(pressure));
+
+        let with_tides = components
+            .with_solid_earth_tide(SolidEarthTideGravity::default())
+            .with_solid_earth_pole_tide(SolidEarthPoleTideGravity::default());
+        assert_eq!(components.solid_earth_tide, None);
+        assert_eq!(components.solid_earth_pole_tide, None);
+        assert_eq!(
+            with_tides.solid_earth_tide,
+            Some(SolidEarthTideGravity::default())
+        );
+        assert_eq!(
+            with_tides.solid_earth_pole_tide,
+            Some(SolidEarthPoleTideGravity::default())
+        );
     }
 
     #[test]

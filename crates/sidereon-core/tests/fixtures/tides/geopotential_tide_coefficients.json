@@ -1,0 +1,47 @@
+{
+  "description": "Solid Earth tide and solid Earth pole tide geopotential coefficient fixtures. Values are fully normalized Cnm/Snm corrections.",
+  "rows": [
+    {
+      "id": "solid_earth_step1_greenwich_equator_unit_body",
+      "source": "IERS Conventions (2010), Chapter 6, Eq. (6.6), Eq. (6.7), and Table 6.3. The tide-raising body is placed on the Greenwich equator at r=Re with GMj/GM_E=1 so the row reduces to the published Legendre normalization and Love-number constants.",
+      "sun_itrf_km": [6378.1363, 0.0, 0.0],
+      "moon_itrf_km": [1000000000000.0, 1000000000000.0, 1000000000000.0],
+      "earth_mu_km3_s2": 398600.4415,
+      "earth_radius_km": 6378.1363,
+      "gm_sun_km3_s2": 398600.4415,
+      "gm_moon_km3_s2": 1.0,
+      "coefficients": [
+        { "degree": 2, "order": 0, "c": -0.06750689224071865, "s": 0.0 },
+        { "degree": 2, "order": 2, "c": 0.11658454468753567, "s": 0.0005034878350069642 },
+        { "degree": 3, "order": 1, "c": -0.02152531731971182, "s": 0.0 },
+        { "degree": 4, "order": 0, "c": 0.0001990100499974813, "s": 0.0 },
+        { "degree": 4, "order": 2, "c": -0.00022076005073382276, "s": 0.0 }
+      ]
+    },
+    {
+      "id": "solid_earth_pole_tide_j2000_unit_wobble",
+      "source": "IERS Conventions (2010), Chapter 6 solid Earth pole tide equations for normalized C21/S21 and Chapter 7 Eq. (7.24), Table 7.7. The epoch is t=2000.0 and polar motion is xp=0.155974 arcsec, yp=0.246346 arcsec.",
+      "jd_tt": 2451545.0,
+      "xp_arcsec": 0.155974,
+      "yp_arcsec": 0.246346,
+      "coefficients": [
+        { "degree": 2, "order": 1, "c": -0.00000000013483295, "s": -0.00000000013176705 }
+      ]
+    },
+    {
+      "id": "solid_earth_step1_orekit_2003_05_06_degree3_degree4",
+      "source": "Orekit 13.1.5 SolidTidesFieldTest.testDeltaCnmSnm reference arrays for AbsoluteDate 2003-05-06T13:43:32.125 UTC, citing IERS Conventions (2010) Chapter 6. This row checks degree 3 and degree 4 values only; Orekit's degree 2 row also includes Step 2 frequency-dependent and permanent-tide terms that this implementation intentionally does not ship.",
+      "utc": "2003-05-06T13:43:32.125Z",
+      "max_abs_error": 0.000000000001,
+      "coefficients": [
+        { "degree": 3, "order": 0, "c": -0.00000000001290639603871307, "s": 0.0 },
+        { "degree": 3, "order": 1, "c": -0.00000000000009287425756410472, "s": -0.000000000000046129961143785774 },
+        { "degree": 3, "order": 2, "c": 0.000000000008356574033404024, "s": 0.000000000018097527720906976 },
+        { "degree": 3, "order": 3, "c": -0.0000000000022644465207860626, "s": 0.00000000001633889224766215 },
+        { "degree": 4, "order": 0, "c": 0.000000000007888138856951149, "s": 0.0 },
+        { "degree": 4, "order": 1, "c": -0.000000000014422209452877158, "s": -0.000000000004897228975221076 },
+        { "degree": 4, "order": 2, "c": -0.000000000006815519349970944, "s": -0.0000000000041034042689652575 }
+      ]
+    }
+  ]
+}

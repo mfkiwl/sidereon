@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 /// Per-evaluation context shared with force models.
 ///
-/// The default context is intentionally empty. A caller that wants a future
-/// body-fixed force to use the precise Earth-fixed frame can attach an
+/// The default context is intentionally empty. A caller that wants a body-fixed
+/// force to use the precise Earth-fixed frame can attach an
 /// [`EarthOrientationProvider`], while existing force models and default
 /// propagation remain bit-identical.
 #[derive(Clone, Default)]

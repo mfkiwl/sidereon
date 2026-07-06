@@ -25,7 +25,7 @@ use crate::astro::math::least_squares::{
     SolveOptions, Status, TrustRegionSolve,
 };
 use crate::astro::propagator::{
-    ForceModelKind, IntegratorKind, IntegratorOptions, StatePropagator,
+    ForceModelKind, IntegratorKind, IntegratorOptions, PropagationContext, StatePropagator,
 };
 use crate::astro::state::CartesianState;
 use crate::astro::time::civil::{civil_from_j2000_seconds, j2000_seconds_from_split};
@@ -61,6 +61,9 @@ pub struct OrbitFitOptions {
     pub drag: Option<DragParameters>,
     /// Optional per-epoch space-weather source for drag.
     pub space_weather: Option<SpaceWeatherSource>,
+    /// Propagation context shared with force models during fitting. Tide
+    /// force models require a body-fixed frame provider here.
+    pub propagation_context: PropagationContext,
 }
 
 impl Default for OrbitFitOptions {
@@ -80,6 +83,7 @@ impl Default for OrbitFitOptions {
             min_ledger_samples: DEFAULT_MIN_LEDGER_SAMPLES,
             drag: None,
             space_weather: None,
+            propagation_context: PropagationContext::default(),
         }
     }
 }
@@ -947,9 +951,10 @@ fn seed_initial_state(
         let jd3 = observations[2].epoch_j2000_s / SECONDS_PER_DAY;
         if let Ok((v2, _, _, _)) = iod::hgibbs(&r1, &r2, &r3, jd1, jd2, jd3) {
             let midpoint = CartesianState::new(observations[1].epoch_j2000_s, r2, v2);
-            if let Ok(result) =
-                build_propagator(midpoint, options).propagate_to(observations[0].epoch_j2000_s)
-            {
+            if let Ok(result) = build_propagator(midpoint, options).propagate_to_with_context(
+                observations[0].epoch_j2000_s,
+                &options.propagation_context,
+            ) {
                 return Ok(result.final_state);
             }
         }
@@ -1107,7 +1112,7 @@ fn propagate_to_observations(
         .map(|observation| observation.epoch_j2000_s)
         .collect();
     build_propagator(initial, options)
-        .ephemeris(&epochs)
+        .ephemeris_with_context(&epochs, &options.propagation_context)
         .map_err(|source| OrbitFitError::Propagation { satellite, source })
 }
 

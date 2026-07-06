@@ -159,7 +159,8 @@ pub mod tolerances;
 pub mod fusion; // GNSS/INS error-state prediction and EKF correction over the inertial surface
 
 pub use crate::astro::frames::{
-    EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider,
+    EarthOrientation, EarthOrientationProvider, PolarMotionSample,
+    PolarMotionSeriesEarthOrientationProvider, TdbEarthOrientationProvider,
 };
 pub use crate::error_metrics::{
     error_ellipse_from_enu_m2, horizontal_radius_at, metrics_from_ecef_covariance_m2,
