@@ -30,7 +30,7 @@
     },
     {
       "id": "solid_earth_step1_orekit_2003_05_06_degree3_degree4",
-      "source": "Orekit 13.1.5 SolidTidesFieldTest.testDeltaCnmSnm reference arrays for AbsoluteDate 2003-05-06T13:43:32.125 UTC, citing IERS Conventions (2010) Chapter 6. This row checks degree 3 and degree 4 values only; Orekit's degree 2 row also includes Step 2 frequency-dependent and permanent-tide terms that this implementation intentionally does not ship.",
+      "source": "Orekit SolidTidesFieldTest.testDeltaCnmSnm reference arrays for AbsoluteDate 2003-05-06T13:43:32.125 UTC, citing IERS Conventions (2010) Chapter 6. This row checks degree 3 and degree 4 values only; Orekit's degree 2 row also includes Step 2 frequency-dependent and permanent-tide terms that this implementation intentionally does not ship.",
       "utc": "2003-05-06T13:43:32.125Z",
       "max_abs_error": 0.000000000001,
       "coefficients": [

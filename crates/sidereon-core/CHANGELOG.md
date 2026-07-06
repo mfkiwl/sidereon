@@ -19,6 +19,13 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Added
 
+- Station displacement corrections now have a public `tides` entry that accepts
+  ITRF/ECEF or WGS84 geodetic station positions, UTC epochs, per-epoch IERS
+  polar motion, and optional caller-supplied BLQ ocean-loading coefficients.
+  The scalar and batch APIs return component-resolved ITRF/ECEF displacements
+  for solid Earth tide, pole tide, and ocean tidal loading. BLQ parsing supports
+  standard Bos-Scherneck/HARDISP six-row station blocks and reports typed errors
+  for unsupported constituents.
 - Solid Earth tide and solid Earth pole tide propagation forces. The solid
   Earth tide force ships the IERS 2010 Chapter 6 Step 1 frequency-independent
   anelastic Love-number `Cnm`/`Snm` corrections from Sun and Moon positions,

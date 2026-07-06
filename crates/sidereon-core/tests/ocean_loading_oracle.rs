@@ -11,8 +11,7 @@
 //! The reference vectors below were produced by the C harness
 //! `~/xuku/rtklib/oracle_harness/oload_oracle.c`, which calls RTKLIB's own
 //! `readblq()` + `tidedisp(..., opt=2, erp=NULL, ...)` (build recipe in the
-//! harness header; the harness reproduces these exact numbers). RTKLIB demo5
-//! commit 75a2e56.
+//! harness header; the harness reproduces these exact numbers).
 //!
 //! ARG2 omits the 18.6-yr nodal modulation and minor side constituents the
 //! admittance method carries; at inland ZIM2 (OTL a few mm) the achieved

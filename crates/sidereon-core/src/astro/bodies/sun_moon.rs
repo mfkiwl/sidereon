@@ -22,7 +22,8 @@ use crate::astro::constants::earth::WGS84_A_M;
 use crate::astro::constants::time::{DAYS_PER_JULIAN_CENTURY, J2000_JD};
 use crate::astro::constants::units::{ARCSEC_TO_RAD, DEG_TO_RAD};
 use crate::astro::frames::transforms::{
-    mat3_vec3_mul_unchecked, mean_of_date_to_itrs_matrix, FrameTransformError,
+    mat3_vec3_mul_unchecked, mean_of_date_to_itrs_matrix,
+    mean_of_date_to_itrs_matrix_with_polar_motion, FrameTransformError, PolarMotion,
 };
 use crate::astro::time::scales::TimeScales;
 use crate::validate;
@@ -181,8 +182,22 @@ pub fn sun_moon_eci_at(ts: &TimeScales) -> Result<SunMoon, SunMoonError> {
 /// using the full GCRS->ITRS transform here would double-count precession (about
 /// 0.37 deg of Sun-direction error at epoch 2026).
 pub fn sun_moon_ecef(ts: &TimeScales) -> Result<SunMoon, SunMoonError> {
+    sun_moon_ecef_with_polar_motion(ts, PolarMotion::ZERO)
+}
+
+/// Analytic Sun and Moon geocentric positions in the Earth-fixed (ITRS) frame
+/// (metres), applying caller-supplied IERS polar motion in the same
+/// mean-of-date-to-ITRS rotation used by the solid-tide force lane.
+pub fn sun_moon_ecef_with_polar_motion(
+    ts: &TimeScales,
+    polar_motion: PolarMotion,
+) -> Result<SunMoon, SunMoonError> {
     let eci = sun_moon_eci_at(ts)?;
-    let r = mean_of_date_to_itrs_matrix(ts)?;
+    let r = if polar_motion == PolarMotion::ZERO {
+        mean_of_date_to_itrs_matrix(ts)?
+    } else {
+        mean_of_date_to_itrs_matrix_with_polar_motion(ts, polar_motion)?
+    };
     let sun = mat3_vec3_mul_unchecked(&r, &eci.sun);
     let moon = mat3_vec3_mul_unchecked(&r, &eci.moon);
     validate_sun_moon(SunMoon { sun, moon })

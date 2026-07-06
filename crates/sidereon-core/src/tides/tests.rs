@@ -1,17 +1,16 @@
 //! Golden-vector validation of [`solid_earth_tide`] against the staged IERS
 //! DEHANTTIDEINEL reference cases.
 //!
-//! Fixture provenance: `tests/fixtures/tides/tides_dehant_golden.json` holds the 4
-//! canonical test cases transcribed from the header comments (source lines 84-165)
-//! of the IERS Conventions routine `DEHANTTIDEINEL.F`
-//! (https://iers-conventions.obspm.fr/content/chapter7/software/dehanttideinel/DEHANTTIDEINEL.F,
-//! downloaded 2026-06-12, 19810 bytes,
-//! sha256 bc6039a1704761881bb785ce44ce084ea82783107ff64c576e69155a4914e2cb).
-//! Each case carries station/Sun/Moon vectors, UTC date, fractional UTC hour `FHR`,
-//! and the expected geocentric ITRF displacement vector (metres; hours for `FHR`).
-//! Only reference test-case data is vendored, not the Fortran routine; the IERS
-//! Conventions Software License grants free use including commercial use and
-//! distribution of derived work with attribution to the IERS origin.
+//! Fixture provenance: `tests/fixtures/tides/tides_dehant_golden.json` holds the
+//! canonical test cases transcribed from the header comments of the IERS
+//! Conventions routine `DEHANTTIDEINEL.F`
+//! (https://iers-conventions.obspm.fr/content/chapter7/software/dehanttideinel/DEHANTTIDEINEL.F).
+//! Each case carries its own source citation, station/Sun/Moon vectors, UTC
+//! date, fractional UTC hour `FHR`, and the expected geocentric ITRF
+//! displacement vector (metres; hours for `FHR`). Only reference test-case data
+//! is vendored, not the Fortran routine; the IERS Conventions Software License
+//! grants free use including commercial use and distribution of derived work
+//! with attribution to the IERS origin.
 
 use std::path::PathBuf;
 
@@ -56,6 +55,12 @@ fn solid_earth_tide_matches_iers_dehant_golden() {
 
     for case in cases {
         let id = case["id"].as_str().unwrap_or("?");
+        assert!(
+            case["source"].as_str().is_some_and(|source| {
+                source.contains("IERS Conventions") && source.contains("DEHANTTIDEINEL")
+            }),
+            "{id} must cite its source row"
+        );
         // case_4 is a known fixture transcription artifact: its `expected`
         // displacement is a verbatim copy of case_3's (the DEHANTTIDEINEL.F
         // header repeats case 3's output in the case-4 comment block), while its
