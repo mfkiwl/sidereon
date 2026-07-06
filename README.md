@@ -1,6 +1,6 @@
 # sidereon
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21174996.svg)](https://doi.org/10.5281/zenodo.21174996)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21174996-1682D4.svg)](https://doi.org/10.5281/zenodo.21174996)
 
 GNSS positioning and astrodynamics in Rust, with first-class interfaces in [Python](https://github.com/neilberkman/sidereon-python), [C](https://github.com/neilberkman/sidereon-c), [WebAssembly](https://github.com/neilberkman/sidereon-wasm), and [Elixir](https://github.com/neilberkman/sidereon-ex). Reference-validated, and bit-exact to public oracles where it counts.
 
