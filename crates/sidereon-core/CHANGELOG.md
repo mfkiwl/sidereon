@@ -2,6 +2,19 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- SSR and Galileo HAS corrections now drive the PPP solve: an SSR-corrected
+  ephemeris provider applies orbit and clock corrections over broadcast
+  ephemeris with strict IODE matching, update-interval staleness handling, and
+  explicit antenna-phase-center versus center-of-mass reference handling; RTCM
+  SSR code and phase biases for GPS and Galileo decode into the correction
+  store and apply in the PPP measurement model. On the end-to-end fixture the
+  SSR-corrected solve closes an 11.6 m broadcast-only error to below 0.1 mm
+  against the SP3-backed reference.
+
 ## [0.19.0]
 
 ### Changed
