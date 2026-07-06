@@ -172,8 +172,11 @@ pub use crate::estimation::{
     alpha_beta_steady_state_gains, cfar_ca_false_alarm_probability, cfar_ca_multiplier_from_pfa,
     cfar_ca_pfa_from_multiplier, cfar_ca_threshold, ewma_update, ewma_update_power_of_two,
     kalman_cv_steady_state_gains, mad_spread, nis_expected_value, nis_gate_test,
-    nis_gate_threshold, nis_statistic, normalized_innovation, AlphaBetaGains, AlphaBetaState,
-    AlphaBetaStep, PrimitiveError, ScalarKalmanGains, MAD_GAUSSIAN_CONSISTENCY,
+    nis_gate_threshold, nis_statistic, normalized_innovation, rts_smooth, smooth_track_rts,
+    AlphaBetaGains, AlphaBetaState, AlphaBetaStep, PrimitiveError, ScalarKalmanGains,
+    SmoothedTrack, SmoothedTrackEpoch, TrackCoordinateFrame, TrackError, TrackFilter,
+    TrackFilterConfig, TrackGatedUpdate, TrackInnovation, TrackPrediction, TrackRtsEpoch,
+    TrackRtsHistory, TrackRtsHistoryBuilder, TrackState, TrackUpdate, MAD_GAUSSIAN_CONSISTENCY,
 };
 pub use crate::quality::{
     reliability_araim, reliability_design, wtest_noncentrality, wtest_noncentrality_components,
