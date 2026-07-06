@@ -10,12 +10,10 @@ All notable changes to `sidereon-core` are documented here.
   matrix product, making fixed-interval smoothing tractable over histories
   recorded at inertial sample rates (found during the deep-urban field
   rematch).
-- Evaluation bits change at the last unit in place for satellite-state and
-  media-correction paths that traverse the Earth-orientation chain (observed:
-  one ULP in troposphere delays), a side effect of wiring the tide forces
-  through the frame provider. Consumers regression-pinning absolute bits on
-  those surfaces should re-pin; record-identity against product text is
-  unaffected.
+- Correction to an earlier draft of this entry: a one-ULP evaluation shift on
+  Earth-orientation-chain paths appeared mid-cycle from the tide-force wiring
+  and was reversed by the station-displacement refactor before release. Net
+  evaluation bits for these surfaces are UNCHANGED relative to 0.18.0.
 
 ### Added
 
