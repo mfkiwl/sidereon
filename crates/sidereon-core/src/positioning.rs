@@ -24,6 +24,13 @@ pub use crate::static_positioning::{
     StaticInfluenceStatus, StaticResidual, StaticSatelliteBatchInfluence, StaticSatelliteInfluence,
     StaticSolution, StaticSolutionMetadata, StaticSolveError, StaticSolveOptions,
 };
+pub use crate::static_reference_station::{
+    solve_static_reference_station_rinex, StaticReferenceCarrierRinexOptions,
+    StaticReferenceCarrierSolution, StaticReferenceCodeSolution, StaticReferenceEpochDiagnostic,
+    StaticReferenceFixStatus, StaticReferenceModeReport, StaticReferenceModeStatus,
+    StaticReferenceStationCovariance, StaticReferenceStationError, StaticReferenceStationMode,
+    StaticReferenceStationRinexOptions, StaticReferenceStationSolution,
+};
 use crate::{astro::time, Error as CoreError, GnssSatelliteId};
 
 /// Role-oriented alias for a solved receiver state.

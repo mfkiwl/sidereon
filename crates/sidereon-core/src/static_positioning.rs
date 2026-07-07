@@ -445,6 +445,15 @@ pub fn solve_static(
     ))
 }
 
+pub(crate) fn solve_static_without_influence(
+    eph: &dyn EphemerisSource,
+    epochs: &[StaticEpoch],
+    options: StaticSolveOptions,
+) -> Result<StaticSolution, StaticSolveError> {
+    let core = solve_static_core(eph, epochs, options)?;
+    Ok(core.into_public(Vec::new(), Vec::new(), Vec::new()))
+}
+
 #[derive(Debug, Clone)]
 struct PreparedEpoch {
     input_index: usize,
