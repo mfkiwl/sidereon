@@ -21,6 +21,7 @@ use sidereon::{
     PositionErrorMetrics, RinexSppEpochInputs, RinexSppOptions, RinexSppSource,
 };
 
+mod mcp;
 mod tui;
 
 #[derive(Parser)]
@@ -123,6 +124,12 @@ enum Command {
         /// Start paused after loading the first epoch.
         #[arg(long)]
         paused: bool,
+    },
+    /// Serve MCP tools over stdio for typed capabilities.
+    ServeMcp {
+        /// Tool profile: gnss, astro, or all.
+        #[arg(long, default_value = "all")]
+        profile: String,
     },
 }
 
@@ -240,6 +247,9 @@ fn run(cli: Cli) -> Result<()> {
                 tui::run_tui(Some(obs_path), &nav_path, speed, paused, mode)
             }
         }
+        Command::ServeMcp { profile } => {
+            mcp::serve_mcp_command(&profile).context("start serve-mcp stdio server")
+        }
     }
 }
 
@@ -278,6 +288,23 @@ fn solve_command(
     sp3_path: Option<&Path>,
     json: bool,
 ) -> Result<()> {
+    let report = solve_rinex_report(obs_path, nav_path, sp3_path)?;
+    if json {
+        print_json(&report)?;
+    } else {
+        print_solve_human(&report);
+    }
+    if report.summary.failed_count > 0 {
+        bail!("{} epoch solves failed", report.summary.failed_count);
+    }
+    Ok(())
+}
+
+pub(crate) fn solve_rinex_report(
+    obs_path: &Path,
+    nav_path: &Path,
+    sp3_path: Option<&Path>,
+) -> Result<SolveJson> {
     let obs =
         load_rinex_obs(obs_path).with_context(|| format!("load OBS {}", obs_path.display()))?;
     let nav =
@@ -307,23 +334,14 @@ fn solve_command(
         ("broadcast".to_string(), assembled, solved)
     };
 
-    let report = solve_report(
+    solve_report(
         source_label,
         obs_path,
         nav_path,
         sp3_path,
         &assembled,
         solved,
-    )?;
-    if json {
-        print_json(&report)?;
-    } else {
-        print_solve_human(&report);
-    }
-    if report.summary.failed_count > 0 {
-        bail!("{} epoch solves failed", report.summary.failed_count);
-    }
-    Ok(())
+    )
 }
 
 fn solve_report(
@@ -531,22 +549,7 @@ fn print_solve_human(report: &SolveJson) {
 }
 
 fn qc_command(obs_path: &Path, json: bool) -> Result<()> {
-    let text = std::fs::read_to_string(obs_path)
-        .with_context(|| format!("read OBS {}", obs_path.display()))?;
-    let lint = sidereon::lint_rinex_obs(&text);
-    let parsed = parse_rinex_obs(&text);
-    let (qc, parse_error) = match parsed {
-        Ok(obs) => (Some(observation_qc(&obs)), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-
-    let report = QcJson {
-        obs: obs_path.display().to_string(),
-        lint: lint_json(&lint),
-        qc,
-        parse_error,
-    };
-
+    let report = qc_log_report(obs_path)?;
     if json {
         print_json(&report)?;
     } else {
@@ -557,6 +560,24 @@ fn qc_command(obs_path: &Path, json: bool) -> Result<()> {
         bail!("RINEX OBS parse failed: {error}");
     }
     Ok(())
+}
+
+pub(crate) fn qc_log_report(obs_path: &Path) -> Result<QcJson> {
+    let text = std::fs::read_to_string(obs_path)
+        .with_context(|| format!("read OBS {}", obs_path.display()))?;
+    let lint = sidereon::lint_rinex_obs(&text);
+    let parsed = parse_rinex_obs(&text);
+    let (qc, parse_error) = match parsed {
+        Ok(obs) => (Some(observation_qc(&obs)), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+
+    Ok(QcJson {
+        obs: obs_path.display().to_string(),
+        lint: lint_json(&lint),
+        qc,
+        parse_error,
+    })
 }
 
 fn print_qc_human(report: &QcJson) {
