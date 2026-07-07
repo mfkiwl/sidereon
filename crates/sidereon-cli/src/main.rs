@@ -21,11 +21,13 @@ use sidereon::{
     PositionErrorMetrics, RinexSppEpochInputs, RinexSppOptions, RinexSppSource,
 };
 
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "sidereon")]
 #[command(about = "GNSS file inspection, QC, SPP solving, and covariance metrics")]
 #[command(
-    after_long_help = "JSON output uses stable field names. solve: source, obs, nav, sp3, epochs, summary, errors. qc: obs, lint, qc, parse_error. inspect output is human text with path, type, span, counts, systems, satellites. metrics accepts JSON input through --json-file."
+    after_long_help = "JSON output uses stable field names. solve: source, obs, nav, sp3, epochs, summary, errors. qc: obs, lint, qc, parse_error. inspect output is human text with path, type, span, counts, systems, satellites. metrics accepts JSON input through --json-file. tui is an interactive replay monitor for RINEX OBS plus NAV."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -80,6 +82,21 @@ enum Command {
         /// File to inspect.
         file: PathBuf,
     },
+    /// Replay a RINEX OBS/NAV solve in a terminal monitor.
+    Tui {
+        /// RINEX observation file.
+        #[arg(long)]
+        obs: PathBuf,
+        /// RINEX broadcast navigation file.
+        #[arg(long)]
+        nav: PathBuf,
+        /// Replay speed multiplier.
+        #[arg(long, default_value_t = 10.0)]
+        speed: f64,
+        /// Start paused after loading the first epoch.
+        #[arg(long)]
+        paused: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -117,6 +134,12 @@ fn run(cli: Cli) -> Result<()> {
             probability,
         } => metrics_command(enu_cov.as_deref(), json_file.as_deref(), probability),
         Command::Inspect { file } => inspect_command(&file),
+        Command::Tui {
+            obs,
+            nav,
+            speed,
+            paused,
+        } => tui::run_tui(&obs, &nav, speed, paused),
     }
 }
 

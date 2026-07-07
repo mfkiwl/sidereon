@@ -2,7 +2,7 @@
 
 `sidereon` is a small command-line wrapper over the `sidereon` facade crate. It parses real GNSS products through the library, assembles RINEX observation epochs for SPP through the core convenience API, and prints compact human output or stable JSON where supported.
 
-This v1 intentionally has no TUI and no MCP server.
+This v1 has no MCP server.
 
 ## Build
 
@@ -38,6 +38,18 @@ Use SP3 precise orbits while retaining broadcast context:
 ```sh
 sidereon solve --obs data/site.obs --nav data/brdc.rnx --sp3 data/orbits.sp3
 ```
+
+Replay a logged OBS/NAV session in a terminal monitor:
+
+```sh
+sidereon tui --obs data/site.obs --nav data/brdc.rnx
+sidereon tui --obs data/site.obs --nav data/brdc.rnx --speed 20 --paused
+```
+
+The TUI replays assembled SPP epochs through the same solve path as `solve`.
+It shows the current fix, per-satellite azimuth/elevation and used flag,
+recent horizontal scatter, and CEP/R95 bounds. It is replay-only; live NTRIP
+networking is not included in this command.
 
 Run RINEX observation lint and observation QC:
 

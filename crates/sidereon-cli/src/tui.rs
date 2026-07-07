@@ -1,0 +1,1006 @@
+use std::collections::{BTreeSet, VecDeque};
+use std::io::{self, Stdout};
+use std::path::Path;
+use std::sync::Once;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::{Frame, Terminal};
+use sidereon::constants::C_M_S;
+use sidereon::ephemeris::BroadcastEphemeris;
+use sidereon::positioning::{EphemerisSource, ReceiverSolution, SolveInputs, SolvePolicy};
+use sidereon::rinex::observations::ObsEpochTime;
+use sidereon::{GnssSatelliteId, ItrfPositionM, RinexSppEpochInputs, RinexSppOptions};
+
+use crate::{format_epoch, rad_to_deg, solution_metrics};
+
+const TICK_RATE: Duration = Duration::from_millis(50);
+const MAX_SPEED: f64 = 1024.0;
+const MIN_SPEED: f64 = 0.25;
+const CONVERGENCE_SAMPLES: usize = 48;
+
+pub(crate) fn run_tui(obs_path: &Path, nav_path: &Path, speed: f64, paused: bool) -> Result<()> {
+    let mut driver = ReplayDriver::from_files(obs_path, nav_path, speed, paused)?;
+    let mut state = TuiState::new(
+        obs_path,
+        nav_path,
+        driver.len(),
+        driver.speed(),
+        driver.is_paused(),
+    );
+    if let Some(frame) = driver.step_forward()? {
+        state.apply_frame(&frame);
+    }
+
+    let mut terminal = TerminalSession::enter()?;
+    let mut last_tick = Instant::now();
+    loop {
+        terminal.draw(|frame| render(frame, &state))?;
+
+        let timeout = TICK_RATE
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char(' ') => {
+                        driver.toggle_pause();
+                        state.set_paused(driver.is_paused());
+                        last_tick = Instant::now();
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        driver.speed_up();
+                        state.set_speed(driver.speed());
+                    }
+                    KeyCode::Char('-') => {
+                        driver.speed_down();
+                        state.set_speed(driver.speed());
+                    }
+                    KeyCode::Right | KeyCode::Down if driver.is_paused() => {
+                        if let Some(frame) = driver.step_forward()? {
+                            state.apply_frame(&frame);
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Up if driver.is_paused() => {
+                        if let Some(frame) = driver.step_backward()? {
+                            state.apply_frame(&frame);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if last_tick.elapsed() >= TICK_RATE {
+            let elapsed = last_tick.elapsed();
+            last_tick = Instant::now();
+            for frame in driver.advance(elapsed)? {
+                state.apply_frame(&frame);
+            }
+        }
+    }
+    Ok(())
+}
+
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        install_panic_hook();
+        enable_raw_mode().context("enable terminal raw mode")?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+            let _ = disable_raw_mode();
+            return Err(error).context("enter alternate screen");
+        }
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                restore_terminal_for_panic();
+                return Err(error).context("create terminal");
+            }
+        };
+        if let Err(error) = terminal.clear() {
+            let _ = disable_raw_mode();
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+            return Err(error).context("clear terminal");
+        }
+        Ok(Self { terminal })
+    }
+
+    fn draw<F>(&mut self, draw: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Frame),
+    {
+        self.terminal.draw(draw).map(|_| ())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+fn install_panic_hook() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal_for_panic();
+            previous(info);
+        }));
+    });
+}
+
+fn restore_terminal_for_panic() {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen, Show);
+}
+
+pub(crate) struct ReplayDriver {
+    nav: BroadcastEphemeris,
+    epochs: Vec<RinexSppEpochInputs>,
+    timeline: ReplayTimeline,
+}
+
+impl ReplayDriver {
+    pub(crate) fn from_files(
+        obs_path: &Path,
+        nav_path: &Path,
+        speed: f64,
+        paused: bool,
+    ) -> Result<Self> {
+        validate_speed(speed)?;
+        let obs = sidereon::load_rinex_obs(obs_path)
+            .with_context(|| format!("load OBS {}", obs_path.display()))?;
+        let nav = sidereon::load_rinex_nav(nav_path)
+            .with_context(|| format!("load NAV {}", nav_path.display()))?;
+        let options =
+            RinexSppOptions::default_for(&obs).context("build default RINEX SPP options")?;
+        let epochs = sidereon::spp_inputs_from_rinex_obs(&obs, &nav, &options)
+            .context("assemble RINEX SPP inputs")?;
+        if epochs.is_empty() {
+            bail!("RINEX OBS has no replayable SPP epochs");
+        }
+        let epoch_times_s = epochs
+            .iter()
+            .map(|epoch| epoch.inputs.t_rx_j2000_s)
+            .collect();
+        Ok(Self {
+            nav,
+            epochs,
+            timeline: ReplayTimeline::new(epoch_times_s, speed, paused)?,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.epochs.len()
+    }
+
+    pub(crate) fn speed(&self) -> f64 {
+        self.timeline.speed()
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.timeline.is_paused()
+    }
+
+    pub(crate) fn toggle_pause(&mut self) {
+        self.timeline.set_paused(!self.timeline.is_paused());
+    }
+
+    pub(crate) fn speed_up(&mut self) {
+        self.timeline.speed_up();
+    }
+
+    pub(crate) fn speed_down(&mut self) {
+        self.timeline.speed_down();
+    }
+
+    pub(crate) fn step_forward(&mut self) -> Result<Option<ReplayFrame>> {
+        self.timeline
+            .step_forward()
+            .map(|index| self.frame_at(index))
+            .transpose()
+    }
+
+    pub(crate) fn step_backward(&mut self) -> Result<Option<ReplayFrame>> {
+        self.timeline
+            .step_backward()
+            .map(|index| self.frame_at(index))
+            .transpose()
+    }
+
+    pub(crate) fn advance(&mut self, wall_delta: Duration) -> Result<Vec<ReplayFrame>> {
+        self.timeline
+            .advance_wall_time(wall_delta)
+            .into_iter()
+            .map(|index| self.frame_at(index))
+            .collect()
+    }
+
+    fn frame_at(&self, replay_index: usize) -> Result<ReplayFrame> {
+        let epoch = self
+            .epochs
+            .get(replay_index)
+            .with_context(|| format!("replay index {replay_index} out of range"))?;
+        let solution = sidereon::solve_spp_batch_serial(
+            &self.nav,
+            std::slice::from_ref(&epoch.inputs),
+            true,
+            SolvePolicy::default(),
+        )
+        .into_iter()
+        .next()
+        .context("missing SPP solve result")?;
+        let satellites = satellite_snapshots(&self.nav, &epoch.inputs, solution.as_ref().ok());
+        Ok(ReplayFrame {
+            replay_index,
+            epoch_index: epoch.epoch_index,
+            epoch: epoch.epoch,
+            observation_count: epoch.inputs.observations.len(),
+            solution,
+            satellites,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayTimeline {
+    epoch_times_s: Vec<f64>,
+    current_index: Option<usize>,
+    accumulated_replay_s: f64,
+    speed: f64,
+    paused: bool,
+}
+
+impl ReplayTimeline {
+    pub(crate) fn new(epoch_times_s: Vec<f64>, speed: f64, paused: bool) -> Result<Self> {
+        validate_speed(speed)?;
+        if epoch_times_s.is_empty() {
+            bail!("replay timeline requires at least one epoch");
+        }
+        if epoch_times_s.iter().any(|value| !value.is_finite()) {
+            bail!("replay timeline contains non-finite epoch time");
+        }
+        Ok(Self {
+            epoch_times_s,
+            current_index: None,
+            accumulated_replay_s: 0.0,
+            speed,
+            paused,
+        })
+    }
+
+    pub(crate) fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+        self.accumulated_replay_s = 0.0;
+    }
+
+    pub(crate) fn speed_up(&mut self) {
+        self.speed = (self.speed * 2.0).min(MAX_SPEED);
+    }
+
+    pub(crate) fn speed_down(&mut self) {
+        self.speed = (self.speed / 2.0).max(MIN_SPEED);
+    }
+
+    pub(crate) fn step_forward(&mut self) -> Option<usize> {
+        let next = self.current_index.map_or(0, |index| index + 1);
+        if next >= self.epoch_times_s.len() {
+            return None;
+        }
+        self.current_index = Some(next);
+        self.accumulated_replay_s = 0.0;
+        Some(next)
+    }
+
+    pub(crate) fn step_backward(&mut self) -> Option<usize> {
+        let current = self.current_index?;
+        let previous = current.checked_sub(1)?;
+        self.current_index = Some(previous);
+        self.accumulated_replay_s = 0.0;
+        Some(previous)
+    }
+
+    pub(crate) fn advance_wall_time(&mut self, wall_delta: Duration) -> Vec<usize> {
+        if self.paused {
+            return Vec::new();
+        }
+        let mut emitted = Vec::new();
+        if self.current_index.is_none() {
+            self.current_index = Some(0);
+            emitted.push(0);
+        }
+        self.accumulated_replay_s += wall_delta.as_secs_f64() * self.speed;
+        while let Some(current) = self.current_index {
+            let next = current + 1;
+            if next >= self.epoch_times_s.len() {
+                break;
+            }
+            let gap_s = (self.epoch_times_s[next] - self.epoch_times_s[current]).max(0.0);
+            if gap_s > self.accumulated_replay_s {
+                break;
+            }
+            self.accumulated_replay_s -= gap_s;
+            self.current_index = Some(next);
+            emitted.push(next);
+        }
+        emitted
+    }
+}
+
+fn validate_speed(speed: f64) -> Result<()> {
+    if !speed.is_finite() || speed <= 0.0 {
+        bail!("--speed must be a finite positive multiplier");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplayFrame {
+    replay_index: usize,
+    epoch_index: usize,
+    epoch: ObsEpochTime,
+    observation_count: usize,
+    solution: sidereon::Result<ReceiverSolution>,
+    satellites: Vec<SatelliteSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TuiState {
+    obs_label: String,
+    nav_label: String,
+    total_epochs: usize,
+    current_replay_epoch: Option<usize>,
+    current_raw_epoch: Option<usize>,
+    observation_count: usize,
+    epoch_time: String,
+    status: String,
+    speed: f64,
+    paused: bool,
+    lat_deg: Option<f64>,
+    lon_deg: Option<f64>,
+    height_m: Option<f64>,
+    bounds: ErrorBounds,
+    satellites: Vec<SatelliteSnapshot>,
+    origin: Option<ConvergenceOrigin>,
+    latest_horizontal_m: Option<f64>,
+    convergence_m: VecDeque<f64>,
+}
+
+impl TuiState {
+    pub(crate) fn new(
+        obs_path: &Path,
+        nav_path: &Path,
+        total_epochs: usize,
+        speed: f64,
+        paused: bool,
+    ) -> Self {
+        Self {
+            obs_label: compact_path(obs_path),
+            nav_label: compact_path(nav_path),
+            total_epochs,
+            current_replay_epoch: None,
+            current_raw_epoch: None,
+            observation_count: 0,
+            epoch_time: "n/a".to_string(),
+            status: "ready".to_string(),
+            speed,
+            paused,
+            lat_deg: None,
+            lon_deg: None,
+            height_m: None,
+            bounds: ErrorBounds::empty(),
+            satellites: Vec::new(),
+            origin: None,
+            latest_horizontal_m: None,
+            convergence_m: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn set_speed(&mut self, speed: f64) {
+        self.speed = speed;
+    }
+
+    pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
+    }
+
+    pub(crate) fn apply_frame(&mut self, frame: &ReplayFrame) {
+        self.current_replay_epoch = Some(frame.replay_index + 1);
+        self.current_raw_epoch = Some(frame.epoch_index);
+        self.observation_count = frame.observation_count;
+        self.epoch_time = format_epoch(frame.epoch);
+        self.satellites = frame.satellites.clone();
+        match &frame.solution {
+            Ok(solution) => {
+                self.status = if solution.metadata.converged {
+                    "solved".to_string()
+                } else {
+                    "not converged".to_string()
+                };
+                self.lat_deg = solution.geodetic.map(|geo| rad_to_deg(geo.lat_rad));
+                self.lon_deg = solution.geodetic.map(|geo| rad_to_deg(geo.lon_rad));
+                self.height_m = solution.geodetic.map(|geo| geo.height_m);
+                self.bounds = ErrorBounds::from_solution(solution);
+                self.push_convergence(solution);
+            }
+            Err(error) => {
+                self.status = format!("error: {error}");
+                self.lat_deg = None;
+                self.lon_deg = None;
+                self.height_m = None;
+                self.bounds = ErrorBounds::empty();
+            }
+        }
+    }
+
+    fn push_convergence(&mut self, solution: &ReceiverSolution) {
+        let ecef = solution.position.as_array();
+        if self.origin.is_none() {
+            if let Some(geo) = solution.geodetic {
+                self.origin = Some(ConvergenceOrigin { ecef, geo });
+            }
+        }
+        let Some(origin) = self.origin else {
+            return;
+        };
+        let delta = [
+            ecef[0] - origin.ecef[0],
+            ecef[1] - origin.ecef[1],
+            ecef[2] - origin.ecef[2],
+        ];
+        let (east, north) = enu_horizontal_axes(origin.geo);
+        let east_m = dot(delta, east);
+        let north_m = dot(delta, north);
+        let horizontal_m = east_m.hypot(north_m);
+        self.latest_horizontal_m = Some(horizontal_m);
+        if self.convergence_m.len() == CONVERGENCE_SAMPLES {
+            self.convergence_m.pop_front();
+        }
+        self.convergence_m.push_back(horizontal_m);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConvergenceOrigin {
+    ecef: [f64; 3],
+    geo: sidereon::Wgs84Geodetic,
+}
+
+#[derive(Debug, Clone)]
+struct ErrorBounds {
+    cep_m: Option<f64>,
+    r95_m: Option<f64>,
+    vertical_95_m: Option<f64>,
+    sigma_e_m: Option<f64>,
+    sigma_n_m: Option<f64>,
+    sigma_u_m: Option<f64>,
+}
+
+impl ErrorBounds {
+    fn empty() -> Self {
+        Self {
+            cep_m: None,
+            r95_m: None,
+            vertical_95_m: None,
+            sigma_e_m: None,
+            sigma_n_m: None,
+            sigma_u_m: None,
+        }
+    }
+
+    fn from_solution(solution: &ReceiverSolution) -> Self {
+        match solution_metrics(solution) {
+            Ok(metrics) => Self {
+                cep_m: Some(metrics.cep_m),
+                r95_m: Some(metrics.r95_m),
+                vertical_95_m: Some(metrics.vertical_95_m),
+                sigma_e_m: Some(metrics.sigma_e_m),
+                sigma_n_m: Some(metrics.sigma_n_m),
+                sigma_u_m: Some(metrics.sigma_u_m),
+            },
+            Err(_) => Self::empty(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SatelliteSnapshot {
+    id: String,
+    elevation_deg: Option<f64>,
+    azimuth_deg: Option<f64>,
+    used: bool,
+}
+
+fn satellite_snapshots(
+    source: &dyn EphemerisSource,
+    inputs: &SolveInputs,
+    solution: Option<&ReceiverSolution>,
+) -> Vec<SatelliteSnapshot> {
+    let used: BTreeSet<GnssSatelliteId> = solution
+        .map(|solution| solution.used_sats.iter().copied().collect())
+        .unwrap_or_default();
+    let receiver_ecef = solution
+        .map(|solution| solution.position.as_array())
+        .unwrap_or([
+            inputs.initial_guess[0],
+            inputs.initial_guess[1],
+            inputs.initial_guess[2],
+        ]);
+
+    inputs
+        .observations
+        .iter()
+        .map(|observation| {
+            let transmit_time_s = inputs.t_rx_j2000_s - observation.pseudorange_m / C_M_S;
+            let sat_ecef = source
+                .position_clock_at_j2000_s(observation.satellite_id, transmit_time_s)
+                .map(|(position, _clock_s)| position);
+            let (azimuth_deg, elevation_deg) = sat_ecef
+                .and_then(|sat_ecef| look_angles_deg(receiver_ecef, sat_ecef))
+                .map_or((None, None), |angles| {
+                    (Some(angles.azimuth_deg), Some(angles.elevation_deg))
+                });
+            SatelliteSnapshot {
+                id: observation.satellite_id.to_string(),
+                elevation_deg,
+                azimuth_deg,
+                used: used.contains(&observation.satellite_id),
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LookAngles {
+    azimuth_deg: f64,
+    elevation_deg: f64,
+}
+
+fn look_angles_deg(receiver_ecef_m: [f64; 3], sat_ecef_m: [f64; 3]) -> Option<LookAngles> {
+    let receiver =
+        ItrfPositionM::new(receiver_ecef_m[0], receiver_ecef_m[1], receiver_ecef_m[2]).ok()?;
+    let geo = sidereon::itrf_to_geodetic(receiver).ok()?;
+    let line = [
+        sat_ecef_m[0] - receiver_ecef_m[0],
+        sat_ecef_m[1] - receiver_ecef_m[1],
+        sat_ecef_m[2] - receiver_ecef_m[2],
+    ];
+    let norm = dot(line, line).sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return None;
+    }
+    let los = [line[0] / norm, line[1] / norm, line[2] / norm];
+    let (east, north, up) = enu_axes(geo);
+    let east_component = dot(los, east);
+    let north_component = dot(los, north);
+    let up_component = dot(los, up).clamp(-1.0, 1.0);
+    let mut azimuth_rad = east_component.atan2(north_component);
+    if azimuth_rad < 0.0 {
+        azimuth_rad += 2.0 * std::f64::consts::PI;
+    }
+    Some(LookAngles {
+        azimuth_deg: rad_to_deg(azimuth_rad),
+        elevation_deg: rad_to_deg(up_component.asin()),
+    })
+}
+
+fn enu_axes(geo: sidereon::Wgs84Geodetic) -> ([f64; 3], [f64; 3], [f64; 3]) {
+    let sin_lat = geo.lat_rad.sin();
+    let cos_lat = geo.lat_rad.cos();
+    let sin_lon = geo.lon_rad.sin();
+    let cos_lon = geo.lon_rad.cos();
+    let east = [-sin_lon, cos_lon, 0.0];
+    let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
+    let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
+    (east, north, up)
+}
+
+fn enu_horizontal_axes(geo: sidereon::Wgs84Geodetic) -> ([f64; 3], [f64; 3]) {
+    let (east, north, _up) = enu_axes(geo);
+    (east, north)
+}
+
+fn dot(left: [f64; 3], right: [f64; 3]) -> f64 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+pub(crate) fn render(frame: &mut Frame, state: &TuiState) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(12)])
+        .split(frame.area());
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(root[0]);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(root[1]);
+
+    render_solution(frame, top[0], state);
+    render_bounds(frame, top[1], state);
+    render_satellites(frame, bottom[0], state);
+    render_convergence(frame, bottom[1], state);
+}
+
+fn render_solution(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let epoch = state
+        .current_replay_epoch
+        .map(|epoch| format!("{epoch}/{}", state.total_epochs))
+        .unwrap_or_else(|| format!("0/{}", state.total_epochs));
+    let raw_epoch = state
+        .current_raw_epoch
+        .map(|epoch| epoch.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("time ", label_style()),
+            Span::raw(state.epoch_time.clone()),
+            Span::raw("   "),
+            Span::styled("epoch ", label_style()),
+            Span::raw(epoch),
+            Span::raw("   "),
+            Span::styled("raw ", label_style()),
+            Span::raw(raw_epoch),
+        ]),
+        Line::from(vec![
+            Span::styled("status ", label_style()),
+            Span::styled(state.status.clone(), status_style(&state.status)),
+        ]),
+        Line::from(vec![
+            Span::styled("lat ", label_style()),
+            Span::raw(format_optional_deg(state.lat_deg)),
+            Span::raw("   "),
+            Span::styled("lon ", label_style()),
+            Span::raw(format_optional_deg(state.lon_deg)),
+            Span::raw("   "),
+            Span::styled("height ", label_style()),
+            Span::raw(format_optional_m(state.height_m)),
+        ]),
+        Line::from(vec![
+            Span::styled("obs ", label_style()),
+            Span::raw(state.obs_label.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("nav ", label_style()),
+            Span::raw(state.nav_label.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("speed ", label_style()),
+            Span::raw(format_speed(state.speed)),
+            Span::raw("   "),
+            Span::styled("paused ", label_style()),
+            Span::raw(if state.paused { "yes" } else { "no" }),
+            Span::raw("   "),
+            Span::styled("observations ", label_style()),
+            Span::raw(state.observation_count.to_string()),
+        ]),
+    ];
+    let paragraph =
+        Paragraph::new(lines).block(Block::default().title("Solution").borders(Borders::ALL));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_bounds(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("CEP ", label_style()),
+            Span::raw(format_optional_m(state.bounds.cep_m)),
+        ]),
+        Line::from(vec![
+            Span::styled("R95 ", label_style()),
+            Span::raw(format_optional_m(state.bounds.r95_m)),
+        ]),
+        Line::from(vec![
+            Span::styled("V95 ", label_style()),
+            Span::raw(format_optional_m(state.bounds.vertical_95_m)),
+        ]),
+        Line::from(vec![
+            Span::styled("sigma E ", label_style()),
+            Span::raw(format_optional_m(state.bounds.sigma_e_m)),
+        ]),
+        Line::from(vec![
+            Span::styled("sigma N ", label_style()),
+            Span::raw(format_optional_m(state.bounds.sigma_n_m)),
+        ]),
+        Line::from(vec![
+            Span::styled("sigma U ", label_style()),
+            Span::raw(format_optional_m(state.bounds.sigma_u_m)),
+        ]),
+    ];
+    let paragraph =
+        Paragraph::new(lines).block(Block::default().title("Error Bounds").borders(Borders::ALL));
+    frame.render_widget(paragraph, area);
+}
+
+fn render_satellites(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let rows = state.satellites.iter().map(|sat| {
+        Row::new(vec![
+            Cell::from(sat.id.clone()),
+            Cell::from(format_optional_deg(sat.elevation_deg)),
+            Cell::from(format_optional_deg(sat.azimuth_deg)),
+            Cell::from(if sat.used { "yes" } else { "no" }),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(8),
+        ],
+    )
+    .header(
+        Row::new(vec!["sat", "elevation", "azimuth", "used"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(Block::default().title("Satellites").borders(Borders::ALL));
+    frame.render_widget(table, area);
+}
+
+fn render_convergence(frame: &mut Frame, area: Rect, state: &TuiState) {
+    let block = Block::default().title("Convergence").borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(inner);
+    let latest = state
+        .latest_horizontal_m
+        .map(|value| format!("{value:.3} m"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let sample_count = state.convergence_m.len();
+    let paragraph = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("latest horizontal scatter ", label_style()),
+            Span::raw(latest),
+        ]),
+        Line::from(vec![
+            Span::styled("samples ", label_style()),
+            Span::raw(sample_count.to_string()),
+        ]),
+    ]);
+    frame.render_widget(paragraph, sections[0]);
+
+    let data = convergence_data(&state.convergence_m);
+    let sparkline = Sparkline::default()
+        .data(&data)
+        .style(Style::default().fg(Color::Cyan));
+    frame.render_widget(sparkline, sections[1]);
+}
+
+fn label_style() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn status_style(status: &str) -> Style {
+    if status == "solved" {
+        Style::default().fg(Color::Green)
+    } else if status.starts_with("error") {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Yellow)
+    }
+}
+
+fn format_optional_deg(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3} deg"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_optional_m(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3} m"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_speed(speed: f64) -> String {
+    if (speed.fract()).abs() < f64::EPSILON {
+        format!("{speed:.0}x")
+    } else {
+        format!("{speed:.2}x")
+    }
+}
+
+fn compact_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn convergence_data(values: &VecDeque<f64>) -> Vec<u64> {
+    let max = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, f64::max);
+    if max <= 0.0 {
+        return vec![0; values.len().max(1)];
+    }
+    values
+        .iter()
+        .map(|value| ((*value / max) * 100.0).round().clamp(0.0, 100.0) as u64)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn fixture(parts: &[&str]) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../sidereon-core/tests/fixtures");
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
+    #[test]
+    fn timeline_advances_by_epoch_gap_and_speed() {
+        let mut timeline =
+            ReplayTimeline::new(vec![0.0, 30.0, 60.0], 10.0, false).expect("timeline");
+        assert_eq!(timeline.advance_wall_time(Duration::from_secs(0)), vec![0]);
+        assert!(timeline
+            .advance_wall_time(Duration::from_millis(2900))
+            .is_empty());
+        assert_eq!(
+            timeline.advance_wall_time(Duration::from_millis(100)),
+            vec![1]
+        );
+
+        timeline.speed_up();
+        assert_eq!(timeline.speed(), 20.0);
+        assert!(timeline
+            .advance_wall_time(Duration::from_millis(1499))
+            .is_empty());
+        assert_eq!(
+            timeline.advance_wall_time(Duration::from_millis(1)),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn timeline_steps_forward_and_backward_while_paused() {
+        let mut timeline =
+            ReplayTimeline::new(vec![10.0, 20.0, 30.0], 4.0, true).expect("timeline");
+        assert!(timeline
+            .advance_wall_time(Duration::from_secs(100))
+            .is_empty());
+        assert_eq!(timeline.step_forward(), Some(0));
+        assert_eq!(timeline.step_forward(), Some(1));
+        assert_eq!(timeline.step_backward(), Some(0));
+        assert_eq!(timeline.step_backward(), None);
+        timeline.speed_down();
+        assert_eq!(timeline.speed(), 2.0);
+    }
+
+    #[test]
+    fn state_updates_from_fixture_replay_without_terminal() {
+        let obs = fixture(&["obs", "ESBC00DNK_R_20201770000_01D_30S_MO_trim.rnx"]);
+        let nav = fixture(&["nav", "ESBC00DNK_R_20201770000_01D_MN.rnx"]);
+        let mut driver = ReplayDriver::from_files(&obs, &nav, 10.0, true).expect("driver");
+        let mut state = TuiState::new(&obs, &nav, driver.len(), driver.speed(), driver.is_paused());
+        let frame = driver
+            .step_forward()
+            .expect("step result")
+            .expect("first frame");
+        state.apply_frame(&frame);
+
+        assert_eq!(state.current_replay_epoch, Some(1));
+        assert_eq!(state.status, "solved");
+        assert!(state.lat_deg.expect("lat") > 50.0);
+        assert!(state.bounds.cep_m.expect("CEP") > 0.0);
+        assert!(state
+            .satellites
+            .iter()
+            .any(|sat| sat.id == "G05" && sat.used));
+        assert!(state
+            .satellites
+            .iter()
+            .any(|sat| sat.elevation_deg.is_some() && sat.azimuth_deg.is_some()));
+    }
+
+    #[test]
+    fn rendering_smoke_test_has_panels_and_formatted_values() {
+        let mut state = TuiState::new(Path::new("site.obs"), Path::new("brdc.rnx"), 2, 10.0, true);
+        state.current_replay_epoch = Some(1);
+        state.current_raw_epoch = Some(0);
+        state.observation_count = 7;
+        state.epoch_time = "2020-06-25T00:00:00.000".to_string();
+        state.status = "solved".to_string();
+        state.lat_deg = Some(55.493575);
+        state.lon_deg = Some(8.456829);
+        state.height_m = Some(59.733);
+        state.bounds = ErrorBounds {
+            cep_m: Some(0.987),
+            r95_m: Some(2.117),
+            vertical_95_m: Some(3.477),
+            sigma_e_m: Some(0.709),
+            sigma_n_m: Some(0.977),
+            sigma_u_m: Some(1.774),
+        };
+        state.satellites = vec![SatelliteSnapshot {
+            id: "G05".to_string(),
+            elevation_deg: Some(45.125),
+            azimuth_deg: Some(123.456),
+            used: true,
+        }];
+        state.latest_horizontal_m = Some(0.123);
+        state.convergence_m.push_back(0.0);
+        state.convergence_m.push_back(0.123);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, &state)).expect("draw");
+        let text = buffer_text(terminal.backend());
+
+        assert!(text.contains("Solution"));
+        assert!(text.contains("Satellites"));
+        assert!(text.contains("Convergence"));
+        assert!(text.contains("Error Bounds"));
+        assert!(text.contains("55.494 deg"));
+        assert!(text.contains("CEP"));
+        assert!(text.contains("0.987 m"));
+        assert!(text.contains("G05"));
+        assert!(text.contains("yes"));
+    }
+
+    fn buffer_text(backend: &TestBackend) -> String {
+        let buffer = backend.buffer();
+        let area = buffer.area;
+        let mut out = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+}
