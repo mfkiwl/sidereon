@@ -241,8 +241,8 @@ fn run(cli: Cli) -> Result<()> {
                 };
                 tui::run_tui(obs.as_deref(), nav_path, speed, paused, mode)
             } else {
-                let obs_path = obs.as_ref().context("live replay mode requires --obs")?;
-                let nav_path = nav.clone().context("live replay mode requires --nav")?;
+                let obs_path = obs.as_ref().context("replay mode requires --obs")?;
+                let nav_path = nav.clone().context("replay mode requires --nav")?;
                 let mode = tui::LiveMode::Replay;
                 tui::run_tui(Some(obs_path), &nav_path, speed, paused, mode)
             }
