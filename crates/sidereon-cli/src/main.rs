@@ -85,17 +85,41 @@ enum Command {
         /// File to inspect.
         file: PathBuf,
     },
-    /// Replay a RINEX OBS/NAV solve in a terminal monitor.
+    /// Replay a RINEX OBS/NAV solve or watch a live RTCM stream.
     Tui {
-        /// RINEX observation file.
+        /// Replay input observation file. Required in replay mode.
         #[arg(long)]
-        obs: PathBuf,
-        /// RINEX broadcast navigation file.
+        obs: Option<PathBuf>,
+        /// Navigation file for replay mode.
         #[arg(long)]
-        nav: PathBuf,
+        nav: Option<PathBuf>,
+        /// Live mode navigation file when `--nav` is not used.
+        #[arg(long)]
+        ntrip_nav: Option<PathBuf>,
+        /// NTRIP caster URL or host[:port].
+        #[arg(long)]
+        ntrip: Option<String>,
+        /// NTRIP mountpoint.
+        #[arg(long)]
+        mount: Option<String>,
+        /// Read-only source host[:port] for raw TCP RTCM.
+        #[arg(long)]
+        tcp: Option<String>,
+        /// NTRIP username.
+        #[arg(long)]
+        user: Option<String>,
+        /// NTRIP password (or `SIDEREON_NTRIP_PASSWORD`).
+        #[arg(long)]
+        pass: Option<String>,
         /// Replay speed multiplier.
         #[arg(long, default_value_t = 10.0)]
         speed: f64,
+        /// Optional static GGA latitude for live mode.
+        #[arg(long)]
+        gga_lat: Option<f64>,
+        /// Optional static GGA longitude for live mode.
+        #[arg(long)]
+        gga_lon: Option<f64>,
         /// Start paused after loading the first epoch.
         #[arg(long)]
         paused: bool,
@@ -141,10 +165,111 @@ fn run(cli: Cli) -> Result<()> {
         Command::Tui {
             obs,
             nav,
+            ntrip_nav,
+            ntrip,
+            mount,
+            tcp,
+            user,
+            pass,
             speed,
+            gga_lat,
+            gga_lon,
             paused,
-        } => tui::run_tui(&obs, &nav, speed, paused),
+        } => {
+            let use_live = ntrip.is_some() || tcp.is_some();
+            let ntrip = validate_path_and_conflict("ntrip", ntrip)?;
+            let tcp = validate_path_and_conflict("tcp", tcp)?;
+            let has_ntrip = ntrip.is_some();
+            let has_tcp = tcp.is_some();
+            if has_ntrip == has_tcp {
+                bail!("exactly one of --ntrip and --tcp is required");
+            }
+            let (nav, live_nav) = match (&nav, &ntrip_nav) {
+                (Some(_), Some(_)) => {
+                    bail!("exactly one of --nav and --ntrip-nav is allowed")
+                }
+                (Some(path), None) => (Some(path.clone()), None),
+                (None, Some(path)) => (None, Some(path.clone())),
+                (None, None) => (None, None),
+            };
+
+            if use_live {
+                if ntrip.is_some() && mount.is_none() {
+                    bail!("--mount is required for --ntrip");
+                }
+                let nav_path = match live_nav.as_deref().or(nav.as_deref()) {
+                    Some(path) => path,
+                    None => bail!("live mode requires --nav or --ntrip-nav"),
+                };
+                let mode = if has_ntrip {
+                    let (host, port) = parse_host_port(&ntrip.unwrap(), "ntrip")?;
+                    let user = user.unwrap_or_else(|| {
+                        std::env::var("SIDEREON_NTRIP_USER")
+                            .ok()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_default()
+                    });
+                    let pass = pass.unwrap_or_else(|| {
+                        std::env::var("SIDEREON_NTRIP_PASSWORD")
+                            .ok()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_default()
+                    });
+                    let mountpoint = match mount.clone() {
+                        Some(mount) if !mount.is_empty() => mount,
+                        _ => bail!("--mount is required for --ntrip"),
+                    };
+                    tui::LiveMode::Ntrip(tui::NtripConfigInput {
+                        host,
+                        port,
+                        mount: mountpoint,
+                        user,
+                        pass,
+                        gga_lat,
+                        gga_lon,
+                    })
+                } else {
+                    let (host, port) = parse_host_port(&tcp.unwrap(), "tcp")?;
+                    tui::LiveMode::Tcp(tui::TcpConfigInput { host, port })
+                };
+                tui::run_tui(obs.as_deref(), nav_path, speed, paused, mode)
+            } else {
+                let obs_path = obs.as_ref().context("live replay mode requires --obs")?;
+                let nav_path = nav.clone().context("live replay mode requires --nav")?;
+                let mode = tui::LiveMode::Replay;
+                tui::run_tui(Some(obs_path), &nav_path, speed, paused, mode)
+            }
+        }
     }
+}
+
+fn validate_path_and_conflict(name: &str, value: Option<String>) -> Result<Option<String>> {
+    if let Some(value) = &value {
+        if value.is_empty() {
+            bail!("--{name} cannot be empty");
+        }
+    }
+    Ok(value)
+}
+
+fn parse_host_port(value: &str, label: &str) -> Result<(String, u16)> {
+    let stripped = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .map(|value| value.find('/').map_or(value, |slash| &value[..slash]))
+        .unwrap_or(value);
+    let (host, port) = if let Some((host, port_text)) = stripped.rsplit_once(':') {
+        let port = port_text
+            .parse::<u16>()
+            .with_context(|| format!("{label}: invalid TCP port {port_text}"))?;
+        (host.to_string(), port)
+    } else {
+        (stripped.to_string(), 2101)
+    };
+    if host.is_empty() {
+        bail!("--{label} must include a host");
+    }
+    Ok((host, port))
 }
 
 fn solve_command(

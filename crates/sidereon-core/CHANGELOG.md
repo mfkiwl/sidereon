@@ -52,6 +52,10 @@ All notable changes to `sidereon-core` are documented here.
   validates IODE-matched GPS SSR-corrected broadcast satellite positions
   against the IGS ultra-rapid SP3 with a non-vacuous broadcast-only error
   margin.
+- RTCM MSM stream-to-SPP conversion for live workflows:
+  `RtcmSppEpochInputs` and `spp_inputs_from_rtcm_msm`, which assemble RTCM
+  MSM observations into the same per-epoch solve input shape used by existing
+  RINEX replay.
 
 ## [0.20.0]
 

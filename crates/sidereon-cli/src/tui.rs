@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, VecDeque};
-use std::io::{self, Stdout};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::Once;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use crossterm::cursor::{Hide, Show};
@@ -17,36 +18,111 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::{Frame, Terminal};
-use sidereon::constants::F_L1_HZ;
+
+use sidereon::astro::time::civil_from_j2000_seconds;
+use sidereon::constants::{
+    BDS_EPOCH_MINUS_GPS_EPOCH_S, F_L1_HZ, GPST_MINUS_BDT_S, GPS_EPOCH_TO_J2000_S, SECONDS_PER_WEEK,
+};
 use sidereon::ephemeris::BroadcastEphemeris;
 use sidereon::observables::{predict, ObservableEphemerisSource, PredictOptions};
-use sidereon::positioning::{ReceiverSolution, SolveInputs, SolvePolicy};
+use sidereon::positioning::{RinexSppOptions, SolveInputs, SolvePolicy};
 use sidereon::rinex::observations::ObsEpochTime;
-use sidereon::{GnssSatelliteId, RinexSppEpochInputs, RinexSppOptions};
+use sidereon::rinex::observations::SignalPolicy;
+use sidereon::rtcm::{self, Message, MsmMessage, SsrStreamAssembler};
+use sidereon::GnssSystem;
 
-use crate::{format_epoch, rad_to_deg, solution_metrics};
+use sidereon::{metrics_from_position_covariance, vertical_radius_at};
+use sidereon_core::ntrip::{
+    GgaPosition, NtripClientMachine, NtripConfig, NtripCredentials, NtripEvent, NtripVersion,
+};
+use sidereon_core::positioning::ReceiverSolution;
+
+use crate::{format_epoch, rad_to_deg};
 
 const TICK_RATE: Duration = Duration::from_millis(50);
 const MAX_SPEED: f64 = 1024.0;
 const MIN_SPEED: f64 = 0.25;
 const CONVERGENCE_SAMPLES: usize = 48;
 const MAX_ADVANCE_FRAMES_PER_TICK: usize = 8;
+const READ_CHUNK: usize = 32 * 1024;
+const NTRIP_GGA_INTERVAL_S: f64 = 10.0;
+const LIVE_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-pub(crate) fn run_tui(obs_path: &Path, nav_path: &Path, speed: f64, paused: bool) -> Result<()> {
-    let mut driver = ReplayDriver::from_files(obs_path, nav_path, speed, paused)?;
+#[derive(Clone, Debug)]
+pub(crate) struct NtripConfigInput {
+    pub host: String,
+    pub port: u16,
+    pub mount: String,
+    pub user: String,
+    pub pass: String,
+    pub gga_lat: Option<f64>,
+    pub gga_lon: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TcpConfigInput {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Clone, Debug)]
+enum LiveSourceConfig {
+    Ntrip(NtripConfigInput),
+    Tcp(TcpConfigInput),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LiveMode {
+    Replay,
+    Ntrip(NtripConfigInput),
+    Tcp(TcpConfigInput),
+}
+
+pub(crate) fn run_tui(
+    obs_path: Option<&Path>,
+    nav_path: &Path,
+    speed: f64,
+    paused: bool,
+    mode: LiveMode,
+) -> Result<()> {
+    validate_speed(speed)?;
+    let mut driver = match mode {
+        LiveMode::Replay => {
+            let obs = obs_path.context("replay mode requires --obs")?;
+            TuiDriver::Replay(Box::new(ReplayDriver::from_files(
+                obs, nav_path, speed, paused,
+            )?))
+        }
+        LiveMode::Ntrip(config) => TuiDriver::Live(Box::new(LiveDriver::from_ntrip(
+            nav_path, speed, paused, config,
+        )?)),
+        LiveMode::Tcp(config) => TuiDriver::Live(Box::new(LiveDriver::from_tcp(
+            nav_path, speed, paused, config,
+        )?)),
+    };
+
+    let obs_label = obs_path
+        .map(compact_path)
+        .unwrap_or_else(|| "live".to_string());
+    let nav_label = compact_path(nav_path);
+
     let mut state = TuiState::new(
-        obs_path,
-        nav_path,
-        driver.len(),
+        &obs_label,
+        &nav_label,
+        driver.total_epochs(),
         driver.speed(),
         driver.is_paused(),
     );
+    state.connection_status = driver.status_text();
+
     if let Some(frame) = driver.step_forward()? {
         state.apply_frame(&frame);
+        state.connection_status = driver.status_text();
     }
 
     let mut terminal = TerminalSession::enter()?;
     let mut last_tick = Instant::now();
+
     loop {
         terminal.draw(|frame| render(frame, &state))?;
 
@@ -63,24 +139,33 @@ pub(crate) fn run_tui(obs_path: &Path, nav_path: &Path, speed: f64, paused: bool
                     KeyCode::Char(' ') => {
                         driver.toggle_pause();
                         state.set_paused(driver.is_paused());
+                        state.connection_status = driver.status_text();
                         last_tick = Instant::now();
                     }
                     KeyCode::Char('+') | KeyCode::Char('=') => {
-                        driver.speed_up();
+                        if let TuiDriver::Replay(driver) = &mut driver {
+                            driver.speed_up();
+                        }
                         state.set_speed(driver.speed());
+                        state.connection_status = driver.status_text();
                     }
                     KeyCode::Char('-') => {
-                        driver.speed_down();
+                        if let TuiDriver::Replay(driver) = &mut driver {
+                            driver.speed_down();
+                        }
                         state.set_speed(driver.speed());
+                        state.connection_status = driver.status_text();
                     }
                     KeyCode::Right | KeyCode::Down if driver.is_paused() => {
                         if let Some(frame) = driver.step_forward()? {
                             state.apply_frame(&frame);
+                            state.connection_status = driver.status_text();
                         }
                     }
                     KeyCode::Left | KeyCode::Up if driver.is_paused() => {
                         if let Some(frame) = driver.step_backward()? {
                             state.apply_frame(&frame);
+                            state.connection_status = driver.status_text();
                         }
                     }
                     _ => {}
@@ -93,14 +178,84 @@ pub(crate) fn run_tui(obs_path: &Path, nav_path: &Path, speed: f64, paused: bool
             last_tick = Instant::now();
             for frame in driver.advance(elapsed)? {
                 state.apply_frame(&frame);
+                state.connection_status = driver.status_text();
             }
         }
     }
     Ok(())
 }
 
+enum TuiDriver {
+    Replay(Box<ReplayDriver>),
+    Live(Box<LiveDriver>),
+}
+
+impl TuiDriver {
+    fn step_forward(&mut self) -> Result<Option<MonitorFrame>> {
+        match self {
+            Self::Replay(driver) => driver.step_forward(),
+            Self::Live(driver) => driver.poll_live().map(|frames| frames.into_iter().next()),
+        }
+    }
+
+    fn step_backward(&mut self) -> Result<Option<MonitorFrame>> {
+        match self {
+            Self::Replay(driver) => driver.step_backward(),
+            Self::Live(_driver) => Ok(None),
+        }
+    }
+
+    fn advance(&mut self, wall_delta: Duration) -> Result<Vec<MonitorFrame>> {
+        match self {
+            Self::Replay(driver) => driver.advance(wall_delta),
+            Self::Live(driver) => {
+                if wall_delta.is_zero() {
+                    Ok(Vec::new())
+                } else {
+                    driver.poll_live()
+                }
+            }
+        }
+    }
+
+    fn speed(&self) -> f64 {
+        match self {
+            Self::Replay(driver) => driver.speed(),
+            Self::Live(driver) => driver.speed(),
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        match self {
+            Self::Replay(driver) => driver.is_paused(),
+            Self::Live(driver) => driver.is_paused(),
+        }
+    }
+
+    fn toggle_pause(&mut self) {
+        match self {
+            Self::Replay(driver) => driver.toggle_pause(),
+            Self::Live(driver) => driver.toggle_pause(),
+        }
+    }
+
+    fn total_epochs(&self) -> usize {
+        match self {
+            Self::Replay(driver) => driver.len(),
+            Self::Live(driver) => driver.len(),
+        }
+    }
+
+    fn status_text(&self) -> String {
+        match self {
+            Self::Replay(driver) => driver.status_text(),
+            Self::Live(driver) => driver.status_text(),
+        }
+    }
+}
+
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
 }
 
 impl TerminalSession {
@@ -161,19 +316,132 @@ fn restore_terminal_for_panic() {
     let _ = execute!(stdout, LeaveAlternateScreen, Show);
 }
 
-pub(crate) struct ReplayDriver {
+#[derive(Debug)]
+struct RtcmEpochMapper {
+    raw_anchor: BTreeMap<GnssSystem, RawState>,
+    source_weeks: BTreeMap<GnssSystem, Vec<u32>>,
+}
+
+#[derive(Clone, Debug)]
+struct RawState {
+    last_raw: Option<u32>,
+    last_continuous_ms: Option<f64>,
+    anchor_week: Option<u32>,
+}
+
+impl RtcmEpochMapper {
+    fn new(source: &BroadcastEphemeris) -> Self {
+        let mut source_weeks = BTreeMap::new();
+        for record in source.records() {
+            let entry = source_weeks
+                .entry(record.satellite_id.system)
+                .or_insert(Vec::new());
+            if !entry.contains(&record.week) {
+                entry.push(record.week);
+            }
+        }
+        for weeks in source_weeks.values_mut() {
+            weeks.sort_unstable();
+        }
+
+        let mut raw_anchor = BTreeMap::new();
+        for (system, rec_week) in source
+            .records()
+            .iter()
+            .map(|record| (record.satellite_id.system, record.week))
+        {
+            raw_anchor.entry(system).or_insert(RawState {
+                last_raw: None,
+                last_continuous_ms: None,
+                anchor_week: Some(rec_week),
+            });
+        }
+
+        Self {
+            raw_anchor,
+            source_weeks,
+        }
+    }
+
+    fn map_epoch(
+        &mut self,
+        system: GnssSystem,
+        raw_epoch_time: u32,
+    ) -> Option<(f64, ObsEpochTime)> {
+        let state = self.raw_anchor.entry(system).or_insert(RawState {
+            last_raw: None,
+            last_continuous_ms: None,
+            anchor_week: None,
+        });
+
+        let continuous_ms =
+            if let (Some(last_raw), Some(last_ms)) = (state.last_raw, state.last_continuous_ms) {
+                let delta = rtcm::msm_epoch_dt_ms(system, last_raw, raw_epoch_time) as f64;
+                last_ms + delta
+            } else {
+                let base_week = state.anchor_week.or_else(|| {
+                    self.source_weeks
+                        .get(&system)
+                        .and_then(|weeks| weeks.first().copied())
+                })?;
+                state.anchor_week = Some(base_week);
+                let base_ms = if system == GnssSystem::Glonass {
+                    let day = raw_epoch_time >> 27;
+                    let ms = raw_epoch_time & ((1_u32 << 27) - 1);
+                    f64::from(day * 86_400_000u32 + ms)
+                } else {
+                    f64::from(raw_epoch_time)
+                };
+                f64::from(base_week) * SECONDS_PER_WEEK * 1000.0 + base_ms
+            };
+
+        state.last_raw = Some(raw_epoch_time);
+        state.last_continuous_ms = Some(continuous_ms);
+
+        let t_rx_j2000_s = match system {
+            GnssSystem::BeiDou => {
+                GPS_EPOCH_TO_J2000_S
+                    + GPST_MINUS_BDT_S
+                    + BDS_EPOCH_MINUS_GPS_EPOCH_S
+                    + continuous_ms / 1000.0
+            }
+            _ => GPS_EPOCH_TO_J2000_S + continuous_ms / 1000.0,
+        };
+
+        let split = split_to_civil(t_rx_j2000_s);
+        Some((t_rx_j2000_s, split))
+    }
+}
+
+fn split_to_civil(t_rx_j2000_s: f64) -> ObsEpochTime {
+    let base = civil_from_j2000_seconds(t_rx_j2000_s.floor() as i64);
+    let second_of_day = split_seconds_of_day(t_rx_j2000_s);
+    let minute = (second_of_day % 3600) / 60;
+    let second = (second_of_day % 60) as f64 + (t_rx_j2000_s.fract().abs());
+    ObsEpochTime {
+        year: base.0 as i32,
+        month: u8::try_from(base.1).expect("month to u8"),
+        day: u8::try_from(base.2).expect("day to u8"),
+        hour: u8::try_from(base.3).expect("hour to u8"),
+        minute: u8::try_from(minute).expect("minute to u8"),
+        second,
+    }
+}
+
+fn split_seconds_of_day(t_rx_j2000_s: f64) -> u32 {
+    let floored = t_rx_j2000_s.floor() as i64;
+    let second_of_day = (floored % 86_400 + 86_400) % 86_400;
+    u32::try_from(second_of_day).expect("seconds in day")
+}
+
+struct ReplayDriver {
     nav: BroadcastEphemeris,
-    epochs: Vec<RinexSppEpochInputs>,
+    epochs: Vec<sidereon::positioning::RinexSppEpochInputs>,
     timeline: ReplayTimeline,
 }
 
 impl ReplayDriver {
-    pub(crate) fn from_files(
-        obs_path: &Path,
-        nav_path: &Path,
-        speed: f64,
-        paused: bool,
-    ) -> Result<Self> {
+    fn from_files(obs_path: &Path, nav_path: &Path, speed: f64, paused: bool) -> Result<Self> {
         validate_speed(speed)?;
         let obs = sidereon::load_rinex_obs(obs_path)
             .with_context(|| format!("load OBS {}", obs_path.display()))?;
@@ -197,45 +465,45 @@ impl ReplayDriver {
         })
     }
 
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.epochs.len()
     }
 
-    pub(crate) fn speed(&self) -> f64 {
+    fn speed(&self) -> f64 {
         self.timeline.speed()
     }
 
-    pub(crate) fn is_paused(&self) -> bool {
+    fn is_paused(&self) -> bool {
         self.timeline.is_paused()
     }
 
-    pub(crate) fn toggle_pause(&mut self) {
-        self.timeline.set_paused(!self.timeline.is_paused());
+    fn toggle_pause(&mut self) {
+        self.timeline.set_paused(!self.timeline.is_paused())
     }
 
-    pub(crate) fn speed_up(&mut self) {
-        self.timeline.speed_up();
+    fn speed_up(&mut self) {
+        self.timeline.speed_up()
     }
 
-    pub(crate) fn speed_down(&mut self) {
-        self.timeline.speed_down();
+    fn speed_down(&mut self) {
+        self.timeline.speed_down()
     }
 
-    pub(crate) fn step_forward(&mut self) -> Result<Option<ReplayFrame>> {
+    fn step_forward(&mut self) -> Result<Option<MonitorFrame>> {
         self.timeline
             .step_forward()
             .map(|index| self.frame_at(index))
             .transpose()
     }
 
-    pub(crate) fn step_backward(&mut self) -> Result<Option<ReplayFrame>> {
+    fn step_backward(&mut self) -> Result<Option<MonitorFrame>> {
         self.timeline
             .step_backward()
             .map(|index| self.frame_at(index))
             .transpose()
     }
 
-    pub(crate) fn advance(&mut self, wall_delta: Duration) -> Result<Vec<ReplayFrame>> {
+    fn advance(&mut self, wall_delta: Duration) -> Result<Vec<MonitorFrame>> {
         self.timeline
             .advance_wall_time(wall_delta)
             .into_iter()
@@ -243,7 +511,7 @@ impl ReplayDriver {
             .collect()
     }
 
-    fn frame_at(&self, replay_index: usize) -> Result<ReplayFrame> {
+    fn frame_at(&self, replay_index: usize) -> Result<MonitorFrame> {
         let epoch = self
             .epochs
             .get(replay_index)
@@ -258,18 +526,429 @@ impl ReplayDriver {
         .next()
         .context("missing SPP solve result")?;
         let satellites = satellite_snapshots(&self.nav, &epoch.inputs, solution.as_ref().ok());
-        Ok(ReplayFrame {
+        Ok(MonitorFrame::Replay(ReplayFrame {
             replay_index,
-            epoch_index: epoch.epoch_index,
+            raw_epoch: Some(epoch.epoch_index),
             epoch: epoch.epoch,
             observation_count: epoch.inputs.observations.len(),
             solution,
             satellites,
-        })
+        }))
+    }
+
+    fn status_text(&self) -> String {
+        if self.is_paused() {
+            "paused".to_string()
+        } else {
+            "replay".to_string()
+        }
     }
 }
 
-#[derive(Debug, Clone)]
+struct LiveDriver {
+    nav: BroadcastEphemeris,
+    options: RinexSppOptions,
+    timeline_speed: f64,
+    paused: bool,
+    status: String,
+    source: LiveSourceConfig,
+    stream: Option<TcpStream>,
+    ntrip_machine: Option<NtripClientMachine>,
+    assembler: SsrStreamAssembler,
+    mapper: RtcmEpochMapper,
+    epoch_buffer: Vec<MsmMessage>,
+    reconnect_attempts: usize,
+    pending_reconnect_at: Option<SystemTime>,
+    total_frames: usize,
+    gga_lat: Option<f64>,
+    gga_lon: Option<f64>,
+    connect_started: Option<SystemTime>,
+}
+
+impl LiveDriver {
+    fn from_ntrip(
+        nav_path: &Path,
+        speed: f64,
+        paused: bool,
+        input: NtripConfigInput,
+    ) -> Result<Self> {
+        let nav = sidereon::load_rinex_nav(nav_path)?;
+        let mapper = RtcmEpochMapper::new(&nav);
+        let gga_lat = input.gga_lat;
+        let gga_lon = input.gga_lon;
+        let host = input.host.clone();
+        let port = input.port;
+        let mount = input.mount.clone();
+        let user = input.user.clone();
+        let pass = input.pass.clone();
+        let options =
+            RinexSppOptions::new(SignalPolicy::default_for(3.05)?).with_initial_guess([0.0; 4]);
+        let credentials = if user.is_empty() || pass.is_empty() {
+            None
+        } else {
+            Some(NtripCredentials {
+                username: user,
+                password: pass,
+            })
+        };
+        let mut machine = NtripClientMachine::new(NtripConfig {
+            host,
+            port,
+            mountpoint: mount,
+            version: NtripVersion::Rev2,
+            credentials,
+            user_agent_product: format!("sidereon/{}", env!("CARGO_PKG_VERSION")),
+            gga_interval_s: Some(NTRIP_GGA_INTERVAL_S),
+        });
+        machine.reset();
+        Ok(Self {
+            nav,
+            options,
+            timeline_speed: speed,
+            paused,
+            status: "disconnected".to_string(),
+            source: LiveSourceConfig::Ntrip(input),
+            stream: None,
+            ntrip_machine: Some(machine),
+            assembler: SsrStreamAssembler::new(),
+            mapper,
+            epoch_buffer: Vec::new(),
+            reconnect_attempts: 0,
+            pending_reconnect_at: None,
+            total_frames: 0,
+            gga_lat,
+            gga_lon,
+            connect_started: None,
+        })
+    }
+
+    fn from_tcp(nav_path: &Path, speed: f64, paused: bool, input: TcpConfigInput) -> Result<Self> {
+        let nav = sidereon::load_rinex_nav(nav_path)?;
+        let mapper = RtcmEpochMapper::new(&nav);
+        let options =
+            RinexSppOptions::new(SignalPolicy::default_for(3.05)?).with_initial_guess([0.0; 4]);
+        Ok(Self {
+            nav,
+            options,
+            timeline_speed: speed,
+            paused,
+            status: "disconnected".to_string(),
+            source: LiveSourceConfig::Tcp(input),
+            stream: None,
+            ntrip_machine: None,
+            assembler: SsrStreamAssembler::new(),
+            mapper,
+            epoch_buffer: Vec::new(),
+            reconnect_attempts: 0,
+            pending_reconnect_at: None,
+            total_frames: 0,
+            gga_lat: None,
+            gga_lon: None,
+            connect_started: None,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.total_frames
+    }
+
+    fn speed(&self) -> f64 {
+        self.timeline_speed
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+    }
+
+    fn status_text(&self) -> String {
+        self.status.clone()
+    }
+
+    fn maybe_reconnect(&mut self) -> Result<()> {
+        if self.stream.is_some() {
+            return Ok(());
+        }
+        if let Some(at) = self.pending_reconnect_at {
+            if SystemTime::now() < at {
+                return Ok(());
+            }
+        }
+        self.connect()
+    }
+
+    fn schedule_reconnect(&mut self, reason: impl std::fmt::Display) {
+        self.connect_started = None;
+        self.stream = None;
+        self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+        let mut delay = Duration::from_millis(500);
+        for _ in 0..self.reconnect_attempts.min(6) {
+            delay = delay.saturating_mul(2);
+        }
+        self.pending_reconnect_at = Some(SystemTime::now() + delay);
+        self.status = format!("reconnecting: {}", reason);
+    }
+
+    fn connect(&mut self) -> Result<()> {
+        let (host, port) = match &self.source {
+            LiveSourceConfig::Ntrip(config) => (config.host.as_str(), config.port),
+            LiveSourceConfig::Tcp(config) => (config.host.as_str(), config.port),
+        };
+        let mut stream = TcpStream::connect(format!("{host}:{port}"))
+            .with_context(|| format!("connect to {host}:{port}"))?;
+        stream.set_read_timeout(Some(LIVE_READ_TIMEOUT))?;
+        match &self.source {
+            LiveSourceConfig::Ntrip(config) => {
+                let Some(machine) = &mut self.ntrip_machine else {
+                    bail!("missing ntrip machine");
+                };
+                let request = machine
+                    .connection_request()
+                    .context("build ntrip request")?;
+                stream.write_all(&request).context("send ntrip request")?;
+                self.gga_lat = config.gga_lat;
+                self.gga_lon = config.gga_lon;
+                self.status = "ntrip connecting".to_string();
+            }
+            LiveSourceConfig::Tcp(_) => {
+                self.status = "tcp connected".to_string();
+            }
+        }
+        self.connect_started = Some(SystemTime::now());
+        self.stream = Some(stream);
+        self.reconnect_attempts = 0;
+        self.pending_reconnect_at = None;
+        Ok(())
+    }
+
+    fn poll_live(&mut self) -> Result<Vec<MonitorFrame>> {
+        if self.paused {
+            return Ok(Vec::new());
+        }
+        if self.stream.is_none() {
+            self.maybe_reconnect()?;
+        }
+        if self.stream.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut chunk = vec![0u8; READ_CHUNK];
+        let read = match self
+            .stream
+            .as_mut()
+            .context("missing stream")?
+            .read(&mut chunk)
+        {
+            Ok(0) => {
+                self.schedule_reconnect("stream ended");
+                return Ok(Vec::new());
+            }
+            Ok(size) => size,
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                self.schedule_reconnect(error.to_string());
+                return Ok(Vec::new());
+            }
+        };
+        chunk.truncate(read);
+        let events = match &self.source {
+            LiveSourceConfig::Ntrip(_) => self.process_ntrip_bytes(&chunk)?,
+            LiveSourceConfig::Tcp(_) => vec![chunk],
+        };
+
+        let mut frames = Vec::new();
+        for payload in events {
+            for parsed in self.assembler.push(&payload) {
+                match parsed {
+                    Ok(Message::Msm(message)) => self.epoch_buffer.push(message),
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+
+        if self.epoch_buffer.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let messages = core::mem::take(&mut self.epoch_buffer);
+        let solved = self.solve_rtcm_epoch_messages(messages)?;
+        frames.extend(solved);
+
+        Ok(frames)
+    }
+
+    fn process_ntrip_bytes(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let Some(machine) = &mut self.ntrip_machine else {
+            bail!("missing ntrip machine");
+        };
+        let mut payloads = Vec::new();
+        for event in machine.push(chunk) {
+            match event {
+                NtripEvent::Connected(_) => {
+                    self.status = "streaming".to_string();
+                }
+                NtripEvent::Payload(payload) => payloads.push(payload),
+                NtripEvent::Sourcetable(_) => {
+                    self.status = "sourcetable".to_string();
+                }
+                NtripEvent::StreamEnded | NtripEvent::StreamCorrupted { .. } => {
+                    self.schedule_reconnect("stream corrupted");
+                }
+                NtripEvent::Rejected(rejection) => {
+                    self.schedule_reconnect(format!("rejected: {rejection:?}"));
+                }
+            }
+        }
+        Ok(payloads)
+    }
+
+    fn solve_rtcm_epoch_messages(
+        &mut self,
+        messages: Vec<MsmMessage>,
+    ) -> Result<Vec<MonitorFrame>> {
+        let epochs = sidereon::spp_inputs_from_rtcm_msm(
+            &messages,
+            &self.nav,
+            &self.options,
+            |system, raw| self.mapper.map_epoch(system, raw),
+        )
+        .context("convert RTCM MSM stream")?;
+
+        let mut frames = Vec::new();
+        for epoch in epochs {
+            let mut solved = sidereon::solve_spp_batch_serial(
+                &self.nav,
+                std::slice::from_ref(&epoch.inputs),
+                true,
+                SolvePolicy::default(),
+            )
+            .into_iter();
+            let solve_result = solved.next().context("missing solve result")?;
+
+            self.total_frames = self.total_frames.saturating_add(1);
+
+            self.send_gga(&solve_result)?;
+
+            let satellites =
+                satellite_snapshots(&self.nav, &epoch.inputs, solve_result.as_ref().ok());
+            frames.push(MonitorFrame::Replay(ReplayFrame {
+                replay_index: epoch.epoch_index,
+                raw_epoch: Some(epoch.epoch_index),
+                epoch: epoch.epoch,
+                observation_count: epoch.inputs.observations.len(),
+                solution: solve_result,
+                satellites,
+            }));
+        }
+
+        Ok(frames)
+    }
+
+    fn send_gga(&mut self, solution: &sidereon::Result<ReceiverSolution>) -> Result<()> {
+        let (mut lat_deg, mut lon_deg, height_m) = match solution
+            .as_ref()
+            .ok()
+            .and_then(|solution| solution.geodetic)
+        {
+            Some(geo) => (
+                geo.lat_rad.to_degrees(),
+                geo.lon_rad.to_degrees(),
+                geo.height_m,
+            ),
+            None => return Ok(()),
+        };
+        if let Some(lat) = self.gga_lat {
+            lat_deg = lat;
+        }
+        if let Some(lon) = self.gga_lon {
+            lon_deg = lon;
+        }
+
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        let Some(machine) = self.ntrip_machine.as_mut() else {
+            return Ok(());
+        };
+        let Some(started) = self.connect_started else {
+            return Ok(());
+        };
+        let Some(now) = started.elapsed().ok().map(|elapsed| elapsed.as_secs_f64()) else {
+            return Ok(());
+        };
+
+        let position = GgaPosition {
+            lat_deg,
+            lon_deg,
+            height_m,
+            fix_quality: 1,
+            num_satellites: 10,
+            hdop: 1.0,
+        };
+        if let Some(message) = machine.gga_message(now, &position, now.rem_euclid(86_400.0)) {
+            stream.write_all(&message)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn poll_from_reader<R: Read>(&mut self, reader: &mut R) -> Result<Vec<MonitorFrame>> {
+        let mut chunk = vec![0u8; READ_CHUNK];
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(Vec::new()),
+            Ok(size) => size,
+            Err(error) => {
+                self.schedule_reconnect(error.to_string());
+                return Ok(Vec::new());
+            }
+        };
+        chunk.truncate(read);
+        let events = match &self.source {
+            LiveSourceConfig::Ntrip(_) => self.process_ntrip_bytes(&chunk)?,
+            LiveSourceConfig::Tcp(_) => vec![chunk],
+        };
+
+        for payload in events {
+            for parsed in self.assembler.push(&payload) {
+                if let Ok(Message::Msm(message)) = parsed {
+                    self.epoch_buffer.push(message)
+                }
+            }
+        }
+        let messages = core::mem::take(&mut self.epoch_buffer);
+        self.solve_rtcm_epoch_messages(messages)
+    }
+}
+
+#[derive(Debug)]
+enum MonitorFrame {
+    Replay(ReplayFrame),
+}
+
+#[derive(Debug)]
+struct ReplayFrame {
+    replay_index: usize,
+    raw_epoch: Option<usize>,
+    epoch: ObsEpochTime,
+    observation_count: usize,
+    solution: sidereon::Result<ReceiverSolution>,
+    satellites: Vec<SatelliteSnapshot>,
+}
+
+fn validate_speed(speed: f64) -> Result<()> {
+    if !speed.is_finite() || speed <= 0.0 {
+        bail!("--speed must be a finite positive multiplier");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
 pub(crate) struct ReplayTimeline {
     epoch_times_s: Vec<f64>,
     current_index: Option<usize>,
@@ -279,7 +958,7 @@ pub(crate) struct ReplayTimeline {
 }
 
 impl ReplayTimeline {
-    pub(crate) fn new(epoch_times_s: Vec<f64>, speed: f64, paused: bool) -> Result<Self> {
+    fn new(epoch_times_s: Vec<f64>, speed: f64, paused: bool) -> Result<Self> {
         validate_speed(speed)?;
         if epoch_times_s.is_empty() {
             bail!("replay timeline requires at least one epoch");
@@ -296,28 +975,28 @@ impl ReplayTimeline {
         })
     }
 
-    pub(crate) fn speed(&self) -> f64 {
+    fn speed(&self) -> f64 {
         self.speed
     }
 
-    pub(crate) fn is_paused(&self) -> bool {
+    fn is_paused(&self) -> bool {
         self.paused
     }
 
-    pub(crate) fn set_paused(&mut self, paused: bool) {
+    fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
         self.accumulated_replay_s = 0.0;
     }
 
-    pub(crate) fn speed_up(&mut self) {
+    fn speed_up(&mut self) {
         self.speed = (self.speed * 2.0).min(MAX_SPEED);
     }
 
-    pub(crate) fn speed_down(&mut self) {
+    fn speed_down(&mut self) {
         self.speed = (self.speed / 2.0).max(MIN_SPEED);
     }
 
-    pub(crate) fn step_forward(&mut self) -> Option<usize> {
+    fn step_forward(&mut self) -> Option<usize> {
         let next = self.current_index.map_or(0, |index| index + 1);
         if next >= self.epoch_times_s.len() {
             return None;
@@ -327,7 +1006,7 @@ impl ReplayTimeline {
         Some(next)
     }
 
-    pub(crate) fn step_backward(&mut self) -> Option<usize> {
+    fn step_backward(&mut self) -> Option<usize> {
         let current = self.current_index?;
         let previous = current.checked_sub(1)?;
         self.current_index = Some(previous);
@@ -335,7 +1014,7 @@ impl ReplayTimeline {
         Some(previous)
     }
 
-    pub(crate) fn advance_wall_time(&mut self, wall_delta: Duration) -> Vec<usize> {
+    fn advance_wall_time(&mut self, wall_delta: Duration) -> Vec<usize> {
         if self.paused {
             return Vec::new();
         }
@@ -345,6 +1024,7 @@ impl ReplayTimeline {
             emitted.push(0);
         }
         self.accumulated_replay_s += wall_delta.as_secs_f64() * self.speed;
+
         while emitted.len() < MAX_ADVANCE_FRAMES_PER_TICK {
             let Some(current) = self.current_index else {
                 break;
@@ -365,25 +1045,8 @@ impl ReplayTimeline {
     }
 }
 
-fn validate_speed(speed: f64) -> Result<()> {
-    if !speed.is_finite() || speed <= 0.0 {
-        bail!("--speed must be a finite positive multiplier");
-    }
-    Ok(())
-}
-
 #[derive(Debug)]
-pub(crate) struct ReplayFrame {
-    replay_index: usize,
-    epoch_index: usize,
-    epoch: ObsEpochTime,
-    observation_count: usize,
-    solution: sidereon::Result<ReceiverSolution>,
-    satellites: Vec<SatelliteSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct TuiState {
+struct TuiState {
     obs_label: String,
     nav_label: String,
     total_epochs: usize,
@@ -392,6 +1055,7 @@ pub(crate) struct TuiState {
     observation_count: usize,
     epoch_time: String,
     status: String,
+    connection_status: String,
     speed: f64,
     paused: bool,
     lat_deg: Option<f64>,
@@ -405,22 +1069,23 @@ pub(crate) struct TuiState {
 }
 
 impl TuiState {
-    pub(crate) fn new(
-        obs_path: &Path,
-        nav_path: &Path,
+    fn new(
+        obs_label: &str,
+        nav_label: &str,
         total_epochs: usize,
         speed: f64,
         paused: bool,
     ) -> Self {
         Self {
-            obs_label: compact_path(obs_path),
-            nav_label: compact_path(nav_path),
+            obs_label: obs_label.to_string(),
+            nav_label: nav_label.to_string(),
             total_epochs,
             current_replay_epoch: None,
             current_raw_epoch: None,
             observation_count: 0,
             epoch_time: "n/a".to_string(),
             status: "ready".to_string(),
+            connection_status: "ready".to_string(),
             speed,
             paused,
             lat_deg: None,
@@ -434,39 +1099,43 @@ impl TuiState {
         }
     }
 
-    pub(crate) fn set_speed(&mut self, speed: f64) {
+    fn set_speed(&mut self, speed: f64) {
         self.speed = speed;
     }
 
-    pub(crate) fn set_paused(&mut self, paused: bool) {
+    fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
     }
 
-    pub(crate) fn apply_frame(&mut self, frame: &ReplayFrame) {
-        self.current_replay_epoch = Some(frame.replay_index + 1);
-        self.current_raw_epoch = Some(frame.epoch_index);
-        self.observation_count = frame.observation_count;
-        self.epoch_time = format_epoch(frame.epoch);
-        self.satellites = frame.satellites.clone();
-        match &frame.solution {
-            Ok(solution) => {
-                self.status = if solution.metadata.converged {
-                    "solved".to_string()
-                } else {
-                    "not converged".to_string()
-                };
-                self.lat_deg = solution.geodetic.map(|geo| rad_to_deg(geo.lat_rad));
-                self.lon_deg = solution.geodetic.map(|geo| rad_to_deg(geo.lon_rad));
-                self.height_m = solution.geodetic.map(|geo| geo.height_m);
-                self.bounds = ErrorBounds::from_solution(solution);
-                self.push_convergence(solution);
-            }
-            Err(error) => {
-                self.status = format!("error: {error}");
-                self.lat_deg = None;
-                self.lon_deg = None;
-                self.height_m = None;
-                self.bounds = ErrorBounds::empty();
+    fn apply_frame(&mut self, frame: &MonitorFrame) {
+        match frame {
+            MonitorFrame::Replay(frame) => {
+                self.current_replay_epoch = Some(frame.replay_index + 1);
+                self.current_raw_epoch = frame.raw_epoch;
+                self.observation_count = frame.observation_count;
+                self.epoch_time = format_epoch(frame.epoch);
+                self.satellites = frame.satellites.clone();
+                match &frame.solution {
+                    Ok(solution) => {
+                        self.status = if solution.metadata.converged {
+                            "solved".to_string()
+                        } else {
+                            "not converged".to_string()
+                        };
+                        self.lat_deg = solution.geodetic.map(|geo| rad_to_deg(geo.lat_rad));
+                        self.lon_deg = solution.geodetic.map(|geo| rad_to_deg(geo.lon_rad));
+                        self.height_m = solution.geodetic.map(|geo| geo.height_m);
+                        self.bounds = ErrorBounds::from_solution(solution);
+                        self.push_convergence(solution);
+                    }
+                    Err(error) => {
+                        self.status = format!("error: {error}");
+                        self.lat_deg = None;
+                        self.lon_deg = None;
+                        self.height_m = None;
+                        self.bounds = ErrorBounds::empty();
+                    }
+                }
             }
         }
     }
@@ -498,7 +1167,7 @@ impl TuiState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ConvergenceOrigin {
     ecef: [f64; 3],
     geo: sidereon::Wgs84Geodetic,
@@ -527,16 +1196,20 @@ impl ErrorBounds {
     }
 
     fn from_solution(solution: &ReceiverSolution) -> Self {
-        match solution_metrics(solution) {
-            Ok(metrics) => Self {
-                cep_m: Some(metrics.cep_m),
-                r95_m: Some(metrics.r95_m),
-                vertical_95_m: Some(metrics.vertical_95_m),
+        let metrics = metrics_from_position_covariance(&solution.position_covariance).ok();
+        let vertical_95_m = metrics.as_ref().and_then(|_metrics| {
+            vertical_radius_at(solution.position_covariance.enu_m2[2][2], 0.95).ok()
+        });
+        match (metrics, vertical_95_m) {
+            (Some(metrics), Some(vertical_95_m)) => Self {
+                cep_m: Some(metrics.cep_m.radius_m),
+                r95_m: Some(metrics.r95_m.radius_m),
+                vertical_95_m: Some(vertical_95_m),
                 sigma_e_m: Some(metrics.sigma_e_m),
                 sigma_n_m: Some(metrics.sigma_n_m),
                 sigma_u_m: Some(metrics.sigma_u_m),
             },
-            Err(_) => Self::empty(),
+            _ => Self::empty(),
         }
     }
 }
@@ -554,7 +1227,7 @@ fn satellite_snapshots(
     inputs: &SolveInputs,
     solution: Option<&ReceiverSolution>,
 ) -> Vec<SatelliteSnapshot> {
-    let used: BTreeSet<GnssSatelliteId> = solution
+    let used: BTreeSet<sidereon::GnssSatelliteId> = solution
         .map(|solution| solution.used_sats.iter().copied().collect())
         .unwrap_or_default();
     let receiver_ecef = solution
@@ -597,7 +1270,7 @@ fn dot(left: [f64; 3], right: [f64; 3]) -> f64 {
     left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
 }
 
-pub(crate) fn render(frame: &mut Frame, state: &TuiState) {
+fn render(frame: &mut Frame, state: &TuiState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(9), Constraint::Min(12)])
@@ -640,6 +1313,13 @@ fn render_solution(frame: &mut Frame, area: Rect, state: &TuiState) {
         Line::from(vec![
             Span::styled("status ", label_style()),
             Span::styled(state.status.clone(), status_style(&state.status)),
+        ]),
+        Line::from(vec![
+            Span::styled("conn ", label_style()),
+            Span::styled(
+                state.connection_status.clone(),
+                status_style(&state.connection_status),
+            ),
         ]),
         Line::from(vec![
             Span::styled("lat ", label_style()),
@@ -776,9 +1456,9 @@ fn label_style() -> Style {
 }
 
 fn status_style(status: &str) -> Style {
-    if status == "solved" {
+    if status == "solved" || status == "connected" || status == "streaming" {
         Style::default().fg(Color::Green)
-    } else if status.starts_with("error") {
+    } else if status.starts_with("error") || status.starts_with("reconnecting") {
         Style::default().fg(Color::Red)
     } else {
         Style::default().fg(Color::Yellow)
@@ -831,10 +1511,11 @@ fn convergence_data(values: &VecDeque<f64>) -> Vec<u64> {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use std::io::{Cursor, Error, ErrorKind, Read};
 
-    fn fixture(parts: &[&str]) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../sidereon-core/tests/fixtures");
+    fn read_fixture(parts: &[&str]) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../sidereon-core/tests/fixtures");
         for part in parts {
             path.push(part);
         }
@@ -883,24 +1564,31 @@ mod tests {
     #[test]
     fn timeline_caps_replay_work_per_tick() {
         let epochs = (0..64).map(|index| index as f64).collect();
-        let mut timeline = ReplayTimeline::new(epochs, MAX_SPEED, false).expect("timeline");
+        let mut timeline =
+            ReplayTimeline::new(epochs, crate::tui::MAX_SPEED, false).expect("timeline");
 
         let first = timeline.advance_wall_time(Duration::from_secs(100));
         assert_eq!(first.len(), MAX_ADVANCE_FRAMES_PER_TICK);
         assert_eq!(first[0], 0);
         assert_eq!(first[MAX_ADVANCE_FRAMES_PER_TICK - 1], 7);
 
-        let second = timeline.advance_wall_time(Duration::from_secs(0));
+        let second = timeline.advance_wall_time(Duration::ZERO);
         assert_eq!(second.len(), MAX_ADVANCE_FRAMES_PER_TICK);
         assert_eq!(second[0], 8);
     }
 
     #[test]
     fn state_updates_from_fixture_replay_without_terminal() {
-        let obs = fixture(&["obs", "ESBC00DNK_R_20201770000_01D_30S_MO_trim.rnx"]);
-        let nav = fixture(&["nav", "ESBC00DNK_R_20201770000_01D_MN.rnx"]);
+        let obs = read_fixture(&["obs", "ESBC00DNK_R_20201770000_01D_30S_MO_trim.rnx"]);
+        let nav = read_fixture(&["nav", "ESBC00DNK_R_20201770000_01D_MN.rnx"]);
         let mut driver = ReplayDriver::from_files(&obs, &nav, 10.0, true).expect("driver");
-        let mut state = TuiState::new(&obs, &nav, driver.len(), driver.speed(), driver.is_paused());
+        let mut state = TuiState::new(
+            &obs.display().to_string(),
+            &nav.display().to_string(),
+            driver.len(),
+            driver.speed(),
+            driver.is_paused(),
+        );
         let frame = driver
             .step_forward()
             .expect("step result")
@@ -923,11 +1611,12 @@ mod tests {
 
     #[test]
     fn rendering_smoke_test_has_panels_and_formatted_values() {
-        let mut state = TuiState::new(Path::new("site.obs"), Path::new("brdc.rnx"), 2, 10.0, true);
+        let mut state = TuiState::new("site.obs", "brdc.rnx", 2, 10.0, true);
         state.current_replay_epoch = Some(1);
         state.current_raw_epoch = Some(0);
         state.observation_count = 7;
         state.epoch_time = "2020-06-25T00:00:00.000".to_string();
+        state.connection_status = "streaming".to_string();
         state.status = "solved".to_string();
         state.lat_deg = Some(55.493575);
         state.lon_deg = Some(8.456829);
@@ -958,12 +1647,98 @@ mod tests {
         assert!(text.contains("Solution"));
         assert!(text.contains("Satellites"));
         assert!(text.contains("Convergence"));
-        assert!(text.contains("Error Bounds"));
-        assert!(text.contains("55.494 deg"));
         assert!(text.contains("CEP"));
+        assert!(text.contains("55.494 deg"));
         assert!(text.contains("0.987 m"));
         assert!(text.contains("G05"));
         assert!(text.contains("yes"));
+        assert!(text.contains("streaming"));
+    }
+
+    #[test]
+    fn live_driver_reads_recorded_rtcm_into_frames() {
+        let nav = read_fixture(&["nav", "KMS300DNK_R_20221591000_01H_MN.rnx"]);
+        let bytes = include_bytes!(
+            "../../../crates/sidereon-core/tests/fixtures/rtcm/gmsd7_20121014.rtcm3"
+        );
+        let mut reader = Cursor::new(&bytes[..]);
+        let mut driver = LiveDriver::from_tcp(
+            &nav,
+            1.0,
+            false,
+            TcpConfigInput {
+                host: "offline".to_string(),
+                port: 0,
+            },
+        )
+        .expect("driver");
+        let mut seen = 0usize;
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            let next = driver.poll_from_reader(&mut reader).expect("poll");
+            if next.is_empty() {
+                break;
+            }
+            seen += 1;
+            frames.extend(next);
+        }
+        assert!(
+            !frames.is_empty(),
+            "expected at least one live frame from fixture"
+        );
+        assert!(seen > 0);
+    }
+
+    struct ScriptedRead {
+        reads: Vec<std::io::Result<usize>>,
+        index: usize,
+    }
+
+    impl ScriptedRead {
+        fn with(reads: Vec<std::io::Result<usize>>) -> Self {
+            Self { reads, index: 0 }
+        }
+    }
+
+    impl Read for ScriptedRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.index >= self.reads.len() {
+                return Ok(0);
+            }
+            let result = std::mem::replace(&mut self.reads[self.index], Ok(0));
+            self.index += 1;
+            match result {
+                Ok(size) => {
+                    for byte in buf.iter_mut().take(size) {
+                        *byte = 0;
+                    }
+                    Ok(size)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn live_reconnect_status_is_entered_after_stream_failure() {
+        let nav = read_fixture(&["nav", "KMS300DNK_R_20221591000_01H_MN.rnx"]);
+        let mut driver = LiveDriver::from_tcp(
+            &nav,
+            1.0,
+            false,
+            TcpConfigInput {
+                host: "offline".to_string(),
+                port: 0,
+            },
+        )
+        .expect("driver");
+        let mut stream = ScriptedRead::with(vec![Err(Error::new(
+            ErrorKind::ConnectionReset,
+            "network down",
+        ))]);
+        let frames = driver.poll_from_reader(&mut stream).expect("poll");
+        assert!(frames.is_empty());
+        assert!(driver.status_text().contains("reconnecting"));
     }
 
     fn buffer_text(backend: &TestBackend) -> String {
