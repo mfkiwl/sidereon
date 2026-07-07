@@ -2,6 +2,14 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- RINEX-to-SPP assembly helpers that convert parsed observation epochs plus a
+  broadcast or precise ephemeris context into per-epoch `SolveInputs`, with a
+  serial batch solve convenience that preserves per-epoch solve errors.
+
 ## [0.20.0]
 
 ### Added

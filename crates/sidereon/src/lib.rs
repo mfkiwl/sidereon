@@ -17,6 +17,9 @@
 //!   with lossy variants for best-effort recovery,
 //! - [`decode_crinex`] / [`load_crinex`] expand Hatanaka-compressed
 //!   observation files,
+//! - [`spp_inputs_from_rinex_obs`] assembles parsed RINEX observations into SPP
+//!   solve inputs, with [`solve_spp_from_rinex_obs`] as the serial batch
+//!   convenience,
 //! - [`solve_spp`] runs single-point positioning,
 //! - [`araim`] exposes multi-hypothesis protection levels from supplied
 //!   geometry and integrity support data,
@@ -190,6 +193,11 @@ pub use sidereon_core::astro::propagator::{ForceModelComponents, ForceModelKind}
 pub use sidereon_core::geometry_quality::{
     classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
 };
+pub use sidereon_core::positioning::{
+    solve_spp_from_rinex_obs, spp_inputs_from_rinex_obs, RinexSppAssemblySource,
+    RinexSppBroadcastCorrections, RinexSppEpochInputs, RinexSppEpochSolution, RinexSppError,
+    RinexSppOptions, RinexSppSource,
+};
 pub use sidereon_core::quality::{
     reliability_araim, reliability_design, spp_robust_fde_driver, wtest_noncentrality,
     wtest_noncentrality_components, ObservationReliability, RangeReliabilityRow,
@@ -221,6 +229,12 @@ pub use sidereon_core::{
     AppliedMediaCorrections, EmissionMediaBatch, EmissionMediaBatchOptions, EmissionMediaStatus,
     MediaPredictOptions, MediaPredictedObservables, MediaRangePrediction,
     ObservableIonosphereCorrection, ObservableMediaOptions, ObservableTroposphereCorrection,
+};
+pub use sidereon_core::{
+    error_ellipse_from_enu_m2, horizontal_radius_at, metrics_from_ecef_covariance_m2,
+    metrics_from_enu_covariance_m2, metrics_from_kinematic_solution,
+    metrics_from_position_covariance, spherical_radius_at, vertical_radius_at, ErrorEllipse,
+    ErrorMetricsError, PercentileRadius, PositionErrorMetrics,
 };
 pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
