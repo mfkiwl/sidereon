@@ -231,6 +231,12 @@ pub use sidereon_core::{
     ObservableIonosphereCorrection, ObservableMediaOptions, ObservableTroposphereCorrection,
 };
 pub use sidereon_core::{
+    error_ellipse_from_enu_m2, horizontal_radius_at, metrics_from_ecef_covariance_m2,
+    metrics_from_enu_covariance_m2, metrics_from_kinematic_solution,
+    metrics_from_position_covariance, spherical_radius_at, vertical_radius_at, ErrorEllipse,
+    ErrorMetricsError, PercentileRadius, PositionErrorMetrics,
+};
+pub use sidereon_core::{
     gauss_markov_bias_decay, gauss_markov_bias_variance_increment, gravity_ecef_mps2,
     mechanize_ecef, normal_gravity_mps2, rodrigues_delta_dcm, simulate_imu_samples,
     simulate_imu_samples_from_increments, true_imu_increment_between, AttitudeQuaternion,
