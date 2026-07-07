@@ -2,7 +2,7 @@
 
 `sidereon` is a small command-line wrapper over the `sidereon` facade crate. It parses real GNSS products through the library, assembles RINEX observation epochs for SPP through the core convenience API, and prints compact human output or stable JSON where supported.
 
-This v1 has no MCP server.
+This branch adds MCP server support with `serve-mcp`.
 
 ## Build
 
@@ -23,6 +23,57 @@ For a local install into Cargo's bin directory:
 ```sh
 cargo install --path crates/sidereon-cli --locked
 ```
+
+## Serve MCP over stdio
+
+Run the typed MCP server with a profile filter:
+
+```sh
+sidereon serve-mcp --profile gnss
+sidereon serve-mcp --profile astro
+sidereon serve-mcp --profile all
+```
+
+Profiles filter Layer 1 tools and graph nodes:
+
+- `gnss`: solve/log/mask tools plus GNSS graph nodes.
+- `astro`: pass-prediction tools plus TLE/time-scan nodes.
+- `all`: full graph and all tools.
+
+### Claude Desktop
+
+```json
+{
+  "mcpServers": {
+    "sidereon-serve": {
+      "command": "sidereon",
+      "args": ["serve-mcp", "--profile", "all"],
+      "env": {}
+    }
+  }
+}
+```
+
+### Claude Code
+
+```json
+{
+  "mcpServers": {
+    "sidereon-serve": {
+      "command": "sidereon",
+      "args": ["serve-mcp", "--profile", "gnss"],
+      "env": {}
+    }
+  }
+}
+```
+
+Configured resources include:
+
+- `sidereon://docs/concepts/frames-time-scales`
+- `sidereon://docs/concepts/cep-r95`
+- `sidereon://docs/concepts/product-expectations`
+- `sidereon://docs/capability-map`
 
 ## Commands
 
