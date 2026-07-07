@@ -194,9 +194,9 @@ pub use sidereon_core::geometry_quality::{
     classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
 };
 pub use sidereon_core::positioning::{
-    solve_spp_from_rinex_obs, spp_inputs_from_rinex_obs, RinexSppAssemblySource,
-    RinexSppBroadcastCorrections, RinexSppEpochInputs, RinexSppEpochSolution, RinexSppError,
-    RinexSppOptions, RinexSppSource,
+    solve_spp_from_rinex_obs, spp_inputs_from_rinex_obs, spp_inputs_from_rtcm_msm,
+    RinexSppAssemblySource, RinexSppBroadcastCorrections, RinexSppEpochInputs,
+    RinexSppEpochSolution, RinexSppError, RinexSppOptions, RinexSppSource, RtcmSppEpochInputs,
 };
 pub use sidereon_core::quality::{
     reliability_araim, reliability_design, spp_robust_fde_driver, wtest_noncentrality,

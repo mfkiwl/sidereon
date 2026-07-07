@@ -16,3 +16,4 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sidereon = { path = "../sidereon", version = "0.21.0" }
+sidereon-core = { path = "../sidereon-core", version = "0.21.0", package = "sidereon-core" }

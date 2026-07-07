@@ -3,12 +3,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::constants::C_M_S;
 pub use crate::dop::{dop, Dop, DopError, LineOfSight};
 use crate::ephemeris::{BroadcastEphemeris, Sp3};
+use crate::id::GnssSystem;
 pub use crate::quality::{
     spp_robust_fde_driver, FdeError, FdeOptions, FdeResult, FdeSppError, FdeSppOptions,
 };
 use crate::rinex::observations::{pseudoranges, ObsEpochTime, ObservationFile, SignalPolicy};
+use crate::rtcm::{self, MsmKind};
 pub use crate::spp::{
     residual_rms, solve, solve_broadcast, solve_doppler_velocity, solve_spp_batch_parallel,
     solve_spp_batch_serial, solve_with_doppler_velocity, solve_with_fallback, solve_with_policy,
@@ -299,6 +302,215 @@ pub struct RinexSppEpochSolution {
     pub solution: Result<ReceiverSolution, SolvePolicyError>,
 }
 
+/// One set of assembled RTCM MSM observations and its SPP inputs.
+#[derive(Debug, Clone)]
+pub struct RtcmSppEpochInputs {
+    /// Index in the ordered set of assembled RTCM observation epochs.
+    pub epoch_index: usize,
+    /// Civil epoch reconstructed from the stream conversion logic.
+    pub epoch: ObsEpochTime,
+    /// Fully assembled SPP inputs for this epoch.
+    pub inputs: SolveInputs,
+}
+
+/// Convert RTCM MSM observation messages into SPP-ready epoch inputs.
+///
+/// Messages are grouped by `(system, epoch_time)` in stream order, so each
+/// RTCM epoch produces one `RtcmSppEpochInputs` entry.
+pub fn spp_inputs_from_rtcm_msm<S, F>(
+    messages: &[rtcm::MsmMessage],
+    source: &S,
+    options: &RinexSppOptions,
+    mut map_epoch: F,
+) -> Result<Vec<RtcmSppEpochInputs>, RinexSppError>
+where
+    S: RinexSppAssemblySource + ?Sized,
+    F: FnMut(GnssSystem, u32) -> Option<(f64, ObsEpochTime)>,
+{
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let initial_guess = options.initial_guess.unwrap_or([0.0; 4]);
+    let base_corrections = merged_broadcast_corrections_from_source(source);
+    let mut groups = Vec::<(GnssSystem, u32, Vec<usize>)>::new();
+    let mut group_index = BTreeMap::<(GnssSystem, u32), usize>::new();
+
+    for (index, message) in messages.iter().enumerate() {
+        let key = (message.system, message.header.epoch_time);
+        let slot = if let Some(index) = group_index.get(&key) {
+            *index
+        } else {
+            let slot = groups.len();
+            groups.push((key.0, key.1, Vec::new()));
+            group_index.insert(key, slot);
+            slot
+        };
+        groups[slot].2.push(index);
+    }
+
+    let mut out = Vec::new();
+    for (epoch_index, (system, epoch_time, group_indexes)) in groups.into_iter().enumerate() {
+        let Some((t_rx_j2000_s, epoch)) = map_epoch(system, epoch_time) else {
+            continue;
+        };
+        let Some(preferred_codes) = options.signal_policy.codes.get(&system) else {
+            continue;
+        };
+        let preferred_codes = preferred_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        let Some(message_kind) = group_indexes
+            .first()
+            .and_then(|index| messages.get(*index))
+            .map(|message| message.kind)
+        else {
+            continue;
+        };
+
+        let mut by_satellite = BTreeMap::<u8, Vec<&rtcm::MsmSignal>>::new();
+        let mut satellite_cache = BTreeMap::<u8, rtcm::MsmSatellite>::new();
+        for message in group_indexes
+            .iter()
+            .copied()
+            .filter_map(|index| messages.get(index))
+        {
+            for satellite in &message.satellites {
+                satellite_cache.insert(satellite.id, *satellite);
+            }
+            for signal in &message.signals {
+                by_satellite
+                    .entry(signal.satellite_id)
+                    .or_default()
+                    .push(signal);
+            }
+        }
+
+        let mut observations = Vec::new();
+        for (satellite_id, signals) in by_satellite {
+            let Some(satellite) = satellite_cache.get(&satellite_id) else {
+                continue;
+            };
+            let Some(pseudorange_m) = rtcm_msm_pseudorange_m(
+                system,
+                message_kind,
+                *satellite,
+                &signals,
+                &preferred_codes,
+            ) else {
+                continue;
+            };
+            if let Ok(satellite_id) = GnssSatelliteId::new(system, satellite_id) {
+                observations.push(Observation {
+                    satellite_id,
+                    pseudorange_m,
+                });
+            }
+        }
+
+        if observations.is_empty() {
+            continue;
+        }
+
+        let t_rx_second_of_day_s =
+            time::second_of_day(epoch.hour.into(), epoch.minute.into(), epoch.second);
+        let day_of_year = time::day_of_year(
+            epoch.year,
+            i32::from(epoch.month),
+            i32::from(epoch.day),
+            epoch.hour.into(),
+            epoch.minute.into(),
+            epoch.second,
+        );
+
+        out.push(RtcmSppEpochInputs {
+            epoch_index,
+            epoch,
+            inputs: SolveInputs {
+                observations,
+                t_rx_j2000_s,
+                t_rx_second_of_day_s,
+                day_of_year,
+                initial_guess,
+                corrections: options.corrections,
+                klobuchar: base_corrections.klobuchar,
+                beidou_klobuchar: base_corrections.beidou_klobuchar,
+                galileo_nequick: base_corrections.galileo_nequick,
+                sbas_iono: None,
+                glonass_channels: base_corrections.glonass_channels.clone(),
+                met: options.met,
+                robust: options.robust,
+            },
+        });
+    }
+
+    Ok(out)
+}
+
+fn rtcm_msm_pseudorange_m(
+    system: GnssSystem,
+    kind: MsmKind,
+    satellite: rtcm::MsmSatellite,
+    signals: &[&rtcm::MsmSignal],
+    preferred_codes: &[&str],
+) -> Option<f64> {
+    if satellite.rough_range_ms == 255 {
+        return None;
+    }
+    let rough_ms =
+        f64::from(satellite.rough_range_ms) + f64::from(satellite.rough_range_mod1) / 1024.0;
+
+    if let Some(signal) = select_rtcm_signal(system, signals, preferred_codes) {
+        let fine_ms = match kind {
+            MsmKind::Msm4 => {
+                if signal.fine_pseudorange == -16_384 {
+                    f64::NAN
+                } else {
+                    f64::from(signal.fine_pseudorange) / 2_f64.powi(24)
+                }
+            }
+            MsmKind::Msm7 => f64::from(signal.fine_pseudorange) / 2_f64.powi(29),
+        };
+        if fine_ms.is_finite() {
+            return Some((rough_ms + fine_ms) * 1.0e-3 * C_M_S);
+        }
+    }
+
+    None
+}
+
+fn select_rtcm_signal<'a>(
+    system: GnssSystem,
+    signals: &'a [&'a rtcm::MsmSignal],
+    preferred_codes: &[&'a str],
+) -> Option<&'a rtcm::MsmSignal> {
+    if signals.is_empty() {
+        return None;
+    }
+
+    if preferred_codes.is_empty() {
+        return signals.iter().copied().next();
+    }
+
+    preferred_codes
+        .iter()
+        .find_map(|requested| {
+            let normalized = requested
+                .strip_prefix('C')
+                .or_else(|| requested.strip_prefix('L'))
+                .unwrap_or(requested);
+            signals.iter().copied().find(|signal| {
+                let Some(code) = rtcm::msm_signal_rinex_code(system, signal.signal_id) else {
+                    return false;
+                };
+                code == *requested || code == normalized
+            })
+        })
+        .or_else(|| signals.iter().copied().next())
+}
+
 /// Assemble every non-event RINEX observation epoch with at least one selected
 /// pseudorange into SPP [`SolveInputs`].
 ///
@@ -443,6 +655,13 @@ where
     corrections
 }
 
+fn merged_broadcast_corrections_from_source<S>(source: &S) -> RinexSppBroadcastCorrections
+where
+    S: RinexSppAssemblySource + ?Sized,
+{
+    source.rinex_spp_broadcast_corrections()
+}
+
 struct EpochTimeContext {
     t_rx_j2000_s: f64,
     t_rx_second_of_day_s: f64,
@@ -459,5 +678,99 @@ fn epoch_time_context(epoch: ObsEpochTime) -> EpochTimeContext {
         t_rx_j2000_s: time::j2000_seconds(year, month, day, hour, minute, epoch.second),
         t_rx_second_of_day_s: time::second_of_day(hour, minute, epoch.second),
         day_of_year: time::day_of_year(year, month, day, hour, minute, epoch.second),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rinex_obs::SignalPolicy;
+    use crate::rtcm::{MsmHeader, MsmKind, MsmMessage, MsmSatellite, MsmSignal};
+
+    #[derive(Default)]
+    struct NoCorrections;
+
+    impl RinexSppAssemblySource for NoCorrections {
+        fn rinex_spp_broadcast_corrections(&self) -> RinexSppBroadcastCorrections {
+            RinexSppBroadcastCorrections::default()
+        }
+    }
+
+    fn synthetic_rtcm_messages() -> Vec<MsmMessage> {
+        vec![MsmMessage {
+            message_number: 1074,
+            system: GnssSystem::Gps,
+            kind: MsmKind::Msm4,
+            header: MsmHeader {
+                reference_station_id: 0,
+                epoch_time: 12_345,
+                multiple_message: false,
+                iods: 1,
+                reserved: 0,
+                clock_steering: 0,
+                external_clock: 0,
+                divergence_free_smoothing: false,
+                smoothing_interval: 0,
+            },
+            satellites: vec![MsmSatellite {
+                id: 1,
+                rough_range_ms: 100,
+                rough_range_mod1: 512,
+                extended_info: None,
+                rough_phase_range_rate_m_s: None,
+            }],
+            signals: vec![
+                MsmSignal {
+                    satellite_id: 1,
+                    signal_id: 1,
+                    fine_pseudorange: 1 << 24,
+                    lock_time_indicator: 0,
+                    half_cycle_ambiguity: false,
+                    cnr: 0,
+                    fine_phase_range: 0,
+                    fine_phase_range_rate: None,
+                },
+                MsmSignal {
+                    satellite_id: 1,
+                    signal_id: 2,
+                    fine_pseudorange: 0,
+                    lock_time_indicator: 0,
+                    half_cycle_ambiguity: false,
+                    cnr: 0,
+                    fine_phase_range: 0,
+                    fine_phase_range_rate: None,
+                },
+            ],
+        }]
+    }
+
+    #[test]
+    fn rtcm_msm_helper_assembles_single_epoch_with_signal_selection() {
+        let messages = synthetic_rtcm_messages();
+        let options = RinexSppOptions::new(SignalPolicy::default_for(3.03).expect("policy"));
+        let inputs =
+            spp_inputs_from_rtcm_msm(&messages, &NoCorrections, &options, |_system, _raw| {
+                Some((
+                    1_234_567.0,
+                    ObsEpochTime {
+                        year: 2026,
+                        month: 7,
+                        day: 7,
+                        hour: 0,
+                        minute: 0,
+                        second: 0.0,
+                    },
+                ))
+            })
+            .expect("convert");
+
+        assert_eq!(inputs.len(), 1);
+        let epoch = &inputs[0];
+        assert_eq!(epoch.inputs.observations.len(), 1);
+        assert_eq!(epoch.inputs.observations[0].satellite_id.to_string(), "G01");
+        assert_eq!(
+            epoch.inputs.observations[0].pseudorange_m as i64,
+            30_129_142
+        );
     }
 }

@@ -48,8 +48,25 @@ sidereon tui --obs data/site.obs --nav data/brdc.rnx --speed 20 --paused
 
 The TUI replays assembled SPP epochs through the same solve path as `solve`.
 It shows the current fix, per-satellite azimuth/elevation and used flag,
-recent horizontal scatter, and CEP/R95 bounds. It is replay-only; live NTRIP
-networking is not included in this command.
+recent horizontal scatter, and CEP/R95 bounds.
+
+Watch a live RTCM stream with the same solve pipeline:
+
+```sh
+sidereon tui --ntrip https://caster.example.com/ --mount /example --nav data/brdc.rnx
+sidereon tui --ntrip https://caster.example.com/ --mount /example --ntrip-nav data/live-nav.rnx --user myname
+SIDEREON_NTRIP_PASSWORD=secret sidereon tui --ntrip https://caster.example.com/ --mount /example --nav data/brdc.rnx
+sidereon tui --tcp 192.168.0.1:5000 --nav data/brdc.rnx
+```
+
+Live mode uses `--user`/`--pass` and prefers `SIDEREON_NTRIP_USER` and
+`SIDEREON_NTRIP_PASSWORD` when credentials are omitted. Passwords are never
+logged and never shown in status text. You can also send a fixed GGA position to
+some casters with:
+
+```sh
+sidereon tui --ntrip https://caster.example.com/ --mount /example --nav data/brdc.rnx --gga-lat 37.4220 --gga-lon -122.0838
+```
 
 Run RINEX observation lint and observation QC:
 
