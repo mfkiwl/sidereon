@@ -17,6 +17,9 @@ All notable changes to `sidereon-core` are documented here.
 - RINEX-to-SPP assembly helpers that convert parsed observation epochs plus a
   broadcast or precise ephemeris context into per-epoch `SolveInputs`, with a
   serial batch solve convenience that preserves per-epoch solve errors.
+- Static reference-station RINEX solve that composes code-DGNSS and carrier RTK
+  modes, returning one station coordinate with covariance, fix status, and
+  per-epoch diagnostics.
 
 ## [0.20.0]
 

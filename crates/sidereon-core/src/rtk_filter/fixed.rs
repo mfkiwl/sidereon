@@ -16,9 +16,9 @@ use crate::estimation::recipe::{EstimationRecipe, NormalRecipe, SolverRecipe};
 use crate::estimation::substrate::parameters::ParameterLayout;
 
 use super::float::{
-    float_normal_equations, float_residuals, run_float, solve_dd_normal_into,
-    validate_float_solve_opts, FloatBaselineSolution, FloatResidual, FloatSolveError,
-    FloatSolveOpts, FloatSolveScratch, FloatSolveStatus, SolveOutcome,
+    baseline_covariance_from_normal_flat, float_normal_equations, float_residuals, run_float,
+    solve_dd_normal_into, validate_float_solve_opts, FloatBaselineSolution, FloatResidual,
+    FloatSolveError, FloatSolveOpts, FloatSolveScratch, FloatSolveStatus, SolveOutcome,
 };
 use super::model::{float_only_set, satellite_system};
 use super::search::{
@@ -67,6 +67,7 @@ impl Default for FixedSolveOpts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedBaselineSolution {
     pub baseline_m: [f64; 3],
+    pub baseline_covariance_m2: [[f64; 3]; 3],
     pub free_ambiguities_m: Vec<(String, f64)>,
     pub fixed_ambiguities_cycles: Vec<(String, i64)>,
     pub fixed_ambiguities_m: Vec<(String, f64)>,
@@ -820,6 +821,12 @@ fn finalize_fixed_baseline(
         fixed_m,
     } = ambiguities;
     build_fixed_rows(ctx, epochs, ambiguities, &state, &mut scratch)?;
+    let n_params = ParameterLayout::rtk(free_ambiguity_ids.len()).dim();
+    float_normal_equations(n_params, &mut scratch).ok_or(FixedSolveError::SingularGeometry)?;
+    let normal = scratch.lambda.clone();
+    let baseline_covariance_m2 =
+        baseline_covariance_from_normal_flat(&normal, n_params, &mut scratch)
+            .ok_or(FixedSolveError::SingularGeometry)?;
     let residuals = float_residuals(&scratch.rows).map_err(FixedSolveError::from)?;
     let code_rms_m = rms(residuals.iter().map(|r| r.code_m));
     let phase_rms_m = rms(residuals.iter().map(|r| r.phase_m));
@@ -827,6 +834,7 @@ fn finalize_fixed_baseline(
 
     Ok(FixedBaselineSolution {
         baseline_m: state.baseline_m,
+        baseline_covariance_m2,
         free_ambiguities_m: free_ambiguity_ids
             .iter()
             .cloned()

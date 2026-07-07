@@ -85,6 +85,7 @@ pub struct FloatResidual {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatBaselineSolution {
     pub baseline_m: [f64; 3],
+    pub baseline_covariance_m2: [[f64; 3]; 3],
     pub ambiguities_m: Vec<(String, f64)>,
     pub ambiguity_covariance_m: Vec<f64>,
     pub ambiguity_covariance_inverse_m: Vec<f64>,
@@ -429,6 +430,9 @@ fn finalize_float_baseline(
     if geometry_quality.tier == ObservabilityTier::RankDeficient {
         return Err(FloatSolveError::SingularGeometry);
     }
+    let baseline_covariance_m2 =
+        baseline_covariance_from_state_covariance(&scratch.state_covariance, n_params)
+            .ok_or(FloatSolveError::SingularGeometry)?;
     let residuals = float_residuals(&scratch.rows)?;
     let code_rms_m = rms(residuals.iter().map(|r| r.code_m));
     let phase_rms_m = rms(residuals.iter().map(|r| r.phase_m));
@@ -436,6 +440,7 @@ fn finalize_float_baseline(
 
     Ok(FloatBaselineSolution {
         baseline_m: state.baseline_m,
+        baseline_covariance_m2,
         ambiguities_m: ambiguity_ids
             .iter()
             .cloned()
@@ -453,6 +458,46 @@ fn finalize_float_baseline(
         n_observations: scratch.rows.len(),
         geometry_quality,
     })
+}
+
+pub(super) fn baseline_covariance_from_normal_flat(
+    normal: &[f64],
+    n_params: usize,
+    scratch: &mut FloatSolveScratch,
+) -> Option<[[f64; 3]; 3]> {
+    invert_flat_first_tie_into(
+        normal,
+        n_params,
+        &mut scratch.state_covariance,
+        &mut scratch.state_cov_invert,
+    )?;
+    baseline_covariance_from_state_covariance(&scratch.state_covariance, n_params)
+}
+
+fn baseline_covariance_from_state_covariance(
+    state_covariance: &[f64],
+    n_params: usize,
+) -> Option<[[f64; 3]; 3]> {
+    if n_params < 3 || state_covariance.len() != n_params.checked_mul(n_params)? {
+        return None;
+    }
+    Some([
+        [
+            state_covariance[0],
+            state_covariance[1],
+            state_covariance[2],
+        ],
+        [
+            state_covariance[n_params],
+            state_covariance[n_params + 1],
+            state_covariance[n_params + 2],
+        ],
+        [
+            state_covariance[2 * n_params],
+            state_covariance[2 * n_params + 1],
+            state_covariance[2 * n_params + 2],
+        ],
+    ])
 }
 
 fn float_geometry_quality(
