@@ -34,7 +34,8 @@ pub enum SsrKind {
 /// Common header for RTCM SSR messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SsrHeader {
-    /// SSR epoch time, seconds of week for GPS and Galileo.
+    /// SSR epoch time. GPS, Galileo, and BeiDou use seconds of week; GLONASS
+    /// uses its RTCM 17-bit day time field.
     pub epoch_time_s: u32,
     /// SSR update interval index.
     pub update_interval: u8,
@@ -61,7 +62,7 @@ pub struct SsrHeader {
 pub struct SsrOrbitRecord {
     /// Constellation-native satellite id.
     pub satellite_id: u8,
-    /// Referenced broadcast issue, IODE for GPS and IODnav for Galileo.
+    /// Referenced broadcast issue, with constellation-specific bit width.
     pub iode: u32,
     /// Radial delta, int22, scale 0.1 mm.
     pub delta_radial: i32,
@@ -161,6 +162,12 @@ pub(crate) fn ssr_kind(message_number: u16) -> Option<(GnssSystem, SsrKind)> {
         1060 => Some((GnssSystem::Gps, SsrKind::CombinedOrbitClock)),
         1061 => Some((GnssSystem::Gps, SsrKind::Ura)),
         1062 => Some((GnssSystem::Gps, SsrKind::HighRateClock)),
+        1063 => Some((GnssSystem::Glonass, SsrKind::Orbit)),
+        1064 => Some((GnssSystem::Glonass, SsrKind::Clock)),
+        1065 => Some((GnssSystem::Glonass, SsrKind::CodeBias)),
+        1066 => Some((GnssSystem::Glonass, SsrKind::CombinedOrbitClock)),
+        1067 => Some((GnssSystem::Glonass, SsrKind::Ura)),
+        1068 => Some((GnssSystem::Glonass, SsrKind::HighRateClock)),
         1265 => Some((GnssSystem::Gps, SsrKind::PhaseBias)),
         1240 => Some((GnssSystem::Galileo, SsrKind::Orbit)),
         1241 => Some((GnssSystem::Galileo, SsrKind::Clock)),
@@ -169,6 +176,13 @@ pub(crate) fn ssr_kind(message_number: u16) -> Option<(GnssSystem, SsrKind)> {
         1244 => Some((GnssSystem::Galileo, SsrKind::Ura)),
         1245 => Some((GnssSystem::Galileo, SsrKind::HighRateClock)),
         1267 => Some((GnssSystem::Galileo, SsrKind::PhaseBias)),
+        1258 => Some((GnssSystem::BeiDou, SsrKind::Orbit)),
+        1259 => Some((GnssSystem::BeiDou, SsrKind::Clock)),
+        1260 => Some((GnssSystem::BeiDou, SsrKind::CodeBias)),
+        1261 => Some((GnssSystem::BeiDou, SsrKind::CombinedOrbitClock)),
+        1262 => Some((GnssSystem::BeiDou, SsrKind::Ura)),
+        1263 => Some((GnssSystem::BeiDou, SsrKind::HighRateClock)),
+        1270 => Some((GnssSystem::BeiDou, SsrKind::PhaseBias)),
         _ => None,
     }
 }
@@ -192,7 +206,7 @@ impl SsrMessage {
                 "message {message_number} is not a supported RTCM SSR Phase A type"
             ))
         })?;
-        let header = read_header(&mut r, kind)?;
+        let header = read_header(&mut r, system, kind)?;
         let count = usize::from(header.satellite_count);
         let mut orbit = Vec::new();
         let mut clock = Vec::new();
@@ -210,7 +224,7 @@ impl SsrMessage {
             SsrKind::Clock => {
                 clock.reserve(count);
                 for _ in 0..count {
-                    clock.push(read_clock_record(&mut r)?);
+                    clock.push(read_clock_record(&mut r, system)?);
                 }
             }
             SsrKind::CombinedOrbitClock => {
@@ -290,7 +304,7 @@ impl SsrMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = BitWriter::new();
         w.push_u(u64::from(self.message_number), 12);
-        write_header(&mut w, &self.header, self.kind);
+        write_header(&mut w, self.system, &self.header, self.kind);
 
         match self.kind {
             SsrKind::Orbit => {
@@ -343,8 +357,12 @@ impl SsrMessage {
     }
 }
 
-fn read_header(r: &mut BitReader<'_>, kind: SsrKind) -> DecodeResult<SsrHeader> {
-    let epoch_time_s = r.u(20)? as u32;
+fn read_header(
+    r: &mut BitReader<'_>,
+    system: GnssSystem,
+    kind: SsrKind,
+) -> DecodeResult<SsrHeader> {
+    let epoch_time_s = r.u(epoch_time_bits(system))? as u32;
     let update_interval = r.u(4)? as u8;
     let multiple_message = r.flag()?;
     let satellite_reference_datum = if matches!(kind, SsrKind::Orbit | SsrKind::CombinedOrbitClock)
@@ -381,8 +399,8 @@ fn read_header(r: &mut BitReader<'_>, kind: SsrKind) -> DecodeResult<SsrHeader> 
     })
 }
 
-fn write_header(w: &mut BitWriter, header: &SsrHeader, kind: SsrKind) {
-    w.push_u(u64::from(header.epoch_time_s), 20);
+fn write_header(w: &mut BitWriter, system: GnssSystem, header: &SsrHeader, kind: SsrKind) {
+    w.push_u(u64::from(header.epoch_time_s), epoch_time_bits(system));
     w.push_u(u64::from(header.update_interval), 4);
     w.push_flag(header.multiple_message);
     if matches!(kind, SsrKind::Orbit | SsrKind::CombinedOrbitClock) {
@@ -422,9 +440,9 @@ fn write_orbit_record(w: &mut BitWriter, system: GnssSystem, rec: &SsrOrbitRecor
     w.push_i(i64::from(rec.dot_delta_cross), 19);
 }
 
-fn read_clock_record(r: &mut BitReader<'_>) -> DecodeResult<SsrClockRecord> {
+fn read_clock_record(r: &mut BitReader<'_>, system: GnssSystem) -> DecodeResult<SsrClockRecord> {
     Ok(SsrClockRecord {
-        satellite_id: r.u(6)? as u8,
+        satellite_id: r.u(satellite_id_bits(system))? as u8,
         c0: r.i(22)? as i32,
         c1: r.i(21)? as i32,
         c2: r.i(27)? as i32,
@@ -507,7 +525,7 @@ fn write_phase_bias_record(w: &mut BitWriter, system: GnssSystem, rec: &SsrPhase
 
 fn satellite_id_bits(system: GnssSystem) -> usize {
     match system {
-        GnssSystem::Gps | GnssSystem::Galileo => 6,
+        GnssSystem::Glonass => 5,
         _ => 6,
     }
 }
@@ -515,7 +533,15 @@ fn satellite_id_bits(system: GnssSystem) -> usize {
 fn iode_bits(system: GnssSystem) -> usize {
     match system {
         GnssSystem::Galileo => 10,
+        GnssSystem::BeiDou => 18,
         _ => 8,
+    }
+}
+
+fn epoch_time_bits(system: GnssSystem) -> usize {
+    match system {
+        GnssSystem::Glonass => 17,
+        _ => 20,
     }
 }
 
@@ -571,9 +597,13 @@ mod tests {
         (31, 67, -227, -1752, 1423, -43, -7, 3, 4170, 0, 0),
     ];
 
-    fn header(kind: SsrKind, count: u8) -> SsrHeader {
+    fn header(system: GnssSystem, kind: SsrKind, count: u8) -> SsrHeader {
         SsrHeader {
-            epoch_time_s: 345_600,
+            epoch_time_s: if system == GnssSystem::Glonass {
+                61_632
+            } else {
+                345_600
+            },
             update_interval: 2,
             multiple_message: true,
             iod_ssr: 9,
@@ -590,10 +620,10 @@ mod tests {
     fn orbit_record(system: GnssSystem) -> SsrOrbitRecord {
         SsrOrbitRecord {
             satellite_id: 3,
-            iode: if system == GnssSystem::Galileo {
-                513
-            } else {
-                42
+            iode: match system {
+                GnssSystem::Galileo => 513,
+                GnssSystem::BeiDou => 123_456,
+                _ => 42,
             },
             delta_radial: -12_345,
             delta_along: 23_456,
@@ -670,7 +700,7 @@ mod tests {
             message_number,
             system,
             kind,
-            header: header(kind, 1),
+            header: header(system, kind, 1),
             orbit,
             clock,
             code_bias,
@@ -704,6 +734,12 @@ mod tests {
             (1061, GnssSystem::Gps, SsrKind::Ura),
             (1062, GnssSystem::Gps, SsrKind::HighRateClock),
             (1265, GnssSystem::Gps, SsrKind::PhaseBias),
+            (1063, GnssSystem::Glonass, SsrKind::Orbit),
+            (1064, GnssSystem::Glonass, SsrKind::Clock),
+            (1065, GnssSystem::Glonass, SsrKind::CodeBias),
+            (1066, GnssSystem::Glonass, SsrKind::CombinedOrbitClock),
+            (1067, GnssSystem::Glonass, SsrKind::Ura),
+            (1068, GnssSystem::Glonass, SsrKind::HighRateClock),
             (1240, GnssSystem::Galileo, SsrKind::Orbit),
             (1241, GnssSystem::Galileo, SsrKind::Clock),
             (1242, GnssSystem::Galileo, SsrKind::CodeBias),
@@ -711,6 +747,13 @@ mod tests {
             (1244, GnssSystem::Galileo, SsrKind::Ura),
             (1245, GnssSystem::Galileo, SsrKind::HighRateClock),
             (1267, GnssSystem::Galileo, SsrKind::PhaseBias),
+            (1258, GnssSystem::BeiDou, SsrKind::Orbit),
+            (1259, GnssSystem::BeiDou, SsrKind::Clock),
+            (1260, GnssSystem::BeiDou, SsrKind::CodeBias),
+            (1261, GnssSystem::BeiDou, SsrKind::CombinedOrbitClock),
+            (1262, GnssSystem::BeiDou, SsrKind::Ura),
+            (1263, GnssSystem::BeiDou, SsrKind::HighRateClock),
+            (1270, GnssSystem::BeiDou, SsrKind::PhaseBias),
         ] {
             let expected = message(number, system, kind);
             let body = expected.encode();
@@ -829,13 +872,13 @@ mod tests {
     #[test]
     fn unsupported_ssr_bias_message_stays_unsupported() {
         let mut w = BitWriter::new();
-        w.push_u(1063, 12);
+        w.push_u(1266, 12);
         let body = w.into_bytes();
         let decoded = Message::decode(&body).unwrap();
         assert_eq!(
             decoded,
             Message::Unsupported(UnsupportedMessage {
-                message_number: 1063,
+                message_number: 1266,
                 body
             })
         );

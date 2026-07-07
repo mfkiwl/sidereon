@@ -1,8 +1,10 @@
 use sidereon_core::astro::time::model::{GnssWeekTow, JulianDateSplit, TimeScale};
 use sidereon_core::astro::time::split_julian_date;
 use sidereon_core::combinations::{ionosphere_free, ionosphere_free_phase_cycles};
-use sidereon_core::constants::{F_L1_HZ, F_L2_HZ, GPS_EPOCH_TO_J2000_S, SECONDS_PER_WEEK};
-use sidereon_core::ephemeris::{BroadcastEphemeris, EphemerisSource, Sp3};
+use sidereon_core::constants::{C_M_S, F_L1_HZ, F_L2_HZ, GPS_EPOCH_TO_J2000_S, SECONDS_PER_WEEK};
+use sidereon_core::ephemeris::{
+    BroadcastEphemeris, BroadcastIssue, EphemerisSource, NavMessage, Sp3,
+};
 use sidereon_core::observables::{j2000_seconds_from_split, predict, PredictOptions};
 use sidereon_core::ppp_corrections::CivilDateTime;
 use sidereon_core::precise_positioning::{
@@ -19,6 +21,37 @@ use sidereon_core::ssr::SsrCorrectionStore;
 use sidereon_core::{GnssSatelliteId, GnssSystem};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+
+// Real SSR fixture provenance:
+// - RTCM SSR source: BKG/IGS-IP products.igs-ip.net mountpoint SSRA03IGS0,
+//   registered account, captured 2026-07-07 07:07-07:42 PDT.
+// - Registration citation request: Weber, Dettmering, and Gebhard (2005),
+//   "Networked Transport of RTCM via Internet Protocol (Ntrip)".
+// - Matching OBS URL:
+//   https://igs.bkg.bund.de/root_ftp/IGS/highrate/2026/188/o/LAMA00POL_S_20261881400_15M_01S_MO.crx.gz
+// - Broadcast NAV URL:
+//   https://igs.bkg.bund.de/root_ftp/IGS/BRDC/2026/188/BRDC00WRD_S_20261880000_01D_MN.rnx.gz
+// - Truth SP3 URL:
+//   https://igs.bkg.bund.de/root_ftp/IGS/products/2426/IGS0OPSULT_20261870600_02D_15M_ORB.SP3.gz
+//   Rapid SP3 was not present in the BKG week-2426 product directory during
+//   this run, so the IGS ultra-rapid SP3 is the truth product here.
+//
+// Trim recipes used for the committed real fixtures:
+// - SSR: scan the supplied RTCM3 capture for whole frames with valid CRC24Q;
+//   keep frames with 4797 <= byte offset < 18386 and message numbers
+//   1059, 1060, 1065, 1066, 1242, 1243, 1260, 1261.
+// - OBS: gzip -dc LAMA00POL_S_20261881400_15M_01S_MO.crx.gz > .crx; decode
+//   CRINEX with sidereon_core::rinex::crinex::decode; keep RINEX epochs
+//   2026-07-07 14:07:40, 14:07:50, 14:08:00, and 14:08:10 GPS.
+// - NAV: gzip -dc BRDC00WRD_S_20261880000_01D_MN.rnx.gz > .rnx; keep only the
+//   30 GPS LNAV records selected by real SSR IODE matching at the comparison
+//   epochs, with toc/toe 230400 s except G23 and G27 at 230384 s.
+// - SP3: gzip -dc IGS0OPSULT_20261870600_02D_15M_ORB.SP3.gz > .SP3; keep the
+//   seven 15-minute epochs from 2026-07-07 13:15 through 14:45 GPS.
+
+const REAL_GPS_WEEK: u32 = 2426;
+const REAL_UPDATE_INTERVAL_S: f64 = 10.0;
+const REAL_UPDATE_CENTER_OFFSET_S: f64 = REAL_UPDATE_INTERVAL_S / 2.0;
 
 fn fixture_path(parts: &[&str]) -> PathBuf {
     parts.iter().fold(
@@ -194,6 +227,15 @@ fn position_error_m(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
+fn rms(values: &[f64]) -> f64 {
+    assert!(!values.is_empty(), "RMS needs at least one value");
+    (values.iter().map(|value| value * value).sum::<f64>() / values.len() as f64).sqrt()
+}
+
+fn gps_week_tow_to_j2000_s(week: u32, tow_s: f64) -> f64 {
+    f64::from(week) * SECONDS_PER_WEEK + tow_s - GPS_EPOCH_TO_J2000_S
+}
+
 fn synthetic_ssr_store(
     broadcast: &BroadcastEphemeris,
     sp3: &Sp3,
@@ -349,6 +391,241 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+fn load_real_ssr_messages() -> Vec<SsrMessage> {
+    let path = fixture_path(&["ssr", "SSRA03IGS0_2026188140760_3epoch.rtcm3"]);
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("read fixture {path:?}: {err}"));
+    let mut assembler = SsrStreamAssembler::new();
+    let mut messages = Vec::new();
+    for decoded in assembler.push(&bytes) {
+        match decoded.expect("decode real SSR RTCM frame") {
+            Message::Ssr(ssr) => messages.push(ssr),
+            other => panic!("real SSR fixture must contain only SSR messages, got {other:?}"),
+        }
+    }
+    assert_eq!(assembler.retained_len(), 0);
+    messages
+}
+
+fn load_real_obs() -> RinexObs {
+    RinexObs::parse(&load_text(&[
+        "obs",
+        "LAMA00POL_S_20261881407_04E_01S_MO.rnx",
+    ]))
+    .expect("parse LAMA observation fixture")
+}
+
+fn load_real_broadcast() -> BroadcastEphemeris {
+    BroadcastEphemeris::from_nav(&load_text(&[
+        "ssr",
+        "BRDC00WRD_S_20261880000_01D_MN_GPS_SSR_20261881400.rnx",
+    ]))
+    .expect("parse real broadcast NAV fixture")
+}
+
+fn load_real_truth_sp3() -> Sp3 {
+    let path = fixture_path(&[
+        "ssr",
+        "IGS0OPSULT_20261870600_02D_15M_ORB_20261881315_07E.SP3",
+    ]);
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("read fixture {path:?}: {err}"));
+    Sp3::parse(&bytes).unwrap_or_else(|err| panic!("parse SP3 {path:?}: {err}"))
+}
+
+fn assert_real_ssr_structure(messages: &[SsrMessage]) {
+    let counts = messages
+        .iter()
+        .fold(BTreeMap::<u16, usize>::new(), |mut counts, message| {
+            *counts.entry(message.message_number).or_default() += 1;
+            counts
+        });
+    assert_eq!(
+        counts,
+        BTreeMap::from([
+            (1059, 3),
+            (1060, 6),
+            (1065, 3),
+            (1066, 3),
+            (1242, 4),
+            (1243, 4),
+            (1260, 3),
+            (1261, 3),
+        ])
+    );
+    assert_eq!(messages.len(), 29);
+    for message in messages {
+        assert_eq!(message.header.update_interval, 3);
+        assert_eq!(message.header.iod_ssr, 1);
+        assert_eq!(message.header.provider_id, 0);
+        assert_eq!(message.header.solution_id, 2);
+    }
+
+    let gps_epochs = gps_combined_by_epoch(messages);
+    assert_eq!(
+        gps_epochs.keys().copied().collect::<Vec<_>>(),
+        vec![223660, 223670, 223680]
+    );
+    for frames in gps_epochs.values() {
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].header.multiple_message);
+        assert!(!frames[1].header.multiple_message);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|message| message.orbit.len())
+                .sum::<usize>(),
+            30
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|message| message.clock.len())
+                .sum::<usize>(),
+            30
+        );
+    }
+
+    let glonass_epochs = messages
+        .iter()
+        .filter(|message| message.message_number == 1066)
+        .map(|message| (message.header.epoch_time_s, message.orbit.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(glonass_epochs, [(61642, 17), (61652, 17), (61662, 17)]);
+
+    let beidou_epochs = messages
+        .iter()
+        .filter(|message| message.message_number == 1261)
+        .map(|message| (message.header.epoch_time_s, message.orbit.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(beidou_epochs, [(223656, 23), (223666, 23), (223676, 23)]);
+}
+
+fn gps_combined_by_epoch(messages: &[SsrMessage]) -> BTreeMap<u32, Vec<&SsrMessage>> {
+    let mut by_epoch = BTreeMap::new();
+    for message in messages {
+        if message.system == GnssSystem::Gps && message.kind == SsrKind::CombinedOrbitClock {
+            by_epoch
+                .entry(message.header.epoch_time_s)
+                .or_insert_with(Vec::new)
+                .push(message);
+        }
+    }
+    by_epoch
+}
+
+#[test]
+fn real_igs_ssr_corrected_gps_states_move_toward_ultra_rapid_sp3() {
+    let messages = load_real_ssr_messages();
+    assert_real_ssr_structure(&messages);
+
+    let obs = load_real_obs();
+    assert_eq!(obs.epochs().len(), 4);
+    assert_eq!(obs.epochs()[0].epoch.hour, 14);
+    assert_eq!(obs.epochs()[0].epoch.minute, 7);
+    assert_eq!(obs.epochs()[0].epoch.second, 40.0);
+    assert!(
+        obs.header().approx_position_m.is_some(),
+        "matching observation fixture must retain LAMA station position"
+    );
+
+    let broadcast = load_real_broadcast();
+    let sp3 = load_real_truth_sp3();
+    let mut broadcast_position_errors_m = Vec::new();
+    let mut ssr_position_errors_m = Vec::new();
+    let mut broadcast_clock_errors_m = Vec::new();
+    let mut ssr_clock_errors_m = Vec::new();
+    let mut matched_iodes = 0usize;
+
+    for (tow, frames) in gps_combined_by_epoch(&messages) {
+        let mut store = SsrCorrectionStore::new();
+        let week_tow =
+            GnssWeekTow::new(TimeScale::Gpst, REAL_GPS_WEEK, f64::from(tow)).expect("GPS week/TOW");
+        for frame in &frames {
+            store
+                .ingest_ssr(frame, week_tow)
+                .expect("ingest real GPS SSR");
+        }
+
+        let query_j2000_s =
+            gps_week_tow_to_j2000_s(REAL_GPS_WEEK, f64::from(tow) + REAL_UPDATE_CENTER_OFFSET_S);
+        let corrected = sidereon_core::ssr::SsrCorrectedEphemeris::new(&broadcast, &store);
+        let sats = store_sats_for_frames(&frames);
+        assert_eq!(sats.len(), 30);
+
+        for sat in sats {
+            let orbit = store.orbit(sat).expect("real SSR orbit correction");
+            assert!((orbit.update_interval_s - REAL_UPDATE_INTERVAL_S).abs() < f64::EPSILON);
+            assert!(
+                (orbit.ref_epoch_j2000_s - query_j2000_s).abs() < 1.0e-9,
+                "SSR update index 3 must center epoch {tow} at TOW + 5 s"
+            );
+            let issue = BroadcastIssue {
+                issue: orbit.iode,
+                message: NavMessage::GpsLnav,
+            };
+            let record = broadcast
+                .select_by_issue_at(sat, issue, NavMessage::GpsLnav, query_j2000_s)
+                .unwrap_or_else(|| {
+                    panic!("IODE-matched LNAV record for {sat} issue {}", orbit.iode)
+                });
+            assert_eq!(record.issue_of_data.issue, orbit.iode);
+            matched_iodes += 1;
+
+            let (broadcast_position, broadcast_clock_s) = broadcast
+                .position_clock_at_j2000_s(sat, query_j2000_s)
+                .unwrap_or_else(|| panic!("broadcast state for {sat}"));
+            let (ssr_position, ssr_clock_s) = corrected
+                .corrected_state(sat, query_j2000_s)
+                .unwrap_or_else(|| panic!("SSR-corrected state for {sat}"));
+            let truth = sp3
+                .position_at_j2000_seconds(sat, query_j2000_s)
+                .unwrap_or_else(|err| panic!("SP3 truth for {sat}: {err}"));
+            let truth_position = truth.position.as_array();
+            let truth_clock_s = truth.clock_s.expect("SP3 clock");
+
+            broadcast_position_errors_m.push(position_error_m(broadcast_position, truth_position));
+            ssr_position_errors_m.push(position_error_m(ssr_position, truth_position));
+            broadcast_clock_errors_m.push((broadcast_clock_s - truth_clock_s).abs() * C_M_S);
+            ssr_clock_errors_m.push((ssr_clock_s - truth_clock_s).abs() * C_M_S);
+        }
+    }
+
+    assert_eq!(matched_iodes, 90);
+    let broadcast_position_rms_m = rms(&broadcast_position_errors_m);
+    let ssr_position_rms_m = rms(&ssr_position_errors_m);
+    let broadcast_clock_rms_m = rms(&broadcast_clock_errors_m);
+    let ssr_clock_rms_m = rms(&ssr_clock_errors_m);
+    eprintln!(
+        "real_ssr_position_rms_m broadcast={broadcast_position_rms_m:.3} ssr={ssr_position_rms_m:.3}; clock_rms_m broadcast={broadcast_clock_rms_m:.3} ssr={ssr_clock_rms_m:.3}"
+    );
+    assert!(
+        broadcast_position_rms_m > 1.5,
+        "broadcast position RMS {broadcast_position_rms_m} m must be non-vacuously large"
+    );
+    assert!(
+        ssr_position_rms_m < 1.35,
+        "SSR position RMS {ssr_position_rms_m} m must stay below the real-data bound"
+    );
+    assert!(
+        ssr_position_rms_m + 0.4 < broadcast_position_rms_m,
+        "SSR position RMS {ssr_position_rms_m} m must beat broadcast {broadcast_position_rms_m} m with margin"
+    );
+    assert!(broadcast_clock_rms_m.is_finite());
+    assert!(ssr_clock_rms_m.is_finite());
+}
+
+fn store_sats_for_frames(frames: &[&SsrMessage]) -> BTreeSet<GnssSatelliteId> {
+    let mut sats = BTreeSet::new();
+    for frame in frames {
+        for record in &frame.orbit {
+            sats.insert(
+                GnssSatelliteId::new(frame.system, record.satellite_id)
+                    .expect("valid SSR satellite id"),
+            );
+        }
+    }
+    sats
 }
 
 #[test]

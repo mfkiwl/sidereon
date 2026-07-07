@@ -47,6 +47,11 @@ All notable changes to `sidereon-core` are documented here.
   IGG-III measurement reweighting or Yang prediction-adaptation settings.
 - Tight-coupling range-rate gyro-bias rows now honor `imu_to_body_dcm` for
   non-identity IMU mounting.
+- Real BKG/IGS-IP SSRA03IGS0 SSR integration fixture covering GPS, GLONASS,
+  Galileo, and BeiDou RTCM SSR orbit, clock, and code-bias decode. The test
+  validates IODE-matched GPS SSR-corrected broadcast satellite positions
+  against the IGS ultra-rapid SP3 with a non-vacuous broadcast-only error
+  margin.
 
 ## [0.20.0]
 
