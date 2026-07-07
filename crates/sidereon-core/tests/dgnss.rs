@@ -394,3 +394,80 @@ fn dgnss_common_mode_error_cancels_in_position_solve() {
     assert_eq!(dgnss.dropped_sats, Vec::<String>::new());
     assert!((clean.baseline_m - dist(base, rover)).abs() <= 1.0e-2);
 }
+
+#[test]
+fn dgnss_covariance_is_exactly_twice_the_spp_covariance_for_the_same_geometry() {
+    // The single-difference correction sums rover and reference code noise, so
+    // under the equal-independent-noise model the corrected observable carries
+    // twice the variance of a raw pseudorange. The solver expresses that as a
+    // 2x scale on the SPP-derived position covariance. SPP covariance depends
+    // only on the converged geometry and the noise model, never on the
+    // observation values, so on clean synthetic data (both solves converge to
+    // the same rover position over the same satellites) the DGNSS covariance
+    // must be the SPP covariance scaled by exactly two. If either side of the
+    // model is dropped or double-counted, this ratio moves off 2.
+    let sp3 = sp3_fixture();
+    let base = [3_512_900.0, 780_500.0, 5_248_700.0];
+    let rover = [base[0] + 2_000.0, base[1] + 1_000.0, base[2] + 1_500.0];
+
+    let base_visible = visible_gps(&sp3, base);
+    let rover_visible = visible_gps(&sp3, rover);
+    let mut sats: Vec<GnssSatelliteId> = base_visible
+        .into_iter()
+        .filter(|sat| rover_visible.contains(sat))
+        .collect();
+    sats.sort_unstable();
+    assert!(sats.len() >= 5);
+
+    let base_clean = synth(&sp3, &sats, base, 1.0e-6);
+    let rover_clean = synth(&sp3, &sats, rover, -2.0e-6);
+
+    let spp = solve(
+        &sp3,
+        &solve_inputs(
+            spp_observations(&rover_clean),
+            [rover[0], rover[1], rover[2], 0.0],
+        ),
+        false,
+    )
+    .expect("clean SPP solve");
+
+    let dgnss = solve_position(
+        &sp3,
+        base,
+        &base_clean,
+        &rover_clean,
+        solve_inputs(Vec::new(), [rover[0], rover[1], rover[2], 0.0]),
+        false,
+    )
+    .expect("clean DGNSS solve");
+
+    let spp_cov = &spp.position_covariance;
+    let dgnss_cov = &dgnss.solution.position_covariance;
+    for row in 0..3 {
+        for col in 0..3 {
+            let expected_ecef = 2.0 * spp_cov.ecef_m2[row][col];
+            let expected_enu = 2.0 * spp_cov.enu_m2[row][col];
+            let scale_ecef = spp_cov.ecef_m2[row][row].max(spp_cov.ecef_m2[col][col]);
+            let scale_enu = spp_cov.enu_m2[row][row].max(spp_cov.enu_m2[col][col]);
+            assert!(
+                (dgnss_cov.ecef_m2[row][col] - expected_ecef).abs() <= 1.0e-9 * scale_ecef,
+                "ECEF[{row}][{col}]: dgnss {} vs 2x spp {}",
+                dgnss_cov.ecef_m2[row][col],
+                expected_ecef
+            );
+            assert!(
+                (dgnss_cov.enu_m2[row][col] - expected_enu).abs() <= 1.0e-9 * scale_enu,
+                "ENU[{row}][{col}]: dgnss {} vs 2x spp {}",
+                dgnss_cov.enu_m2[row][col],
+                expected_enu
+            );
+        }
+    }
+    // The unscaled covariances must genuinely differ, so the pin cannot pass
+    // vacuously if the DGNSS scale is removed.
+    assert!(
+        (dgnss_cov.enu_m2[0][0] - spp_cov.enu_m2[0][0]).abs() > 0.4 * spp_cov.enu_m2[0][0],
+        "scaled and unscaled covariance are indistinguishable; the pin is vacuous"
+    );
+}
