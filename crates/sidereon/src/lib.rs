@@ -334,9 +334,9 @@ pub mod precise_positioning {
         FixedSolveError, FloatEpoch, FloatObservation, FloatResidual, FloatSolution,
         FloatSolveConfig, FloatSolveError, FloatSolveOptions, FloatState, FloatStatus,
         IntegerStatus, MeasurementWeights, MissingCorrection, NoEphemerisReason, PcvSample,
-        PppAutoInitError, PppAutoInitOptions, PppAutoInitStrategy, PppCorrectionLookup,
-        PppInitialGuess, RangeCorrections, ReceiverAntennaFrequency, ReceiverAntennaOptions,
-        SatelliteClockCorrections, TroposphereOptions,
+        PositionCovariance, PppAutoInitError, PppAutoInitOptions, PppAutoInitStrategy,
+        PppCorrectionLookup, PppInitialGuess, RangeCorrections, ReceiverAntennaFrequency,
+        ReceiverAntennaOptions, SatelliteClockCorrections, TroposphereOptions,
     };
 }
 
@@ -1472,6 +1472,10 @@ mod tests {
     fn empty_ppp_float_solution() -> FloatSolution {
         FloatSolution {
             position_m: [0.0; 3],
+            position_covariance: sidereon_core::dop::PositionCovariance {
+                ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            },
             epoch_clocks_m: Vec::new(),
             ambiguities_m: BTreeMap::new(),
             ztd_residual_m: None,

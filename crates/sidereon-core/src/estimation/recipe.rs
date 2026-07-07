@@ -205,17 +205,18 @@ pub enum NormalRecipe {
     /// RTK double-difference block assembly with the first-tie covariance fold
     /// (`rtk_filter::normal` first-tie block).
     RtkDoubleDifferenceBlockFirstTie,
-    /// PPP dense normal equations with the last-tie solve
-    /// (`precise_positioning::normal` `*_last_tie`).
+    /// PPP weighted normal equations with epoch-local receiver clocks eliminated
+    /// and the reduced static system solved last-tie.
     PppDenseLastTie,
     /// Canonical square-root-information solve, shared by canonical RTK and
     /// canonical PPP: the SPD normal system is solved by the owned deterministic
     /// Cholesky factorization `Λ = L Lᵀ` plus forward/back substitution, where
     /// `L` is the information-matrix square root. For RTK this is the
     /// double-difference information system `Λ x = η` assembled by the same shared
-    /// block fold the RTK reference uses; for PPP it is the dense weighted normal
-    /// system `AᵀWA x = AᵀWy` assembled from the same undifferenced rows the PPP
-    /// reference uses. This is the numerically rigorous op-order for an SPD normal
+    /// block fold the RTK reference uses; for PPP it is the weighted normal
+    /// system assembled from the same undifferenced rows the PPP reference uses,
+    /// with epoch-local receiver clocks eliminated before factorization. This is
+    /// the numerically rigorous op-order for an SPD normal
     /// matrix (no pivoting; exploits symmetry), distinct from the reference RTK
     /// general first-tie Gaussian elimination
     /// ([`Self::RtkDoubleDifferenceBlockFirstTie`]) and the reference PPP last-tie
@@ -385,9 +386,10 @@ impl EstimationRecipe {
     /// (the rounded-microsecond fixed-iteration light-time with the rigorous
     /// closed-form Sagnac Z-rotation, and the geodetic NEU antenna frame), because
     /// the canonical PPP divergence the physics calls for is in the linear
-    /// algebra, not the observation model: the same dense SPD weighted normal
-    /// system `AᵀWA x = AᵀWy` the reference assembles from the undifferenced rows
-    /// is solved by the owned deterministic Cholesky square-root factorization
+    /// algebra, not the observation model: the same weighted normal equations
+    /// the reference assembles from the undifferenced rows are reduced by
+    /// eliminating epoch-local receiver clocks, then solved by the owned
+    /// deterministic Cholesky square-root factorization
     /// ([`NormalRecipe::CanonicalSquareRoot`] on
     /// [`SolverRecipe::OwnedDeterministicCholesky`]) instead of the reference's
     /// dense last-tie Gaussian elimination ([`SolverRecipe::DenseGaussianLastTie`]).

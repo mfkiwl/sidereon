@@ -70,6 +70,7 @@ impl ParameterLayout {
     }
 
     /// Column offset of the ambiguity block (the index of its first column).
+    #[cfg(test)]
     pub(crate) const fn ambiguity_offset(&self) -> usize {
         self.geometry + self.clocks + self.ztd
     }

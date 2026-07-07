@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::astro::math::interp::lerp;
+use crate::dop::PositionCovariance;
 use crate::ils::IlsError;
 use crate::ppp_corrections::{CivilDateTime, PppCorrections, PppCorrectionsOptions};
 use crate::ssr::SsrCorrectionStore;
@@ -547,7 +548,16 @@ pub struct FloatResidual {
 /// Static float solution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatSolution {
+    /// Estimated static receiver position in ECEF/ITRF metres.
     pub position_m: [f64; 3],
+    /// Posterior covariance of [`Self::position_m`].
+    ///
+    /// The ECEF and ENU matrices follow [`PositionCovariance`]. They are the
+    /// top-left position block of the inverse final weighted normal matrix after
+    /// the per-epoch receiver clocks are eliminated and the remaining static
+    /// states are marginalized. The scale is therefore set by the supplied PPP
+    /// measurement weights, not by a post-fit residual multiplier.
+    pub position_covariance: PositionCovariance,
     pub epoch_clocks_m: Vec<f64>,
     pub ambiguities_m: BTreeMap<String, f64>,
     pub ztd_residual_m: Option<f64>,
@@ -731,7 +741,14 @@ pub struct FixedIntegerMetadata {
 /// Static integer-fixed PPP solution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FixedSolution {
+    /// Estimated static receiver position in ECEF/ITRF metres.
     pub position_m: [f64; 3],
+    /// Posterior covariance of [`Self::position_m`] after fixed ambiguities are
+    /// held and the per-epoch receiver clocks are eliminated.
+    ///
+    /// The ECEF and ENU matrices follow [`PositionCovariance`]. The scale is set
+    /// by the supplied PPP measurement weights, matching the float PPP result.
+    pub position_covariance: PositionCovariance,
     pub epoch_clocks_m: Vec<f64>,
     pub fixed_ambiguities_cycles: BTreeMap<String, i64>,
     pub fixed_ambiguities_m: BTreeMap<String, f64>,

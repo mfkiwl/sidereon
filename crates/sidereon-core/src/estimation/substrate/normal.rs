@@ -249,50 +249,6 @@ impl NormalAssembler {
         solve_linear_last_tie(ata, aty)
     }
 
-    /// PPP dense assembly only (no solve): the `AᵀWA` / `AᵀWy` pair the fixed
-    /// solver reduces with a Schur complement to seed the ambiguity covariance.
-    pub(crate) fn assemble_dense<'a, I>(
-        &self,
-        rows: I,
-        n: usize,
-    ) -> Option<(Vec<Vec<f64>>, Vec<f64>)>
-    where
-        I: IntoIterator<Item = (&'a [f64], f64, f64)>,
-    {
-        debug_assert_eq!(self.recipe, NormalRecipe::PppDenseLastTie);
-        normal_equations_weighted(rows, n)
-    }
-
-    /// Canonical PPP square-root path: assemble the SAME dense weighted normal
-    /// system `AᵀWA x = AᵀWy` the PPP reference assembles from independent
-    /// undifferenced rows (a diagonal-covariance fold), but solve it by the owned
-    /// deterministic Cholesky (square-root) factorization `AᵀWA = L Lᵀ` plus
-    /// forward/back substitution ([`NormalRecipe::CanonicalSquareRoot`], driven by
-    /// the owned [`crate::estimation::recipe::SolverRecipe::OwnedDeterministicCholesky`]
-    /// kernel). The Cholesky factor `L` is the information-matrix square root, so
-    /// this is the square-root-information solve: the numerically rigorous op-order
-    /// for the SPD normal matrix (no pivoting; exploits symmetry), distinct from
-    /// the reference's dense last-tie Gaussian elimination
-    /// ([`NormalRecipe::PppDenseLastTie`]). Assembly plus solve is owned scalar
-    /// arithmetic with no nalgebra and no BLAS, and f64 sqrt is IEEE-754 correctly
-    /// rounded, so this solve is bit-portable; the surrounding PPP measurement
-    /// model that builds the weighted rows uses platform transcendentals, so the
-    /// end-to-end canonical PPP bits are this-build reproducible, not portable.
-    /// Returns `None` if `AᵀWA` is not positive definite (rank-deficient geometry).
-    pub(crate) fn solve_dense_square_root<'a, I>(&self, rows: I, n: usize) -> Option<Vec<f64>>
-    where
-        I: IntoIterator<Item = (&'a [f64], f64, f64)>,
-    {
-        debug_assert_eq!(self.recipe, NormalRecipe::CanonicalSquareRoot);
-        let (ata, aty) = normal_equations_weighted(rows, n)?;
-        let mut lambda = Vec::with_capacity(n * n);
-        for row in &ata {
-            lambda.extend_from_slice(row);
-        }
-        let mut scratch = FlatCholeskySolveScratch::default();
-        solve_flat_normal_square_root_into(&lambda, &aty, &mut scratch).map(<[f64]>::to_vec)
-    }
-
     /// RTK flat path: solve the accumulated information system `Λ x = η` with
     /// first-tie flat Gaussian elimination, reusing `scratch`
     /// ([`NormalRecipe::RtkDoubleDifferenceBlockFirstTie`]). `lambda` is the

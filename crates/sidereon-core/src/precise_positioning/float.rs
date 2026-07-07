@@ -16,7 +16,7 @@ use crate::estimation::substrate::parameters::ParameterLayout;
 use crate::estimation::substrate::qc::normalized_residual;
 use crate::observables::ObservableEphemerisSource;
 
-use super::normal::solve_normal_equations;
+use super::normal::{ppp_position_covariance, solve_normal_equations, PppNormalLayout};
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
 use super::{
     estimates_ztd, max_abs, rms, state_from_solution, validate_float_solution_output,
@@ -143,14 +143,14 @@ fn solve_float_multi_screened(
             let screened_wrms = solution_weighted_rms(
                 ctx,
                 &retained,
-                &screened,
+                screened.as_ref(),
                 &state_from_solution(&screened, &FloatState::default_for_epochs(&retained)),
             );
             if screened_wrms.is_finite()
                 && unscreened_wrms.is_finite()
                 && screened_wrms * RESIDUAL_SCREEN_ACCEPT_FACTOR < unscreened_wrms
             {
-                Ok(screened)
+                Ok(*screened)
             } else {
                 Ok(solution)
             }
@@ -161,7 +161,7 @@ fn solve_float_multi_screened(
 enum ScreenResult {
     Clean,
     Screened {
-        solution: FloatSolution,
+        solution: Box<FloatSolution>,
         epochs: Vec<FloatEpoch>,
     },
 }
@@ -175,7 +175,10 @@ fn run_residual_screen(
     pass: usize,
 ) -> Result<ScreenResult, FloatSolveError> {
     if pass > RESIDUAL_SCREEN_MAX_PASSES {
-        return Ok(ScreenResult::Screened { solution, epochs });
+        return Ok(ScreenResult::Screened {
+            solution: Box::new(solution),
+            epochs,
+        });
     }
 
     let candidate_state = state_from_solution(&solution, &seed_state);
@@ -183,7 +186,10 @@ fn run_residual_screen(
         Some((epoch_idx, sat)) => {
             let pruned = exclude_observation(&epochs, epoch_idx, &sat);
             if !multi_enough_after_prune(&pruned, ctx.tropo) {
-                return Ok(ScreenResult::Screened { solution, epochs });
+                return Ok(ScreenResult::Screened {
+                    solution: Box::new(solution),
+                    epochs,
+                });
             }
             let ambiguity_ids = multi_ambiguity_ids(&pruned);
             let candidate = iterate_multi(
@@ -200,7 +206,10 @@ fn run_residual_screen(
             if pass == 1 {
                 Ok(ScreenResult::Clean)
             } else {
-                Ok(ScreenResult::Screened { solution, epochs })
+                Ok(ScreenResult::Screened {
+                    solution: Box::new(solution),
+                    epochs,
+                })
             }
         }
     }
@@ -214,12 +223,6 @@ fn iterate_multi(
     opts: FloatSolveOptions,
     iter: usize,
 ) -> Result<FloatSolution, FloatSolveError> {
-    let n = ParameterLayout::ppp(
-        epochs.len(),
-        ztd_unknown_count(ctx.tropo),
-        ambiguity_ids.len(),
-    )
-    .dim();
     let mut current = state;
     let mut iteration = iter;
     let max_iterations = opts.max_iterations;
@@ -230,7 +233,12 @@ fn iterate_multi(
             values: &current.ambiguities_m,
         };
         let rows = build_rows(ctx, epochs, &binding, &current).map_err(PppRowError::into_float)?;
-        let dx = solve_normal_equations(&rows, n, ctx.normal)?;
+        let layout = PppNormalLayout::new(
+            epochs.len(),
+            ztd_unknown_count(ctx.tropo),
+            ambiguity_ids.len(),
+        );
+        let dx = solve_normal_equations(&rows, layout, ctx.normal)?;
         let next = apply_multi_delta(&current, epochs.len(), ambiguity_ids, &dx, ctx.tropo)?;
         let (pos_step, clock_step, ztd_step, ambiguity_step) =
             multi_step_norms(&dx, epochs.len(), ctx.tropo);
@@ -344,10 +352,25 @@ fn finalize_multi(
 ) -> Result<FloatSolution, FloatSolveError> {
     let residuals = residual_rows(ctx, epochs, &state.ambiguities_m, &state)
         .map_err(PppRowError::into_float)?;
+    let binding = AmbiguityBinding::Estimated {
+        ids: ambiguity_ids,
+        values: &state.ambiguities_m,
+    };
+    let rows = build_rows(ctx, epochs, &binding, &state).map_err(PppRowError::into_float)?;
+    let position_covariance = ppp_position_covariance(
+        &rows,
+        PppNormalLayout::new(
+            epochs.len(),
+            ztd_unknown_count(ctx.tropo),
+            ambiguity_ids.len(),
+        ),
+        state.position_m,
+    )?;
     let code: Vec<f64> = residuals.iter().map(|r| r.code_m).collect();
     let phase: Vec<f64> = residuals.iter().map(|r| r.phase_m).collect();
     let solution = FloatSolution {
         position_m: state.position_m,
+        position_covariance,
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: if estimates_ztd(ctx.tropo) {
