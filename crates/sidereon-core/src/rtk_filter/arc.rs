@@ -675,6 +675,7 @@ pub fn solve_static_rtk_arc(
         epochs
     };
     let batch = build_static_batch_arc(solve_input, &config.arc)?;
+    let (wavelengths_m, offsets_m) = expanded_batch_scale_maps(&batch, &config.arc);
     let antenna = config.arc.update_opts.receiver_antenna_corrections.as_ref();
     let float_solution = solve_float_baseline(
         &batch.epochs,
@@ -693,8 +694,8 @@ pub fn solve_static_rtk_arc(
             ids: &batch.ambiguity_ids,
             satellites: &batch.ambiguity_satellites,
             scale: AmbiguityScale {
-                wavelengths_m: &config.arc.wavelengths_m,
-                offsets_m: &config.arc.offsets_m,
+                wavelengths_m: &wavelengths_m,
+                offsets_m: &offsets_m,
             },
             float_only_systems: &config.arc.update_opts.float_only_systems,
         },
@@ -1024,6 +1025,78 @@ fn build_static_batch_arc(
         ambiguity_ids,
         ambiguity_satellites,
     })
+}
+
+fn expanded_sd_scale_maps(
+    epochs: &[NormalizedEpoch],
+    config: &RtkArcConfig,
+) -> (BTreeMap<String, f64>, BTreeMap<String, f64>) {
+    let mut wavelengths_m = config.wavelengths_m.clone();
+    let mut offsets_m = config.offsets_m.clone();
+    for epoch in epochs {
+        for (sat, (base, rover)) in &epoch.paired {
+            let sd_id = sd_ambiguity_token(sat, &base.ambiguity_id, &rover.ambiguity_id);
+            insert_derived_scale(&mut wavelengths_m, &config.wavelengths_m, &sd_id, sat);
+            insert_derived_scale(&mut offsets_m, &config.offsets_m, &sd_id, sat);
+        }
+    }
+    (wavelengths_m, offsets_m)
+}
+
+fn expanded_batch_scale_maps(
+    batch: &BatchArc,
+    config: &RtkArcConfig,
+) -> (BTreeMap<String, f64>, BTreeMap<String, f64>) {
+    let mut wavelengths_m = config.wavelengths_m.clone();
+    let mut offsets_m = config.offsets_m.clone();
+    for ambiguity_id in &batch.ambiguity_ids {
+        let Some(satellite_id) = batch.ambiguity_satellites.get(ambiguity_id) else {
+            continue;
+        };
+        insert_derived_scale(
+            &mut wavelengths_m,
+            &config.wavelengths_m,
+            ambiguity_id,
+            satellite_id,
+        );
+        insert_derived_scale(
+            &mut offsets_m,
+            &config.offsets_m,
+            ambiguity_id,
+            satellite_id,
+        );
+    }
+    (wavelengths_m, offsets_m)
+}
+
+fn insert_derived_scale(
+    target: &mut BTreeMap<String, f64>,
+    source: &BTreeMap<String, f64>,
+    ambiguity_id: &str,
+    satellite_id: &str,
+) {
+    if target.contains_key(ambiguity_id) {
+        return;
+    }
+    if let Some(value) = scale_value_for(source, ambiguity_id, satellite_id) {
+        target.insert(ambiguity_id.to_string(), value);
+    }
+}
+
+fn scale_value_for(
+    source: &BTreeMap<String, f64>,
+    ambiguity_id: &str,
+    satellite_id: &str,
+) -> Option<f64> {
+    source
+        .get(ambiguity_id)
+        .or_else(|| {
+            ambiguity_id
+                .split_once("|ref=")
+                .and_then(|(sd_id, _)| source.get(sd_id))
+        })
+        .or_else(|| source.get(satellite_id))
+        .copied()
 }
 
 fn build_static_batch_epochs(
@@ -1604,6 +1677,7 @@ fn solve_prepared_arc(
             minimum: MINIMUM_ARC_SATELLITES,
         });
     }
+    let (wavelengths_m, offsets_m) = expanded_sd_scale_maps(&normalized, config);
 
     // Per-system references for the whole arc (geometry-based by default).
     let reference_epochs = reference_epoch_terms(&normalized);
@@ -1656,8 +1730,8 @@ fn solve_prepared_arc(
             &epoch,
             config.base_m,
             &config.model,
-            &config.wavelengths_m,
-            &config.offsets_m,
+            &wavelengths_m,
+            &offsets_m,
             &config.update_opts,
         )
         .map_err(|source| RtkArcError::Update {
@@ -2449,6 +2523,26 @@ mod tests {
             .any(|arc| arc.satellite_id == "G02"));
     }
 
+    #[test]
+    fn arc_cycle_slip_split_derives_scale_for_split_ids() {
+        let (mut epochs, mut config, baseline, _tokens) = integer_arc();
+        for obs in &mut epochs[3].rover {
+            if obs.satellite_id == "G02" {
+                obs.lli = Some(1);
+            }
+        }
+        config.preprocessing.cycle_slip = Some(CycleSlipPolicy::SplitArc);
+
+        let solution = solve_rtk_arc(&epochs, &config).expect("arc solves");
+        assert!(!solution.split_cycle_slip_arcs.is_empty());
+        let final_baseline = solution
+            .epochs
+            .last()
+            .expect("final epoch")
+            .reported_baseline_m;
+        assert!(norm3(sub3(final_baseline, baseline)) < 1.0e-6);
+    }
+
     /// (b) Cycle-slip drop: the same LLI flag under the drop policy removes the
     /// satellite entirely; the driver equals manual composition.
     #[test]
@@ -2767,6 +2861,38 @@ mod tests {
         assert_eq!(driver, manual);
         assert_static_solution_bits(&driver, &manual);
         assert_eq!(driver.elevation_masked_sats, vec!["G03".to_string()]);
+    }
+
+    #[test]
+    fn static_batch_cycle_slip_split_derives_scale_for_split_ids() {
+        let (mut epochs, mut arc_config, baseline, _tokens) = integer_arc();
+        for obs in &mut epochs[3].rover {
+            if obs.satellite_id == "G02" {
+                obs.lli = Some(1);
+            }
+        }
+        arc_config.preprocessing.cycle_slip = Some(CycleSlipPolicy::SplitArc);
+        let static_config = RtkStaticArcConfig {
+            arc: arc_config,
+            opts: validated_opts(),
+        };
+
+        let solution = solve_static_rtk_arc(&epochs, &static_config).expect("static driver");
+        assert!(!solution.split_cycle_slip_arcs.is_empty());
+        assert!(
+            solution
+                .fixed_solution
+                .fixed_solution
+                .search
+                .integer_candidates
+                > 0
+        );
+        assert!(
+            norm3(sub3(
+                solution.fixed_solution.fixed_solution.baseline_m,
+                baseline,
+            )) < 1.0e-6
+        );
     }
 
     fn dual_observation(
