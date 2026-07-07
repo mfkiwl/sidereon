@@ -44,6 +44,7 @@ use sidereon_core::atmosphere::troposphere::Met;
 use sidereon_core::bias::BiasSet;
 use sidereon_core::combinations::{ionosphere_free, ionosphere_free_phase_cycles};
 use sidereon_core::constants::{F_L1_HZ, F_L2_HZ, SECONDS_PER_DAY};
+use sidereon_core::dop::ecef_to_enu_rotation;
 use sidereon_core::ephemeris::Sp3;
 use sidereon_core::frame::{itrf_to_geodetic, ItrfPositionM};
 use sidereon_core::observables::{j2000_seconds_from_split, predict, PredictOptions};
@@ -327,6 +328,89 @@ fn position_error_m(position_m: [f64; 3], truth_m: [f64; 3]) -> f64 {
         + (position_m[1] - truth_m[1]).powi(2)
         + (position_m[2] - truth_m[2]).powi(2))
     .sqrt()
+}
+
+fn position_delta_m(position_m: [f64; 3], truth_m: [f64; 3]) -> [f64; 3] {
+    [
+        position_m[0] - truth_m[0],
+        position_m[1] - truth_m[1],
+        position_m[2] - truth_m[2],
+    ]
+}
+
+fn enu_delta_m(position_m: [f64; 3], truth_m: [f64; 3]) -> [f64; 3] {
+    let truth = ItrfPositionM::new(truth_m[0], truth_m[1], truth_m[2]).expect("finite truth");
+    let geodetic = itrf_to_geodetic(truth).expect("truth geodetic");
+    let rotation = ecef_to_enu_rotation(geodetic.lat_rad, geodetic.lon_rad);
+    let delta = position_delta_m(position_m, truth_m);
+    [
+        rotation[0][0] * delta[0] + rotation[0][1] * delta[1] + rotation[0][2] * delta[2],
+        rotation[1][0] * delta[0] + rotation[1][1] * delta[1] + rotation[1][2] * delta[2],
+        rotation[2][0] * delta[0] + rotation[2][1] * delta[1] + rotation[2][2] * delta[2],
+    ]
+}
+
+fn covariance_sigma(covariance_m2: [[f64; 3]; 3]) -> [f64; 3] {
+    [
+        covariance_m2[0][0].sqrt(),
+        covariance_m2[1][1].sqrt(),
+        covariance_m2[2][2].sqrt(),
+    ]
+}
+
+fn assert_position_covariance_positive_definite(
+    covariance: &sidereon_core::precise_positioning::PositionCovariance,
+) {
+    fn assert_matrix(name: &str, matrix: [[f64; 3]; 3]) {
+        for (idx, row) in matrix.iter().enumerate() {
+            assert!(
+                row[idx].is_finite() && row[idx] > 0.0,
+                "{name} covariance diagonal {idx} was {}",
+                row[idx]
+            );
+            for (jdx, other_row) in matrix.iter().enumerate().skip(idx + 1) {
+                assert!(
+                    (row[jdx] - other_row[idx]).abs() < 1.0e-10,
+                    "{name} covariance is asymmetric at {idx},{jdx}"
+                );
+            }
+        }
+        let dense = matrix
+            .iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<Vec<f64>>>();
+        assert!(
+            sidereon_core::astro::math::linear::invert_symmetric_pd(&dense).is_some(),
+            "{name} covariance was not positive definite"
+        );
+    }
+
+    assert_matrix("ECEF", covariance.ecef_m2);
+    assert_matrix("ENU", covariance.enu_m2);
+}
+
+fn assert_covariance_bounds_truth(
+    name: &str,
+    delta_m: [f64; 3],
+    sigma_m: [f64; 3],
+    sigma_multiple: f64,
+    min_ratio: f64,
+) {
+    let mut max_ratio = 0.0_f64;
+    for idx in 0..3 {
+        let ratio = delta_m[idx].abs() / sigma_m[idx];
+        max_ratio = max_ratio.max(ratio);
+        assert!(
+            ratio <= sigma_multiple,
+            "{name} component {idx} truth error {} m exceeded {sigma_multiple} sigma ({})",
+            delta_m[idx].abs(),
+            sigma_m[idx]
+        );
+    }
+    assert!(
+        max_ratio >= min_ratio,
+        "{name} covariance was too broad: max truth/sigma ratio {max_ratio} < {min_ratio}"
+    );
 }
 
 fn antex_epoch() -> AntexDateTime {
@@ -666,9 +750,14 @@ fn zim2_full_stack_ppp_static_reaches_decimeter_truth() {
     let truth_err = position_error_m(solution.position_m, ZIM2_TRUTH_ECEF_M);
     let rtklib_err = position_error_m(solution.position_m, RTKLIB_PPP_STATIC_ECEF_M);
     let rtklib_vs_truth = position_error_m(RTKLIB_PPP_STATIC_ECEF_M, ZIM2_TRUTH_ECEF_M);
+    assert_position_covariance_positive_definite(&solution.position_covariance);
+    let ecef_delta = position_delta_m(solution.position_m, ZIM2_TRUTH_ECEF_M);
+    let enu_delta = enu_delta_m(solution.position_m, ZIM2_TRUTH_ECEF_M);
+    let ecef_sigma = covariance_sigma(solution.position_covariance.ecef_m2);
+    let enu_sigma = covariance_sigma(solution.position_covariance.enu_m2);
 
     eprintln!(
-        "ZIM2 full-stack PPP-static: pos={:?}\n  vs ITRF2020 truth = {truth_err:.4} m\n  vs RTKLIB ppp-static = {rtklib_err:.4} m\n  (RTKLIB vs truth = {rtklib_vs_truth:.4} m)",
+        "ZIM2 full-stack PPP-static: pos={:?}\n  vs ITRF2020 truth = {truth_err:.4} m\n  vs RTKLIB ppp-static = {rtklib_err:.4} m\n  (RTKLIB vs truth = {rtklib_vs_truth:.4} m)\n  ECEF delta={ecef_delta:?} sigma={ecef_sigma:?}\n  ENU delta={enu_delta:?} sigma={enu_sigma:?}",
         solution.position_m
     );
 
@@ -680,6 +769,12 @@ fn zim2_full_stack_ppp_static_reaches_decimeter_truth() {
         rtklib_err < SIDEREON_VS_RTKLIB_BOUND_M,
         "full-stack PPP vs RTKLIB ppp-static {rtklib_err} m exceeded {SIDEREON_VS_RTKLIB_BOUND_M} m"
     );
+    // Formal posterior covariance is produced from the weighted final normal
+    // matrix. It does not include external ITRF, multipath, or unmodelled loading
+    // systematics, so this real-arc check uses a 4-sigma component bound and a
+    // lower ratio guard to prove the covariance is present and not overly broad.
+    assert_covariance_bounds_truth("ECEF", ecef_delta, ecef_sigma, 4.0, 0.25);
+    assert_covariance_bounds_truth("ENU", enu_delta, enu_sigma, 4.0, 0.25);
 }
 
 #[test]

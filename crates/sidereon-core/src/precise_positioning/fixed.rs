@@ -12,10 +12,12 @@ use crate::ambiguity::AmbiguityId;
 use crate::astro::math::vec3;
 use crate::estimation::recipe::{EstimationRecipe, NormalRecipe};
 use crate::estimation::substrate::ambiguity::resolve_integer_lattice;
-use crate::estimation::substrate::parameters::ParameterLayout;
 use crate::observables::ObservableEphemerisSource;
 
-use super::normal::{ambiguity_covariance_from_normal, normal_equations, solve_normal_equations};
+use super::normal::{
+    ambiguity_covariance_from_normal, clock_eliminated_normal_equations, ppp_position_covariance,
+    solve_normal_equations, PppNormalLayout,
+};
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
 use super::{
     estimates_ztd, max_abs, rms, state_from_solution, validate_fixed_solve_boundary, weighted_rms,
@@ -174,7 +176,6 @@ fn iterate_fixed_multi(
     opts: FloatSolveOptions,
     iter: usize,
 ) -> Result<FixedResolve, FixedSolveError> {
-    let n = ParameterLayout::ppp(epochs.len(), ztd_unknown_count(ctx.tropo), 0).dim();
     let mut current = state;
     let mut iteration = iter;
     let max_iterations = opts.max_iterations;
@@ -182,7 +183,8 @@ fn iterate_fixed_multi(
     loop {
         let binding = AmbiguityBinding::Held { values: fixed_m };
         let rows = build_rows(ctx, epochs, &binding, &current).map_err(PppRowError::into_fixed)?;
-        let dx = solve_normal_equations(&rows, n, ctx.normal)?;
+        let layout = PppNormalLayout::new(epochs.len(), ztd_unknown_count(ctx.tropo), 0);
+        let dx = solve_normal_equations(&rows, layout, ctx.normal)?;
         let next = apply_fixed_multi_delta(&current, epochs.len(), &dx, ctx.tropo);
         let (pos_step, clock_step, ztd_step) = fixed_multi_step_norms(&dx, ctx.tropo);
 
@@ -269,10 +271,18 @@ fn finalize_fixed_multi(
     } = resolve;
     let residuals =
         residual_rows(ctx, epochs, &fixed_m, &state).map_err(PppRowError::into_fixed)?;
+    let binding = AmbiguityBinding::Held { values: &fixed_m };
+    let rows = build_rows(ctx, epochs, &binding, &state).map_err(PppRowError::into_fixed)?;
+    let position_covariance = ppp_position_covariance(
+        &rows,
+        PppNormalLayout::new(epochs.len(), ztd_unknown_count(ctx.tropo), 0),
+        state.position_m,
+    )?;
     let code: Vec<f64> = residuals.iter().map(|r| r.code_m).collect();
     let phase: Vec<f64> = residuals.iter().map(|r| r.phase_m).collect();
     Ok(FixedSolution {
         position_m: state.position_m,
+        position_covariance,
         epoch_clocks_m: state.clocks_m,
         fixed_ambiguities_cycles: search.fixed_cycles,
         fixed_ambiguities_m: fixed_m,
@@ -358,13 +368,12 @@ fn ambiguity_covariance_cycles(
     config: &FixedSolveConfig,
 ) -> Result<Vec<Vec<f64>>, FixedSolveError> {
     let state = state_from_solution(float_solution, &FloatState::default_for_epochs(epochs));
-    let layout = ParameterLayout::ppp(
+    let layout = PppNormalLayout::new(
         epochs.len(),
         ztd_unknown_count(config.tropo),
         ambiguity_ids.len(),
     );
-    let n = layout.dim();
-    let start = layout.ambiguity_offset();
+    let start = layout.reduced_ambiguity_offset();
     let ctx = ModelContext {
         source,
         weights: config.weights,
@@ -380,7 +389,7 @@ fn ambiguity_covariance_cycles(
     };
     let rows = build_rows(ctx, epochs, &binding, &state)
         .map_err(|e| FixedSolveError::from(e.into_float()))?;
-    let (normal, _rhs) = normal_equations(&rows, n)?;
+    let (normal, _rhs) = clock_eliminated_normal_equations(&rows, layout)?;
     let covariance_m = ambiguity_covariance_from_normal(&normal, start, ambiguity_ids.len())?;
     let mut covariance_cycles = vec![vec![0.0; ambiguity_ids.len()]; ambiguity_ids.len()];
     for i in 0..ambiguity_ids.len() {

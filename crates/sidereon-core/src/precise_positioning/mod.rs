@@ -143,6 +143,7 @@ pub mod tec;
 mod types;
 pub mod velocity;
 
+pub use crate::dop::PositionCovariance;
 pub use auto_init::{
     solve_ppp_auto_init_fixed, solve_ppp_auto_init_fixed_with_strategy, solve_ppp_auto_init_float,
     solve_ppp_auto_init_float_with_strategy, PppAutoInitError, PppAutoInitOptions,
@@ -443,6 +444,8 @@ fn validate_float_solution(
     validate_solution_clock_count(solution, n_epochs)?;
     validate::finite_vec3(solution.position_m, "ppp float_solution position_m")
         .map_err(invalid_fixed_input)?;
+    validate_position_covariance(&solution.position_covariance, "ppp float_solution")
+        .map_err(FixedSolveError::Float)?;
     validate::finite_slice(
         &solution.epoch_clocks_m,
         "ppp float_solution epoch_clocks_m",
@@ -488,6 +491,7 @@ pub(super) fn validate_float_solution_output(
     validate_float_solution_clock_count(solution, n_epochs)?;
     validate::finite_vec3(solution.position_m, "ppp float_solution position_m")
         .map_err(invalid_input)?;
+    validate_position_covariance(&solution.position_covariance, "ppp float_solution")?;
     validate::finite_slice(
         &solution.epoch_clocks_m,
         "ppp float_solution epoch_clocks_m",
@@ -521,6 +525,37 @@ pub(super) fn validate_float_solution_output(
         .map_err(invalid_input)?;
     validate::finite_nonneg(solution.weighted_rms_m, "ppp float_solution weighted_rms_m")
         .map_err(invalid_input)?;
+    Ok(())
+}
+
+fn validate_position_covariance(
+    covariance: &crate::dop::PositionCovariance,
+    label: &'static str,
+) -> Result<(), FloatSolveError> {
+    validate_covariance_matrix(covariance.ecef_m2, label, "ecef_m2")?;
+    validate_covariance_matrix(covariance.enu_m2, label, "enu_m2")
+}
+
+fn validate_covariance_matrix(
+    matrix: [[f64; 3]; 3],
+    label: &'static str,
+    frame: &'static str,
+) -> Result<(), FloatSolveError> {
+    for row in matrix {
+        validate::finite_slice(&row, label).map_err(invalid_input)?;
+    }
+    for (idx, row) in matrix.iter().enumerate() {
+        validate::finite_positive(row[idx], label).map_err(invalid_input)?;
+        for (jdx, other_row) in matrix.iter().enumerate().skip(idx + 1) {
+            let scale = row[jdx].abs().max(other_row[idx].abs()).max(1.0);
+            if (row[jdx] - other_row[idx]).abs() > 1.0e-10 * scale {
+                return Err(FloatSolveError::InvalidInput {
+                    field: label,
+                    reason: frame,
+                });
+            }
+        }
+    }
     Ok(())
 }
 

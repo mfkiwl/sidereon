@@ -2,6 +2,19 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Static PPP float and fixed solutions now expose posterior receiver-position
+  covariance in ECEF and ENU coordinates through `PositionCovariance`.
+
+### Changed
+
+- Static PPP eliminates per-epoch receiver clocks from the normal equations and
+  back-substitutes them after solving the reduced static system, making
+  day-length arcs tractable without changing the public clock output.
+
 ## [0.21.0]
 
 ### Added

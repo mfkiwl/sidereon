@@ -68,6 +68,7 @@ impl EstimateOptions {
 /// variant carries exactly the arguments the shared per-technique runner needs;
 /// [`estimate`] drives that runner with the resolved recipe. RTK and PPP expose a
 /// float and a fixed entry; both map to the same [`Technique`].
+#[allow(clippy::large_enum_variant)]
 pub enum EstimateInput<'a> {
     /// SPP under the public validation/orchestration policy
     /// (`spp::solve_with_policy`).

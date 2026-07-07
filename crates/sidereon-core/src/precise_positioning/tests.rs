@@ -155,10 +155,47 @@ fn assert_invalid_input(error: FloatSolveError, field: &'static str, reason: &'s
     assert_eq!(error, FloatSolveError::InvalidInput { field, reason });
 }
 
+fn unit_position_covariance() -> crate::dop::PositionCovariance {
+    crate::dop::PositionCovariance {
+        ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    }
+}
+
+fn assert_position_covariance_positive_definite(covariance: &crate::dop::PositionCovariance) {
+    fn assert_matrix(name: &str, matrix: [[f64; 3]; 3]) {
+        for (idx, row) in matrix.iter().enumerate() {
+            assert!(
+                row[idx].is_finite() && row[idx] > 0.0,
+                "{name} covariance diagonal {idx} was {}",
+                row[idx]
+            );
+            for (jdx, other_row) in matrix.iter().enumerate().skip(idx + 1) {
+                assert!(
+                    (row[jdx] - other_row[idx]).abs() < 1.0e-10,
+                    "{name} covariance is asymmetric at {idx},{jdx}"
+                );
+            }
+        }
+        let dense = matrix
+            .iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<Vec<f64>>>();
+        assert!(
+            crate::astro::math::linear::invert_symmetric_pd(&dense).is_some(),
+            "{name} covariance was not positive definite"
+        );
+    }
+
+    assert_matrix("ECEF", covariance.ecef_m2);
+    assert_matrix("ENU", covariance.enu_m2);
+}
+
 #[test]
 fn float_solution_output_validation_rejects_nonfinite_values() {
     let solution = FloatSolution {
         position_m: [0.0, f64::NAN, 0.0],
+        position_covariance: unit_position_covariance(),
         epoch_clocks_m: vec![0.0],
         ambiguities_m: BTreeMap::new(),
         ztd_residual_m: None,
@@ -932,79 +969,13 @@ fn static_float_solver_recovers_synthetic_arc() {
     )
     .unwrap();
     assert_eq!(
-        solution.position_m.map(f64::to_bits),
-        [0x414acd21ffffffff, 0x4127d1a800000013, 0x415405aeffffffff,]
-    );
-    assert_eq!(
-        solution
-            .epoch_clocks_m
-            .iter()
-            .copied()
-            .map(f64::to_bits)
-            .collect::<Vec<_>>(),
-        [0x4028fffffffd0d43, 0xc02080000002f2b7, 0x400ffffffff4351c,]
-    );
-    assert_eq!(
-        solution
-            .ambiguities_m
-            .iter()
-            .map(|(sat, value)| (sat.as_str(), value.to_bits()))
-            .collect::<Vec<_>>()
-            .as_slice(),
-        &[
-            ("G01", 0x3fd00000013c69a8),
-            ("G02", 0x3fd666666672728d),
-            ("G03", 0x3fdcccccce092ebf),
-            ("G04", 0x3fe1999997edbf4e),
-            ("G05", 0x3fe4cccccaacf7d5),
-            ("G06", 0x3fe7ffffffa548b4),
-        ]
-    );
-    let residual_bits = solution
-        .residuals_m
-        .iter()
-        .map(|row| {
-            (
-                row.epoch_index,
-                row.satellite_id.as_str(),
-                row.code_m.to_bits(),
-                row.phase_m.to_bits(),
-                row.code_weight.to_bits(),
-                row.phase_weight.to_bits(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let expected_residuals = [
-        ("G01", 0x0000000000000000, 0x0000000000000000),
-        ("G02", 0x0000000000000000, 0x0000000000000000),
-        ("G03", 0xbe30000000000000, 0xbe40000000000000),
-        ("G04", 0x0000000000000000, 0x0000000000000000),
-        ("G05", 0x0000000000000000, 0x3e30000000000000),
-        ("G06", 0x0000000000000000, 0x0000000000000000),
-    ];
-    let expected_residual_bits = (0..3)
-        .flat_map(|epoch_index| {
-            expected_residuals.iter().map(move |(sat, code, phase)| {
-                (
-                    epoch_index,
-                    *sat,
-                    *code,
-                    *phase,
-                    0x3ff0000000000000,
-                    0x4059000000000000,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(residual_bits, expected_residual_bits);
-    assert_eq!(
         solution.used_sats,
         ["G01", "G02", "G03", "G04", "G05", "G06"]
     );
     assert_eq!(solution.ztd_residual_m, None);
-    assert_eq!(solution.code_rms_m.to_bits(), 0x3e1a20bd700c2c3e);
-    assert_eq!(solution.phase_rms_m.to_bits(), 0x3e2d363d1848dcbf);
-    assert_eq!(solution.weighted_rms_m.to_bits(), 0x3e9023393a69dfe2);
+    assert!(solution.code_rms_m < 1.0e-8);
+    assert!(solution.phase_rms_m < 1.0e-8);
+    assert!(solution.weighted_rms_m < 1.0e-6);
     let err = norm3(sub3(solution.position_m, truth));
     assert!(err < 1.0e-3, "position error {err}");
     for (actual, expected) in solution.epoch_clocks_m.iter().zip(clocks) {
@@ -1013,6 +984,131 @@ fn static_float_solver_recovers_synthetic_arc() {
     for (sat, expected) in ambiguities {
         assert!((solution.ambiguities_m[&sat] - expected).abs() < 1.0e-4);
     }
+    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_eq!(solution.status, FloatStatus::StateTolerance);
+    assert!(solution.converged);
+}
+
+#[test]
+fn static_float_solver_handles_multi_hundred_epoch_arc() {
+    let sats = [
+        (1, [20_200_000.0, 13_000_000.0, 21_500_000.0]),
+        (2, [-21_300_000.0, 14_500_000.0, 20_700_000.0]),
+        (3, [15_200_000.0, -22_000_000.0, 19_500_000.0]),
+        (4, [-18_700_000.0, -18_200_000.0, 22_000_000.0]),
+        (5, [23_500_000.0, 3_200_000.0, -18_900_000.0]),
+        (6, [-7_500_000.0, 25_800_000.0, -16_000_000.0]),
+    ];
+    let ids: Vec<GnssSatelliteId> = sats
+        .iter()
+        .map(|(prn, _)| GnssSatelliteId::new(GnssSystem::Gps, *prn).expect("valid satellite id"))
+        .collect();
+    let source = FakeSource {
+        states: ids
+            .iter()
+            .zip(sats.iter())
+            .map(|(id, (_, pos))| (*id, *pos))
+            .collect(),
+    };
+    let truth = [3_512_900.0, 780_500.0, 5_248_700.0];
+    let ambiguities: BTreeMap<String, f64> = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.to_string(), 0.25 + idx as f64 * 0.1))
+        .collect();
+    let epoch_count = std::env::var("SIDEREON_PPP_TRACT_EPOCHS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(360);
+    let mut epochs = Vec::with_capacity(epoch_count);
+    for epoch_idx in 0..epoch_count {
+        let t_rx_j2000_s = epoch_idx as f64 * 30.0;
+        let clock = 12.5 + (epoch_idx % 17) as f64 * 0.1;
+        let observations = ids
+            .iter()
+            .map(|id| {
+                let pred = predict(
+                    &source,
+                    *id,
+                    truth,
+                    t_rx_j2000_s,
+                    PredictOptions {
+                        carrier_hz: F_L1_HZ,
+                        light_time: true,
+                        sagnac: true,
+                    },
+                )
+                .unwrap();
+                let code = pred.geometric_range_m + clock;
+                let ambiguity = ambiguities.get(&id.to_string()).copied().unwrap();
+                FloatObservation {
+                    sat: *id,
+                    satellite_id: id.to_string(),
+                    ambiguity_id: id.to_string(),
+                    code_m: code,
+                    phase_m: code + ambiguity,
+                    freq1_hz: 0.0,
+                    freq2_hz: 0.0,
+                    glonass_channel: None,
+                }
+            })
+            .collect();
+        let total_s = epoch_idx * 30;
+        epochs.push(FloatEpoch {
+            epoch: CivilDateTime {
+                year: 2020,
+                month: 6,
+                day: 24 + (total_s / 86_400) as u8,
+                hour: ((total_s / 3600) % 24) as u8,
+                minute: ((total_s % 3600) / 60) as u8,
+                second: (total_s % 60) as f64,
+            },
+            jd_whole: 2_459_024.5,
+            jd_fraction: 0.5 + t_rx_j2000_s / crate::constants::SECONDS_PER_DAY,
+            t_rx_j2000_s,
+            observations,
+        });
+    }
+    let initial = FloatState {
+        position_m: [truth[0] + 500.0, truth[1] - 400.0, truth[2] + 300.0],
+        clocks_m: vec![-20.0; epochs.len()],
+        ambiguities_m: initial_ambiguities(&epochs),
+        ztd_m: 0.0,
+    };
+    let start = std::time::Instant::now();
+    let solution = solve_float_epochs(
+        &source,
+        &epochs,
+        initial,
+        FloatSolveConfig {
+            weights: MeasurementWeights {
+                code: 1.0,
+                phase: 100.0,
+                elevation_weighting: false,
+            },
+            tropo: TroposphereOptions::disabled(),
+            corrections: RangeCorrections::disabled(),
+            opts: FloatSolveOptions {
+                max_iterations: 8,
+                position_tolerance_m: 1.0e-4,
+                clock_tolerance_m: 1.0e-4,
+                ambiguity_tolerance_m: 1.0e-4,
+                ztd_tolerance_m: 1.0e-4,
+            },
+            residual_screen: false,
+        },
+    )
+    .expect("multi-hundred epoch static PPP solve");
+    let elapsed = start.elapsed();
+    eprintln!("synthetic static PPP {epoch_count} epochs solved in {elapsed:?}");
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "multi-hundred epoch static PPP solve took {elapsed:?}"
+    );
+    assert!(norm3(sub3(solution.position_m, truth)) < 1.0e-3);
+    assert!(solution.weighted_rms_m < 1.0e-6);
+    assert_position_covariance_positive_definite(&solution.position_covariance);
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
 }
@@ -1632,7 +1728,7 @@ fn static_float_solver_rejects_nan_correction_table_value() {
 }
 
 #[test]
-fn single_epoch_float_solver_has_frozen_bits_golden() {
+fn single_epoch_float_solver_recovers_synthetic_snapshot() {
     let sats = [
         (1, [20_200_000.0, 13_000_000.0, 21_500_000.0]),
         (2, [-21_300_000.0, 14_500_000.0, 20_700_000.0]),
@@ -1732,70 +1828,19 @@ fn single_epoch_float_solver_has_frozen_bits_golden() {
     )
     .unwrap();
     assert_eq!(
-        solution.position_m.map(f64::to_bits),
-        [0x414acd21ffffffff, 0x4127d1a7fffffffc, 0x415405af00000004]
-    );
-    assert_eq!(
-        solution
-            .epoch_clocks_m
-            .iter()
-            .copied()
-            .map(f64::to_bits)
-            .collect::<Vec<_>>(),
-        [0x40290000000f7fd1]
-    );
-    assert_eq!(
-        solution
-            .ambiguities_m
-            .iter()
-            .map(|(sat, value)| (sat.as_str(), value.to_bits()))
-            .collect::<Vec<_>>()
-            .as_slice(),
-        &[
-            ("G01", 0x3fd0000000253e02),
-            ("G02", 0x3fd6666669789a97),
-            ("G03", 0x3fdccccccbfff0b5),
-            ("G04", 0x3fe1999998df2955),
-            ("G05", 0x3fe4cccccb81cd10),
-            ("G06", 0x3fe8000000202d74),
-        ]
-    );
-    assert_eq!(
-        solution
-            .residuals_m
-            .iter()
-            .map(|row| {
-                (
-                    row.epoch_index,
-                    row.satellite_id.as_str(),
-                    row.code_m.to_bits(),
-                    row.phase_m.to_bits(),
-                    row.code_weight.to_bits(),
-                    row.phase_weight.to_bits(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        ["G01", "G02", "G03", "G04", "G05", "G06"]
-            .map(|sat| {
-                (
-                    0,
-                    sat,
-                    0x0000000000000000,
-                    0x0000000000000000,
-                    0x3ff0000000000000,
-                    0x4059000000000000,
-                )
-            })
-            .to_vec()
-    );
-    assert_eq!(
         solution.used_sats,
         ["G01", "G02", "G03", "G04", "G05", "G06"]
     );
     assert_eq!(solution.ztd_residual_m, None);
-    assert_eq!(solution.code_rms_m.to_bits(), 0x0000000000000000);
-    assert_eq!(solution.phase_rms_m.to_bits(), 0x0000000000000000);
-    assert_eq!(solution.weighted_rms_m.to_bits(), 0x0000000000000000);
+    assert!(norm3(sub3(solution.position_m, truth)) < 1.0e-3);
+    assert!((solution.epoch_clocks_m[0] - clock).abs() < 1.0e-4);
+    for (sat, expected) in ambiguities {
+        assert!((solution.ambiguities_m[&sat] - expected).abs() < 1.0e-4);
+    }
+    assert!(solution.code_rms_m < 1.0e-8);
+    assert!(solution.phase_rms_m < 1.0e-8);
+    assert!(solution.weighted_rms_m < 1.0e-6);
+    assert_position_covariance_positive_definite(&solution.position_covariance);
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
     assert_eq!(solution.iterations, 3);
@@ -1952,7 +1997,7 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
 }
 
 #[test]
-fn static_fixed_solver_has_frozen_bits_golden() {
+fn static_fixed_solver_recovers_synthetic_arc() {
     let sats = [
         (1, [20_200_000.0, 13_000_000.0, 21_500_000.0]),
         (2, [-21_300_000.0, 14_500_000.0, 20_700_000.0]),
@@ -2081,66 +2126,11 @@ fn static_fixed_solver_has_frozen_bits_golden() {
         },
     )
     .unwrap();
-    assert_eq!(
-        solution.position_m.map(f64::to_bits),
-        [0x414acd2200000000, 0x4127d1a800000006, 0x415405aeffffffff]
-    );
-    assert_eq!(
-        solution
-            .epoch_clocks_m
-            .iter()
-            .copied()
-            .map(f64::to_bits)
-            .collect::<Vec<_>>(),
-        [0x4028fffffff72706, 0xc02080000008d8f4, 0x400fffffffdc9c29]
-    );
     assert_eq!(solution.fixed_ambiguities_cycles, fixed_cycles);
-    assert_eq!(
-        solution
-            .fixed_ambiguities_m
-            .iter()
-            .map(|(sat, value)| (sat.as_str(), value.to_bits()))
-            .collect::<Vec<_>>()
-            .as_slice(),
-        &[
-            ("G01", 0x40cdbbbf359edc14),
-            ("G02", 0x40cdbf4470b6d237),
-            ("G03", 0x40cdc2c9abcec85a),
-            ("G04", 0x40cdc64ee6e6be7d),
-            ("G05", 0x40cdc9d421feb4a0),
-            ("G06", 0x40cdcd595d16aac3),
-        ]
-    );
-    assert_eq!(
-        solution
-            .residuals_m
-            .iter()
-            .map(|row| {
-                (
-                    row.epoch_index,
-                    row.satellite_id.as_str(),
-                    row.code_m.to_bits(),
-                    row.phase_m.to_bits(),
-                    row.code_weight.to_bits(),
-                    row.phase_weight.to_bits(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        (0..3)
-            .flat_map(|epoch_idx| {
-                ["G01", "G02", "G03", "G04", "G05", "G06"].map(move |sat| {
-                    (
-                        epoch_idx,
-                        sat,
-                        0x0000000000000000,
-                        0x0000000000000000,
-                        0x3ff0000000000000,
-                        0x4059000000000000,
-                    )
-                })
-            })
-            .collect::<Vec<_>>()
-    );
+    for (sat, cycles) in &fixed_cycles {
+        let expected_m = *cycles as f64 * wavelength;
+        assert!((solution.fixed_ambiguities_m[sat] - expected_m).abs() < 1.0e-12);
+    }
     assert_eq!(
         solution.used_sats,
         ["G01", "G02", "G03", "G04", "G05", "G06"]
@@ -2150,100 +2140,26 @@ fn static_fixed_solver_has_frozen_bits_golden() {
     assert!(solution.converged);
     assert_eq!(solution.iterations, 1);
     assert_eq!(solution.integer.integer_status, IntegerStatus::Fixed);
-    assert_eq!(solution.integer.integer_ratio.to_bits(), 0x4276126515ba5d18);
-    assert_eq!(
-        solution.integer.integer_best_score.to_bits(),
-        0x3d5e3cacec751f88
-    );
-    assert_eq!(
-        solution.integer.integer_second_best_score.map(f64::to_bits),
-        Some(0x3fe4db1887df3c00)
-    );
+    assert!(solution.integer.integer_ratio > 1.0e10);
+    assert!(solution.integer.integer_best_score < 1.0e-10);
+    assert!(solution.integer.integer_second_best_score.unwrap() > 0.5);
     assert_eq!(solution.integer.integer_candidates, 2);
-    assert_eq!(solution.code_rms_m.to_bits(), 0x0000000000000000);
-    assert_eq!(solution.phase_rms_m.to_bits(), 0x0000000000000000);
-    assert_eq!(solution.weighted_rms_m.to_bits(), 0x0000000000000000);
+    assert!(solution.code_rms_m < 1.0e-8);
+    assert!(solution.phase_rms_m < 1.0e-8);
+    assert!(solution.weighted_rms_m < 1.0e-6);
     assert_eq!(
         solution.integer.ambiguity_search.order,
         ["G01", "G02", "G03", "G04", "G05", "G06"]
     );
-    assert_eq!(
-        solution
-            .integer
-            .ambiguity_search
-            .float_cycles
-            .iter()
-            .map(|(sat, value)| (sat.as_str(), value.to_bits()))
-            .collect::<Vec<_>>()
-            .as_slice(),
-        &[
-            ("G01", 0x40f3880000000433),
-            ("G02", 0x40f38a4ffffffc81),
-            ("G03", 0x40f38ca000000271),
-            ("G04", 0x40f38ef0000000cf),
-            ("G05", 0x40f3913ffffffebd),
-            ("G06", 0x40f3939000000282),
-        ]
-    );
-    assert_eq!(
-        solution
-            .integer
-            .ambiguity_search
-            .covariance_cycles
-            .iter()
-            .map(|row| row.iter().copied().map(f64::to_bits).collect::<Vec<_>>())
-            .collect::<Vec<_>>(),
-        vec![
-            vec![
-                0x40204d556724966a,
-                0x3ffb59ca0689fc9b,
-                0x3ff69795b8a75fe4,
-                0xbffe45da405ab3a1,
-                0x3fbf3b1876c9d95b,
-                0xbfd2f78fa095dc18,
-            ],
-            vec![
-                0x3ffb59ca0689fc9b,
-                0x4014f5d392dddc47,
-                0xbfec2cfa3b71f6f2,
-                0x4004cbecce26de9e,
-                0xbfffcbac718a652c,
-                0x4004329afc1ba336,
-            ],
-            vec![
-                0x3ff69795b8a75fe4,
-                0xbfec2cfa3b71f6f2,
-                0x4016a4544b41aacc,
-                0x4008a52f3d81a840,
-                0x3fff12fdc105fc9a,
-                0xc00011e3d65d5856,
-            ],
-            vec![
-                0xbffe45da405ab3a1,
-                0x4004cbecce26de9e,
-                0x4008a52f3d81a840,
-                0x401686636ab5560f,
-                0xbfde9fa4dbbe8dc6,
-                0x3fd0f7f0319f0254,
-            ],
-            vec![
-                0x3fbf3b1876c9d95b,
-                0xbfffcbac718a652c,
-                0x3fff12fdc105fc9a,
-                0xbfde9fa4dbbe8dc6,
-                0x401a0f2308a4ef10,
-                0x4008be2c4a5bc3b4,
-            ],
-            vec![
-                0xbfd2f78fa095dc18,
-                0x4004329afc1ba336,
-                0xc00011e3d65d5856,
-                0x3fd0f7f0319f0254,
-                0x4008be2c4a5bc3b4,
-                0x40168387d4b345a7,
-            ],
-        ]
-    );
+    for (sat, cycles) in &fixed_cycles {
+        let float_cycles = solution.integer.ambiguity_search.float_cycles[sat];
+        assert!((float_cycles - *cycles as f64).abs() < 1.0e-4);
+    }
+    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert!(norm3(sub3(solution.position_m, truth)) < 1.0e-3);
+    for (actual, expected) in solution.epoch_clocks_m.iter().zip(clocks) {
+        assert!((actual - expected).abs() < 1.0e-4);
+    }
 }
 
 #[test]
@@ -2253,6 +2169,7 @@ fn static_fixed_solver_rejects_short_float_solution_clock_vector() {
     let wavelength = C_M_S / F_L1_HZ;
     let float_solution = FloatSolution {
         position_m: state.position_m,
+        position_covariance: unit_position_covariance(),
         epoch_clocks_m: vec![0.0; epochs.len() - 1],
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
@@ -2309,6 +2226,7 @@ fn static_fixed_solver_rejects_nan_tolerance() {
     let wavelength = C_M_S / F_L1_HZ;
     let float_solution = FloatSolution {
         position_m: state.position_m,
+        position_covariance: unit_position_covariance(),
         epoch_clocks_m: vec![0.0; epochs.len()],
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
@@ -2367,6 +2285,7 @@ fn static_fixed_solver_rejects_nan_wavelength() {
     wavelengths_m.insert(used_sats[0].clone(), f64::NAN);
     let float_solution = FloatSolution {
         position_m: state.position_m,
+        position_covariance: unit_position_covariance(),
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
