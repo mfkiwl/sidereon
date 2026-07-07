@@ -6,6 +6,13 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Added
 
+- RINEX RTK arc builders as library API: rover and base observations plus
+  ephemeris and base coordinates in, double-differenced carrier-phase arcs
+  built by the library, static float and wide-lane fixed baselines out with
+  covariance and fix status. On the real WTZR/WTZZ station pair the fixed
+  baseline lands within 2.8 mm of the published ITRF antenna-reference-point
+  baseline (float: 8.3 mm).
+
 - SSR and Galileo HAS corrections now drive the PPP solve: an SSR-corrected
   ephemeris provider applies orbit and clock corrections over broadcast
   ephemeris with strict IODE matching, update-interval staleness handling, and
