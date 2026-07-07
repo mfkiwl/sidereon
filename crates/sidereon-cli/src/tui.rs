@@ -17,11 +17,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::{Frame, Terminal};
-use sidereon::constants::C_M_S;
+use sidereon::constants::F_L1_HZ;
 use sidereon::ephemeris::BroadcastEphemeris;
-use sidereon::positioning::{EphemerisSource, ReceiverSolution, SolveInputs, SolvePolicy};
+use sidereon::observables::{predict, ObservableEphemerisSource, PredictOptions};
+use sidereon::positioning::{ReceiverSolution, SolveInputs, SolvePolicy};
 use sidereon::rinex::observations::ObsEpochTime;
-use sidereon::{GnssSatelliteId, ItrfPositionM, RinexSppEpochInputs, RinexSppOptions};
+use sidereon::{GnssSatelliteId, RinexSppEpochInputs, RinexSppOptions};
 
 use crate::{format_epoch, rad_to_deg, solution_metrics};
 
@@ -29,6 +30,7 @@ const TICK_RATE: Duration = Duration::from_millis(50);
 const MAX_SPEED: f64 = 1024.0;
 const MIN_SPEED: f64 = 0.25;
 const CONVERGENCE_SAMPLES: usize = 48;
+const MAX_ADVANCE_FRAMES_PER_TICK: usize = 8;
 
 pub(crate) fn run_tui(obs_path: &Path, nav_path: &Path, speed: f64, paused: bool) -> Result<()> {
     let mut driver = ReplayDriver::from_files(obs_path, nav_path, speed, paused)?;
@@ -343,7 +345,10 @@ impl ReplayTimeline {
             emitted.push(0);
         }
         self.accumulated_replay_s += wall_delta.as_secs_f64() * self.speed;
-        while let Some(current) = self.current_index {
+        while emitted.len() < MAX_ADVANCE_FRAMES_PER_TICK {
+            let Some(current) = self.current_index else {
+                break;
+            };
             let next = current + 1;
             if next >= self.epoch_times_s.len() {
                 break;
@@ -481,9 +486,9 @@ impl TuiState {
             ecef[1] - origin.ecef[1],
             ecef[2] - origin.ecef[2],
         ];
-        let (east, north) = enu_horizontal_axes(origin.geo);
-        let east_m = dot(delta, east);
-        let north_m = dot(delta, north);
+        let enu = sidereon::dop::ecef_to_enu_rotation(origin.geo.lat_rad, origin.geo.lon_rad);
+        let east_m = dot(delta, enu[0]);
+        let north_m = dot(delta, enu[1]);
         let horizontal_m = east_m.hypot(north_m);
         self.latest_horizontal_m = Some(horizontal_m);
         if self.convergence_m.len() == CONVERGENCE_SAMPLES {
@@ -545,7 +550,7 @@ pub(crate) struct SatelliteSnapshot {
 }
 
 fn satellite_snapshots(
-    source: &dyn EphemerisSource,
+    source: &dyn ObservableEphemerisSource,
     inputs: &SolveInputs,
     solution: Option<&ReceiverSolution>,
 ) -> Vec<SatelliteSnapshot> {
@@ -564,15 +569,20 @@ fn satellite_snapshots(
         .observations
         .iter()
         .map(|observation| {
-            let transmit_time_s = inputs.t_rx_j2000_s - observation.pseudorange_m / C_M_S;
-            let sat_ecef = source
-                .position_clock_at_j2000_s(observation.satellite_id, transmit_time_s)
-                .map(|(position, _clock_s)| position);
-            let (azimuth_deg, elevation_deg) = sat_ecef
-                .and_then(|sat_ecef| look_angles_deg(receiver_ecef, sat_ecef))
-                .map_or((None, None), |angles| {
-                    (Some(angles.azimuth_deg), Some(angles.elevation_deg))
-                });
+            let (azimuth_deg, elevation_deg) = predict(
+                source,
+                observation.satellite_id,
+                receiver_ecef,
+                inputs.t_rx_j2000_s,
+                PredictOptions {
+                    carrier_hz: F_L1_HZ,
+                    light_time: true,
+                    sagnac: true,
+                },
+            )
+            .map_or((None, None), |prediction| {
+                (Some(prediction.azimuth_deg), Some(prediction.elevation_deg))
+            });
             SatelliteSnapshot {
                 id: observation.satellite_id.to_string(),
                 elevation_deg,
@@ -581,56 +591,6 @@ fn satellite_snapshots(
             }
         })
         .collect()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LookAngles {
-    azimuth_deg: f64,
-    elevation_deg: f64,
-}
-
-fn look_angles_deg(receiver_ecef_m: [f64; 3], sat_ecef_m: [f64; 3]) -> Option<LookAngles> {
-    let receiver =
-        ItrfPositionM::new(receiver_ecef_m[0], receiver_ecef_m[1], receiver_ecef_m[2]).ok()?;
-    let geo = sidereon::itrf_to_geodetic(receiver).ok()?;
-    let line = [
-        sat_ecef_m[0] - receiver_ecef_m[0],
-        sat_ecef_m[1] - receiver_ecef_m[1],
-        sat_ecef_m[2] - receiver_ecef_m[2],
-    ];
-    let norm = dot(line, line).sqrt();
-    if !norm.is_finite() || norm <= 0.0 {
-        return None;
-    }
-    let los = [line[0] / norm, line[1] / norm, line[2] / norm];
-    let (east, north, up) = enu_axes(geo);
-    let east_component = dot(los, east);
-    let north_component = dot(los, north);
-    let up_component = dot(los, up).clamp(-1.0, 1.0);
-    let mut azimuth_rad = east_component.atan2(north_component);
-    if azimuth_rad < 0.0 {
-        azimuth_rad += 2.0 * std::f64::consts::PI;
-    }
-    Some(LookAngles {
-        azimuth_deg: rad_to_deg(azimuth_rad),
-        elevation_deg: rad_to_deg(up_component.asin()),
-    })
-}
-
-fn enu_axes(geo: sidereon::Wgs84Geodetic) -> ([f64; 3], [f64; 3], [f64; 3]) {
-    let sin_lat = geo.lat_rad.sin();
-    let cos_lat = geo.lat_rad.cos();
-    let sin_lon = geo.lon_rad.sin();
-    let cos_lon = geo.lon_rad.cos();
-    let east = [-sin_lon, cos_lon, 0.0];
-    let north = [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat];
-    let up = [cos_lat * cos_lon, cos_lat * sin_lon, sin_lat];
-    (east, north, up)
-}
-
-fn enu_horizontal_axes(geo: sidereon::Wgs84Geodetic) -> ([f64; 3], [f64; 3]) {
-    let (east, north, _up) = enu_axes(geo);
-    (east, north)
 }
 
 fn dot(left: [f64; 3], right: [f64; 3]) -> f64 {
@@ -918,6 +878,21 @@ mod tests {
         assert_eq!(timeline.step_backward(), None);
         timeline.speed_down();
         assert_eq!(timeline.speed(), 2.0);
+    }
+
+    #[test]
+    fn timeline_caps_replay_work_per_tick() {
+        let epochs = (0..64).map(|index| index as f64).collect();
+        let mut timeline = ReplayTimeline::new(epochs, MAX_SPEED, false).expect("timeline");
+
+        let first = timeline.advance_wall_time(Duration::from_secs(100));
+        assert_eq!(first.len(), MAX_ADVANCE_FRAMES_PER_TICK);
+        assert_eq!(first[0], 0);
+        assert_eq!(first[MAX_ADVANCE_FRAMES_PER_TICK - 1], 7);
+
+        let second = timeline.advance_wall_time(Duration::from_secs(0));
+        assert_eq!(second.len(), MAX_ADVANCE_FRAMES_PER_TICK);
+        assert_eq!(second[0], 8);
     }
 
     #[test]

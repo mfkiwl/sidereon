@@ -32,7 +32,7 @@ use super::state::{
     ERROR_STATE_DIMENSION_15, ERROR_STATE_DIMENSION_21, ERROR_VELOCITY_INDEX,
 };
 use super::tight::{TightCouplingConfig, TightFusionState};
-use super::timesync::TimeSyncHistory;
+use super::timesync::{StationarityDetectorSnapshotSample, TimeSyncHistory};
 use super::ukf::{ukf_correct_closed_loop, UkfUpdateOptions};
 
 const LOOSE_MIN_SATELLITES: usize = 4;
@@ -174,8 +174,6 @@ pub struct LooseCouplingConfig {
     pub stationary_updates: Option<StationaryUpdateConfig>,
     /// Optional wheeled-vehicle lateral and vertical velocity constraints.
     pub non_holonomic: Option<NonHolonomicConstraintConfig>,
-    /// Optional near-real-time outage endpoint matching configuration.
-    pub velocity_matching: Option<VelocityMatchingConfig>,
 }
 
 impl Default for LooseCouplingConfig {
@@ -188,7 +186,6 @@ impl Default for LooseCouplingConfig {
             prediction_adaptation: None,
             stationary_updates: None,
             non_holonomic: None,
-            velocity_matching: None,
         }
     }
 }
@@ -212,9 +209,6 @@ impl LooseCouplingConfig {
         }
         if let Some(non_holonomic) = self.non_holonomic {
             non_holonomic.validate()?;
-        }
-        if let Some(velocity_matching) = self.velocity_matching {
-            velocity_matching.validate()?;
         }
         Ok(())
     }
@@ -567,15 +561,11 @@ pub struct InertialFilter {
     pub(super) state: InsFilterState,
     pub(super) config: InertialFilterConfig,
     pub(super) last_body_rate_wrt_ecef_rps: [f64; 3],
-    stationarity_window: VecDeque<StationarityDetectorSample>,
+    pub(super) stationarity_window: VecDeque<StationarityDetectorSnapshotSample>,
+    pub(super) last_stationary_update_t_j2000_s: Option<f64>,
+    pub(super) last_non_holonomic_update_t_j2000_s: Option<f64>,
     pub(super) time_sync: TimeSyncHistory,
     pub(super) tight: TightFusionState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct StationarityDetectorSample {
-    specific_force_norm_error_mps2: f64,
-    body_rate_wrt_ecef_norm_rps: f64,
 }
 
 impl InertialFilter {
@@ -599,6 +589,8 @@ impl InertialFilter {
             config,
             last_body_rate_wrt_ecef_rps: [0.0; 3],
             stationarity_window: VecDeque::new(),
+            last_stationary_update_t_j2000_s: None,
+            last_non_holonomic_update_t_j2000_s: None,
             time_sync,
             tight,
         })
@@ -734,7 +726,7 @@ impl InertialFilter {
             measurement.fix_status,
             self.config.loose.fix_status_weighting,
         )?;
-        self.apply_loose_style_correction(correction)
+        self.apply_loose_style_correction(correction, self.config.loose)
     }
 
     /// Apply a gated zero-velocity and zero-angular-rate update.
@@ -745,13 +737,23 @@ impl InertialFilter {
         if !self.is_stationary(config.detector)? {
             return Ok(None);
         }
+        let update_t_j2000_s = self.state.nominal.t_j2000_s;
+        if self.last_stationary_update_t_j2000_s == Some(update_t_j2000_s) {
+            return Err(invalid_input(
+                "t_j2000_s",
+                "stationary update already applied at this epoch",
+            ));
+        }
         let correction = stationary_correction(
             &self.state,
             self.last_body_rate_wrt_ecef_rps,
             config,
             self.config.imu_to_body_dcm,
         )?;
-        self.apply_loose_style_correction(correction).map(Some)
+        let update =
+            self.apply_loose_style_correction(correction, self.pseudo_measurement_config())?;
+        self.last_stationary_update_t_j2000_s = Some(update_t_j2000_s);
+        Ok(Some(update))
     }
 
     /// Apply a gated wheeled-vehicle non-holonomic constraint update.
@@ -762,15 +764,26 @@ impl InertialFilter {
         if !self.nhc_motion_gate(config)? {
             return Ok(None);
         }
+        let update_t_j2000_s = self.state.nominal.t_j2000_s;
+        if self.last_non_holonomic_update_t_j2000_s == Some(update_t_j2000_s) {
+            return Err(invalid_input(
+                "t_j2000_s",
+                "non-holonomic update already applied at this epoch",
+            ));
+        }
         let correction = non_holonomic_correction(&self.state, config)?;
-        self.apply_loose_style_correction(correction).map(Some)
+        let update =
+            self.apply_loose_style_correction(correction, self.pseudo_measurement_config())?;
+        self.last_non_holonomic_update_t_j2000_s = Some(update_t_j2000_s);
+        Ok(Some(update))
     }
 
     fn apply_loose_style_correction(
         &mut self,
         correction: EkfCorrection,
+        loose_config: LooseCouplingConfig,
     ) -> Result<FusionUpdate, FusionError> {
-        let prepared = prepare_loose_correction(&self.state, correction, self.config.loose)?;
+        let prepared = prepare_loose_correction(&self.state, correction, loose_config)?;
         let rows = prepared.correction.row_count();
         let filter_kind = self.config.filter_kind;
         let ekf_options = self.config.loose.update_options;
@@ -797,13 +810,21 @@ impl InertialFilter {
         Ok(FusionUpdate::from_report(rows, report))
     }
 
+    fn pseudo_measurement_config(&self) -> LooseCouplingConfig {
+        LooseCouplingConfig {
+            measurement_reweighting: None,
+            prediction_adaptation: None,
+            ..self.config.loose
+        }
+    }
+
     fn record_stationarity_sample(
         &mut self,
         specific_force_body_mps2: [f64; 3],
         body_rate_wrt_ecef_rps: [f64; 3],
     ) -> Result<(), FusionError> {
         let gravity_norm_mps2 = norm3(gravity_ecef_mps2(self.state.nominal.position_ecef_m)?);
-        let sample = StationarityDetectorSample {
+        let sample = StationarityDetectorSnapshotSample {
             specific_force_norm_error_mps2: (norm3(specific_force_body_mps2) - gravity_norm_mps2)
                 .abs(),
             body_rate_wrt_ecef_norm_rps: norm3(body_rate_wrt_ecef_rps),
@@ -1105,14 +1126,40 @@ pub struct VelocityMatchedTrajectory {
 /// The input span starts at the last pre-outage state and ends at the
 /// pre-update return-fix state. The first sample keeps zero correction, the
 /// final sample matches the GNSS position and velocity, and interior samples
-/// receive a cubic Hermite endpoint correction.
+/// receive a cubic Hermite endpoint correction. When a caller has already
+/// applied the return fix and wants continuity into the posterior trajectory,
+/// use [`velocity_match_outage_to_state`] with that post-update endpoint.
 pub fn velocity_match_outage(
     states: &[VelocityMatchState],
     first_good_fix: &GnssFixMeasurement,
     config: VelocityMatchingConfig,
 ) -> Result<VelocityMatchedTrajectory, FusionError> {
-    config.validate()?;
     first_good_fix.validate()?;
+    let Some(fix_velocity) = first_good_fix.velocity_ecef_mps else {
+        return Err(invalid_input(
+            "velocity_ecef_mps",
+            "return fix must include velocity",
+        ));
+    };
+    let endpoint = VelocityMatchState::new(
+        first_good_fix.t_j2000_s,
+        first_good_fix.position_ecef_m,
+        fix_velocity,
+    )?;
+    velocity_match_outage_to_state(states, endpoint, config)
+}
+
+/// Blend an outage span to a caller-supplied endpoint state.
+///
+/// Use this when the first good post-outage GNSS fix has already been fused and
+/// continuity should land on the posterior filter state rather than the raw
+/// GNSS position/velocity measurement.
+pub fn velocity_match_outage_to_state(
+    states: &[VelocityMatchState],
+    endpoint: VelocityMatchState,
+    config: VelocityMatchingConfig,
+) -> Result<VelocityMatchedTrajectory, FusionError> {
+    config.validate()?;
     if states.len() < 2 {
         return Err(invalid_input(
             "velocity_match_states",
@@ -1136,18 +1183,17 @@ pub fn velocity_match_outage(
     }
     let first = states[0];
     let last = states[states.len() - 1];
-    if first_good_fix.t_j2000_s != last.t_j2000_s {
+    let endpoint = VelocityMatchState::new(
+        endpoint.t_j2000_s,
+        endpoint.position_ecef_m,
+        endpoint.velocity_ecef_mps,
+    )?;
+    if endpoint.t_j2000_s != last.t_j2000_s {
         return Err(invalid_input(
             "t_j2000_s",
-            "return fix must match the last state epoch",
+            "endpoint state must match the last state epoch",
         ));
     }
-    let Some(fix_velocity) = first_good_fix.velocity_ecef_mps else {
-        return Err(invalid_input(
-            "velocity_ecef_mps",
-            "return fix must include velocity",
-        ));
-    };
     let duration_s = last.t_j2000_s - first.t_j2000_s;
     validate_positive(duration_s, "velocity_match_duration_s")?;
     if duration_s > config.max_outage_duration_s {
@@ -1157,9 +1203,9 @@ pub fn velocity_match_outage(
         ));
     }
 
-    let endpoint_position_correction_ecef_m =
-        sub3(first_good_fix.position_ecef_m, last.position_ecef_m);
-    let endpoint_velocity_correction_ecef_mps = sub3(fix_velocity, last.velocity_ecef_mps);
+    let endpoint_position_correction_ecef_m = sub3(endpoint.position_ecef_m, last.position_ecef_m);
+    let endpoint_velocity_correction_ecef_mps =
+        sub3(endpoint.velocity_ecef_mps, last.velocity_ecef_mps);
     let mut matched = Vec::with_capacity(states.len());
     for state in states {
         let tau = (state.t_j2000_s - first.t_j2000_s) / duration_s;
@@ -2026,6 +2072,55 @@ mod tests {
 
         assert_eq!(robust_update, guarded_update);
         assert_eq!(robust.state(), guarded.state());
+    }
+
+    #[test]
+    fn stationary_pseudo_update_ignores_gnss_robust_options() {
+        let stationary_updates = StationaryUpdateConfig {
+            detector: StationaryDetectorConfig {
+                window_len: 1,
+                max_specific_force_norm_error_mps2: 1.0,
+                max_body_rate_wrt_ecef_norm_rps: 1.0,
+            },
+            zero_velocity_sigma_mps: 1.0,
+            zero_angular_rate_sigma_rps: 1.0,
+        };
+        let plain_config = LooseCouplingConfig {
+            stationary_updates: Some(stationary_updates),
+            ..LooseCouplingConfig::default()
+        };
+        let robust_config = LooseCouplingConfig {
+            measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
+            prediction_adaptation: Some(YangPredictionAdaptiveFactor {
+                threshold: 0.1,
+                outlier_gate_probability: 0.99,
+            }),
+            stationary_updates: Some(stationary_updates),
+            ..LooseCouplingConfig::default()
+        };
+        let mut plain = direct_update_filter(70.0, plain_config);
+        let mut robust = direct_update_filter(70.0, robust_config);
+        for filter in [&mut plain, &mut robust] {
+            filter.state.nominal.velocity_ecef_mps = [50.0, 0.0, 0.0];
+            filter
+                .stationarity_window
+                .push_back(StationarityDetectorSnapshotSample {
+                    specific_force_norm_error_mps2: 0.0,
+                    body_rate_wrt_ecef_norm_rps: 0.0,
+                });
+        }
+
+        let plain_update = plain
+            .update_stationary()
+            .expect("plain stationary update")
+            .expect("plain stationary update applied");
+        let robust_update = robust
+            .update_stationary()
+            .expect("robust stationary update")
+            .expect("robust stationary update applied");
+
+        assert_eq!(plain_update, robust_update);
+        assert_eq!(plain.state(), robust.state());
     }
 
     fn inverted_static_sample(

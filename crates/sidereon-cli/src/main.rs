@@ -27,7 +27,7 @@ mod tui;
 #[command(name = "sidereon")]
 #[command(about = "GNSS file inspection, QC, SPP solving, and covariance metrics")]
 #[command(
-    after_long_help = "JSON output uses stable field names. solve: source, obs, nav, sp3, epochs, summary, errors. qc: obs, lint, qc, parse_error. inspect output is human text with path, type, span, counts, systems, satellites. metrics accepts JSON input through --json-file. tui is an interactive replay monitor for RINEX OBS plus NAV."
+    after_long_help = "JSON output uses stable field names. solve: source, obs, nav, sp3, epochs, summary, errors. qc: obs, lint, qc, parse_error. inspect output is human text with path, type, span, counts, systems, satellites. metrics accepts JSON input through --json-file and emits JSON with --json. tui is an interactive replay monitor for RINEX OBS plus NAV."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -76,6 +76,9 @@ enum Command {
         /// Additional percentile probability for horizontal, vertical, and spherical bounds.
         #[arg(long, default_value_t = 0.95)]
         probability: f64,
+        /// Emit JSON with stable fields for covariance and derived metrics.
+        #[arg(long)]
+        json: bool,
     },
     /// Detect a file type by trying the real parsers.
     Inspect {
@@ -132,7 +135,8 @@ fn run(cli: Cli) -> Result<()> {
             enu_cov,
             json_file,
             probability,
-        } => metrics_command(enu_cov.as_deref(), json_file.as_deref(), probability),
+            json,
+        } => metrics_command(enu_cov.as_deref(), json_file.as_deref(), probability, json),
         Command::Inspect { file } => inspect_command(&file),
         Command::Tui {
             obs,
@@ -163,15 +167,18 @@ fn solve_command(
         let source = RinexSppSource::with_broadcast_context(&sp3, &nav);
         let assembled = spp_inputs_from_rinex_obs(&obs, &source, &options)
             .context("assemble RINEX SPP inputs")?;
-        let inputs: Vec<_> = assembled.iter().map(|epoch| epoch.inputs.clone()).collect();
-        let solved =
-            sidereon::solve_spp_batch_serial(&source, &inputs, true, SolvePolicy::default());
+        let solved = assembled
+            .iter()
+            .map(|epoch| sidereon::solve_spp(&source, &epoch.inputs, true, SolvePolicy::default()))
+            .collect();
         ("sp3".to_string(), assembled, solved)
     } else {
         let assembled =
             spp_inputs_from_rinex_obs(&obs, &nav, &options).context("assemble RINEX SPP inputs")?;
-        let inputs: Vec<_> = assembled.iter().map(|epoch| epoch.inputs.clone()).collect();
-        let solved = sidereon::solve_spp_batch_serial(&nav, &inputs, true, SolvePolicy::default());
+        let solved = assembled
+            .iter()
+            .map(|epoch| sidereon::solve_spp(&nav, &epoch.inputs, true, SolvePolicy::default()))
+            .collect();
         ("broadcast".to_string(), assembled, solved)
     };
 
@@ -206,6 +213,7 @@ fn solve_report(
     let mut errors = Vec::new();
     let mut solved_count = 0usize;
     let mut nsats_total = 0usize;
+    let mut metrics_count = 0usize;
     let mut cep_total = 0.0;
     let mut r95_total = 0.0;
     let mut vertical_total = 0.0;
@@ -215,15 +223,22 @@ fn solve_report(
             Ok(solution) => {
                 solved_count += 1;
                 nsats_total += solution.used_sats.len();
-                let metrics = solution_metrics(&solution)?;
-                cep_total += metrics.cep_m;
-                r95_total += metrics.r95_m;
-                vertical_total += metrics.vertical_95_m;
+                let (metrics, metrics_error) = match solution_metrics(&solution) {
+                    Ok(metrics) => {
+                        metrics_count += 1;
+                        cep_total += metrics.cep_m;
+                        r95_total += metrics.r95_m;
+                        vertical_total += metrics.vertical_95_m;
+                        (Some(metrics), None)
+                    }
+                    Err(error) => (None, Some(error.to_string())),
+                };
                 epochs.push(SolveEpochJson {
                     epoch_index: epoch_inputs.epoch_index,
                     time: format_epoch(epoch_inputs.epoch),
                     solved: true,
                     error: None,
+                    metrics_error,
                     lat_deg: solution.geodetic.map(|geo| rad_to_deg(geo.lat_rad)),
                     lon_deg: solution.geodetic.map(|geo| rad_to_deg(geo.lon_rad)),
                     height_m: solution.geodetic.map(|geo| geo.height_m),
@@ -236,7 +251,7 @@ fn solve_report(
                         .iter()
                         .map(|system| system.to_string())
                         .collect(),
-                    metrics: Some(metrics),
+                    metrics,
                 });
             }
             Err(error) => {
@@ -251,6 +266,7 @@ fn solve_report(
                     time: format_epoch(epoch_inputs.epoch),
                     solved: false,
                     error: Some(message),
+                    metrics_error: None,
                     lat_deg: None,
                     lon_deg: None,
                     height_m: None,
@@ -269,9 +285,9 @@ fn solve_report(
         solved_count,
         failed_count: errors.len(),
         mean_nsats: mean(nsats_total as f64, solved_count),
-        mean_cep_m: mean(cep_total, solved_count),
-        mean_r95_m: mean(r95_total, solved_count),
-        mean_vertical_95_m: mean(vertical_total, solved_count),
+        mean_cep_m: mean(cep_total, metrics_count),
+        mean_r95_m: mean(r95_total, metrics_count),
+        mean_vertical_95_m: mean(vertical_total, metrics_count),
     };
 
     Ok(SolveJson {
@@ -326,6 +342,18 @@ fn print_solve_human(report: &SolveJson) {
                 metrics.r95_m,
                 metrics.vertical_95_m
             );
+        } else if epoch.solved {
+            println!(
+                "{:<20} {:>11.6} {:>12.6} {:>9.2} {:>5} {:>9} {:>9} {:>9}",
+                epoch.time,
+                epoch.lat_deg.unwrap_or(f64::NAN),
+                epoch.lon_deg.unwrap_or(f64::NAN),
+                epoch.height_m.unwrap_or(f64::NAN),
+                epoch.nsats,
+                "ERR",
+                "ERR",
+                "ERR"
+            );
         } else {
             println!(
                 "{:<20} {:>11} {:>12} {:>9} {:>5} {:>9} {:>9} {:>9}",
@@ -357,6 +385,22 @@ fn print_solve_human(report: &SolveJson) {
                 "  epoch {} {}: {}",
                 error.epoch_index, error.time, error.message
             );
+        }
+    }
+    let metrics_errors: Vec<_> = report
+        .epochs
+        .iter()
+        .filter_map(|epoch| {
+            epoch
+                .metrics_error
+                .as_ref()
+                .map(|error| (epoch.epoch_index, epoch.time.as_str(), error))
+        })
+        .collect();
+    if !metrics_errors.is_empty() {
+        println!("metric errors:");
+        for (epoch_index, time, error) in metrics_errors {
+            println!("  epoch {epoch_index} {time}: {error}");
         }
     }
 }
@@ -435,6 +479,7 @@ fn metrics_command(
     enu_cov: Option<&str>,
     json_file: Option<&Path>,
     probability: f64,
+    json: bool,
 ) -> Result<()> {
     let covariance = if let Some(text) = enu_cov {
         parse_covariance_arg(text)?
@@ -454,7 +499,7 @@ fn metrics_command(
     let vertical = vertical_radius_at(covariance[2][2], probability)
         .map_err(|err| anyhow!("compute vertical radius: {err:?}"))?;
 
-    print_metrics_human(
+    let report = MetricsJson::from_parts(
         covariance,
         probability,
         &metrics,
@@ -462,6 +507,18 @@ fn metrics_command(
         vertical,
         spherical,
     );
+    if json {
+        print_json(&report)?;
+    } else {
+        print_metrics_human(
+            covariance,
+            probability,
+            &metrics,
+            horizontal,
+            vertical,
+            spherical,
+        );
+    }
     Ok(())
 }
 
@@ -518,9 +575,9 @@ fn print_metrics_human(
 
 fn inspect_command(path: &Path) -> Result<()> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let text = String::from_utf8(bytes.clone()).ok();
+    let text = std::str::from_utf8(&bytes).ok();
 
-    if let Some(text) = &text {
+    if let Some(text) = text {
         if let Ok(obs) = parse_rinex_obs(text) {
             print_inspect(InspectReport::obs(path, &obs));
             return Ok(());
@@ -534,14 +591,16 @@ fn inspect_command(path: &Path) -> Result<()> {
         print_inspect(InspectReport::sp3(path, &sp3));
         return Ok(());
     }
-    if let Some(text) = &text {
-        if let Ok(antex) = parse_antex(text) {
-            print_inspect(InspectReport::antex(path, &antex));
-            return Ok(());
-        }
+    if let Some(text) = text {
         if let Some(report) = InspectReport::tle(path, text) {
             print_inspect(report);
             return Ok(());
+        }
+        if let Ok(antex) = parse_antex(text) {
+            if !antex.antennas.is_empty() {
+                print_inspect(InspectReport::antex(path, &antex));
+                return Ok(());
+            }
         }
     }
 
@@ -743,6 +802,7 @@ struct SolveEpochJson {
     time: String,
     solved: bool,
     error: Option<String>,
+    metrics_error: Option<String>,
     lat_deg: Option<f64>,
     lon_deg: Option<f64>,
     height_m: Option<f64>,
@@ -781,6 +841,62 @@ struct SolveErrorJson {
     epoch_index: usize,
     time: String,
     message: String,
+}
+
+#[derive(Serialize)]
+struct MetricsJson {
+    enu_covariance_m2: [[f64; 3]; 3],
+    probability: f64,
+    sigma_e_m: f64,
+    sigma_n_m: f64,
+    sigma_u_m: f64,
+    ellipse_semi_major_m: f64,
+    ellipse_semi_minor_m: f64,
+    ellipse_orientation_deg: f64,
+    cep_m: f64,
+    r95_m: f64,
+    r99_m: f64,
+    drms_m: f64,
+    two_drms_m: f64,
+    vep_m: f64,
+    sep_m: f64,
+    mrse_m: f64,
+    horizontal_radius_m: f64,
+    vertical_radius_m: f64,
+    spherical_radius_m: f64,
+}
+
+impl MetricsJson {
+    fn from_parts(
+        enu_covariance_m2: [[f64; 3]; 3],
+        probability: f64,
+        metrics: &PositionErrorMetrics,
+        horizontal: PercentileRadius,
+        vertical: f64,
+        spherical: PercentileRadius,
+    ) -> Self {
+        Self {
+            enu_covariance_m2,
+            probability,
+            sigma_e_m: metrics.sigma_e_m,
+            sigma_n_m: metrics.sigma_n_m,
+            sigma_u_m: metrics.sigma_u_m,
+            ellipse_semi_major_m: metrics.ellipse.semi_major_m,
+            ellipse_semi_minor_m: metrics.ellipse.semi_minor_m,
+            ellipse_orientation_deg: rad_to_deg(metrics.ellipse.orientation_rad),
+            cep_m: metrics.cep_m.radius_m,
+            r95_m: metrics.r95_m.radius_m,
+            r99_m: metrics.r99_m.radius_m,
+            drms_m: metrics.drms_m,
+            two_drms_m: metrics.two_drms_m,
+            vep_m: metrics.vep_m,
+            sep_m: metrics.sep_m.radius_m,
+            mrse_m: metrics.mrse_m,
+            horizontal_radius_m: horizontal.radius_m,
+            vertical_radius_m: vertical,
+            spherical_radius_m: spherical.radius_m,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -940,19 +1056,36 @@ fn obs_span(obs: &ObservationFile) -> Option<String> {
 }
 
 fn nav_span(nav: &BroadcastEphemeris) -> Option<String> {
-    let mut first: Option<f64> = None;
-    let mut last: Option<f64> = None;
+    let mut native_first: Option<f64> = None;
+    let mut native_last: Option<f64> = None;
     for record in nav.records() {
         update_min_max(
-            &mut first,
-            &mut last,
+            &mut native_first,
+            &mut native_last,
             f64::from(record.toe.week) * 604_800.0 + record.toe.tow_s,
         );
     }
-    for record in nav.glonass_records() {
-        update_min_max(&mut first, &mut last, record.toe_utc_j2000_s);
+    let mut spans = Vec::new();
+    if let Some(span) = span_from_numbers(native_first, native_last, "native_week_s") {
+        spans.push(span);
     }
-    span_from_numbers(first, last, "native_s")
+    let mut glonass_first: Option<f64> = None;
+    let mut glonass_last: Option<f64> = None;
+    for record in nav.glonass_records() {
+        update_min_max(
+            &mut glonass_first,
+            &mut glonass_last,
+            record.toe_utc_j2000_s,
+        );
+    }
+    if let Some(span) = span_from_numbers(glonass_first, glonass_last, "glonass_j2000_s") {
+        spans.push(span);
+    }
+    if spans.is_empty() {
+        None
+    } else {
+        Some(spans.join("; "))
+    }
 }
 
 fn span_from_numbers(first: Option<f64>, last: Option<f64>, unit: &str) -> Option<String> {

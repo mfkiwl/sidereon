@@ -214,10 +214,6 @@ impl FusionRtsHistoryBuilder {
         }
         FusionRtsHistory::new(self.epochs)
     }
-
-    fn validate_update_ready(&self) -> Result<(), FusionError> {
-        Ok(())
-    }
 }
 
 fn matmul_square_transition(
@@ -385,7 +381,6 @@ impl InertialFilter {
         measurement: &GnssFixMeasurement,
         history: &mut FusionRtsHistoryBuilder,
     ) -> Result<FusionUpdate, FusionError> {
-        history.validate_update_ready()?;
         let predicted = self.snapshot();
         let mut working_filter = self.clone();
         let mut working_history = history.clone();
@@ -402,7 +397,6 @@ impl InertialFilter {
         &mut self,
         history: &mut FusionRtsHistoryBuilder,
     ) -> Result<Option<FusionUpdate>, FusionError> {
-        history.validate_update_ready()?;
         let predicted = self.snapshot();
         let mut working_filter = self.clone();
         let mut working_history = history.clone();
@@ -421,7 +415,6 @@ impl InertialFilter {
         &mut self,
         history: &mut FusionRtsHistoryBuilder,
     ) -> Result<Option<FusionUpdate>, FusionError> {
-        history.validate_update_ready()?;
         let predicted = self.snapshot();
         let mut working_filter = self.clone();
         let mut working_history = history.clone();
@@ -442,7 +435,6 @@ impl InertialFilter {
         epoch: &TightGnssEpoch,
         history: &mut FusionRtsHistoryBuilder,
     ) -> Result<FusionUpdate, FusionError> {
-        history.validate_update_ready()?;
         let predicted = self.snapshot();
         let mut working_filter = self.clone();
         let mut working_history = history.clone();

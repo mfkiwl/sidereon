@@ -15,7 +15,7 @@ use sidereon_core::fusion::{
     ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15, ERROR_VELOCITY_INDEX,
 };
 use sidereon_core::inertial::{
-    simulate_imu_samples_from_increments, true_imu_increment_between, ImuBias, ImuGrade,
+    simulate_imu_samples_from_increments, true_imu_increment_between, ImuBias, ImuGrade, ImuSample,
     ImuSimulationOptions, ImuSpec, NavState,
 };
 use sidereon_core::positioning::{
@@ -358,6 +358,172 @@ fn non_holonomic_constraint_removes_lateral_velocity_error() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
+#[allow(clippy::needless_range_loop)]
+fn stationary_update_rejects_short_windows_and_nonstationary_samples() {
+    let truth = static_truth(3, 1.0);
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
+    let mut config = LooseCouplingConfig::default();
+    config.stationary_updates = Some(StationaryUpdateConfig {
+        detector: StationaryDetectorConfig {
+            window_len: 3,
+            max_specific_force_norm_error_mps2: 0.08,
+            max_body_rate_wrt_ecef_norm_rps: 0.003,
+        },
+        zero_velocity_sigma_mps: 0.015,
+        zero_angular_rate_sigma_rps: 0.00008,
+    });
+    let mut filter = direct_filter(truth[0], spec, initial_covariance_diagonal(), config);
+    let stationary_force_mps2 = [9.80665, 0.0, 0.0];
+    for step in 1..=2 {
+        filter
+            .propagate(ImuSample::rate(
+                truth[step].t_j2000_s,
+                stationary_force_mps2,
+                [0.0; 3],
+            ))
+            .expect("short-window propagate");
+        assert!(
+            filter
+                .update_stationary()
+                .expect("short-window stationary update")
+                .is_none(),
+            "stationary update must wait for a full detector window"
+        );
+    }
+    filter
+        .propagate(ImuSample::rate(
+            truth[3].t_j2000_s,
+            [20.0, 0.0, 0.0],
+            [0.02, 0.0, 0.0],
+        ))
+        .expect("moving propagate");
+    assert!(
+        filter
+            .update_stationary()
+            .expect("moving stationary update")
+            .is_none(),
+        "stationary update must reject high force/rate samples"
+    );
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn stationary_update_rejects_duplicate_epoch_application() {
+    let truth = static_truth(3, 1.0);
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
+    let mut config = LooseCouplingConfig::default();
+    config.stationary_updates = Some(StationaryUpdateConfig {
+        detector: StationaryDetectorConfig {
+            window_len: 3,
+            max_specific_force_norm_error_mps2: 0.08,
+            max_body_rate_wrt_ecef_norm_rps: 0.003,
+        },
+        zero_velocity_sigma_mps: 0.015,
+        zero_angular_rate_sigma_rps: 0.00008,
+    });
+    let mut filter = direct_filter(truth[0], spec, initial_covariance_diagonal(), config);
+    for state in truth.iter().take(4).skip(1) {
+        filter
+            .propagate(ImuSample::rate(
+                state.t_j2000_s,
+                [9.80665, 0.0, 0.0],
+                [0.0; 3],
+            ))
+            .expect("stationary propagate");
+    }
+
+    assert!(filter
+        .update_stationary()
+        .expect("first stationary update")
+        .is_some());
+    assert!(
+        filter.update_stationary().is_err(),
+        "stationary update must reject a second application at the same epoch"
+    );
+}
+
+#[test]
+fn non_holonomic_constraint_rejects_sub_min_speed_and_high_rate() {
+    let truth = straight_vehicle_truth(1, 1.0);
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
+    let config = LooseCouplingConfig {
+        non_holonomic: Some(NonHolonomicConstraintConfig {
+            lateral_velocity_sigma_mps: 0.03,
+            vertical_velocity_sigma_mps: 0.03,
+            min_speed_mps: 2.0,
+            max_body_rate_wrt_ecef_norm_rps: 0.01,
+        }),
+        ..LooseCouplingConfig::default()
+    };
+    let mut slow_nominal = truth[0];
+    slow_nominal.velocity_ecef_mps = [0.5, 0.0, 0.0];
+    let mut slow_filter = direct_filter(slow_nominal, spec, initial_covariance_diagonal(), config);
+    slow_filter
+        .propagate(ImuSample::rate(
+            truth[1].t_j2000_s,
+            [9.80665, 0.0, 0.0],
+            [0.0; 3],
+        ))
+        .expect("slow propagate");
+    assert!(
+        slow_filter
+            .update_non_holonomic()
+            .expect("slow NHC update")
+            .is_none(),
+        "NHC must reject speeds below the configured gate"
+    );
+
+    let mut high_rate_filter = direct_filter(truth[0], spec, initial_covariance_diagonal(), config);
+    high_rate_filter
+        .propagate(ImuSample::rate(
+            truth[1].t_j2000_s,
+            [9.80665, 0.0, 0.0],
+            [0.02, 0.0, 0.0],
+        ))
+        .expect("high-rate propagate");
+    assert!(
+        high_rate_filter
+            .update_non_holonomic()
+            .expect("high-rate NHC update")
+            .is_none(),
+        "NHC must reject body rates above the configured gate"
+    );
+}
+
+#[test]
+fn non_holonomic_constraint_rejects_duplicate_epoch_application() {
+    let truth = straight_vehicle_truth(1, 1.0);
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
+    let config = LooseCouplingConfig {
+        non_holonomic: Some(NonHolonomicConstraintConfig {
+            lateral_velocity_sigma_mps: 0.03,
+            vertical_velocity_sigma_mps: 0.03,
+            min_speed_mps: 2.0,
+            max_body_rate_wrt_ecef_norm_rps: 0.01,
+        }),
+        ..LooseCouplingConfig::default()
+    };
+    let mut filter = direct_filter(truth[0], spec, initial_covariance_diagonal(), config);
+    filter
+        .propagate(ImuSample::rate(
+            truth[1].t_j2000_s,
+            [9.80665, 0.0, 0.0],
+            [0.0; 3],
+        ))
+        .expect("NHC propagate");
+
+    assert!(filter
+        .update_non_holonomic()
+        .expect("first NHC update")
+        .is_some());
+    assert!(
+        filter.update_non_holonomic().is_err(),
+        "NHC must reject a second application at the same epoch"
+    );
+}
+
+#[test]
 fn velocity_matching_reduces_outage_peak_error_and_keeps_span_continuous() {
     let scenario = field_scenario();
     let simulated = simulate_scenario(&scenario).expect("simulate scenario");
@@ -430,6 +596,39 @@ fn velocity_matching_reduces_outage_peak_error_and_keeps_span_continuous() {
 }
 
 #[test]
+fn velocity_matching_can_land_on_posterior_endpoint_state() {
+    let states = [
+        VelocityMatchState::new(0.0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]).expect("state 0"),
+        VelocityMatchState::new(1.0, [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]).expect("state 1"),
+        VelocityMatchState::new(2.0, [2.0, 0.0, 0.0], [1.0, 0.0, 0.0]).expect("state 2"),
+    ];
+    let endpoint =
+        VelocityMatchState::new(2.0, [2.4, -0.2, 0.1], [0.7, 0.3, -0.1]).expect("endpoint");
+
+    let matched = sidereon_core::fusion::velocity_match_outage_to_state(
+        &states,
+        endpoint,
+        VelocityMatchingConfig {
+            max_outage_duration_s: 5.0,
+        },
+    )
+    .expect("velocity match to state");
+
+    assert_eq!(matched.states[0], states[0]);
+    assert_eq!(matched.states[2], endpoint);
+    assert_vec3_close(
+        matched.endpoint_position_correction_ecef_m,
+        [0.4, -0.2, 0.1],
+        1.0e-15,
+    );
+    assert_vec3_close(
+        matched.endpoint_velocity_correction_ecef_mps,
+        [-0.3, 0.3, -0.1],
+        1.0e-15,
+    );
+}
+
+#[test]
 fn fix_status_weighting_inflates_float_covariance_by_configured_sigma() {
     let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
     let nominal =
@@ -475,6 +674,7 @@ fn fix_status_weighting_inflates_float_covariance_by_configured_sigma() {
 
 #[test]
 fn field_mode_defaults_keep_existing_loose_fixture_bits() {
+    const EXPECTED_DEFAULT_HASH: u64 = 0x174a_b3c7_0087_c76c;
     let scenario = field_scenario();
     let simulated = simulate_scenario(&scenario).expect("simulate scenario");
     let source = source_from_scenario(&scenario);
@@ -494,7 +694,6 @@ fn field_mode_defaults_keep_existing_loose_fixture_bits() {
                 fix_status_weighting: GnssFixStatusWeighting::default(),
                 stationary_updates: None,
                 non_holonomic: None,
-                velocity_matching: None,
                 measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
                 prediction_adaptation: Some(YangPredictionAdaptiveFactor::standard()),
                 ..LooseCouplingConfig::default()
@@ -502,9 +701,12 @@ fn field_mode_defaults_keep_existing_loose_fixture_bits() {
             InertialFilter::with_config(state, config).expect("filter")
         });
 
-    assert_eq!(baseline.positions, explicit_defaulted.positions);
-    assert_eq!(baseline.velocities, explicit_defaulted.velocities);
-    assert_eq!(baseline.covariances, explicit_defaulted.covariances);
+    let default_hash = fusion_run_bits_hash(&baseline);
+    assert_eq!(
+        default_hash, EXPECTED_DEFAULT_HASH,
+        "default fixture hash {default_hash:#018x}"
+    );
+    assert_eq!(default_hash, fusion_run_bits_hash(&explicit_defaulted));
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +723,44 @@ struct FusionRun {
     velocities: Vec<[f64; 3]>,
     covariances: Vec<Vec<Vec<f64>>>,
     history: Option<sidereon_core::fusion::FusionRtsHistory>,
+}
+
+fn fusion_run_bits_hash(run: &FusionRun) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    hash_usize(&mut hash, run.positions.len());
+    for position in &run.positions {
+        for value in position {
+            hash_u64(&mut hash, value.to_bits());
+        }
+    }
+    hash_usize(&mut hash, run.velocities.len());
+    for velocity in &run.velocities {
+        for value in velocity {
+            hash_u64(&mut hash, value.to_bits());
+        }
+    }
+    hash_usize(&mut hash, run.covariances.len());
+    for covariance in &run.covariances {
+        hash_usize(&mut hash, covariance.len());
+        for row in covariance {
+            hash_usize(&mut hash, row.len());
+            for value in row {
+                hash_u64(&mut hash, value.to_bits());
+            }
+        }
+    }
+    hash
+}
+
+fn hash_usize(hash: &mut u64, value: usize) {
+    hash_u64(hash, value as u64);
+}
+
+fn hash_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
 }
 
 struct SplitMix64 {
@@ -1257,6 +1497,18 @@ where
 
 fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
     norm3(sub3(a, b))
+}
+
+fn assert_vec3_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64) {
+    for axis in 0..3 {
+        assert!(
+            (actual[axis] - expected[axis]).abs() <= tolerance,
+            "axis {axis}: actual {:.17e}, expected {:.17e}, tolerance {:.17e}",
+            actual[axis],
+            expected[axis],
+            tolerance
+        );
+    }
 }
 
 fn outlier_epoch_count(epoch_count: usize) -> usize {

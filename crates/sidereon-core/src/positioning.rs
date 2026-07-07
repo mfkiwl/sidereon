@@ -27,9 +27,9 @@ pub use crate::static_positioning::{
 pub use crate::static_reference_station::{
     solve_static_reference_station_rinex, StaticReferenceCarrierRinexOptions,
     StaticReferenceCarrierSolution, StaticReferenceCodeSolution, StaticReferenceEpochDiagnostic,
-    StaticReferenceFixStatus, StaticReferenceModeReport, StaticReferenceModeStatus,
-    StaticReferenceStationCovariance, StaticReferenceStationError, StaticReferenceStationMode,
-    StaticReferenceStationRinexOptions, StaticReferenceStationSolution,
+    StaticReferenceFixStatus, StaticReferenceModeError, StaticReferenceModeReport,
+    StaticReferenceModeStatus, StaticReferenceStationCovariance, StaticReferenceStationError,
+    StaticReferenceStationMode, StaticReferenceStationRinexOptions, StaticReferenceStationSolution,
 };
 use crate::{astro::time, Error as CoreError, GnssSatelliteId};
 

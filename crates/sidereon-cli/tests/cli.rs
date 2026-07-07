@@ -1,5 +1,7 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -23,6 +25,19 @@ fn run(args: &[&str]) -> Output {
         .expect("run sidereon binary")
 }
 
+fn temp_text_file(name: &str, text: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "sidereon-cli-test-{}-{nonce}-{name}",
+        std::process::id()
+    ));
+    fs::write(&path, text).expect("write temp file");
+    path
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("stdout utf8")
 }
@@ -31,19 +46,48 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr utf8")
 }
 
+fn assert_close(actual: f64, expected: f64, tolerance: f64, label: &str) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{label}: actual {actual}, expected {expected}, tolerance {tolerance}"
+    );
+}
+
 #[test]
-fn metrics_prints_expected_bounds() {
-    let output = run(&["metrics", "--enu-cov", "4,0,0,0,9,0,0,0,16"]);
+fn metrics_json_reports_expected_numeric_bounds() {
+    let output = run(&["metrics", "--enu-cov", "4,0,0,0,9,0,0,0,16", "--json"]);
     assert!(
         output.status.success(),
         "status {:?}\nstderr:\n{}",
         output.status.code(),
         stderr(&output)
     );
-    let stdout = stdout(&output);
-    assert!(stdout.contains("CEP"));
-    assert!(stdout.contains("R95"));
-    assert!(stdout.contains("V(0.950)"));
+    let json: Value = serde_json::from_slice(&output.stdout).expect("metrics JSON");
+    assert_eq!(json["enu_covariance_m2"][0][0].as_f64(), Some(4.0));
+    assert_eq!(json["enu_covariance_m2"][1][1].as_f64(), Some(9.0));
+    assert_eq!(json["enu_covariance_m2"][2][2].as_f64(), Some(16.0));
+    assert_eq!(json["sigma_e_m"].as_f64(), Some(2.0));
+    assert_eq!(json["sigma_n_m"].as_f64(), Some(3.0));
+    assert_eq!(json["sigma_u_m"].as_f64(), Some(4.0));
+    assert_eq!(json["ellipse_orientation_deg"].as_f64(), Some(90.0));
+    assert_close(
+        json["cep_m"].as_f64().expect("CEP"),
+        2.9263950341693947,
+        1.0e-12,
+        "CEP",
+    );
+    assert_close(
+        json["r95_m"].as_f64().expect("R95"),
+        6.366519799238128,
+        1.0e-12,
+        "R95",
+    );
+    assert_close(
+        json["vertical_radius_m"].as_f64().expect("vertical radius"),
+        7.839855938160215,
+        1.0e-12,
+        "vertical radius",
+    );
 }
 
 #[test]
@@ -61,6 +105,61 @@ fn inspect_observation_fixture_reports_structure() {
     assert!(stdout.contains("epochs: 2"));
     assert!(stdout.contains("satellites:"));
     assert!(stdout.contains("G05"));
+}
+
+#[test]
+fn inspect_tle_fixture_is_not_misclassified_as_antex() {
+    let tle = fixture(&["celestrak", "stations.tle"]);
+    let output = run(&["inspect", tle.to_str().expect("fixture path utf8")]);
+    assert!(
+        output.status.success(),
+        "status {:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr(&output)
+    );
+    let stdout = stdout(&output);
+    assert!(stdout.contains("type: TLE"), "{stdout}");
+    assert!(!stdout.contains("type: ANTEX"), "{stdout}");
+    assert!(stdout.contains("tle_pairs:"), "{stdout}");
+}
+
+#[test]
+fn inspect_empty_and_garbage_text_are_unrecognized() {
+    for (name, text) in [("empty.txt", ""), ("garbage.txt", "not a gnss file\n")] {
+        let path = temp_text_file(name, text);
+        let output = run(&["inspect", path.to_str().expect("temp path utf8")]);
+        assert!(
+            !output.status.success(),
+            "{name} should not inspect successfully\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("unrecognized file type"),
+            "{name} stderr:\n{}",
+            stderr(&output)
+        );
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[test]
+fn inspect_nav_reports_compatible_time_bases_separately() {
+    let nav = fixture(&["nav", "ESBC00DNK_R_20201770000_01D_MN.rnx"]);
+    let output = run(&["inspect", nav.to_str().expect("fixture path utf8")]);
+    assert!(
+        output.status.success(),
+        "status {:?}\nstderr:\n{}",
+        output.status.code(),
+        stderr(&output)
+    );
+    let stdout = stdout(&output);
+    assert!(stdout.contains("type: RINEX NAV"), "{stdout}");
+    assert!(stdout.contains("native_week_s"), "{stdout}");
+    if !stdout.contains("glonass_records: 0") {
+        assert!(stdout.contains("glonass_j2000_s"), "{stdout}");
+    }
+    assert!(!stdout.contains("native_s"), "{stdout}");
 }
 
 #[test]

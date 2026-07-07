@@ -328,7 +328,10 @@ fn enu_rotation(
 }
 
 /// ECEF -> ENU rotation matrix at geodetic latitude/longitude (radians).
-pub(crate) fn ecef_to_enu_rotation(lat_rad: f64, lon_rad: f64) -> [[f64; 3]; 3] {
+///
+/// Rows are `[east; north; up]` and match RTKLIB's geodetic-normal ENU
+/// convention used by the DOP and covariance helpers.
+pub fn ecef_to_enu_rotation(lat_rad: f64, lon_rad: f64) -> [[f64; 3]; 3] {
     let sphi = lat_rad.sin();
     let cphi = lat_rad.cos();
     let slam = lon_rad.sin();

@@ -46,6 +46,16 @@ pub enum StaticReferenceFixStatus {
     CarrierFixed,
 }
 
+impl From<StaticReferenceFixStatus> for crate::fusion::GnssFixStatus {
+    fn from(value: StaticReferenceFixStatus) -> Self {
+        match value {
+            StaticReferenceFixStatus::CodeDgnss => Self::Single,
+            StaticReferenceFixStatus::CarrierFloat => Self::Float,
+            StaticReferenceFixStatus::CarrierFixed => Self::Fixed,
+        }
+    }
+}
+
 /// Attempt status for one mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticReferenceModeStatus {
@@ -96,9 +106,94 @@ pub struct StaticReferenceModeReport {
     pub skipped_epochs: usize,
     /// Measurement rows used by the final solve, when known.
     pub used_measurements: usize,
-    /// Failure text, when the mode failed.
-    pub error: Option<String>,
+    /// Failure detail, when the mode failed.
+    pub error: Option<StaticReferenceModeError>,
 }
+
+/// Typed failure detail for one attempted static reference-station mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StaticReferenceModeError {
+    /// RINEX/SPP input assembly failed before mode-specific solving.
+    RinexAssembly {
+        /// Observation side being assembled.
+        side: &'static str,
+        /// Source error text.
+        reason: String,
+    },
+    /// Code-DGNSS reference and rover assemblies had no epoch in common.
+    NoMatchedCodeEpochs,
+    /// Code-DGNSS correction or single-epoch solve failed.
+    CodeDgnss {
+        /// Source error text.
+        reason: String,
+    },
+    /// Multi-epoch static code solve failed.
+    StaticSolve {
+        /// Source error text.
+        reason: String,
+    },
+    /// Carrier RTK arc construction failed.
+    CarrierArc {
+        /// Source error text.
+        reason: String,
+    },
+    /// Carrier static RTK solve failed.
+    CarrierSolve {
+        /// Source error text.
+        reason: String,
+    },
+    /// Frame, coordinate, or covariance conversion failed.
+    Frame {
+        /// Conversion field.
+        field: &'static str,
+        /// Source error text.
+        reason: String,
+    },
+    /// Corrected code observations could not be applied or converted.
+    CorrectedObservation {
+        /// Source error text.
+        reason: String,
+    },
+    /// A corrected satellite identifier could not be parsed back to a typed ID.
+    InvalidCorrectedSatelliteId {
+        /// Invalid satellite identifier text.
+        satellite_id: String,
+    },
+}
+
+impl core::fmt::Display for StaticReferenceModeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RinexAssembly { side, reason } => {
+                write!(f, "{side} RINEX assembly failed: {reason}")
+            }
+            Self::NoMatchedCodeEpochs => f.write_str("no matched epochs"),
+            Self::CodeDgnss { reason } => {
+                write!(f, "code-DGNSS failed: {reason}")
+            }
+            Self::StaticSolve { reason } => {
+                write!(f, "static code solve failed: {reason}")
+            }
+            Self::CarrierArc { reason } => {
+                write!(f, "carrier RTK arc failed: {reason}")
+            }
+            Self::CarrierSolve { reason } => {
+                write!(f, "carrier RTK solve failed: {reason}")
+            }
+            Self::Frame { field, reason } => {
+                write!(f, "{field} conversion failed: {reason}")
+            }
+            Self::CorrectedObservation { reason } => {
+                write!(f, "corrected observation failed: {reason}")
+            }
+            Self::InvalidCorrectedSatelliteId { satellite_id } => {
+                write!(f, "invalid corrected satellite id {satellite_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StaticReferenceModeError {}
 
 /// Code-DGNSS static solve detail.
 #[derive(Debug, Clone, PartialEq)]
@@ -261,11 +356,15 @@ impl core::fmt::Display for StaticReferenceStationError {
                 f.write_str("static reference-station solve has no enabled modes")
             }
             Self::AllModesFailed { mode_reports } => {
-                write!(
-                    f,
-                    "all static reference-station modes failed: {:?}",
-                    mode_reports
-                )
+                f.write_str("all static reference-station modes failed")?;
+                for report in mode_reports {
+                    if let Some(error) = &report.error {
+                        write!(f, "; {}: {error}", mode_label(report.mode))?;
+                    } else {
+                        write!(f, "; {}: failed", mode_label(report.mode))?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -345,14 +444,14 @@ where
                     status: StaticReferenceModeStatus::Solved,
                     used_epochs: solution.diagnostics.len(),
                     skipped_epochs,
-                    used_measurements: solution.rtk_solution.float_solution.n_observations,
+                    used_measurements: carrier_used_measurements(&solution),
                     error: None,
                 });
                 Some(solution)
             }
             Err(error) => {
                 reports.push(failed_report(
-                    StaticReferenceStationMode::CarrierFloat,
+                    StaticReferenceStationMode::CarrierFixed,
                     error,
                 ));
                 None
@@ -372,17 +471,27 @@ fn solve_code_dgnss_static<S>(
     reference_position_m: [f64; 3],
     code_options: &RinexSppOptions,
     with_geodetic: bool,
-) -> Result<StaticReferenceCodeSolution, String>
+) -> Result<StaticReferenceCodeSolution, StaticReferenceModeError>
 where
     S: EphemerisSource + ObservableEphemerisSource + RinexSppAssemblySource,
 {
-    let reference_epochs = spp_inputs_from_rinex_obs(reference_obs, source, code_options)
-        .map_err(|error| error.to_string())?;
+    let reference_epochs =
+        spp_inputs_from_rinex_obs(reference_obs, source, code_options).map_err(|error| {
+            StaticReferenceModeError::RinexAssembly {
+                side: "reference",
+                reason: error.to_string(),
+            }
+        })?;
     let rover_epochs =
-        spp_inputs_from_rinex_obs(rover_obs, source, code_options).map_err(|e| e.to_string())?;
+        spp_inputs_from_rinex_obs(rover_obs, source, code_options).map_err(|error| {
+            StaticReferenceModeError::RinexAssembly {
+                side: "rover",
+                reason: error.to_string(),
+            }
+        })?;
     let matched = matched_code_epochs(&reference_epochs, &rover_epochs);
     if matched.is_empty() {
-        return Err("code-DGNSS RINEX assembly found no matched epochs".to_string());
+        return Err(StaticReferenceModeError::NoMatchedCodeEpochs);
     }
 
     if matched.len() == 1 {
@@ -401,7 +510,9 @@ where
         let mut inputs = rover_epoch.inputs.clone();
         inputs.observations = corrected;
         inputs.corrections = Corrections::NONE;
-        static_epochs.push(StaticEpoch::from_solve_inputs(inputs));
+        let mut static_epoch = StaticEpoch::from_solve_inputs(inputs);
+        static_epoch.weights = Some(vec![0.5; static_epoch.measurements.len()]);
+        static_epochs.push(static_epoch);
     }
 
     let static_solution = crate::static_positioning::solve_static_without_influence(
@@ -409,7 +520,9 @@ where
         &static_epochs,
         static_options,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| StaticReferenceModeError::StaticSolve {
+        reason: error.to_string(),
+    })?;
     let position = static_solution.position;
     let covariance = StaticReferenceStationCovariance {
         position_ecef_m2: static_solution.covariance.position_ecef_m2,
@@ -435,7 +548,7 @@ fn solve_single_code_epoch<S>(
     reference_position_m: [f64; 3],
     matched: (&RinexSppEpochInputs, &RinexSppEpochInputs),
     with_geodetic: bool,
-) -> Result<StaticReferenceCodeSolution, String>
+) -> Result<StaticReferenceCodeSolution, StaticReferenceModeError>
 where
     S: EphemerisSource + ObservableEphemerisSource,
 {
@@ -450,7 +563,9 @@ where
         rover_epoch.inputs.clone(),
         with_geodetic,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| StaticReferenceModeError::CodeDgnss {
+        reason: error.to_string(),
+    })?;
     let covariance = StaticReferenceStationCovariance {
         position_ecef_m2: solution.solution.position_covariance.ecef_m2,
         position_enu_m2: solution.solution.position_covariance.enu_m2,
@@ -489,7 +604,7 @@ fn solve_carrier_static<S>(
     reference_position_m: [f64; 3],
     carrier_options: &StaticReferenceCarrierRinexOptions,
     with_geodetic: bool,
-) -> Result<(StaticReferenceCarrierSolution, usize), String>
+) -> Result<(StaticReferenceCarrierSolution, usize), StaticReferenceModeError>
 where
     S: ObservableEphemerisSource,
 {
@@ -499,13 +614,19 @@ where
         rover_obs,
         &carrier_options.arc_options,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| StaticReferenceModeError::CarrierArc {
+        reason: error.to_string(),
+    })?;
     let mut config = carrier_options.static_config.clone();
     config.arc.base_m = reference_position_m;
     config.arc.wavelengths_m = arc.wavelengths_m.clone();
     config.arc.offsets_m = arc.offsets_m.clone();
     let rtk_solution =
-        crate::rtk_filter::solve_static_rtk_arc(&arc.epochs, &config).map_err(|e| e.to_string())?;
+        crate::rtk_filter::solve_static_rtk_arc(&arc.epochs, &config).map_err(|error| {
+            StaticReferenceModeError::CarrierSolve {
+                reason: error.to_string(),
+            }
+        })?;
     let fixed = &rtk_solution.fixed_solution.fixed_solution;
     let (baseline_vector_m, covariance_ecef_m2, diagnostics) =
         if fixed.search.integer_status == IntegerStatus::Fixed {
@@ -525,11 +646,21 @@ where
             )
         };
     let position_m = vec3::add3(reference_position_m, baseline_vector_m);
-    let position = ItrfPositionM::new(position_m[0], position_m[1], position_m[2])
-        .map_err(|error| error.to_string())?;
+    let position =
+        ItrfPositionM::new(position_m[0], position_m[1], position_m[2]).map_err(|error| {
+            StaticReferenceModeError::Frame {
+                field: "position",
+                reason: error.to_string(),
+            }
+        })?;
     let covariance = covariance_from_ecef(position, covariance_ecef_m2)?;
     let geodetic = if with_geodetic {
-        Some(itrf_to_geodetic(position).map_err(|error| error.to_string())?)
+        Some(
+            itrf_to_geodetic(position).map_err(|error| StaticReferenceModeError::Frame {
+                field: "geodetic",
+                reason: error.to_string(),
+            })?,
+        )
     } else {
         None
     };
@@ -562,23 +693,24 @@ fn select_solution(
         });
     }
 
-    let mode = carrier
-        .as_ref()
-        .map(solution_mode_from_carrier)
-        .or(code.as_ref().map(|_| StaticReferenceStationMode::CodeDgnss))
-        .expect("at least one solution exists");
-
-    let (position, geodetic, covariance, baseline_vector_m, baseline_m, diagnostics) =
+    let (mode, position, geodetic, covariance, baseline_vector_m, mut baseline_m, diagnostics) =
         match (carrier.as_ref(), code.as_ref()) {
-            (Some(carrier), _) => (
-                carrier.position,
-                carrier.geodetic,
-                carrier.covariance,
-                carrier.baseline_vector_m,
-                carrier.baseline_m,
-                carrier.diagnostics.clone(),
-            ),
-            (None, Some(code)) => (
+            (Some(carrier), _)
+                if solution_mode_from_carrier(carrier)
+                    == StaticReferenceStationMode::CarrierFixed =>
+            {
+                (
+                    StaticReferenceStationMode::CarrierFixed,
+                    carrier.position,
+                    carrier.geodetic,
+                    carrier.covariance,
+                    carrier.baseline_vector_m,
+                    carrier.baseline_m,
+                    carrier.diagnostics.clone(),
+                )
+            }
+            (_, Some(code)) => (
+                StaticReferenceStationMode::CodeDgnss,
                 code.position,
                 code.geodetic,
                 code.covariance,
@@ -586,12 +718,23 @@ fn select_solution(
                 code.baseline_m,
                 code.diagnostics.clone(),
             ),
+            (Some(carrier), None) => (
+                StaticReferenceStationMode::CarrierFloat,
+                carrier.position,
+                carrier.geodetic,
+                carrier.covariance,
+                carrier.baseline_vector_m,
+                carrier.baseline_m,
+                carrier.diagnostics.clone(),
+            ),
             (None, None) => unreachable!("handled above"),
         };
     let baseline_vector_m = if baseline_vector_m.iter().all(|value| value.is_finite()) {
         baseline_vector_m
     } else {
-        vec3::sub3(position.as_array(), reference_position_m)
+        let fallback = vec3::sub3(position.as_array(), reference_position_m);
+        baseline_m = vec3::norm3(fallback);
+        fallback
     };
 
     Ok(StaticReferenceStationSolution {
@@ -632,7 +775,7 @@ fn corrected_rover_observations<S>(
     reference_position_m: [f64; 3],
     reference_epoch: &RinexSppEpochInputs,
     rover_epoch: &RinexSppEpochInputs,
-) -> Result<Vec<Observation>, String>
+) -> Result<Vec<Observation>, StaticReferenceModeError>
 where
     S: ObservableEphemerisSource,
 {
@@ -642,12 +785,16 @@ where
         &code_observations(&reference_epoch.inputs.observations),
         reference_epoch.inputs.t_rx_j2000_s,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| StaticReferenceModeError::CodeDgnss {
+        reason: error.to_string(),
+    })?;
     let corrected = apply_corrections(
         &code_observations(&rover_epoch.inputs.observations),
         &corrections,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| StaticReferenceModeError::CorrectedObservation {
+        reason: error.to_string(),
+    })?;
     corrected
         .corrected
         .into_iter()
@@ -658,7 +805,9 @@ where
                     satellite_id,
                     pseudorange_m: obs.pseudorange_m,
                 })
-                .map_err(|_| format!("invalid corrected satellite id {}", obs.satellite_id))
+                .map_err(|_| StaticReferenceModeError::InvalidCorrectedSatelliteId {
+                    satellite_id: obs.satellite_id,
+                })
         })
         .collect()
 }
@@ -749,10 +898,18 @@ fn carrier_diagnostics(
 fn covariance_from_ecef(
     position: ItrfPositionM,
     position_ecef_m2: [[f64; 3]; 3],
-) -> Result<StaticReferenceStationCovariance, String> {
-    let geodetic = itrf_to_geodetic(position).map_err(|error| error.to_string())?;
-    let position_enu_m2 = rotate_covariance_ecef_to_enu_m2(position_ecef_m2, geodetic)
-        .map_err(|error| error.to_string())?;
+) -> Result<StaticReferenceStationCovariance, StaticReferenceModeError> {
+    let geodetic = itrf_to_geodetic(position).map_err(|error| StaticReferenceModeError::Frame {
+        field: "geodetic",
+        reason: error.to_string(),
+    })?;
+    let position_enu_m2 =
+        rotate_covariance_ecef_to_enu_m2(position_ecef_m2, geodetic).map_err(|error| {
+            StaticReferenceModeError::Frame {
+                field: "covariance",
+                reason: error.to_string(),
+            }
+        })?;
     Ok(StaticReferenceStationCovariance {
         position_ecef_m2,
         position_enu_m2,
@@ -769,11 +926,31 @@ fn solution_mode_from_carrier(
     }
 }
 
+fn carrier_used_measurements(solution: &StaticReferenceCarrierSolution) -> usize {
+    if solution.integer_status == IntegerStatus::Fixed {
+        solution
+            .rtk_solution
+            .fixed_solution
+            .fixed_solution
+            .n_observations
+    } else {
+        solution.rtk_solution.float_solution.n_observations
+    }
+}
+
 fn fix_status_from_mode(mode: StaticReferenceStationMode) -> StaticReferenceFixStatus {
     match mode {
         StaticReferenceStationMode::CodeDgnss => StaticReferenceFixStatus::CodeDgnss,
         StaticReferenceStationMode::CarrierFloat => StaticReferenceFixStatus::CarrierFloat,
         StaticReferenceStationMode::CarrierFixed => StaticReferenceFixStatus::CarrierFixed,
+    }
+}
+
+fn mode_label(mode: StaticReferenceStationMode) -> &'static str {
+    match mode {
+        StaticReferenceStationMode::CodeDgnss => "code-DGNSS",
+        StaticReferenceStationMode::CarrierFloat => "carrier-float",
+        StaticReferenceStationMode::CarrierFixed => "carrier-fixed",
     }
 }
 
@@ -787,7 +964,10 @@ fn residuals_rms(values: impl IntoIterator<Item = f64>) -> Option<f64> {
     (count > 0).then(|| (sum / count as f64).sqrt())
 }
 
-fn failed_report(mode: StaticReferenceStationMode, error: String) -> StaticReferenceModeReport {
+fn failed_report(
+    mode: StaticReferenceStationMode,
+    error: StaticReferenceModeError,
+) -> StaticReferenceModeReport {
     StaticReferenceModeReport {
         mode,
         status: StaticReferenceModeStatus::Failed,

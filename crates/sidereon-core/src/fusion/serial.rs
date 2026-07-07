@@ -10,8 +10,8 @@ use super::tight::{
     TightGnssObservation, TightRangeRateObservation,
 };
 use super::timesync::{
-    InertialFilterSnapshot, RateEndpoint, StoredCheckpoint, StoredGnssMeasurement, StoredImuSample,
-    TimeSyncHistoryConfig, TimeSyncHistorySnapshot,
+    InertialFilterSnapshot, RateEndpoint, StationarityDetectorSnapshotSample, StoredCheckpoint,
+    StoredGnssMeasurement, StoredImuSample, TimeSyncHistoryConfig, TimeSyncHistorySnapshot,
 };
 use crate::inertial::{ImuSample, ImuSampleKind, NavState};
 use crate::{GnssSatelliteId, GnssSystem};
@@ -21,7 +21,8 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Current binary and serde schema version for fusion checkpoints.
-pub const FUSION_STATE_CODEC_VERSION: u16 = 1;
+pub const FUSION_STATE_CODEC_VERSION: u16 = 4;
+const MIN_SUPPORTED_FUSION_STATE_CODEC_VERSION: u16 = 1;
 
 /// Exact JSON representation of an `f64` bit pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -291,6 +292,33 @@ impl SerializableRateEndpoint {
             t_j2000_s: self.t_j2000_s.to_f64(),
             specific_force_mps2: f643(self.specific_force_mps2),
             angular_rate_rps: f643(self.angular_rate_rps),
+        }
+    }
+}
+
+/// Serializable stationary-detector sample retained by a filter snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SerializableStationarityDetectorSample {
+    /// Specific-force norm error in m/s^2, stored as raw `f64` bits.
+    pub specific_force_norm_error_mps2: F64Bits,
+    /// Body angular-rate norm relative to ECEF in rad/s, stored as raw `f64` bits.
+    pub body_rate_wrt_ecef_norm_rps: F64Bits,
+}
+
+impl SerializableStationarityDetectorSample {
+    fn from_native(sample: StationarityDetectorSnapshotSample) -> Self {
+        Self {
+            specific_force_norm_error_mps2: F64Bits::from_f64(
+                sample.specific_force_norm_error_mps2,
+            ),
+            body_rate_wrt_ecef_norm_rps: F64Bits::from_f64(sample.body_rate_wrt_ecef_norm_rps),
+        }
+    }
+
+    fn to_native(self) -> StationarityDetectorSnapshotSample {
+        StationarityDetectorSnapshotSample {
+            specific_force_norm_error_mps2: self.specific_force_norm_error_mps2.to_f64(),
+            body_rate_wrt_ecef_norm_rps: self.body_rate_wrt_ecef_norm_rps.to_f64(),
         }
     }
 }
@@ -738,6 +766,15 @@ pub struct SerializableFusionSnapshot {
     pub state: SerializableInsFilterState,
     /// Last propagated body angular rate relative to ECEF, stored as raw `f64` bits.
     pub last_body_rate_wrt_ecef_rps: [F64Bits; 3],
+    /// Recent detector samples used by stationary-update gating.
+    #[serde(default)]
+    pub stationarity_window: Vec<SerializableStationarityDetectorSample>,
+    /// Epoch of the last stationary pseudo-measurement, if any.
+    #[serde(default)]
+    pub last_stationary_update_t_j2000_s: Option<F64Bits>,
+    /// Epoch of the last non-holonomic pseudo-measurement, if any.
+    #[serde(default)]
+    pub last_non_holonomic_update_t_j2000_s: Option<F64Bits>,
     /// Tight receiver-clock augmentation and augmented covariance.
     pub tight: SerializableTightFilterState,
 }
@@ -748,6 +785,18 @@ impl SerializableFusionSnapshot {
         Self {
             state: SerializableInsFilterState::from_native(&snapshot.state),
             last_body_rate_wrt_ecef_rps: bits3(snapshot.last_body_rate_wrt_ecef_rps),
+            stationarity_window: snapshot
+                .stationarity_window
+                .iter()
+                .copied()
+                .map(SerializableStationarityDetectorSample::from_native)
+                .collect(),
+            last_stationary_update_t_j2000_s: snapshot
+                .last_stationary_update_t_j2000_s
+                .map(F64Bits::from_f64),
+            last_non_holonomic_update_t_j2000_s: snapshot
+                .last_non_holonomic_update_t_j2000_s
+                .map(F64Bits::from_f64),
             tight: SerializableTightFilterState::from_native(&snapshot.tight),
         }
     }
@@ -758,13 +807,58 @@ impl SerializableFusionSnapshot {
         let last_body_rate_wrt_ecef_rps = f643(self.last_body_rate_wrt_ecef_rps);
         validate_finite_slice(&last_body_rate_wrt_ecef_rps, "last_body_rate_wrt_ecef_rps")
             .map_err(invalid_state)?;
+        let stationarity_window = stationarity_window_to_native(&self.stationarity_window)?;
+        let last_stationary_update_t_j2000_s = optional_epoch_to_native(
+            self.last_stationary_update_t_j2000_s,
+            "last_stationary_update_t_j2000_s",
+        )?;
+        let last_non_holonomic_update_t_j2000_s = optional_epoch_to_native(
+            self.last_non_holonomic_update_t_j2000_s,
+            "last_non_holonomic_update_t_j2000_s",
+        )?;
         let tight = self.tight.to_native(state.dimension())?;
         Ok(InertialFilterSnapshot {
             state,
             last_body_rate_wrt_ecef_rps,
+            stationarity_window,
+            last_stationary_update_t_j2000_s,
+            last_non_holonomic_update_t_j2000_s,
             tight,
         })
     }
+}
+
+fn stationarity_window_to_native(
+    samples: &[SerializableStationarityDetectorSample],
+) -> Result<Vec<StationarityDetectorSnapshotSample>, FusionStateCodecError> {
+    let out = samples
+        .iter()
+        .copied()
+        .map(SerializableStationarityDetectorSample::to_native)
+        .collect::<Vec<_>>();
+    for sample in &out {
+        validate_finite_slice(
+            &[
+                sample.specific_force_norm_error_mps2,
+                sample.body_rate_wrt_ecef_norm_rps,
+            ],
+            "stationarity_window",
+        )
+        .map_err(invalid_state)?;
+    }
+    Ok(out)
+}
+
+fn optional_epoch_to_native(
+    value: Option<F64Bits>,
+    field: &'static str,
+) -> Result<Option<f64>, FusionStateCodecError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.to_f64();
+    validate_finite_slice(&[value], field).map_err(invalid_state)?;
+    Ok(Some(value))
 }
 
 /// Serializable retained time-sync replay history.
@@ -838,6 +932,15 @@ pub struct SerializableFusionState {
     pub state: SerializableInsFilterState,
     /// Last propagated body angular rate relative to ECEF, stored as raw `f64` bits.
     pub last_body_rate_wrt_ecef_rps: [F64Bits; 3],
+    /// Recent detector samples used by stationary-update gating.
+    #[serde(default)]
+    pub stationarity_window: Vec<SerializableStationarityDetectorSample>,
+    /// Epoch of the last stationary pseudo-measurement, if any.
+    #[serde(default)]
+    pub last_stationary_update_t_j2000_s: Option<F64Bits>,
+    /// Epoch of the last non-holonomic pseudo-measurement, if any.
+    #[serde(default)]
+    pub last_non_holonomic_update_t_j2000_s: Option<F64Bits>,
     /// Tight receiver-clock augmentation and augmented covariance.
     pub tight: SerializableTightFilterState,
     /// Retained time-sync replay history.
@@ -854,6 +957,18 @@ impl SerializableFusionState {
             version: FUSION_STATE_CODEC_VERSION,
             state: SerializableInsFilterState::from_native(&snapshot.state),
             last_body_rate_wrt_ecef_rps: bits3(snapshot.last_body_rate_wrt_ecef_rps),
+            stationarity_window: snapshot
+                .stationarity_window
+                .iter()
+                .copied()
+                .map(SerializableStationarityDetectorSample::from_native)
+                .collect(),
+            last_stationary_update_t_j2000_s: snapshot
+                .last_stationary_update_t_j2000_s
+                .map(F64Bits::from_f64),
+            last_non_holonomic_update_t_j2000_s: snapshot
+                .last_non_holonomic_update_t_j2000_s
+                .map(F64Bits::from_f64),
             tight: SerializableTightFilterState::from_native(&snapshot.tight),
             time_sync,
         }
@@ -866,6 +981,18 @@ impl SerializableFusionState {
             version: FUSION_STATE_CODEC_VERSION,
             state: SerializableInsFilterState::from_native(&snapshot.state),
             last_body_rate_wrt_ecef_rps: bits3(snapshot.last_body_rate_wrt_ecef_rps),
+            stationarity_window: snapshot
+                .stationarity_window
+                .iter()
+                .copied()
+                .map(SerializableStationarityDetectorSample::from_native)
+                .collect(),
+            last_stationary_update_t_j2000_s: snapshot
+                .last_stationary_update_t_j2000_s
+                .map(F64Bits::from_f64),
+            last_non_holonomic_update_t_j2000_s: snapshot
+                .last_non_holonomic_update_t_j2000_s
+                .map(F64Bits::from_f64),
             tight: SerializableTightFilterState::from_native(&snapshot.tight),
             time_sync: SerializableTimeSyncHistory::from_native(
                 &filter.time_sync.snapshot_history(),
@@ -880,10 +1007,22 @@ impl SerializableFusionState {
         let last_body_rate_wrt_ecef_rps = f643(self.last_body_rate_wrt_ecef_rps);
         validate_finite_slice(&last_body_rate_wrt_ecef_rps, "last_body_rate_wrt_ecef_rps")
             .map_err(invalid_state)?;
+        let stationarity_window = stationarity_window_to_native(&self.stationarity_window)?;
+        let last_stationary_update_t_j2000_s = optional_epoch_to_native(
+            self.last_stationary_update_t_j2000_s,
+            "last_stationary_update_t_j2000_s",
+        )?;
+        let last_non_holonomic_update_t_j2000_s = optional_epoch_to_native(
+            self.last_non_holonomic_update_t_j2000_s,
+            "last_non_holonomic_update_t_j2000_s",
+        )?;
         let tight = self.tight.to_native(state.dimension())?;
         Ok(InertialFilterSnapshot {
             state,
             last_body_rate_wrt_ecef_rps,
+            stationarity_window,
+            last_stationary_update_t_j2000_s,
+            last_non_holonomic_update_t_j2000_s,
             tight,
         })
     }
@@ -896,7 +1035,7 @@ impl SerializableFusionState {
 
     /// Encode the checkpoint with a binary magic, version, and checksum.
     pub fn encode_versioned(&self) -> Result<Vec<u8>, FusionStateCodecError> {
-        self.validate_version()?;
+        self.validate_current_version()?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&FUSION_STATE_MAGIC);
         write_u16(&mut bytes, self.version);
@@ -907,6 +1046,9 @@ impl SerializableFusionState {
         write_f64_array(&mut bytes, &self.state.accel_scale_factor);
         write_f64_array(&mut bytes, &self.state.gyro_scale_factor);
         write_f64_array(&mut bytes, &self.last_body_rate_wrt_ecef_rps);
+        write_stationarity_window(&mut bytes, &self.stationarity_window)?;
+        write_optional_f64(&mut bytes, self.last_stationary_update_t_j2000_s);
+        write_optional_f64(&mut bytes, self.last_non_holonomic_update_t_j2000_s);
         write_f64(&mut bytes, self.tight.clock_bias_m);
         write_f64(&mut bytes, self.tight.clock_drift_m_s);
         write_f64_matrix(&mut bytes, &self.tight.augmented_covariance)?;
@@ -938,7 +1080,7 @@ impl SerializableFusionState {
 
         let mut cursor = FUSION_STATE_MAGIC.len();
         let version = read_u16(bytes, &mut cursor, checksum_offset)?;
-        if version != FUSION_STATE_CODEC_VERSION {
+        if !is_supported_fusion_state_codec_version(version) {
             return Err(FusionStateCodecError::UnsupportedVersion { version });
         }
         let layout = read_layout(bytes, &mut cursor, checksum_offset)?;
@@ -948,10 +1090,24 @@ impl SerializableFusionState {
         let accel_scale_factor = read_f64_array(bytes, &mut cursor, checksum_offset)?;
         let gyro_scale_factor = read_f64_array(bytes, &mut cursor, checksum_offset)?;
         let last_body_rate_wrt_ecef_rps = read_f64_array(bytes, &mut cursor, checksum_offset)?;
+        let stationarity_window = if version >= 3 {
+            read_stationarity_window(bytes, &mut cursor, checksum_offset)?
+        } else {
+            Vec::new()
+        };
+        let (last_stationary_update_t_j2000_s, last_non_holonomic_update_t_j2000_s) =
+            if version >= 4 {
+                (
+                    read_optional_f64(bytes, &mut cursor, checksum_offset)?,
+                    read_optional_f64(bytes, &mut cursor, checksum_offset)?,
+                )
+            } else {
+                (None, None)
+            };
         let clock_bias_m = read_f64(bytes, &mut cursor, checksum_offset)?;
         let clock_drift_m_s = read_f64(bytes, &mut cursor, checksum_offset)?;
         let augmented_covariance = read_f64_matrix(bytes, &mut cursor, checksum_offset)?;
-        let time_sync = read_time_sync_history(bytes, &mut cursor, checksum_offset)?;
+        let time_sync = read_time_sync_history(bytes, &mut cursor, checksum_offset, version)?;
         if cursor != checksum_offset {
             return Err(FusionStateCodecError::TrailingBytes {
                 remaining: checksum_offset - cursor,
@@ -968,6 +1124,9 @@ impl SerializableFusionState {
                 gyro_scale_factor,
             },
             last_body_rate_wrt_ecef_rps,
+            stationarity_window,
+            last_stationary_update_t_j2000_s,
+            last_non_holonomic_update_t_j2000_s,
             tight: SerializableTightFilterState {
                 clock_bias_m,
                 clock_drift_m_s,
@@ -982,7 +1141,7 @@ impl SerializableFusionState {
 
     /// Serialize this checkpoint to JSON using the serde representation.
     pub fn to_json_string(&self) -> Result<String, FusionStateCodecError> {
-        self.validate_version()?;
+        self.validate_current_version()?;
         serde_json::to_string(self).map_err(|error| FusionStateCodecError::Json {
             message: error.to_string(),
         })
@@ -1000,6 +1159,16 @@ impl SerializableFusionState {
     }
 
     fn validate_version(&self) -> Result<(), FusionStateCodecError> {
+        if is_supported_fusion_state_codec_version(self.version) {
+            Ok(())
+        } else {
+            Err(FusionStateCodecError::UnsupportedVersion {
+                version: self.version,
+            })
+        }
+    }
+
+    fn validate_current_version(&self) -> Result<(), FusionStateCodecError> {
         if self.version == FUSION_STATE_CODEC_VERSION {
             Ok(())
         } else {
@@ -1008,6 +1177,10 @@ impl SerializableFusionState {
             })
         }
     }
+}
+
+fn is_supported_fusion_state_codec_version(version: u16) -> bool {
+    (MIN_SUPPORTED_FUSION_STATE_CODEC_VERSION..=FUSION_STATE_CODEC_VERSION).contains(&version)
 }
 
 impl InertialFilterSnapshot {
@@ -1235,6 +1408,7 @@ fn read_time_sync_history(
     bytes: &[u8],
     cursor: &mut usize,
     limit: usize,
+    version: u16,
 ) -> Result<SerializableTimeSyncHistory, FusionStateCodecError> {
     let config = SerializableTimeSyncHistoryConfig {
         imu_capacity: read_u32(bytes, cursor, limit)?,
@@ -1248,7 +1422,7 @@ fn read_time_sync_history(
     let checkpoint_len = read_len(bytes, cursor, limit, 1, "checkpoints")?;
     let mut checkpoints = Vec::with_capacity(checkpoint_len);
     for _ in 0..checkpoint_len {
-        checkpoints.push(read_stored_checkpoint(bytes, cursor, limit)?);
+        checkpoints.push(read_stored_checkpoint(bytes, cursor, limit, version)?);
     }
     let measurement_len = read_len(bytes, cursor, limit, 1, "gnss_measurements")?;
     let mut measurements = Vec::with_capacity(measurement_len);
@@ -1375,10 +1549,11 @@ fn read_stored_checkpoint(
     bytes: &[u8],
     cursor: &mut usize,
     limit: usize,
+    version: u16,
 ) -> Result<SerializableStoredCheckpoint, FusionStateCodecError> {
     Ok(SerializableStoredCheckpoint {
         t_j2000_s: read_f64(bytes, cursor, limit)?,
-        snapshot: Box::new(read_fusion_snapshot(bytes, cursor, limit)?),
+        snapshot: Box::new(read_fusion_snapshot(bytes, cursor, limit, version)?),
     })
 }
 
@@ -1393,6 +1568,9 @@ fn write_fusion_snapshot(
     write_f64_array(bytes, &snapshot.state.accel_scale_factor);
     write_f64_array(bytes, &snapshot.state.gyro_scale_factor);
     write_f64_array(bytes, &snapshot.last_body_rate_wrt_ecef_rps);
+    write_stationarity_window(bytes, &snapshot.stationarity_window)?;
+    write_optional_f64(bytes, snapshot.last_stationary_update_t_j2000_s);
+    write_optional_f64(bytes, snapshot.last_non_holonomic_update_t_j2000_s);
     write_f64(bytes, snapshot.tight.clock_bias_m);
     write_f64(bytes, snapshot.tight.clock_drift_m_s);
     write_f64_matrix(bytes, &snapshot.tight.augmented_covariance)
@@ -1402,23 +1580,92 @@ fn read_fusion_snapshot(
     bytes: &[u8],
     cursor: &mut usize,
     limit: usize,
+    version: u16,
 ) -> Result<SerializableFusionSnapshot, FusionStateCodecError> {
+    let state = SerializableInsFilterState {
+        layout: read_layout(bytes, cursor, limit)?,
+        nominal: read_nav(bytes, cursor, limit)?,
+        error_state: read_f64_vec(bytes, cursor, limit)?,
+        covariance: read_f64_matrix(bytes, cursor, limit)?,
+        accel_scale_factor: read_f64_array(bytes, cursor, limit)?,
+        gyro_scale_factor: read_f64_array(bytes, cursor, limit)?,
+    };
+    let last_body_rate_wrt_ecef_rps = read_f64_array(bytes, cursor, limit)?;
+    let stationarity_window = if version >= 3 {
+        read_stationarity_window(bytes, cursor, limit)?
+    } else {
+        Vec::new()
+    };
+    let (last_stationary_update_t_j2000_s, last_non_holonomic_update_t_j2000_s) = if version >= 4 {
+        (
+            read_optional_f64(bytes, cursor, limit)?,
+            read_optional_f64(bytes, cursor, limit)?,
+        )
+    } else {
+        (None, None)
+    };
     Ok(SerializableFusionSnapshot {
-        state: SerializableInsFilterState {
-            layout: read_layout(bytes, cursor, limit)?,
-            nominal: read_nav(bytes, cursor, limit)?,
-            error_state: read_f64_vec(bytes, cursor, limit)?,
-            covariance: read_f64_matrix(bytes, cursor, limit)?,
-            accel_scale_factor: read_f64_array(bytes, cursor, limit)?,
-            gyro_scale_factor: read_f64_array(bytes, cursor, limit)?,
-        },
-        last_body_rate_wrt_ecef_rps: read_f64_array(bytes, cursor, limit)?,
+        state,
+        last_body_rate_wrt_ecef_rps,
+        stationarity_window,
+        last_stationary_update_t_j2000_s,
+        last_non_holonomic_update_t_j2000_s,
         tight: SerializableTightFilterState {
             clock_bias_m: read_f64(bytes, cursor, limit)?,
             clock_drift_m_s: read_f64(bytes, cursor, limit)?,
             augmented_covariance: read_f64_matrix(bytes, cursor, limit)?,
         },
     })
+}
+
+fn write_stationarity_window(
+    bytes: &mut Vec<u8>,
+    samples: &[SerializableStationarityDetectorSample],
+) -> Result<(), FusionStateCodecError> {
+    write_u32_checked(bytes, samples.len())?;
+    for sample in samples {
+        write_f64(bytes, sample.specific_force_norm_error_mps2);
+        write_f64(bytes, sample.body_rate_wrt_ecef_norm_rps);
+    }
+    Ok(())
+}
+
+fn read_stationarity_window(
+    bytes: &[u8],
+    cursor: &mut usize,
+    limit: usize,
+) -> Result<Vec<SerializableStationarityDetectorSample>, FusionStateCodecError> {
+    let len = read_len(bytes, cursor, limit, 16, "stationarity_window")?;
+    let mut samples = Vec::with_capacity(len);
+    for _ in 0..len {
+        samples.push(SerializableStationarityDetectorSample {
+            specific_force_norm_error_mps2: read_f64(bytes, cursor, limit)?,
+            body_rate_wrt_ecef_norm_rps: read_f64(bytes, cursor, limit)?,
+        });
+    }
+    Ok(samples)
+}
+
+fn write_optional_f64(bytes: &mut Vec<u8>, value: Option<F64Bits>) {
+    match value {
+        Some(value) => {
+            write_bool(bytes, true);
+            write_f64(bytes, value);
+        }
+        None => write_bool(bytes, false),
+    }
+}
+
+fn read_optional_f64(
+    bytes: &[u8],
+    cursor: &mut usize,
+    limit: usize,
+) -> Result<Option<F64Bits>, FusionStateCodecError> {
+    if read_bool(bytes, cursor, limit)? {
+        Ok(Some(read_f64(bytes, cursor, limit)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn write_stored_measurement(
@@ -2088,6 +2335,21 @@ mod tests {
     }
 
     #[test]
+    fn binary_decoder_accepts_legacy_v2_without_stationarity_window() {
+        let filter = test_filter();
+        let serial = filter.serializable_state().expect("serial state");
+        let encoded = encode_legacy_without_stationarity(&serial, 2).expect("legacy encode");
+
+        let decoded = SerializableFusionState::decode_versioned(&encoded).expect("decode v2");
+        assert_eq!(decoded.version, 2);
+        let mut expected = filter.snapshot();
+        expected.stationarity_window.clear();
+        expected.last_stationary_update_t_j2000_s = None;
+        expected.last_non_holonomic_update_t_j2000_s = None;
+        assert_snapshot_bits(&decoded.to_snapshot().expect("snapshot"), &expected);
+    }
+
+    #[test]
     fn truncated_and_corrupted_payloads_are_typed_errors() {
         let serial = test_filter().serializable_state().expect("serial state");
         let encoded = serial.encode_versioned().expect("encode");
@@ -2178,6 +2440,34 @@ mod tests {
                 expected.last_body_rate_wrt_ecef_rps[axis].to_bits()
             );
         }
+        assert_eq!(
+            actual.stationarity_window.len(),
+            expected.stationarity_window.len()
+        );
+        for (actual_sample, expected_sample) in actual
+            .stationarity_window
+            .iter()
+            .zip(expected.stationarity_window.iter())
+        {
+            assert_eq!(
+                actual_sample.specific_force_norm_error_mps2.to_bits(),
+                expected_sample.specific_force_norm_error_mps2.to_bits()
+            );
+            assert_eq!(
+                actual_sample.body_rate_wrt_ecef_norm_rps.to_bits(),
+                expected_sample.body_rate_wrt_ecef_norm_rps.to_bits()
+            );
+        }
+        assert_eq!(
+            actual.last_stationary_update_t_j2000_s.map(f64::to_bits),
+            expected.last_stationary_update_t_j2000_s.map(f64::to_bits)
+        );
+        assert_eq!(
+            actual.last_non_holonomic_update_t_j2000_s.map(f64::to_bits),
+            expected
+                .last_non_holonomic_update_t_j2000_s
+                .map(f64::to_bits)
+        );
         for row in 0..actual.state.covariance.len() {
             for col in 0..actual.state.covariance[row].len() {
                 assert_eq!(
@@ -2202,5 +2492,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn encode_legacy_without_stationarity(
+        serial: &SerializableFusionState,
+        version: u16,
+    ) -> Result<Vec<u8>, FusionStateCodecError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FUSION_STATE_MAGIC);
+        write_u16(&mut bytes, version);
+        write_layout(&mut bytes, serial.state.layout);
+        write_nav(&mut bytes, &serial.state.nominal);
+        write_f64_vec(&mut bytes, &serial.state.error_state)?;
+        write_f64_matrix(&mut bytes, &serial.state.covariance)?;
+        write_f64_array(&mut bytes, &serial.state.accel_scale_factor);
+        write_f64_array(&mut bytes, &serial.state.gyro_scale_factor);
+        write_f64_array(&mut bytes, &serial.last_body_rate_wrt_ecef_rps);
+        write_f64(&mut bytes, serial.tight.clock_bias_m);
+        write_f64(&mut bytes, serial.tight.clock_drift_m_s);
+        write_f64_matrix(&mut bytes, &serial.tight.augmented_covariance)?;
+        write_time_sync_history_legacy_without_stationarity(&mut bytes, &serial.time_sync)?;
+        let checksum = fnv1a64(&bytes);
+        write_u64(&mut bytes, checksum);
+        Ok(bytes)
+    }
+
+    fn write_time_sync_history_legacy_without_stationarity(
+        bytes: &mut Vec<u8>,
+        history: &SerializableTimeSyncHistory,
+    ) -> Result<(), FusionStateCodecError> {
+        write_u32_checked(bytes, history.config.imu_capacity as usize)?;
+        write_u32_checked(bytes, history.config.checkpoint_capacity as usize)?;
+        write_u32_checked(bytes, history.imu_samples.len())?;
+        for sample in &history.imu_samples {
+            write_stored_imu_sample(bytes, sample);
+        }
+        write_u32_checked(bytes, history.checkpoints.len())?;
+        for checkpoint in &history.checkpoints {
+            write_f64(bytes, checkpoint.t_j2000_s);
+            write_fusion_snapshot_legacy_without_stationarity(bytes, checkpoint.snapshot.as_ref())?;
+        }
+        write_u32_checked(bytes, history.measurements.len())?;
+        for measurement in &history.measurements {
+            write_stored_measurement(bytes, measurement)?;
+        }
+        Ok(())
+    }
+
+    fn write_fusion_snapshot_legacy_without_stationarity(
+        bytes: &mut Vec<u8>,
+        snapshot: &SerializableFusionSnapshot,
+    ) -> Result<(), FusionStateCodecError> {
+        write_layout(bytes, snapshot.state.layout);
+        write_nav(bytes, &snapshot.state.nominal);
+        write_f64_vec(bytes, &snapshot.state.error_state)?;
+        write_f64_matrix(bytes, &snapshot.state.covariance)?;
+        write_f64_array(bytes, &snapshot.state.accel_scale_factor);
+        write_f64_array(bytes, &snapshot.state.gyro_scale_factor);
+        write_f64_array(bytes, &snapshot.last_body_rate_wrt_ecef_rps);
+        write_f64(bytes, snapshot.tight.clock_bias_m);
+        write_f64(bytes, snapshot.tight.clock_drift_m_s);
+        write_f64_matrix(bytes, &snapshot.tight.augmented_covariance)
     }
 }

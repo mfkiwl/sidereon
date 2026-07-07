@@ -25,9 +25,9 @@ pub use error_state::{
     predict_error_state_covariance, ErrorStateImuKinematics, ErrorStateLinearization,
 };
 pub use loose::{
-    loose_coupling_correction, velocity_match_outage, FusionUpdate, GnssFixMeasurement,
-    GnssFixStatus, GnssFixStatusWeighting, IggIiiMeasurementReweighting, InertialFilter,
-    InertialFilterConfig, LooseCouplingConfig, NonHolonomicConstraintConfig,
+    loose_coupling_correction, velocity_match_outage, velocity_match_outage_to_state, FusionUpdate,
+    GnssFixMeasurement, GnssFixStatus, GnssFixStatusWeighting, IggIiiMeasurementReweighting,
+    InertialFilter, InertialFilterConfig, LooseCouplingConfig, NonHolonomicConstraintConfig,
     StationaryDetectorConfig, StationaryUpdateConfig, VelocityMatchState,
     VelocityMatchedTrajectory, VelocityMatchingConfig, YangPredictionAdaptiveFactor,
 };
@@ -36,7 +36,8 @@ pub use serial::{
     SerializableFusionState, SerializableGnssFixStatus, SerializableImuSample,
     SerializableImuSampleKind, SerializableInsFilterState, SerializableLooseMeasurement,
     SerializableNavState, SerializableRateEndpoint, SerializableSatelliteId,
-    SerializableStoredCheckpoint, SerializableStoredGnssMeasurement, SerializableStoredImuSample,
+    SerializableStationarityDetectorSample, SerializableStoredCheckpoint,
+    SerializableStoredGnssMeasurement, SerializableStoredImuSample,
     SerializableTightCarrierPhaseObservation, SerializableTightFilterState,
     SerializableTightGnssEpoch, SerializableTightGnssObservation,
     SerializableTightRangeRateObservation, SerializableTimeSyncHistory,
@@ -61,7 +62,7 @@ pub use tight::{
 };
 pub use timesync::{
     validate_time_sync_gnss_order, validate_time_sync_imu_order, InertialFilterSnapshot,
-    TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
-    DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
+    StationarityDetectorSnapshotSample, TimeSyncHistoryConfig, TimeSyncHistoryStatus,
+    TimeSyncUpdate, DEFAULT_TIME_SYNC_CHECKPOINT_CAPACITY, DEFAULT_TIME_SYNC_IMU_CAPACITY,
 };
 pub use ukf::{ukf_correct_closed_loop, UkfUpdateOptions, UnscentedTransformOptions};

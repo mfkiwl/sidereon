@@ -624,6 +624,57 @@ mod tests {
     }
 
     #[test]
+    fn imu_to_body_dcm_matches_identity_mount_in_imu_frame_with_nonidentity_attitude() {
+        let body_to_ecef = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let imu_to_body = [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let imu_to_ecef = inline_rxr(&body_to_ecef, &imu_to_body);
+        let body_state = NavState::new(
+            25.0,
+            [WGS84_A_M + 750.0, -125.0, 80.0],
+            [4.0, -3.0, 2.0],
+            body_to_ecef,
+        )
+        .expect("body-frame state");
+        let imu_frame_state = NavState::new(
+            body_state.t_j2000_s,
+            body_state.position_ecef_m,
+            body_state.velocity_ecef_mps,
+            imu_to_ecef,
+        )
+        .expect("imu-frame state");
+        let body_kinematics = ErrorStateImuKinematics::new([1.5, -0.25, 9.6], [0.03, -0.02, 0.01])
+            .expect("body kinematics");
+        let body_to_imu = inline_tr(&imu_to_body);
+        let imu_frame_kinematics = ErrorStateImuKinematics::new(
+            mul_vec3(&body_to_imu, body_kinematics.specific_force_body_mps2),
+            mul_vec3(&body_to_imu, body_kinematics.angular_rate_body_rps),
+        )
+        .expect("imu-frame kinematics");
+
+        let mounted = error_state_system_matrix_ecef_with_imu_to_body(
+            &body_state,
+            body_kinematics,
+            &reference_spec(),
+            ErrorStateLayout::TwentyOne,
+            imu_to_body,
+        )
+        .expect("mounted system matrix");
+        let identity_in_imu_frame = error_state_system_matrix_ecef(
+            &imu_frame_state,
+            imu_frame_kinematics,
+            &reference_spec(),
+            ErrorStateLayout::TwentyOne,
+        )
+        .expect("identity system matrix");
+
+        for row in 0..mounted.len() {
+            for col in 0..mounted[row].len() {
+                assert_close(mounted[row][col], identity_in_imu_frame[row][col], 1.0e-15);
+            }
+        }
+    }
+
+    #[test]
     fn propagate_only_logdet_grows_monotonically_with_process_noise() {
         let state = reference_state();
         let imu = reference_imu();

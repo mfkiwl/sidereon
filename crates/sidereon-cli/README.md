@@ -63,6 +63,7 @@ Compute covariance-derived position metrics:
 ```sh
 sidereon metrics --enu-cov "4,0,0,0,9,0,0,0,16"
 sidereon metrics --json-file covariance.json --probability 0.99
+sidereon metrics --enu-cov "4,0,0,0,9,0,0,0,16" --json
 ```
 
 Inspect a GNSS file by trying the supported parsers:

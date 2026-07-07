@@ -6,11 +6,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::astro::math::mat3::{inline_rxr, mul_vec3};
+use crate::astro::math::mat3::{inline_rxr, mul_vec3, Mat3};
 use crate::astro::math::vec3::{add3, cross3, norm3, sub3};
 use crate::constants::C_M_S;
 use crate::estimation::recipe::{FrameRecipe, RangeRecipe, SagnacRecipe};
-use crate::inertial::state::skew;
+use crate::inertial::state::{skew, validate_dcm_orthonormal};
 use crate::inertial::{validate_finite, validate_vec3};
 use crate::observables::{
     transmit_time_satellite_state, ObservableEphemerisSource, ObservablesError, TransmitTimeOptions,
@@ -516,6 +516,7 @@ impl InertialFilter {
             &self.tight,
             epoch,
             self.config.tight,
+            self.config.imu_to_body_dcm,
             self.last_body_rate_wrt_ecef_rps,
         )?;
         let rows = correction.row_count();
@@ -545,12 +546,14 @@ pub(super) fn tight_coupling_correction(
     tight_state: &TightFusionState,
     epoch: &TightGnssEpoch,
     config: TightCouplingConfig,
+    imu_to_body_dcm: Mat3,
     body_rate_wrt_ecef_rps: [f64; 3],
 ) -> Result<EkfCorrection, FusionError> {
     state.validate()?;
     tight_state.validate(state.dimension())?;
     epoch.validate()?;
     config.validate()?;
+    validate_dcm_orthonormal(&imu_to_body_dcm, "imu_to_body_dcm").map_err(FusionError::from)?;
     validate_vec3(body_rate_wrt_ecef_rps, "body_rate_wrt_ecef_rps").map_err(FusionError::from)?;
     if epoch.t_j2000_s != state.nominal.t_j2000_s {
         return Err(invalid_input("t_j2000_s", "must equal nominal state epoch"));
@@ -560,7 +563,12 @@ pub(super) fn tight_coupling_correction(
     let aug_dim = augmented_dimension(base_dim);
     let clock_bias = clock_bias_index(base_dim);
     let clock_drift = clock_drift_index(base_dim);
-    let kinematics = antenna_kinematics(state, config.lever_arm_body_m, body_rate_wrt_ecef_rps);
+    let kinematics = antenna_kinematics(
+        state,
+        config.lever_arm_body_m,
+        body_rate_wrt_ecef_rps,
+        imu_to_body_dcm,
+    );
     let options = TransmitTimeOptions {
         light_time: config.light_time,
         sagnac: config.sagnac,
@@ -876,7 +884,12 @@ fn tight_measurement_predictions(
         return Err(invalid_input("t_j2000_s", "must equal nominal state epoch"));
     }
 
-    let kinematics = antenna_kinematics(state, config.lever_arm_body_m, body_rate_wrt_ecef_rps);
+    let kinematics = antenna_kinematics(
+        state,
+        config.lever_arm_body_m,
+        body_rate_wrt_ecef_rps,
+        crate::inertial::state::mat3_identity(),
+    );
     let options = TransmitTimeOptions {
         light_time: config.light_time,
         sagnac: config.sagnac,
@@ -1070,6 +1083,7 @@ fn antenna_kinematics(
     state: &InsFilterState,
     lever_arm_body_m: [f64; 3],
     body_rate_wrt_ecef_rps: [f64; 3],
+    imu_to_body_dcm: Mat3,
 ) -> AntennaKinematics {
     let c_b_e = state.nominal.attitude_body_to_ecef;
     let lever_arm_ecef_m = mul_vec3(&c_b_e, lever_arm_body_m);
@@ -1077,7 +1091,10 @@ fn antenna_kinematics(
     let lever_velocity_body_mps = cross3(body_rate_wrt_ecef_rps, lever_arm_body_m);
     let lever_velocity_ecef_mps = mul_vec3(&c_b_e, lever_velocity_body_mps);
     let antenna_velocity_ecef_mps = add3(state.nominal.velocity_ecef_mps, lever_velocity_ecef_mps);
-    let gyro_bias_velocity_block = inline_rxr(&c_b_e, &skew(lever_arm_body_m));
+    let gyro_bias_velocity_block = inline_rxr(
+        &inline_rxr(&c_b_e, &skew(lever_arm_body_m)),
+        &imu_to_body_dcm,
+    );
     AntennaKinematics {
         antenna_position_ecef_m,
         antenna_velocity_ecef_mps,
@@ -1394,6 +1411,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn range_rate_gyro_bias_row_rotates_imu_to_body_dcm() {
+        let nominal = NavState::new(
+            T0,
+            [WGS84_A_M + 10.0, 20.0, -30.0],
+            [0.0; 3],
+            mat3_identity(),
+        )
+        .expect("nominal");
+        let state = InsFilterState::from_diagonal(
+            nominal,
+            ErrorStateLayout::Fifteen,
+            &[1.0; ERROR_STATE_DIMENSION_15],
+        )
+        .expect("state");
+        let lever_arm_body_m = [2.0, -3.0, 5.0];
+        let imu_to_body = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let kinematics =
+            antenna_kinematics(&state, lever_arm_body_m, [0.01, -0.02, 0.03], imu_to_body);
+        let los_unit = normalized([0.25, -0.5, 0.75]);
+        let row = range_rate_design_row(
+            augmented_dimension(ERROR_STATE_DIMENSION_15),
+            clock_drift_index(ERROR_STATE_DIMENSION_15),
+            los_unit,
+            kinematics.lever_velocity_ecef_mps,
+            kinematics.gyro_bias_velocity_block,
+        );
+        let expected_block = inline_rxr(&skew(lever_arm_body_m), &imu_to_body);
+        let unrotated_block = skew(lever_arm_body_m);
+
+        for col in 0..3 {
+            let expected = -(los_unit[0] * expected_block[0][col]
+                + los_unit[1] * expected_block[1][col]
+                + los_unit[2] * expected_block[2][col]);
+            assert_eq!(
+                row[ERROR_GYRO_BIAS_INDEX + col].to_bits(),
+                expected.to_bits()
+            );
+        }
+        let unrotated_col0 = -(los_unit[0] * unrotated_block[0][0]
+            + los_unit[1] * unrotated_block[1][0]
+            + los_unit[2] * unrotated_block[2][0]);
+        assert_ne!(
+            row[ERROR_GYRO_BIAS_INDEX].to_bits(),
+            unrotated_col0.to_bits()
+        );
+    }
+
     fn logdet_spd(matrix: &[Vec<f64>]) -> f64 {
         let n = matrix.len();
         let flat = matrix.iter().flatten().copied().collect::<Vec<_>>();
@@ -1578,6 +1643,7 @@ mod tests {
             &filter.tight,
             &epoch,
             filter.config.tight,
+            filter.config.imu_to_body_dcm,
             [0.0; 3],
         )
         .expect("correction");
@@ -1950,6 +2016,7 @@ mod tests {
             &filter.tight,
             &epoch,
             config,
+            filter.config.imu_to_body_dcm,
             body_rate_wrt_ecef_rps,
         )
         .expect("correction");

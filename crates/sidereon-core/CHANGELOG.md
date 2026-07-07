@@ -8,18 +8,45 @@ All notable changes to `sidereon-core` are documented here.
 
 - Loose GNSS/INS field-mode options: stationary ZUPT/ZARU pseudo-updates with
   a configurable accel and gyro magnitude window, wheeled-vehicle
-  non-holonomic lateral and vertical velocity constraints, first-fix
-  velocity matching for GNSS outage spans, and per-fix-status GNSS covariance
-  weighting for single, float, and fixed updates. The inertial filter config
-  also accepts a fixed IMU-to-body direction-cosine matrix for callers that do
-  not pre-rotate IMU samples.
-
+  non-holonomic lateral and vertical velocity constraints, and
+  per-fix-status GNSS covariance weighting for single, float, and fixed
+  updates. The inertial filter config also accepts a fixed IMU-to-body
+  direction-cosine matrix for callers that do not pre-rotate IMU samples.
+- Standalone first-fix velocity matching helpers for GNSS outage spans,
+  including `velocity_match_outage_to_state` for blending an outage segment to
+  a caller-supplied post-update endpoint instead of only to the raw GNSS fix.
 - RINEX-to-SPP assembly helpers that convert parsed observation epochs plus a
   broadcast or precise ephemeris context into per-epoch `SolveInputs`, with a
   serial batch solve convenience that preserves per-epoch solve errors.
 - Static reference-station RINEX solve that composes code-DGNSS and carrier RTK
   modes, returning one station coordinate with covariance, fix status, and
   per-epoch diagnostics.
+
+### Changed
+
+- Fusion state checkpoints use codec version 4 and still read earlier v1-v3
+  streams. Checkpoints now preserve the stationary-detector window plus the
+  last stationary and non-holonomic pseudo-update epochs, so restored filters
+  keep detector state and duplicate-update guards.
+- `GnssFixMeasurement` now carries public `fix_status`; JSON
+  `SerializableLooseMeasurement` defaults the field for older payloads.
+- RTK `FloatBaselineSolution` and `FixedBaselineSolution` now expose
+  `baseline_covariance_m2`; computing that covariance can surface
+  `SingularGeometry` on degenerate final normal equations.
+- Fusion RTS histories accept same-epoch predicted/updated checkpoints for
+  measurement-only updates, synthesize an identity transition for those
+  updates, and permit zero-duration smoothing transitions.
+- Static reference-station selection now prefers fixed carrier RTK, then code
+  DGNSS, then float carrier fallback; reports keep the fixed-solution
+  measurement count, label fixed-mode failures correctly, carry typed
+  per-mode errors, and format all-mode failures by mode instead of dumping
+  debug structs.
+- Code-DGNSS covariance now accounts for both rover and reference code noise,
+  including the multi-epoch static reference-station path.
+- Stationary ZUPT/ZARU and non-holonomic pseudo-updates no longer inherit GNSS
+  IGG-III measurement reweighting or Yang prediction-adaptation settings.
+- Tight-coupling range-rate gyro-bias rows now honor `imu_to_body_dcm` for
+  non-identity IMU mounting.
 
 ## [0.20.0]
 
@@ -28,7 +55,7 @@ All notable changes to `sidereon-core` are documented here.
 - RINEX RTK arc builders as library API: rover and base observations plus
   ephemeris and base coordinates in, double-differenced carrier-phase arcs
   built by the library, static float and wide-lane fixed baselines out with
-  covariance and fix status. On the real WTZR/WTZZ station pair the fixed
+  fix status. On the real WTZR/WTZZ station pair the fixed
   baseline lands within 2.8 mm of the published ITRF antenna-reference-point
   baseline (float: 8.3 mm).
 

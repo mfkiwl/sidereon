@@ -4,9 +4,11 @@ use std::path::PathBuf;
 use nalgebra::{Matrix3, Vector3};
 use sidereon_core::dgnss::{solve_position, CodeObservation};
 use sidereon_core::ephemeris::Sp3;
+use sidereon_core::fusion::GnssFixStatus;
 use sidereon_core::positioning::{
     solve_static_reference_station_rinex, spp_inputs_from_rinex_obs, RinexSppOptions,
-    StaticReferenceCarrierRinexOptions, StaticReferenceFixStatus, StaticReferenceModeStatus,
+    StaticReferenceCarrierRinexOptions, StaticReferenceFixStatus, StaticReferenceModeError,
+    StaticReferenceModeReport, StaticReferenceModeStatus, StaticReferenceStationError,
     StaticReferenceStationMode, StaticReferenceStationRinexOptions,
 };
 use sidereon_core::rinex::observations::RinexObs;
@@ -246,6 +248,19 @@ fn wettzell_reference_station_static_returns_coordinate_and_covariance() {
         BTreeMap::from([("G".to_string(), "G30".to_string())])
     );
     assert_eq!(carrier.diagnostics.len(), 24);
+    let carrier_report = solution
+        .mode_reports
+        .iter()
+        .find(|report| report.mode == StaticReferenceStationMode::CarrierFixed)
+        .expect("carrier report");
+    assert_eq!(
+        carrier_report.used_measurements,
+        carrier
+            .rtk_solution
+            .fixed_solution
+            .fixed_solution
+            .n_observations
+    );
 
     let code = solution.code_solution.as_ref().expect("code detail");
     assert!(code.static_solution.is_some());
@@ -261,6 +276,84 @@ fn wettzell_reference_station_static_returns_coordinate_and_covariance() {
         position_m,
         error_norm_m,
         three_sigma_along(error_m, solution.covariance.position_ecef_m2)
+    );
+}
+
+#[test]
+fn code_solution_outprioritizes_unfixed_carrier_float() {
+    let sp3 = load_sp3();
+    let (mut reference_obs, mut rover_obs) = load_wettzell_obs();
+    reference_obs.epochs.truncate(24);
+    rover_obs.epochs.truncate(24);
+    let reference_arp_m = arp_position(WTZR_MARKER_M, &reference_obs);
+    let code_options = RinexSppOptions::default_for(&rover_obs).expect("default signal policy");
+    let mut carrier = carrier_options(reference_arp_m, 24);
+    carrier.static_config.opts.fixed.ratio_threshold = 1.0e12;
+    carrier.static_config.arc.update_opts.search.ratio_threshold = 1.0e12;
+    let options = StaticReferenceStationRinexOptions::code_and_carrier(code_options, carrier, true);
+
+    let solution = solve_static_reference_station_rinex(
+        &sp3,
+        &reference_obs,
+        &rover_obs,
+        reference_arp_m,
+        &options,
+    )
+    .expect("static reference-station solve");
+
+    assert_eq!(solution.mode, StaticReferenceStationMode::CodeDgnss);
+    assert_eq!(solution.fix_status, StaticReferenceFixStatus::CodeDgnss);
+    assert!(solution.code_solution.is_some());
+    let carrier = solution.carrier_solution.as_ref().expect("carrier detail");
+    assert_eq!(carrier.integer_status, IntegerStatus::NotFixed);
+    assert!(solution.mode_reports.iter().any(|report| report.mode
+        == StaticReferenceStationMode::CarrierFloat
+        && report.status == StaticReferenceModeStatus::Solved));
+}
+
+#[test]
+fn all_modes_failed_display_lists_mode_errors_without_debug_dump() {
+    let error = StaticReferenceStationError::AllModesFailed {
+        mode_reports: vec![
+            StaticReferenceModeReport {
+                mode: StaticReferenceStationMode::CodeDgnss,
+                status: StaticReferenceModeStatus::Failed,
+                used_epochs: 0,
+                skipped_epochs: 0,
+                used_measurements: 0,
+                error: Some(StaticReferenceModeError::NoMatchedCodeEpochs),
+            },
+            StaticReferenceModeReport {
+                mode: StaticReferenceStationMode::CarrierFixed,
+                status: StaticReferenceModeStatus::Failed,
+                used_epochs: 0,
+                skipped_epochs: 0,
+                used_measurements: 0,
+                error: Some(StaticReferenceModeError::CarrierSolve {
+                    reason: "singular geometry".to_string(),
+                }),
+            },
+        ],
+    };
+    let display = error.to_string();
+    assert!(display.contains("code-DGNSS: no matched epochs"));
+    assert!(display.contains("carrier-fixed: carrier RTK solve failed: singular geometry"));
+    assert!(!display.contains("StaticReferenceModeReport"));
+}
+
+#[test]
+fn static_reference_fix_status_converts_to_loose_gnss_fix_status() {
+    assert_eq!(
+        GnssFixStatus::from(StaticReferenceFixStatus::CodeDgnss),
+        GnssFixStatus::Single
+    );
+    assert_eq!(
+        GnssFixStatus::from(StaticReferenceFixStatus::CarrierFloat),
+        GnssFixStatus::Float
+    );
+    assert_eq!(
+        GnssFixStatus::from(StaticReferenceFixStatus::CarrierFixed),
+        GnssFixStatus::Fixed
     );
 }
 

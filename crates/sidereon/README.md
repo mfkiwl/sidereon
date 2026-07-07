@@ -122,6 +122,7 @@ of epochs across a rayon pool, bit-identical to the serial path.
 - **Bodies & almanac:** Sun/Moon/planet apparent places (geocentric or topocentric RA/Dec), Sun and Moon rise/set, seasons, moon phases, eclipses, planetary transits, plus JPL SPK (DAF/.bsp) kernels
 - **Observation geometry:** angular separation and position angle, phase/beta/parallactic angles, sub-solar and sub-observer points, terminator, satellite visual magnitude
 - **Positioning:** SPP, RTK (float/fixed), PPP (float/fixed), DOP, velocity, robust fault detection and exclusion
+- **GNSS/INS fusion:** loose and tight updates, inertial checkpoint serialization, RTS smoothing, outage velocity matching, stationary and non-holonomic pseudo-updates
 - **GNSS data:** SP3, RINEX (obs/nav/clock), CRINEX, ANTEX, broadcast ephemeris, Bias-SINEX / CODE DCB biases, source-agnostic ephemeris sampling
 - **Corrections:** SBAS, RTCM SSR and Galileo HAS orbit/clock/bias correction stores
 - **Space situational awareness:** conjunction/TCA screening, collision probability, CDM, covariance, relative motion (RIC/RTN/LVLH, Clohessy-Wiltshire)
@@ -129,7 +130,7 @@ of epochs across a rayon pool, bit-identical to the serial path.
 
 The product parsers, look-angle helpers, and propagation shortcuts live at the
 crate root (`load_sp3`, `solve_spp`, `passes`, `sgp4`, `tle`, `tca`, `relative`,
-`almanac`); the full astrodynamics tree is under `sidereon::astro`. Lower-level RTK/PPP internals stay
+`almanac`, `InertialFilter`, `velocity_match_outage_to_state`); the full astrodynamics tree is under `sidereon::astro`. Lower-level RTK/PPP internals stay
 behind the explicit `sidereon::raw` escape hatch so the ergonomic surface stays
 small.
 

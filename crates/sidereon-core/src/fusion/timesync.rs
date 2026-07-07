@@ -60,8 +60,23 @@ pub struct InertialFilterSnapshot {
     pub state: InsFilterState,
     /// Last propagated body angular rate relative to ECEF, resolved in body axes.
     pub last_body_rate_wrt_ecef_rps: [f64; 3],
+    /// Recent detector samples used by stationary-update gating.
+    pub stationarity_window: Vec<StationarityDetectorSnapshotSample>,
+    /// Epoch of the last applied stationary pseudo-measurement, if any.
+    pub last_stationary_update_t_j2000_s: Option<f64>,
+    /// Epoch of the last applied non-holonomic pseudo-measurement, if any.
+    pub last_non_holonomic_update_t_j2000_s: Option<f64>,
     /// Tight receiver-clock augmentation and full augmented covariance.
     pub tight: TightFilterSnapshot,
+}
+
+/// One retained stationary-detector sample stored in filter snapshots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationarityDetectorSnapshotSample {
+    /// Absolute difference between measured specific-force norm and local gravity, m/s^2.
+    pub specific_force_norm_error_mps2: f64,
+    /// Body angular-rate norm relative to ECEF, rad/s.
+    pub body_rate_wrt_ecef_norm_rps: f64,
 }
 
 /// Current retained-history occupancy for time synchronization.
@@ -146,6 +161,9 @@ impl TimeSyncHistory {
         history.push_checkpoint(InertialFilterSnapshot {
             state: state.clone(),
             last_body_rate_wrt_ecef_rps: [0.0; 3],
+            stationarity_window: Vec::new(),
+            last_stationary_update_t_j2000_s: None,
+            last_non_holonomic_update_t_j2000_s: None,
             tight: tight.snapshot(),
         });
         history
@@ -425,6 +443,9 @@ impl InertialFilter {
         InertialFilterSnapshot {
             state: self.state.clone(),
             last_body_rate_wrt_ecef_rps: self.last_body_rate_wrt_ecef_rps,
+            stationarity_window: self.stationarity_window.iter().copied().collect(),
+            last_stationary_update_t_j2000_s: self.last_stationary_update_t_j2000_s,
+            last_non_holonomic_update_t_j2000_s: self.last_non_holonomic_update_t_j2000_s,
             tight: self.tight.snapshot(),
         }
     }
@@ -439,9 +460,29 @@ impl InertialFilter {
             snapshot.last_body_rate_wrt_ecef_rps,
             "last_body_rate_wrt_ecef_rps",
         )?;
+        validate_stationarity_window(&snapshot.stationarity_window)?;
+        validate_optional_epoch(
+            snapshot.last_stationary_update_t_j2000_s,
+            "last_stationary_update_t_j2000_s",
+        )?;
+        validate_optional_epoch(
+            snapshot.last_non_holonomic_update_t_j2000_s,
+            "last_non_holonomic_update_t_j2000_s",
+        )?;
         let restored = snapshot.clone();
         self.state = restored.state.clone();
         self.last_body_rate_wrt_ecef_rps = restored.last_body_rate_wrt_ecef_rps;
+        self.stationarity_window = restored.stationarity_window.iter().copied().collect();
+        let max_stationarity_len = self
+            .config
+            .loose
+            .stationary_updates
+            .map_or(1, |config| config.detector.window_len);
+        while self.stationarity_window.len() > max_stationarity_len {
+            self.stationarity_window.pop_front();
+        }
+        self.last_stationary_update_t_j2000_s = restored.last_stationary_update_t_j2000_s;
+        self.last_non_holonomic_update_t_j2000_s = restored.last_non_holonomic_update_t_j2000_s;
         self.tight
             .restore(&restored.tight, restored.state.dimension())?;
         self.time_sync.restore_to_snapshot(restored);
@@ -895,6 +936,29 @@ fn validate_vec3(value: [f64; 3], field: &'static str) -> Result<(), FusionError
     Ok(())
 }
 
+fn validate_stationarity_window(
+    samples: &[StationarityDetectorSnapshotSample],
+) -> Result<(), FusionError> {
+    for sample in samples {
+        validate_epoch(
+            sample.specific_force_norm_error_mps2,
+            "specific_force_norm_error_mps2",
+        )?;
+        validate_epoch(
+            sample.body_rate_wrt_ecef_norm_rps,
+            "body_rate_wrt_ecef_norm_rps",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_optional_epoch(value: Option<f64>, field: &'static str) -> Result<(), FusionError> {
+    if let Some(value) = value {
+        validate_epoch(value, field)?;
+    }
+    Ok(())
+}
+
 fn validate_history_snapshot(snapshot: &TimeSyncHistorySnapshot) -> Result<(), FusionError> {
     snapshot.config.validate()?;
     if snapshot.imu_samples.len() > snapshot.config.imu_capacity {
@@ -968,6 +1032,15 @@ fn validate_history_snapshot(snapshot: &TimeSyncHistorySnapshot) -> Result<(), F
         validate_vec3(
             checkpoint.snapshot.last_body_rate_wrt_ecef_rps,
             "last_body_rate_wrt_ecef_rps",
+        )?;
+        validate_stationarity_window(&checkpoint.snapshot.stationarity_window)?;
+        validate_optional_epoch(
+            checkpoint.snapshot.last_stationary_update_t_j2000_s,
+            "last_stationary_update_t_j2000_s",
+        )?;
+        validate_optional_epoch(
+            checkpoint.snapshot.last_non_holonomic_update_t_j2000_s,
+            "last_non_holonomic_update_t_j2000_s",
         )?;
         if checkpoint.t_j2000_s != checkpoint.snapshot.state.nominal.t_j2000_s {
             return Err(invalid_input("checkpoints", "epoch must match snapshot"));

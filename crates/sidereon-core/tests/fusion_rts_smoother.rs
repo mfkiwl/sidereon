@@ -410,6 +410,9 @@ fn snapshot_from_vector(
     InertialFilterSnapshot {
         state,
         last_body_rate_wrt_ecef_rps: [0.0; 3],
+        stationarity_window: Vec::new(),
+        last_stationary_update_t_j2000_s: None,
+        last_non_holonomic_update_t_j2000_s: None,
         tight: TightFilterSnapshot {
             clock_bias_m: 0.0,
             clock_drift_m_s: 0.0,

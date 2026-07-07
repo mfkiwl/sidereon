@@ -225,7 +225,8 @@ where
         .collect();
     solve_inputs.corrections = spp::Corrections::NONE;
 
-    let solution = spp::solve(source, &solve_inputs, with_geodetic)?;
+    let mut solution = spp::solve(source, &solve_inputs, with_geodetic)?;
+    scale_position_covariance(&mut solution.position_covariance, 2.0);
     let pos = solution.position.as_array();
     let baseline_vector_m = vec3::sub3(pos, base_position_m);
     let baseline_m = vec3::norm3(baseline_vector_m);
@@ -236,6 +237,15 @@ where
         baseline_m,
         dropped_sats: applied.dropped,
     })
+}
+
+fn scale_position_covariance(covariance: &mut crate::dop::PositionCovariance, scale: f64) {
+    for row in 0..3 {
+        for col in 0..3 {
+            covariance.ecef_m2[row][col] *= scale;
+            covariance.enu_m2[row][col] *= scale;
+        }
+    }
 }
 
 fn sat_from_token(token: &str) -> Option<GnssSatelliteId> {
