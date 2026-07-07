@@ -2,6 +2,16 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- SP3 multi-center merge coordinate-label reconciliation options:
+  caller-asserted label equivalence and catalog Helmert reconciliation between
+  known ITRF/IGS realizations, with merge-report audit fields for the selected
+  method, affected records, published parameters, rates, provenance, and catalog
+  direction.
+
 ## [0.21.0]
 
 ### Added

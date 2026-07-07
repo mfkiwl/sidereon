@@ -1090,7 +1090,8 @@ mod write;
 
 pub use combine::{
     align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
-    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport,
+    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport, Sp3FrameLabelSet,
+    Sp3FrameReconciliation, Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions,
 };
 pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
 pub use interpolant_store::{
