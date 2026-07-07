@@ -245,6 +245,75 @@ fn forward_then_inverse_round_trip_is_sub_nanometre() {
 }
 
 #[test]
+fn itrf2020_to_itrf2014_rates_propagate_linearly() {
+    let entry = catalog()
+        .iter()
+        .find(|entry| {
+            entry.from == TerrestrialFrame::Itrf2020 && entry.to == TerrestrialFrame::Itrf2014
+        })
+        .expect("published entry present");
+
+    let reference = entry
+        .parameters_at(entry.reference_epoch_year)
+        .expect("reference parameters");
+    let later = entry
+        .parameters_at(entry.reference_epoch_year + 7.25)
+        .expect("later parameters");
+
+    assert_array_bits(
+        "translation propagated by published rates",
+        later.translation_mm,
+        [
+            reference.translation_mm[0] + 0.0 * 7.25,
+            reference.translation_mm[1] - 0.1 * 7.25,
+            reference.translation_mm[2] + 0.2 * 7.25,
+        ],
+    );
+    assert_bits(
+        "scale propagated by published rates",
+        later.scale_ppb,
+        reference.scale_ppb + 0.0 * 7.25,
+    );
+    assert_array_bits(
+        "rotation propagated by published rates",
+        later.rotation_mas,
+        [
+            reference.rotation_mas[0] + 0.0 * 7.25,
+            reference.rotation_mas[1] + 0.0 * 7.25,
+            reference.rotation_mas[2] + 0.0 * 7.25,
+        ],
+    );
+}
+
+#[test]
+fn identity_transform_is_bit_equal() {
+    let position = TerrestrialPositionM::new(3_875_112.125, -912_445.875, 4_966_320.25)
+        .expect("finite position");
+    let velocity =
+        TerrestrialVelocityMPerYear::new(-0.0125, 0.019, 0.0045).expect("finite velocity");
+
+    let transformed = transform(
+        position,
+        Some(velocity),
+        TerrestrialFrame::Itrf2020,
+        TerrestrialFrame::Itrf2020,
+        2026.5,
+    )
+    .expect("identity transform");
+
+    assert_array_bits(
+        "identity position",
+        transformed.position.as_array(),
+        position.as_array(),
+    );
+    assert_array_bits(
+        "identity velocity",
+        transformed.velocity.expect("velocity").as_array(),
+        velocity.as_array(),
+    );
+}
+
+#[test]
 fn transform_composition_matches_direct_published_link_tightly() {
     let position = TerrestrialPositionM::new(1_234_567.25, -4_321_987.5, 4_876_543.75)
         .expect("finite position");

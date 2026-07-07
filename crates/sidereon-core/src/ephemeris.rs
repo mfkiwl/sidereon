@@ -45,8 +45,9 @@ pub use crate::sp3::{
     MergeCombine, MergeFlag, MergeOptions, MergeReport, MmapPreciseEphemerisInterpolant,
     PreciseEphemerisInterpolant, PreciseEphemerisSample, PreciseEphemerisSamples,
     PreciseEphemerisStateSample, PreciseInterpolantError, PreciseInterpolantStoreError,
-    PreciseSamplesError, ReferenceState, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State,
-    Sp3TimeSystem, Sp3Version,
+    PreciseSamplesError, ReferenceState, Sp3, Sp3DataType, Sp3Flags, Sp3FrameLabelSet,
+    Sp3FrameReconciliation, Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions, Sp3Header,
+    Sp3State, Sp3TimeSystem, Sp3Version,
 };
 pub use crate::spp::EphemerisSource;
 use crate::{validate, GnssSatelliteId, GnssSystem};

@@ -9,21 +9,28 @@
 //! `other - reference`); subtract it from `other`'s clocks to put both products
 //! on `reference`'s datum.
 //!
-//! Orbit positions need no such treatment: every center reports ITRF
-//! center-of-mass coordinates, so cross-center position differences are already
-//! directly comparable.
+//! Orbit positions are directly comparable only when the SP3 coordinate-system
+//! labels match, or when the caller explicitly opts into an audited label
+//! assertion or terrestrial Helmert reconciliation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::astro::math::vec3;
-use crate::astro::time::civil::mjd_from_jd;
+use crate::astro::time::civil::{
+    civil_from_julian_day_number, fractional_day_of_year_from_instant, is_leap_year,
+    julian_date_from_instant, mjd_from_jd,
+};
 use crate::astro::time::gnss;
 use crate::astro::time::model::Instant;
 
 use super::interp::{instant_to_j2000_seconds, sp3_epoch_j2000_seconds};
 use super::{RawNode, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State};
-use crate::constants::{GPS_EPOCH_TO_J2000_S, KM_TO_M};
-use crate::frame::ItrfPositionM;
+use crate::constants::{DAYS_PER_JULIAN_YEAR, GPS_EPOCH_TO_J2000_S, KM_TO_M, SECONDS_PER_DAY};
+use crate::frame::{ItrfPositionM, ItrfVelocityMS};
+use crate::frame_catalog::{
+    self, HelmertParameters, HelmertRates, TerrestrialFrame, TerrestrialPositionM,
+    TerrestrialVelocityMPerYear,
+};
 use crate::id::{GnssSatelliteId, GnssSystem};
 use crate::tolerances::WHOLE_SECOND_EPS_S;
 use crate::validate;
@@ -178,6 +185,9 @@ pub struct MergeOptions {
     /// Optional constellation/system filter. When set, only satellites whose
     /// system is in this set are considered for the merged product.
     pub systems: Option<BTreeSet<GnssSystem>>,
+    /// Explicit coordinate-label reconciliation rules. Default is disabled, so
+    /// mismatched coordinate-system labels are rejected.
+    pub frame_reconciliation: Sp3FrameReconciliationOptions,
 }
 
 impl Default for MergeOptions {
@@ -192,7 +202,62 @@ impl Default for MergeOptions {
             combine: MergeCombine::Mean,
             target_epoch_interval_s: None,
             systems: None,
+            frame_reconciliation: Sp3FrameReconciliationOptions::default(),
         }
+    }
+}
+
+/// Explicit opt-in rules for reconciling mismatched SP3 coordinate labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sp3FrameReconciliationOptions {
+    /// Caller-asserted label sets that may be treated as physically equivalent
+    /// without applying any coordinate transform.
+    pub asserted_equivalent_label_sets: Vec<Sp3FrameLabelSet>,
+    /// Whether to apply catalog Helmert transforms between known ITRF/IGS
+    /// realizations when labels differ and no assertion covers the pair.
+    pub helmert: bool,
+}
+
+impl Sp3FrameReconciliationOptions {
+    /// Construct disabled reconciliation options.
+    pub const fn disabled() -> Self {
+        Self {
+            asserted_equivalent_label_sets: Vec::new(),
+            helmert: false,
+        }
+    }
+
+    /// Construct options that enable catalog Helmert reconciliation.
+    pub const fn helmert() -> Self {
+        Self {
+            asserted_equivalent_label_sets: Vec::new(),
+            helmert: true,
+        }
+    }
+}
+
+/// A caller-asserted set of SP3 coordinate labels that may be merged as one
+/// physical frame with no coordinate math.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sp3FrameLabelSet {
+    /// Exact trimmed labels in this asserted-equivalent set.
+    pub labels: BTreeSet<String>,
+}
+
+impl Sp3FrameLabelSet {
+    /// Construct an asserted-equivalent label set from an iterator of labels.
+    pub fn new(labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            labels: labels
+                .into_iter()
+                .map(|label| label.into().trim().to_string())
+                .collect(),
+        }
+    }
+
+    /// Construct a two-label asserted-equivalent set.
+    pub fn pair(a: impl Into<String>, b: impl Into<String>) -> Self {
+        Self::new([a.into(), b.into()])
     }
 }
 
@@ -266,9 +331,67 @@ pub struct EpochAgreement {
     pub clock_max_s: Option<f64>,
 }
 
+/// Mechanism used to reconcile one non-reference source's coordinate label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sp3FrameReconciliationMethod {
+    /// Caller asserted the labels are physically equivalent; no coordinate math
+    /// was applied.
+    AssertedEquivalence,
+    /// A catalog Helmert transform, or exact identity for the same resolved
+    /// realization, reconciled the source to the target label.
+    Helmert,
+}
+
+/// Audit record for one reconciled SP3 source coordinate label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sp3FrameReconciliation {
+    /// Source index in the input slice.
+    pub source_index: usize,
+    /// Original coordinate-system label on that source.
+    pub source_label: String,
+    /// Target coordinate-system label, taken from source 0.
+    pub target_label: String,
+    /// Mechanism selected by the explicit caller options.
+    pub method: Sp3FrameReconciliationMethod,
+    /// Caller-asserted label set used for [`Sp3FrameReconciliationMethod::AssertedEquivalence`].
+    pub asserted_label_set: Option<Vec<String>>,
+    /// Resolved source terrestrial realization for Helmert reconciliation.
+    pub source_frame: Option<TerrestrialFrame>,
+    /// Resolved target terrestrial realization for Helmert reconciliation.
+    pub target_frame: Option<TerrestrialFrame>,
+    /// Source realization of the published catalog row used for Helmert
+    /// reconciliation.
+    pub catalog_source_frame: Option<TerrestrialFrame>,
+    /// Target realization of the published catalog row used for Helmert
+    /// reconciliation.
+    pub catalog_target_frame: Option<TerrestrialFrame>,
+    /// Whether the published catalog row was applied in reverse.
+    pub catalog_inverse: bool,
+    /// Published transform reference epoch, when a non-identity catalog entry was
+    /// used.
+    pub reference_epoch_year: Option<f64>,
+    /// Published seven Helmert parameters at the reference epoch, when a
+    /// non-identity catalog entry was used.
+    pub parameters: Option<HelmertParameters>,
+    /// Published parameter rates, when a non-identity catalog entry was used.
+    pub rates: Option<HelmertRates>,
+    /// Published-table provenance for the catalog entry, when available.
+    pub provenance: Option<String>,
+    /// Decimal-year span of transformed records, inclusive, when Helmert
+    /// reconciliation was applied.
+    pub epoch_year_span: Option<[f64; 2]>,
+    /// Number of satellite position records covered by the reconciliation.
+    pub records_affected: usize,
+    /// Whether the resolved source and target realizations were identical, so
+    /// the Helmert path left coordinates bit-equal.
+    pub identity: bool,
+}
+
 /// Audit trail for a [`merge`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MergeReport {
+    /// Coordinate-label reconciliations applied before source consensus.
+    pub frame_reconciliations: Vec<Sp3FrameReconciliation>,
     /// Cells where two or more sources disagreed beyond tolerance with no
     /// agreeing subset of `min_agree` - omitted from the merged product.
     pub quarantined: Vec<MergeFlag>,
@@ -459,13 +582,16 @@ fn fold_max(acc: Option<f64>, value: f64) -> f64 {
 /// centers at adjacent epochs. If that source is missing a cell, the cell is
 /// omitted rather than filled from a lower-precedence source.
 ///
-/// All inputs must share an exact SP3 time-system label and exact
-/// coordinate-system label (epochs are matched across products in that scale);
-/// mismatches are rejected. The merged record flags are the union (OR) of the
-/// contributing sources' flags - in particular a `clock_event` on any
-/// clock-consensus member is preserved, so the interpolator still splits the
-/// clock arc. The merged header is **synthetic**: its first-epoch fields
-/// describe the union's first epoch and its data type is position-only.
+/// All inputs must share an exact SP3 time-system label. Coordinate-system
+/// labels must also match unless [`MergeOptions::frame_reconciliation`] opts
+/// into a caller assertion or catalog Helmert reconciliation; every such
+/// reconciliation is recorded in [`MergeReport::frame_reconciliations`].
+/// Otherwise coordinate-label mismatches are rejected. The merged record flags
+/// are the union (OR) of the contributing sources' flags - in particular a
+/// `clock_event` on any clock-consensus member is preserved, so the interpolator
+/// still splits the clock arc. The merged header is **synthetic**: its
+/// first-epoch fields describe the union's first epoch and its data type is
+/// position-only.
 ///
 /// Pure and deterministic: order the inputs by center precedence and ties (equal
 /// cluster sizes, `Precedence` combine) resolve to the earliest-listed source.
@@ -483,9 +609,8 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
 
     // Inputs must be combinable: epochs are matched in one exact product time
     // system, and positions are only comparable in an exactly common coordinate
-    // system / frame. Do not silently alias labels such as QZS/GPS or
-    // IGS20/IGc20 here: without an explicit transform, a differently labeled
-    // product contract is a different product contract.
+    // system / frame unless the caller explicitly opted into one of the audited
+    // reconciliation mechanisms below.
     let base = &sources[0].header;
     for s in &sources[1..] {
         if s.header.time_system != base.time_system {
@@ -494,13 +619,10 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
                 base.time_system, s.header.time_system
             )));
         }
-        if s.header.coordinate_system.trim() != base.coordinate_system.trim() {
-            return Err(Error::InvalidInput(format!(
-                "merge inputs have mismatched coordinate systems ({:?} vs {:?})",
-                base.coordinate_system, s.header.coordinate_system
-            )));
-        }
     }
+
+    let (prepared_sources, frame_reconciliations) = reconcile_sp3_coordinate_labels(sources, opts)?;
+    let sources = prepared_sources.as_slice();
 
     // floored-J2000-second -> epoch index, per source.
     let epoch_index: Vec<BTreeMap<i64, usize>> = sources
@@ -603,7 +725,10 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
     let mut out_states: Vec<BTreeMap<GnssSatelliteId, Sp3State>> =
         Vec::with_capacity(epoch_keys.len());
     let mut out_raw: Vec<BTreeMap<GnssSatelliteId, RawNode>> = Vec::with_capacity(epoch_keys.len());
-    let mut report = MergeReport::default();
+    let mut report = MergeReport {
+        frame_reconciliations,
+        ..MergeReport::default()
+    };
     let mut all_sats: BTreeSet<GnssSatelliteId> = BTreeSet::new();
 
     for (&key, &epoch) in &epoch_keys {
@@ -907,6 +1032,242 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
     };
 
     Ok((merged, report))
+}
+
+fn reconcile_sp3_coordinate_labels(
+    sources: &[Sp3],
+    opts: &MergeOptions,
+) -> Result<(Vec<Sp3>, Vec<Sp3FrameReconciliation>)> {
+    let target_label = normalized_sp3_frame_label(&sources[0].header.coordinate_system);
+    let mut prepared = sources.to_vec();
+    let mut report = Vec::new();
+
+    for idx in 1..sources.len() {
+        let source_label = normalized_sp3_frame_label(&sources[idx].header.coordinate_system);
+        if source_label == target_label {
+            continue;
+        }
+
+        if let Some(asserted) = asserted_frame_label_set(
+            &source_label,
+            &target_label,
+            &opts.frame_reconciliation.asserted_equivalent_label_sets,
+        ) {
+            prepared[idx].header.coordinate_system = target_label.clone();
+            report.push(Sp3FrameReconciliation {
+                source_index: idx,
+                source_label,
+                target_label: target_label.clone(),
+                method: Sp3FrameReconciliationMethod::AssertedEquivalence,
+                asserted_label_set: Some(asserted),
+                source_frame: None,
+                target_frame: None,
+                catalog_source_frame: None,
+                catalog_target_frame: None,
+                catalog_inverse: false,
+                reference_epoch_year: None,
+                parameters: None,
+                rates: None,
+                provenance: None,
+                epoch_year_span: None,
+                records_affected: count_position_records(&sources[idx]),
+                identity: true,
+            });
+            continue;
+        }
+
+        if opts.frame_reconciliation.helmert {
+            let from = sp3_coordinate_label_frame(&source_label).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "merge inputs have mismatched coordinate systems ({:?} vs {:?}); source label {:?} is not a known ITRF/IGS realization",
+                    sources[0].header.coordinate_system,
+                    sources[idx].header.coordinate_system,
+                    sources[idx].header.coordinate_system
+                ))
+            })?;
+            let to = sp3_coordinate_label_frame(&target_label).ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "merge inputs have mismatched coordinate systems ({:?} vs {:?}); target label {:?} is not a known ITRF/IGS realization",
+                    sources[0].header.coordinate_system,
+                    sources[idx].header.coordinate_system,
+                    sources[0].header.coordinate_system
+                ))
+            })?;
+
+            let transform_report = reconcile_source_by_helmert(
+                &mut prepared[idx],
+                idx,
+                source_label,
+                target_label.clone(),
+                from,
+                to,
+            )?;
+            report.push(transform_report);
+            continue;
+        }
+
+        return Err(Error::InvalidInput(format!(
+            "merge inputs have mismatched coordinate systems ({:?} vs {:?})",
+            sources[0].header.coordinate_system, sources[idx].header.coordinate_system
+        )));
+    }
+
+    Ok((prepared, report))
+}
+
+fn asserted_frame_label_set(
+    source_label: &str,
+    target_label: &str,
+    label_sets: &[Sp3FrameLabelSet],
+) -> Option<Vec<String>> {
+    label_sets.iter().find_map(|set| {
+        if set.labels.contains(source_label) && set.labels.contains(target_label) {
+            Some(set.labels.iter().cloned().collect())
+        } else {
+            None
+        }
+    })
+}
+
+fn reconcile_source_by_helmert(
+    source: &mut Sp3,
+    source_index: usize,
+    source_label: String,
+    target_label: String,
+    from: TerrestrialFrame,
+    to: TerrestrialFrame,
+) -> Result<Sp3FrameReconciliation> {
+    let records_affected = count_position_records(source);
+    let epoch_year_span = epoch_year_span(source);
+    let identity = from == to;
+
+    if !identity {
+        transform_sp3_positions(source, from, to)?;
+    }
+    source.header.coordinate_system = target_label.clone();
+
+    let published = published_transform_for_report(from, to);
+    Ok(Sp3FrameReconciliation {
+        source_index,
+        source_label,
+        target_label,
+        method: Sp3FrameReconciliationMethod::Helmert,
+        asserted_label_set: None,
+        source_frame: Some(from),
+        target_frame: Some(to),
+        catalog_source_frame: published.map(|published| published.entry.from),
+        catalog_target_frame: published.map(|published| published.entry.to),
+        catalog_inverse: published.is_some_and(|published| published.inverse),
+        reference_epoch_year: published.map(|published| published.entry.reference_epoch_year),
+        parameters: published.map(|published| published.entry.parameters),
+        rates: published.map(|published| published.entry.rates),
+        provenance: published.map(|published| published.entry.provenance.to_string()),
+        epoch_year_span,
+        records_affected,
+        identity,
+    })
+}
+
+fn transform_sp3_positions(
+    source: &mut Sp3,
+    from: TerrestrialFrame,
+    to: TerrestrialFrame,
+) -> Result<()> {
+    let seconds_per_julian_year = DAYS_PER_JULIAN_YEAR * SECONDS_PER_DAY;
+    for epoch_idx in 0..source.epochs.len() {
+        let epoch_year = decimal_year(source.epochs[epoch_idx]);
+        let states = &mut source.states[epoch_idx];
+        let raw_nodes = &mut source.interp_raw[epoch_idx];
+        for (sat, state) in states.iter_mut() {
+            let position = TerrestrialPositionM::from_itrf(state.position);
+            let velocity = state
+                .velocity
+                .map(|velocity| {
+                    let [vx, vy, vz] = velocity.as_array();
+                    TerrestrialVelocityMPerYear::new(
+                        vx * seconds_per_julian_year,
+                        vy * seconds_per_julian_year,
+                        vz * seconds_per_julian_year,
+                    )
+                })
+                .transpose()
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            let transformed = frame_catalog::transform(position, velocity, from, to, epoch_year)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            let [x, y, z] = transformed.position.as_array();
+            state.position = ItrfPositionM::new(x, y, z)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            state.velocity = transformed
+                .velocity
+                .map(|velocity| {
+                    let [vx, vy, vz] = velocity.as_array();
+                    ItrfVelocityMS::new(
+                        vx / seconds_per_julian_year,
+                        vy / seconds_per_julian_year,
+                        vz / seconds_per_julian_year,
+                    )
+                })
+                .transpose()
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            if let Some(raw) = raw_nodes.get_mut(sat) {
+                raw.km = [x / KM_TO_M, y / KM_TO_M, z / KM_TO_M];
+            }
+        }
+    }
+    Ok(())
+}
+
+fn count_position_records(source: &Sp3) -> usize {
+    source.states.iter().map(BTreeMap::len).sum()
+}
+
+fn epoch_year_span(source: &Sp3) -> Option<[f64; 2]> {
+    let first = source.epochs.first().copied().map(decimal_year)?;
+    let last = source.epochs.last().copied().map(decimal_year)?;
+    Some([first, last])
+}
+
+fn decimal_year(epoch: Instant) -> f64 {
+    let jd_midnight = julian_date_from_instant(epoch) + 0.5;
+    let (year, _, _) = civil_from_julian_day_number(jd_midnight.floor() as i64);
+    let days = if is_leap_year(year) { 366.0 } else { 365.0 };
+    year as f64 + (fractional_day_of_year_from_instant(epoch) - 1.0) / days
+}
+
+fn normalized_sp3_frame_label(label: &str) -> String {
+    label.trim().to_string()
+}
+
+fn sp3_coordinate_label_frame(label: &str) -> Option<TerrestrialFrame> {
+    match label.trim() {
+        "ITRF2020" | "ITRF20" | "IGS20" | "IGc20" => Some(TerrestrialFrame::Itrf2020),
+        "ITRF2014" | "ITRF14" | "IGS14" | "IGb14" => Some(TerrestrialFrame::Itrf2014),
+        "ITRF2008" | "ITRF08" | "IGS08" | "IGb08" => Some(TerrestrialFrame::Itrf2008),
+        _ => None,
+    }
+}
+
+fn published_transform_for_report(
+    from: TerrestrialFrame,
+    to: TerrestrialFrame,
+) -> Option<PublishedTransformForReport> {
+    frame_catalog::catalog_entry(from, to)
+        .map(|entry| PublishedTransformForReport {
+            entry,
+            inverse: false,
+        })
+        .or_else(|| {
+            frame_catalog::catalog_entry(to, from).map(|entry| PublishedTransformForReport {
+                entry,
+                inverse: true,
+            })
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublishedTransformForReport {
+    entry: &'static frame_catalog::HelmertTransform,
+    inverse: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1303,7 +1664,7 @@ mod tests {
     use super::super::Sp3;
     use super::{
         align_clock_reference, clock_reference_offset, merge, MergeCombine, MergeOptions,
-        MergeReport,
+        MergeReport, Sp3FrameLabelSet, Sp3FrameReconciliationMethod,
     };
     use crate::constants::SECONDS_PER_DAY;
     use crate::id::{GnssSatelliteId, GnssSystem};
@@ -1706,6 +2067,227 @@ mod tests {
         assert!(
             err.to_string().contains("mismatched coordinate systems"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_accepts_asserted_equivalent_labels_and_reports_assertion() {
+        for (a_label, b_label) in [("IGS14", "ITRF2"), ("ITRF2", "IGS14")] {
+            let a = sp3_build(
+                &[("G01", [15000.0, -20000.0, 5000.0], Some(100.0), "")],
+                a_label,
+            );
+            let b = sp3_build(
+                &[("G02", [16000.0, -21000.0, 6000.0], Some(200.0), "")],
+                b_label,
+            );
+            let opts = MergeOptions {
+                frame_reconciliation: super::Sp3FrameReconciliationOptions {
+                    asserted_equivalent_label_sets: vec![Sp3FrameLabelSet::pair("IGS14", "ITRF2")],
+                    helmert: false,
+                },
+                ..MergeOptions::default()
+            };
+
+            let (merged, report) = merge(&[a, b], &opts).expect("asserted frame merge");
+
+            let states = merged.states_at(0).expect("epoch 0");
+            assert!(states.contains_key(&gps(1)));
+            assert!(states.contains_key(&gps(2)));
+            assert_eq!(merged.header.coordinate_system, a_label);
+            assert_eq!(report.frame_reconciliations.len(), 1);
+            let reconciliation = &report.frame_reconciliations[0];
+            assert_eq!(
+                reconciliation.method,
+                Sp3FrameReconciliationMethod::AssertedEquivalence
+            );
+            assert_eq!(reconciliation.source_index, 1);
+            assert_eq!(reconciliation.source_label, b_label);
+            assert_eq!(reconciliation.target_label, a_label);
+            assert_eq!(reconciliation.records_affected, 1);
+            assert!(reconciliation.parameters.is_none());
+            assert!(reconciliation.rates.is_none());
+            assert_eq!(
+                reconciliation
+                    .asserted_label_set
+                    .as_ref()
+                    .expect("assertion set"),
+                &vec!["IGS14".to_string(), "ITRF2".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn merge_applies_helmert_reconciliation_to_resolved_labels() {
+        // Source 0 sets the target label. Source 1 is IGS20, which resolves to
+        // ITRF2020 and is transformed into IGS14/ITRF2014 at the record epoch.
+        // Expected coordinates duplicate the ITRF/IGN 2020->2014 table values:
+        // T=(-1.4,-0.9,1.4) mm, dT=(0,-0.1,0.2) mm/year, D=-0.42 ppb.
+        let a = sp3_build(
+            &[("G01", [14000.0, -19000.0, 4000.0], Some(100.0), "")],
+            "IGS14",
+        );
+        let b = sp3_build(
+            &[("G02", [15000.0, -20000.0, 5000.0], Some(200.0), "")],
+            "IGS20",
+        );
+        let opts = MergeOptions {
+            min_agree: 1,
+            frame_reconciliation: super::Sp3FrameReconciliationOptions::helmert(),
+            ..MergeOptions::default()
+        };
+
+        let (merged, report) = merge(&[a, b], &opts).expect("helmert frame merge");
+
+        let g02 = merged.states_at(0).expect("epoch 0")[&gps(2)];
+        let got = g02.position.as_array();
+        let expected = [
+            14_999_999.992_3,
+            -19_999_999.993_048_087,
+            5_000_000.000_396_175,
+        ];
+        for axis in 0..3 {
+            assert!(
+                (got[axis] - expected[axis]).abs() < 2.0e-9,
+                "axis {axis}: got {}, expected {}",
+                got[axis],
+                expected[axis]
+            );
+        }
+        assert_eq!(merged.header.coordinate_system, "IGS14");
+        assert_eq!(report.frame_reconciliations.len(), 1);
+        let reconciliation = &report.frame_reconciliations[0];
+        assert_eq!(reconciliation.method, Sp3FrameReconciliationMethod::Helmert);
+        assert_eq!(reconciliation.source_label, "IGS20");
+        assert_eq!(reconciliation.target_label, "IGS14");
+        assert_eq!(reconciliation.records_affected, 1);
+        assert_eq!(
+            reconciliation
+                .parameters
+                .expect("published parameters")
+                .translation_mm,
+            [-1.4, -0.9, 1.4]
+        );
+        assert_eq!(
+            reconciliation.catalog_source_frame,
+            Some(crate::frame_catalog::TerrestrialFrame::Itrf2020)
+        );
+        assert_eq!(
+            reconciliation.catalog_target_frame,
+            Some(crate::frame_catalog::TerrestrialFrame::Itrf2014)
+        );
+        assert!(!reconciliation.catalog_inverse);
+        assert_eq!(
+            reconciliation
+                .rates
+                .expect("published rates")
+                .translation_mm_per_year,
+            [0.0, -0.1, 0.2]
+        );
+        assert!(reconciliation
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .contains("ITRF2020 to past ITRFs"));
+    }
+
+    #[test]
+    fn merge_reports_inverse_helmert_catalog_direction() {
+        let a = sp3_build(
+            &[("G01", [14000.0, -19000.0, 4000.0], Some(100.0), "")],
+            "IGS20",
+        );
+        let b = sp3_build(
+            &[("G02", [15000.0, -20000.0, 5000.0], Some(200.0), "")],
+            "IGS14",
+        );
+        let opts = MergeOptions {
+            min_agree: 1,
+            frame_reconciliation: super::Sp3FrameReconciliationOptions::helmert(),
+            ..MergeOptions::default()
+        };
+
+        let (_merged, report) = merge(&[a, b], &opts).expect("inverse helmert frame merge");
+
+        let reconciliation = &report.frame_reconciliations[0];
+        assert_eq!(reconciliation.method, Sp3FrameReconciliationMethod::Helmert);
+        assert_eq!(
+            reconciliation.source_frame,
+            Some(crate::frame_catalog::TerrestrialFrame::Itrf2014)
+        );
+        assert_eq!(
+            reconciliation.target_frame,
+            Some(crate::frame_catalog::TerrestrialFrame::Itrf2020)
+        );
+        assert_eq!(
+            reconciliation.catalog_source_frame,
+            Some(crate::frame_catalog::TerrestrialFrame::Itrf2020)
+        );
+        assert_eq!(
+            reconciliation.catalog_target_frame,
+            Some(crate::frame_catalog::TerrestrialFrame::Itrf2014)
+        );
+        assert!(reconciliation.catalog_inverse);
+        assert_eq!(
+            reconciliation
+                .parameters
+                .expect("published parameters")
+                .translation_mm,
+            [-1.4, -0.9, 1.4]
+        );
+    }
+
+    #[test]
+    fn helmert_identity_label_reconciliation_is_bit_equal() {
+        let a = sp3_build(
+            &[("G01", [14000.0, -19000.0, 4000.0], Some(100.0), "")],
+            "IGS20",
+        );
+        let b = sp3_build(
+            &[("G02", [15000.125, -20000.5, 5000.25], Some(200.0), "")],
+            "IGc20",
+        );
+        let original = b.states_at(0).expect("epoch 0")[&gps(2)].position;
+        let opts = MergeOptions {
+            min_agree: 1,
+            frame_reconciliation: super::Sp3FrameReconciliationOptions::helmert(),
+            ..MergeOptions::default()
+        };
+
+        let (merged, report) = merge(&[a, b], &opts).expect("identity frame merge");
+
+        let g02 = merged.states_at(0).expect("epoch 0")[&gps(2)].position;
+        for axis in 0..3 {
+            assert_eq!(
+                g02.as_array()[axis].to_bits(),
+                original.as_array()[axis].to_bits()
+            );
+        }
+        assert_eq!(report.frame_reconciliations.len(), 1);
+        assert!(report.frame_reconciliations[0].identity);
+        assert!(report.frame_reconciliations[0].parameters.is_none());
+    }
+
+    #[test]
+    fn helmert_reconciliation_rejects_unknown_labels() {
+        let a = sp3_build(
+            &[("G01", [14000.0, -19000.0, 4000.0], Some(100.0), "")],
+            "ITRF2",
+        );
+        let b = sp3_build(
+            &[("G02", [15000.0, -20000.0, 5000.0], Some(200.0), "")],
+            "IGS20",
+        );
+        let opts = MergeOptions {
+            frame_reconciliation: super::Sp3FrameReconciliationOptions::helmert(),
+            ..MergeOptions::default()
+        };
+
+        let err = merge(&[a, b], &opts).expect_err("unknown frame label");
+
+        assert!(
+            err.to_string().contains("target label"),
+            "unknown labels must not be guessed: {err}"
         );
     }
 
