@@ -4,7 +4,8 @@ use sidereon_core::astro::constants::earth::WGS84_A_M;
 use sidereon_core::fusion::{
     covariance_is_positive_semidefinite, smooth_fusion_rts, ErrorStateLayout, FusionRtsEpoch,
     FusionRtsHistory, FusionRtsHistoryBuilder, GnssFixMeasurement, InertialFilter,
-    InertialFilterSnapshot, InsFilterState, TightFilterSnapshot, ERROR_STATE_DIMENSION_15,
+    InertialFilterConfig, InertialFilterSnapshot, InsFilterState, StationaryDetectorConfig,
+    StationaryUpdateConfig, TightFilterSnapshot, ERROR_STATE_DIMENSION_15,
 };
 use sidereon_core::inertial::{
     simulate_imu_samples_from_increments, true_imu_increment_between, ImuSimulationOptions,
@@ -179,13 +180,78 @@ fn recorded_update_failure_does_not_mutate_filter_or_history() {
     let mut filter = scenario_filter(truth[0], spec);
     let before = filter.snapshot();
     let mut history = FusionRtsHistoryBuilder::from_filter(&filter).expect("history");
-    let measurement = scenario_measurement(truth[0], 4.0, [0.0; 3]);
+    let measurement = scenario_measurement(truth[1], 4.0, [0.0; 3]);
 
     assert!(filter
         .update_loose_recorded(&measurement, &mut history)
         .is_err());
     assert_eq!(filter.snapshot(), before);
     assert_eq!(history.clone().finish().expect("history").epochs.len(), 1);
+}
+
+#[test]
+fn recorded_stationary_update_and_loose_update_can_share_epoch() {
+    let start =
+        NavState::new(T0_J2000_S, [WGS84_A_M, 0.0, 0.0], [0.0; 3], IDENTITY_3).expect("start");
+    let end = NavState::new(
+        T0_J2000_S + 1.0,
+        [WGS84_A_M, 0.0, 0.0],
+        [0.0; 3],
+        IDENTITY_3,
+    )
+    .expect("end");
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 300.0, 300.0, None, None);
+    let sequence = simulate_imu_samples_from_increments(
+        &[true_imu_increment_between(&start, &end).expect("truth increment")],
+        spec,
+        ImuSimulationOptions::default(),
+    )
+    .expect("simulated IMU");
+    let mut diagonal = vec![0.01; ERROR_STATE_DIMENSION_15];
+    diagonal[3] = 1.0;
+    diagonal[4] = 1.0;
+    diagonal[5] = 1.0;
+    let state =
+        InsFilterState::from_diagonal(start, ErrorStateLayout::Fifteen, &diagonal).expect("state");
+    let mut config = InertialFilterConfig::new(spec).expect("filter config");
+    config.loose.stationary_updates = Some(StationaryUpdateConfig {
+        detector: StationaryDetectorConfig {
+            window_len: 1,
+            max_specific_force_norm_error_mps2: 1.0e-6,
+            max_body_rate_wrt_ecef_norm_rps: 1.0e-6,
+        },
+        zero_velocity_sigma_mps: 0.01,
+        zero_angular_rate_sigma_rps: 1.0e-4,
+    });
+    let mut filter = InertialFilter::with_config(state, config).expect("filter");
+    let mut history = FusionRtsHistoryBuilder::from_filter(&filter).expect("history");
+
+    filter
+        .propagate_recorded(sequence.samples[0], &mut history)
+        .expect("propagate");
+    let stationary = filter
+        .update_stationary_recorded(&mut history)
+        .expect("stationary update");
+    assert!(stationary.is_some());
+    let measurement = GnssFixMeasurement::position(
+        end.t_j2000_s,
+        end.position_ecef_m,
+        [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]],
+        8,
+    )
+    .expect("measurement");
+    filter
+        .update_loose_recorded(&measurement, &mut history)
+        .expect("loose update");
+
+    let history = history.finish().expect("complete history");
+    assert_eq!(history.epochs.len(), 3);
+    assert_eq!(
+        history.epochs[1].t_j2000_s.to_bits(),
+        history.epochs[2].t_j2000_s.to_bits()
+    );
+    let smoothed = smooth_fusion_rts(&history).expect("smooth");
+    assert_eq!(smoothed.epochs.len(), history.epochs.len());
 }
 
 #[test]

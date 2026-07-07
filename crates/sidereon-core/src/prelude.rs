@@ -6,8 +6,10 @@ pub use crate::ephemeris::{
 pub use crate::ephemeris::{BroadcastEphemeris, EphemerisSource, Sp3, SP3};
 pub use crate::frame::{ItrfPositionM, ItrfVelocityMS, Wgs84Geodetic};
 pub use crate::fusion::{
-    FusionUpdate, GnssFixMeasurement, InertialFilter, InertialFilterConfig, LooseCouplingConfig,
-    TimeSyncHistoryConfig, TimeSyncHistoryStatus, TimeSyncUpdate,
+    velocity_match_outage, FusionUpdate, GnssFixMeasurement, GnssFixStatus, GnssFixStatusWeighting,
+    InertialFilter, InertialFilterConfig, LooseCouplingConfig, NonHolonomicConstraintConfig,
+    StationaryDetectorConfig, StationaryUpdateConfig, TimeSyncHistoryConfig, TimeSyncHistoryStatus,
+    TimeSyncUpdate, VelocityMatchState, VelocityMatchedTrajectory, VelocityMatchingConfig,
 };
 pub use crate::id::{GnssSatelliteId, GnssSystem};
 pub use crate::positioning::{

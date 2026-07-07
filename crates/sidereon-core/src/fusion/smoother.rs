@@ -11,7 +11,7 @@ use crate::inertial::validate_finite;
 use super::ekf::{apply_closed_loop_navigation_error, apply_closed_loop_scale_error};
 use super::loose::{FusionUpdate, GnssFixMeasurement, InertialFilter};
 use super::state::{
-    invalid_input, matmul, matrix_add, matrix_sub, reproject_covariance_psd, solve_spd,
+    identity, invalid_input, matmul, matrix_add, matrix_sub, reproject_covariance_psd, solve_spd,
     symmetrize_in_place, transpose, validate_covariance_matrix, validate_finite_slice,
     validate_square_matrix, ErrorStateVector, FusionError, InsFilterState, ERROR_ACCEL_SCALE_INDEX,
     ERROR_ATTITUDE_INDEX, ERROR_GYRO_SCALE_INDEX, ERROR_POSITION_INDEX, ERROR_VELOCITY_INDEX,
@@ -122,8 +122,8 @@ impl FusionRtsHistory {
                 }
                 (_, Some(transition)) => {
                     validate_transition_dimension(transition, layout.dimension())?;
-                    if epoch.t_j2000_s <= self.epochs[idx - 1].t_j2000_s {
-                        return Err(invalid_input("history", "epochs must be increasing"));
+                    if epoch.t_j2000_s < self.epochs[idx - 1].t_j2000_s {
+                        return Err(invalid_input("history", "epochs must not regress"));
                     }
                 }
                 (_, None) => {
@@ -185,12 +185,15 @@ impl FusionRtsHistoryBuilder {
     ) -> Result<(), FusionError> {
         let transition = if self.epochs.is_empty() {
             None
+        } else if let Some(transition) = self.pending_transition.clone() {
+            Some(transition)
         } else {
-            Some(
-                self.pending_transition
-                    .clone()
-                    .ok_or_else(|| invalid_input("transition", "missing propagated interval"))?,
-            )
+            let last_epoch = self.epochs[self.epochs.len() - 1].t_j2000_s;
+            if predicted.state.nominal.t_j2000_s == last_epoch {
+                Some(identity(predicted.state.dimension()))
+            } else {
+                return Err(invalid_input("transition", "missing propagated interval"));
+            }
         };
         let epoch = FusionRtsEpoch::new(predicted, updated, transition)?;
         let mut epochs = self.epochs.clone();
@@ -213,11 +216,7 @@ impl FusionRtsHistoryBuilder {
     }
 
     fn validate_update_ready(&self) -> Result<(), FusionError> {
-        if self.epochs.is_empty() || self.pending_transition.is_some() {
-            Ok(())
-        } else {
-            Err(invalid_input("transition", "missing propagated interval"))
-        }
+        Ok(())
     }
 }
 
@@ -395,6 +394,44 @@ impl InertialFilter {
         working_history.record_update(predicted, updated)?;
         *self = working_filter;
         *history = working_history;
+        Ok(update)
+    }
+
+    /// Apply a stationary update and record the before/after checkpoints.
+    pub fn update_stationary_recorded(
+        &mut self,
+        history: &mut FusionRtsHistoryBuilder,
+    ) -> Result<Option<FusionUpdate>, FusionError> {
+        history.validate_update_ready()?;
+        let predicted = self.snapshot();
+        let mut working_filter = self.clone();
+        let mut working_history = history.clone();
+        let update = working_filter.update_stationary()?;
+        if update.is_some() {
+            let updated = working_filter.snapshot();
+            working_history.record_update(predicted, updated)?;
+            *self = working_filter;
+            *history = working_history;
+        }
+        Ok(update)
+    }
+
+    /// Apply a non-holonomic constraint and record the before/after checkpoints.
+    pub fn update_non_holonomic_recorded(
+        &mut self,
+        history: &mut FusionRtsHistoryBuilder,
+    ) -> Result<Option<FusionUpdate>, FusionError> {
+        history.validate_update_ready()?;
+        let predicted = self.snapshot();
+        let mut working_filter = self.clone();
+        let mut working_history = history.clone();
+        let update = working_filter.update_non_holonomic()?;
+        if update.is_some() {
+            let updated = working_filter.snapshot();
+            working_history.record_update(predicted, updated)?;
+            *self = working_filter;
+            *history = working_history;
+        }
         Ok(update)
     }
 
@@ -644,8 +681,8 @@ fn smoothing_transition(
 ) -> Result<Vec<Vec<f64>>, FusionError> {
     validate_transition_dimension(transition, base_dimension)?;
     validate_finite(dt_s, "dt_s").map_err(FusionError::from)?;
-    if dt_s <= 0.0 {
-        return Err(invalid_input("dt_s", "must be positive"));
+    if dt_s < 0.0 {
+        return Err(invalid_input("dt_s", "must be non-negative"));
     }
     let smooth_dimension = smoothing_dimension(base_dimension);
     if transition.len() == smooth_dimension {

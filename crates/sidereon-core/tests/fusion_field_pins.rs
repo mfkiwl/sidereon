@@ -1,4 +1,5 @@
 use nalgebra::{DMatrix, DVector};
+use sidereon_core::astro::constants::earth::WGS84_A_M;
 use sidereon_core::astro::math::vec3::{norm3, sub3};
 use sidereon_core::astro::time::civil::{
     civil_from_j2000_seconds, day_of_year, j2000_seconds, second_of_day,
@@ -6,13 +7,15 @@ use sidereon_core::astro::time::civil::{
 use sidereon_core::constants::C_M_S;
 use sidereon_core::fusion::{
     smooth_fusion_rts, ErrorStateLayout, FusionRtsHistoryBuilder, GnssFixMeasurement,
-    IggIiiMeasurementReweighting, InertialFilter, InertialFilterConfig, InsFilterState,
-    LooseCouplingConfig, TightCouplingConfig, TightGnssEpoch, TightGnssObservation,
-    TightRangeRateObservation, YangPredictionAdaptiveFactor, ERROR_POSITION_INDEX,
-    ERROR_STATE_DIMENSION_15, ERROR_VELOCITY_INDEX,
+    GnssFixStatus, GnssFixStatusWeighting, IggIiiMeasurementReweighting, InertialFilter,
+    InertialFilterConfig, InsFilterState, LooseCouplingConfig, NonHolonomicConstraintConfig,
+    StationaryDetectorConfig, StationaryUpdateConfig, TightCouplingConfig, TightGnssEpoch,
+    TightGnssObservation, TightRangeRateObservation, VelocityMatchState, VelocityMatchingConfig,
+    YangPredictionAdaptiveFactor, ERROR_ACCEL_BIAS_INDEX, ERROR_GYRO_BIAS_INDEX,
+    ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15, ERROR_VELOCITY_INDEX,
 };
 use sidereon_core::inertial::{
-    simulate_imu_samples_from_increments, true_imu_increment_between, ImuGrade,
+    simulate_imu_samples_from_increments, true_imu_increment_between, ImuBias, ImuGrade,
     ImuSimulationOptions, ImuSpec, NavState,
 };
 use sidereon_core::positioning::{
@@ -263,6 +266,245 @@ fn low_sat_tight_window_remains_bounded_and_consistent() {
             LOW_SAT_START + offset
         );
     }
+}
+
+#[test]
+fn stationary_zupt_zaru_bounds_static_drift_and_estimates_biases() {
+    let steps = 80usize;
+    let dt_s = 1.0;
+    let truth = static_truth(steps, dt_s);
+    let accel_bias = [0.020, 0.0, 0.0];
+    let gyro_bias = [0.0010, -0.0008, 0.0006];
+    let spec = ImuSpec::datasheet(0.0015, 2.0e-5, 0.0002, 2.0e-6, 600.0, 600.0, None, None);
+    let sequence = simulate_imu_samples_from_increments(
+        &truth_increments(&truth),
+        spec,
+        ImuSimulationOptions {
+            seed: SEED ^ 0x5a75_7100_0000_0001,
+            initial_bias: ImuBias {
+                accel_mps2: accel_bias,
+                gyro_rps: gyro_bias,
+            },
+            ..ImuSimulationOptions::default()
+        },
+    )
+    .expect("stationary IMU");
+
+    let no_updates = run_stationary_constraint_case(&truth, sequence.samples.clone(), spec, false);
+    let with_updates = run_stationary_constraint_case(&truth, sequence.samples, spec, true);
+    let no_update_drift = distance3(
+        no_updates.state().nominal.position_ecef_m,
+        truth[steps].position_ecef_m,
+    );
+    let zupt_drift = distance3(
+        with_updates.state().nominal.position_ecef_m,
+        truth[steps].position_ecef_m,
+    );
+    let accel_bias_error = (with_updates.state().nominal.accel_bias_mps2[0] - accel_bias[0]).abs();
+    let gyro_bias_error = norm3(sub3(with_updates.state().nominal.gyro_bias_rps, gyro_bias));
+    assert!(
+        no_update_drift > 40.0,
+        "no-ZUPT drift {no_update_drift:.6} m"
+    );
+    assert!(zupt_drift < 0.80, "ZUPT drift {zupt_drift:.6} m");
+    assert!(
+        zupt_drift * 100.0 < no_update_drift,
+        "ZUPT drift {zupt_drift:.6} m, no-ZUPT drift {no_update_drift:.6} m"
+    );
+    assert!(
+        accel_bias_error < 0.006,
+        "accel x-bias error {accel_bias_error:.6} m/s^2, estimate {:?}, injected {:?}",
+        with_updates.state().nominal.accel_bias_mps2,
+        accel_bias
+    );
+    assert!(
+        gyro_bias_error < 0.00025,
+        "gyro bias error {gyro_bias_error:.9} rad/s"
+    );
+}
+
+#[test]
+fn non_holonomic_constraint_removes_lateral_velocity_error() {
+    let steps = 30usize;
+    let dt_s = 1.0;
+    let truth = straight_vehicle_truth(steps, dt_s);
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
+    let sequence = simulate_imu_samples_from_increments(
+        &truth_increments(&truth),
+        spec,
+        ImuSimulationOptions {
+            seed: SEED ^ 0x5a75_7100_0000_0002,
+            ..ImuSimulationOptions::default()
+        },
+    )
+    .expect("vehicle IMU");
+
+    let coast = run_nhc_case(&truth, sequence.samples.clone(), spec, false);
+    let constrained = run_nhc_case(&truth, sequence.samples, spec, true);
+    let coast_lateral = coast.state().nominal.velocity_ecef_mps[1].abs();
+    let constrained_lateral = constrained.state().nominal.velocity_ecef_mps[1].abs();
+    assert!(
+        coast_lateral > 1.45,
+        "coast lateral velocity {coast_lateral:.6} m/s"
+    );
+    assert!(
+        constrained_lateral < 0.015,
+        "NHC lateral velocity {constrained_lateral:.6} m/s"
+    );
+    assert!(
+        constrained_lateral * 100.0 < coast_lateral,
+        "NHC lateral velocity {constrained_lateral:.6} m/s, coast {coast_lateral:.6} m/s"
+    );
+}
+
+#[test]
+fn velocity_matching_reduces_outage_peak_error_and_keeps_span_continuous() {
+    let scenario = field_scenario();
+    let simulated = simulate_scenario(&scenario).expect("simulate scenario");
+    let source = source_from_scenario(&scenario);
+    let truth = truth_nav_states(&simulated);
+    let gnss = solve_gnss_epochs(&simulated, &source, true);
+    let return_epoch = OUTAGE_START + OUTAGE_LEN;
+    let coast = run_loose_fusion_with_filter_and_spec(
+        &truth,
+        &gnss,
+        Some(OUTAGE_START..return_epoch + 1),
+        false,
+        ImuSpec::preset(ImuGrade::Mems),
+        loose_filter,
+    );
+    let span = (OUTAGE_START - 1..=return_epoch)
+        .map(|idx| {
+            VelocityMatchState::new(
+                truth[idx].t_j2000_s,
+                coast.positions[idx],
+                coast.velocities[idx],
+            )
+            .expect("velocity-match state")
+        })
+        .collect::<Vec<_>>();
+    let return_fix = GnssFixMeasurement::position_velocity(
+        truth[return_epoch].t_j2000_s,
+        truth[return_epoch].position_ecef_m,
+        truth[return_epoch].velocity_ecef_mps,
+        loose_covariance(&IDENTITY_3),
+        8,
+    )
+    .expect("return fix");
+    let matched = sidereon_core::fusion::velocity_match_outage(
+        &span,
+        &return_fix,
+        VelocityMatchingConfig {
+            max_outage_duration_s: 20.0,
+        },
+    )
+    .expect("velocity match");
+
+    let coast_peak = (OUTAGE_START..=return_epoch)
+        .map(|idx| distance3(coast.positions[idx], truth[idx].position_ecef_m))
+        .fold(0.0_f64, f64::max);
+    let matched_peak = matched
+        .states
+        .iter()
+        .skip(1)
+        .zip(truth.iter().skip(OUTAGE_START))
+        .map(|(state, truth)| distance3(state.position_ecef_m, truth.position_ecef_m))
+        .fold(0.0_f64, f64::max);
+    let return_step = distance3(
+        matched.states[matched.states.len() - 1].position_ecef_m,
+        matched.states[matched.states.len() - 2].position_ecef_m,
+    );
+    let truth_return_step = distance3(
+        truth[return_epoch].position_ecef_m,
+        truth[return_epoch - 1].position_ecef_m,
+    );
+    assert!(coast_peak > 4.0, "coast peak {coast_peak:.6} m");
+    assert!(
+        matched_peak * 2.0 < coast_peak,
+        "matched peak {matched_peak:.6} m, coast peak {coast_peak:.6} m"
+    );
+    assert!(
+        return_step < truth_return_step + 1.0,
+        "return step {return_step:.6} m, truth step {truth_return_step:.6} m"
+    );
+}
+
+#[test]
+fn fix_status_weighting_inflates_float_covariance_by_configured_sigma() {
+    let spec = ImuSpec::datasheet(0.0, 0.0, 0.0, 0.0, 600.0, 600.0, None, None);
+    let nominal =
+        NavState::new(0.0, [WGS84_A_M + 1.0, 0.0, 0.0], [0.0; 3], IDENTITY_3).expect("nominal");
+    let mut diagonal = [1.0e-9; ERROR_STATE_DIMENSION_15];
+    for axis in 0..3 {
+        diagonal[ERROR_POSITION_INDEX + axis] = 4.0;
+    }
+    let measurement = GnssFixMeasurement::position(0.0, [WGS84_A_M, 0.0, 0.0], IDENTITY_3, 8)
+        .expect("measurement")
+        .with_fix_status(GnssFixStatus::Float);
+    let mut unweighted = direct_filter(nominal, spec, diagonal, LooseCouplingConfig::default());
+    let mut weighted = direct_filter(
+        nominal,
+        spec,
+        diagonal,
+        LooseCouplingConfig {
+            fix_status_weighting: GnssFixStatusWeighting {
+                float_sigma_multiplier: 3.0,
+                ..GnssFixStatusWeighting::default()
+            },
+            ..LooseCouplingConfig::default()
+        },
+    );
+
+    unweighted
+        .update_loose(&measurement)
+        .expect("unweighted update");
+    weighted
+        .update_loose(&measurement)
+        .expect("weighted update");
+    let unweighted_var = unweighted.state().covariance[ERROR_POSITION_INDEX][ERROR_POSITION_INDEX];
+    let weighted_var = weighted.state().covariance[ERROR_POSITION_INDEX][ERROR_POSITION_INDEX];
+    let expected_unweighted = 4.0 / 5.0;
+    let expected_weighted = 36.0 / 13.0;
+    assert!((unweighted_var - expected_unweighted).abs() < 1.0e-14);
+    assert!((weighted_var - expected_weighted).abs() < 1.0e-14);
+    assert!(
+        weighted_var > unweighted_var,
+        "weighted variance {weighted_var:.12}, unweighted {unweighted_var:.12}"
+    );
+}
+
+#[test]
+fn field_mode_defaults_keep_existing_loose_fixture_bits() {
+    let scenario = field_scenario();
+    let simulated = simulate_scenario(&scenario).expect("simulate scenario");
+    let source = source_from_scenario(&scenario);
+    let truth = truth_nav_states(&simulated);
+    let gnss = solve_gnss_epochs(&simulated, &source, true);
+    let baseline = run_loose_fusion_with_filter(&truth, &gnss, None, false, loose_filter);
+    let explicit_defaulted =
+        run_loose_fusion_with_filter(&truth, &gnss, None, false, |truth, spec| {
+            let state = InsFilterState::from_diagonal(
+                initial_nominal(truth),
+                ErrorStateLayout::Fifteen,
+                &initial_covariance_diagonal(),
+            )
+            .expect("filter state");
+            let mut config = InertialFilterConfig::new(spec).expect("filter config");
+            config.loose = LooseCouplingConfig {
+                fix_status_weighting: GnssFixStatusWeighting::default(),
+                stationary_updates: None,
+                non_holonomic: None,
+                velocity_matching: None,
+                measurement_reweighting: Some(IggIiiMeasurementReweighting::standard()),
+                prediction_adaptation: Some(YangPredictionAdaptiveFactor::standard()),
+                ..LooseCouplingConfig::default()
+            };
+            InertialFilter::with_config(state, config).expect("filter")
+        });
+
+    assert_eq!(baseline.positions, explicit_defaulted.positions);
+    assert_eq!(baseline.velocities, explicit_defaulted.velocities);
+    assert_eq!(baseline.covariances, explicit_defaulted.covariances);
 }
 
 #[derive(Debug, Clone)]
@@ -567,8 +809,41 @@ fn run_loose_fusion(
     outage: Option<std::ops::Range<usize>>,
     recorded: bool,
 ) -> FusionRun {
-    let spec = ImuSpec::preset(ImuGrade::Tactical);
-    let mut filter = loose_filter(truth[0], spec);
+    run_loose_fusion_with_filter(truth, gnss, outage, recorded, loose_filter)
+}
+
+fn run_loose_fusion_with_filter<F>(
+    truth: &[NavState],
+    gnss: &[GnssEpochSolution],
+    outage: Option<std::ops::Range<usize>>,
+    recorded: bool,
+    build_filter: F,
+) -> FusionRun
+where
+    F: Fn(NavState, ImuSpec) -> InertialFilter,
+{
+    run_loose_fusion_with_filter_and_spec(
+        truth,
+        gnss,
+        outage,
+        recorded,
+        ImuSpec::preset(ImuGrade::Tactical),
+        build_filter,
+    )
+}
+
+fn run_loose_fusion_with_filter_and_spec<F>(
+    truth: &[NavState],
+    gnss: &[GnssEpochSolution],
+    outage: Option<std::ops::Range<usize>>,
+    recorded: bool,
+    spec: ImuSpec,
+    build_filter: F,
+) -> FusionRun
+where
+    F: Fn(NavState, ImuSpec) -> InertialFilter,
+{
+    let mut filter = build_filter(truth[0], spec);
     let first = loose_measurement(truth[0].t_j2000_s, &gnss[0]);
     filter.update_loose(&first).expect("initial loose update");
     let mut history = if recorded {
@@ -623,6 +898,130 @@ fn run_loose_fusion(
         covariances,
         history: history.map(|history| history.finish().expect("finished history")),
     }
+}
+
+fn static_truth(steps: usize, dt_s: f64) -> Vec<NavState> {
+    (0..=steps)
+        .map(|idx| {
+            NavState::new(
+                start_j2000_s() + idx as f64 * dt_s,
+                [WGS84_A_M, 0.0, 0.0],
+                [0.0; 3],
+                IDENTITY_3,
+            )
+            .expect("static truth")
+        })
+        .collect()
+}
+
+fn straight_vehicle_truth(steps: usize, dt_s: f64) -> Vec<NavState> {
+    let velocity = [12.0, 0.0, 0.0];
+    (0..=steps)
+        .map(|idx| {
+            let t = idx as f64 * dt_s;
+            NavState::new(
+                start_j2000_s() + t,
+                [WGS84_A_M + velocity[0] * t, 0.0, 0.0],
+                velocity,
+                IDENTITY_3,
+            )
+            .expect("straight truth")
+        })
+        .collect()
+}
+
+fn run_stationary_constraint_case(
+    truth: &[NavState],
+    samples: Vec<sidereon_core::inertial::ImuSample>,
+    spec: ImuSpec,
+    enable_updates: bool,
+) -> InertialFilter {
+    let mut diagonal = [1.0e-8; ERROR_STATE_DIMENSION_15];
+    for axis in 0..3 {
+        diagonal[ERROR_POSITION_INDEX + axis] = 1.0;
+        diagonal[ERROR_VELOCITY_INDEX + axis] = 1.0;
+        diagonal[ERROR_ACCEL_BIAS_INDEX + axis] = 0.05 * 0.05;
+        diagonal[ERROR_GYRO_BIAS_INDEX + axis] = 0.003 * 0.003;
+    }
+    let mut config = LooseCouplingConfig::default();
+    if enable_updates {
+        config.stationary_updates = Some(StationaryUpdateConfig {
+            detector: StationaryDetectorConfig {
+                window_len: 3,
+                max_specific_force_norm_error_mps2: 0.08,
+                max_body_rate_wrt_ecef_norm_rps: 0.003,
+            },
+            zero_velocity_sigma_mps: 0.015,
+            zero_angular_rate_sigma_rps: 0.00008,
+        });
+    }
+    let mut filter = direct_filter(truth[0], spec, diagonal, config);
+    let mut applied_updates = 0usize;
+    for sample in samples {
+        filter.propagate(sample).expect("stationary propagate");
+        if enable_updates {
+            let update = filter.update_stationary().expect("stationary update");
+            applied_updates += usize::from(update.is_some());
+        }
+    }
+    if enable_updates {
+        assert!(
+            applied_updates + 2 >= truth.len() - 1,
+            "stationary updates applied {applied_updates}"
+        );
+    }
+    filter
+}
+
+fn run_nhc_case(
+    truth: &[NavState],
+    samples: Vec<sidereon_core::inertial::ImuSample>,
+    spec: ImuSpec,
+    enable_updates: bool,
+) -> InertialFilter {
+    let mut nominal = truth[0];
+    nominal.velocity_ecef_mps[1] = 1.5;
+    nominal.velocity_ecef_mps[2] = -0.4;
+    let mut diagonal = [1.0e-8; ERROR_STATE_DIMENSION_15];
+    for axis in 0..3 {
+        diagonal[ERROR_POSITION_INDEX + axis] = 1.0;
+        diagonal[ERROR_VELOCITY_INDEX + axis] = 4.0;
+    }
+    let mut config = LooseCouplingConfig::default();
+    if enable_updates {
+        config.non_holonomic = Some(NonHolonomicConstraintConfig {
+            lateral_velocity_sigma_mps: 0.03,
+            vertical_velocity_sigma_mps: 0.03,
+            min_speed_mps: 2.0,
+            max_body_rate_wrt_ecef_norm_rps: 0.01,
+        });
+    }
+    let mut filter = direct_filter(nominal, spec, diagonal, config);
+    let mut applied_updates = 0usize;
+    for sample in samples {
+        filter.propagate(sample).expect("vehicle propagate");
+        if enable_updates {
+            let update = filter.update_non_holonomic().expect("NHC update");
+            applied_updates += usize::from(update.is_some());
+        }
+    }
+    if enable_updates {
+        assert_eq!(applied_updates, truth.len() - 1);
+    }
+    filter
+}
+
+fn direct_filter(
+    nominal: NavState,
+    spec: ImuSpec,
+    diagonal: [f64; ERROR_STATE_DIMENSION_15],
+    loose: LooseCouplingConfig,
+) -> InertialFilter {
+    let state = InsFilterState::from_diagonal(nominal, ErrorStateLayout::Fifteen, &diagonal)
+        .expect("filter state");
+    let mut config = InertialFilterConfig::new(spec).expect("filter config");
+    config.loose = loose;
+    InertialFilter::with_config(state, config).expect("filter")
 }
 
 fn run_tight_fusion(
