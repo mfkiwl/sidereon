@@ -479,7 +479,16 @@ fn canonical_ppp_is_deterministic_bounded_and_truthful() {
         "canonical PPP truth error was {terr} m (> {CANONICAL_PPP_TRUTH_BOUND_M} m)"
     );
 
-    // BAR 1: a second canonical solve is bit-identical on the same build.
+    // BAR 1: frozen-bits determinism golden (this-build reproducible; the solve
+    // is owned scalar, the surrounding measurement model rides platform libm).
+    // Re-frozen when static PPP moved to Schur-reduced per-epoch clock
+    // elimination: X and Y moved a few ULP, Z is unchanged, and the reduced
+    // path is pinned equivalent to the dense one in normal.rs.
+    assert_eq!(canonical.position_m[0].to_bits(), 0x414b544c30f74f98);
+    assert_eq!(canonical.position_m[1].to_bits(), 0x412040d68a0054fe);
+    assert_eq!(canonical.position_m[2].to_bits(), 0x4153f61c555f9818);
+
+    // BAR 1b: a second canonical solve is bit-identical on the same build.
     let again = run_canonical();
     assert_eq!(
         canonical.position_m[0].to_bits(),

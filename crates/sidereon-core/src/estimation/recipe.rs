@@ -273,7 +273,9 @@ pub enum SolverRecipe {
 
 /// The full operation-order recipe a strategy composes: one variant per stage.
 /// `Default` and the named constructors reproduce the CURRENT behavior of each
-/// existing strategy, so selecting a recipe never changes a reference golden.
+/// existing strategy, so selecting a recipe never changes a reference golden
+/// (PPP goldens were re-frozen once when static PPP moved to clock-eliminated
+/// reduced normals; see `estimation::strategies`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct EstimationRecipe {
     pub range: RangeRecipe,

@@ -15,7 +15,10 @@
 
 /// One weighted measurement row: design coefficients `h` (length
 /// [`super::parameters::ParameterLayout::dim`]), prefit residual `y`, and the
-/// diagonal information weight (inverse variance).
+/// row weight as an inverse SIGMA (1/standard deviation, NOT inverse
+/// variance): consumers scale the row by this weight before forming normals,
+/// so the information contribution is `weight^2 * h * h^T`. This matches
+/// `MeasurementWeights` ("values are inverse sigmas") across the codebase.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResidualRow {
     pub(crate) h: Vec<f64>,

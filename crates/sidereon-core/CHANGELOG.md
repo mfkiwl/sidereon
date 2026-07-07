@@ -4,6 +4,13 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Breaking
+
+- `FloatSolution` and `FixedSolution` in precise positioning gained a required
+  `position_covariance` field. Callers constructing these structs directly must
+  populate it; callers only reading results are unaffected. The next release is
+  0.22.0 for this reason.
+
 ### Added
 
 - Static PPP float and fixed solutions now expose posterior receiver-position

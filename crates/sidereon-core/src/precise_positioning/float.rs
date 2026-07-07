@@ -65,8 +65,9 @@ pub fn solve_float_epochs(
 /// per-technique implementation that
 /// [`crate::estimation::strategies::estimate`] dispatches to. The recipe's
 /// [`NormalRecipe`] reaches the solve seam through [`ModelContext::normal`]; for
-/// the PPP reference recipe (`NormalRecipe::PppDenseLastTie`) this is
-/// bit-identical to the legacy path.
+/// the PPP reference recipe (`NormalRecipe::PppDenseLastTie`) the static path
+/// uses clock-eliminated reduced normals, pinned equivalent to the legacy dense
+/// solve (solution and covariance oracles in `precise_positioning::normal`).
 pub(crate) fn run_float_epochs(
     recipe: &EstimationRecipe,
     source: &dyn ObservableEphemerisSource,

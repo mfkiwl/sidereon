@@ -393,6 +393,47 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn ppp_position_covariance_matches_unreduced_dense_inverse() {
+        let n_epochs = 10;
+        let n_ambiguities = 6;
+        let layout = PppNormalLayout::new(n_epochs, 1, n_ambiguities);
+        let rows = ppp_schur_rows(n_epochs, n_ambiguities);
+
+        // Dense oracle: assemble the full unreduced normal matrix, invert it,
+        // and read the position block straight out of the inverse. The reduced
+        // path must reproduce this scale, not merely stay positive definite.
+        // Row weights are inverse SIGMAS (see MeasurementWeights), so the
+        // information contribution of a row is weight^2 * h * h^T.
+        let dim = layout.full_dim();
+        let mut normal = vec![vec![0.0_f64; dim]; dim];
+        for row in &rows {
+            for i in 0..dim {
+                for j in 0..dim {
+                    normal[i][j] += row.weight * row.weight * row.h[i] * row.h[j];
+                }
+            }
+        }
+        let dense_inverse = invert_symmetric_pd(&normal).expect("dense normal inverts");
+
+        let position_m = [4_075_580.0, 931_854.0, 4_801_568.0];
+        let covariance =
+            ppp_position_covariance(&rows, layout, position_m).expect("reduced covariance");
+
+        for i in 0..3 {
+            for j in 0..3 {
+                let oracle = dense_inverse[i][j];
+                let got = covariance.ecef_m2[i][j];
+                let scale = oracle.abs().max(1.0e-12);
+                assert!(
+                    ((got - oracle) / scale).abs() < 1.0e-6,
+                    "covariance [{i}][{j}] = {got} differs from dense inverse {oracle}"
+                );
+            }
+        }
+    }
+
     fn ppp_schur_rows(n_epochs: usize, n_ambiguities: usize) -> Vec<Row> {
         let los = [
             [-0.72, 0.11, -0.68],

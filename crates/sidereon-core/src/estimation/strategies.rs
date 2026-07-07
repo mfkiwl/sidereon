@@ -19,8 +19,12 @@
 //! `solve_fixed_baseline_validated`, `precise_positioning::solve_float_epochs` /
 //! `solve_fixed_from_float`) are now thin compatibility wrappers that call
 //! [`estimate`] under their reference strategy. For a reference recipe every
-//! selected operation order equals the value the legacy path hard-coded, so the
-//! result is bit-identical and every existing 0-ULP golden is unchanged.
+//! selected operation order equals the value the legacy path hard-coded, so
+//! results are bit-identical and existing 0-ULP goldens are unchanged, with one
+//! exception: the static PPP reference path now eliminates per-epoch receiver
+//! clocks from the normal equations (pinned equivalent to the unreduced dense
+//! solve and its inverse in `precise_positioning::normal` tests), so PPP
+//! goldens were re-frozen at the reduced path's bits.
 //!
 //! `Canonical` strategies (the bounded-tolerance "best" model) are the P6
 //! additive strategy, and all three techniques are now wired. Resolving
