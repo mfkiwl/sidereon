@@ -17,6 +17,9 @@
 //!   with lossy variants for best-effort recovery,
 //! - [`decode_crinex`] / [`load_crinex`] expand Hatanaka-compressed
 //!   observation files,
+//! - [`spp_inputs_from_rinex_obs`] assembles parsed RINEX observations into SPP
+//!   solve inputs, with [`solve_spp_from_rinex_obs`] as the serial batch
+//!   convenience,
 //! - [`solve_spp`] runs single-point positioning,
 //! - [`araim`] exposes multi-hypothesis protection levels from supplied
 //!   geometry and integrity support data,
@@ -189,6 +192,11 @@ pub use sidereon_core::astro::frames::{
 pub use sidereon_core::astro::propagator::{ForceModelComponents, ForceModelKind};
 pub use sidereon_core::geometry_quality::{
     classify, GeometryQuality, GeometryQualityThresholds, ObservabilityTier,
+};
+pub use sidereon_core::positioning::{
+    solve_spp_from_rinex_obs, spp_inputs_from_rinex_obs, RinexSppAssemblySource,
+    RinexSppBroadcastCorrections, RinexSppEpochInputs, RinexSppEpochSolution, RinexSppError,
+    RinexSppOptions, RinexSppSource,
 };
 pub use sidereon_core::quality::{
     reliability_araim, reliability_design, spp_robust_fde_driver, wtest_noncentrality,
