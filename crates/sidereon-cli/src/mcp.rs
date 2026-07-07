@@ -164,6 +164,11 @@ pub fn serve_mcp_command(profile: &str) -> Result<()> {
             continue;
         }
         let request: RpcRequest = serde_json::from_str(&line).context("parse MCP json")?;
+        // JSON-RPC notifications (no id) never receive responses; MCP clients
+        // send notifications/initialized right after the handshake.
+        if request.id.is_none() {
+            continue;
+        }
         let response = handle_request(request, &graph);
         let encoded = serde_json::to_string(&response)?;
         out.write_all(encoded.as_bytes())?;
@@ -177,12 +182,26 @@ pub fn serve_mcp_command(profile: &str) -> Result<()> {
 fn handle_request(request: RpcRequest, graph: &CapabilityGraph) -> RpcResponse {
     let params = request.params.unwrap_or_else(|| json!({}));
     match request.method.as_str() {
-        "initialize" => RpcResponse {
-            jsonrpc: "2.0",
-            id: request.id,
-            result: Some(json!({"status": "ok", "profile": format!("{:?}", graph.profile)})),
-            error: None,
-        },
+        "initialize" => {
+            let requested = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("2024-11-05");
+            RpcResponse {
+                jsonrpc: "2.0",
+                id: request.id,
+                result: Some(json!({
+                    "protocolVersion": requested,
+                    "capabilities": {"tools": {}, "resources": {}},
+                    "serverInfo": {
+                        "name": "sidereon",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "profile": format!("{:?}", graph.profile),
+                    },
+                })),
+                error: None,
+            }
+        }
         "ping" => RpcResponse {
             jsonrpc: "2.0",
             id: request.id,
@@ -210,14 +229,25 @@ fn handle_request(request: RpcRequest, graph: &CapabilityGraph) -> RpcResponse {
                     Ok(result) => RpcResponse {
                         jsonrpc: "2.0",
                         id: request.id,
-                        result: Some(result),
+                        result: Some(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&result)
+                                    .unwrap_or_else(|_| result.to_string()),
+                            }],
+                            "structuredContent": result,
+                            "isError": false,
+                        })),
                         error: None,
                     },
                     Err(error) => RpcResponse {
                         jsonrpc: "2.0",
                         id: request.id,
-                        result: None,
-                        error: Some(json!(RpcError::new(-32000, error.to_string()))),
+                        result: Some(json!({
+                            "content": [{"type": "text", "text": error.to_string()}],
+                            "isError": true,
+                        })),
+                        error: None,
                     },
                 },
                 None => RpcResponse {
@@ -601,7 +631,7 @@ impl CapabilityGraph {
                 json!({
                     "name": tool.name,
                     "description": tool.description,
-                    "input_schema": tool.schema,
+                    "inputSchema": tool.schema,
                 })
             })
             .collect()
@@ -775,7 +805,7 @@ fn solve_rinex_invocation(raw: Value) -> Result<Value> {
 fn solve_rinex_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["obs_path"],
+        "required": ["obs_path", "nav_path"],
         "properties": {
             "obs_path": {"type": "string"},
             "nav_path": {"type": "string"},
@@ -1366,5 +1396,107 @@ mod tests {
         let graph = CapabilityGraph::v1(Profile::All);
         let schema = graph.describe("solve_rinex").expect("schema");
         let _: Value = serde_json::from_value(schema).expect("json");
+    }
+
+    fn request(method: &str, params: Value) -> RpcRequest {
+        RpcRequest {
+            method: method.to_string(),
+            id: Some(json!(1)),
+            params: Some(params),
+        }
+    }
+
+    #[test]
+    fn mcp_initialize_returns_spec_shape() {
+        let graph = CapabilityGraph::v1(Profile::All);
+        let response = handle_request(
+            request("initialize", json!({"protocolVersion": "2024-11-05"})),
+            &graph,
+        );
+        let result = response.result.expect("result");
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert!(result["capabilities"]["tools"].is_object());
+        assert!(result["capabilities"]["resources"].is_object());
+        assert_eq!(result["serverInfo"]["name"], "sidereon");
+        assert!(result["serverInfo"]["version"].is_string());
+    }
+
+    #[test]
+    fn mcp_tools_list_uses_camel_case_input_schema() {
+        let graph = CapabilityGraph::v1(Profile::All);
+        let response = handle_request(request("tools/list", json!({})), &graph);
+        let result = response.result.expect("result");
+        let tools = result["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty());
+        for tool in tools {
+            assert!(
+                tool["inputSchema"].is_object(),
+                "missing inputSchema: {tool}"
+            );
+            assert!(tool.get("input_schema").is_none());
+        }
+        let solve = tools
+            .iter()
+            .find(|tool| tool["name"] == "solve_rinex")
+            .expect("solve_rinex listed");
+        let required = solve["inputSchema"]["required"]
+            .as_array()
+            .expect("required");
+        assert!(required.contains(&json!("nav_path")));
+    }
+
+    #[test]
+    fn mcp_tools_call_wraps_results_in_content() {
+        let graph = CapabilityGraph::v1(Profile::All);
+        let response = handle_request(
+            request(
+                "tools/call",
+                json!({"name": "error_metrics", "arguments": {
+                    "enu_covariance_3x3": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 4.0]],
+                }}),
+            ),
+            &graph,
+        );
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], false);
+        let content = result["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].is_string());
+        assert!(result["structuredContent"].is_object());
+    }
+
+    #[test]
+    fn mcp_tool_failures_are_is_error_content_not_protocol_errors() {
+        let graph = CapabilityGraph::v1(Profile::All);
+        let response = handle_request(
+            request(
+                "tools/call",
+                json!({"name": "solve_rinex", "arguments": {
+                    "obs_path": "/nonexistent.obs", "nav_path": "/nonexistent.nav",
+                }}),
+            ),
+            &graph,
+        );
+        assert!(
+            response.error.is_none(),
+            "tool failure must not be a protocol error"
+        );
+        let result = response.result.expect("result");
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].is_string());
+    }
+
+    #[test]
+    fn mcp_unknown_tool_is_a_protocol_error() {
+        let graph = CapabilityGraph::v1(Profile::All);
+        let response = handle_request(
+            request(
+                "tools/call",
+                json!({"name": "no_such_tool", "arguments": {}}),
+            ),
+            &graph,
+        );
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
     }
 }

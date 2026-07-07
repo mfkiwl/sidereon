@@ -188,7 +188,7 @@ fn run(cli: Cli) -> Result<()> {
             let tcp = validate_path_and_conflict("tcp", tcp)?;
             let has_ntrip = ntrip.is_some();
             let has_tcp = tcp.is_some();
-            if has_ntrip == has_tcp {
+            if use_live && has_ntrip == has_tcp {
                 bail!("exactly one of --ntrip and --tcp is required");
             }
             let (nav, live_nav) = match (&nav, &ntrip_nav) {

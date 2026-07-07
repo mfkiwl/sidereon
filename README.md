@@ -50,10 +50,25 @@ println!("az {:.2} el {:.2} range {:.1} km", look.azimuth_deg, look.elevation_de
 
 More runnable examples, in all five languages, are on the [live demo](https://sidereon.dev).
 
+## The command line
+
+The repo ships a single binary for working without writing code:
+
+```text
+sidereon solve --obs rover.obs --nav brdc.nav     # SPP per epoch, bounds always shown
+sidereon qc --obs rover.obs                       # teqc-style observation quality report
+sidereon inspect FILE                             # detect and summarize RINEX/SP3/ANTEX/TLE
+sidereon metrics --enu-cov "..."                  # CEP / DRMS / R95 / ellipse from a covariance
+sidereon tui --obs rover.obs --nav brdc.nav       # replay a session in the terminal monitor
+sidereon tui --ntrip host:2101 --mount MP ...     # watch a live stream solve in real time
+sidereon serve-mcp                                # expose the engine to AI agents over MCP
+```
+
 ## Crates
 
 - [`sidereon-core`](crates/sidereon-core): the engine. SGP4/SDP4 propagation, coordinate and time transforms, RINEX/SP3/ANTEX/OMM/RTCM parsing, broadcast and precise ephemeris, SPP/RTK/PPP/DGNSS positioning, DOP and visibility, conjunction assessment, and the supporting numerical kernels.
 - [`sidereon`](crates/sidereon): the ergonomic Rust interface over `sidereon-core`. Product loaders plus SPP/RTK/PPP solves with result structs and one error enum. This is the Rust interface, held to the same parity bar as the bindings below.
+- [`sidereon-cli`](crates/sidereon-cli): the `sidereon` command-line tool over the engine: `solve` (SPP from RINEX with covariance-derived bounds always shown), `qc`, `metrics`, `inspect`, a terminal solution monitor (`tui`) that replays a logged RINEX session or watches a live NTRIP/TCP RTCM stream, and `serve-mcp`, a Model Context Protocol server exposing the engine to AI agents through task tools plus a typed capability graph. Built from this repo with `cargo build -p sidereon-cli`; not yet on crates.io.
 - [`trust-region-least-squares`](crates/trust-region-least-squares): a standalone, independently publishable nonlinear least-squares solver that reproduces SciPy's trust-region-reflective `least_squares` bit-for-bit. It does not depend on the engine.
 
 ## Interfaces
