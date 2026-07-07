@@ -1,10 +1,10 @@
 //! ECEF indirect error-state system model and covariance prediction.
 
 use crate::astro::constants::earth::{GM_EARTH_M3_S2, OMEGA_E_DOT_RAD_S};
-use crate::astro::math::mat3::{mul_vec3, Mat3};
+use crate::astro::math::mat3::{inline_tr, mul_vec3, Mat3};
 use crate::astro::math::vec3::norm3;
 use crate::inertial::config::RANDOM_WALK_BIAS_TAU_S;
-use crate::inertial::state::skew;
+use crate::inertial::state::{mat3_identity, skew, validate_dcm_orthonormal};
 use crate::inertial::{validate_vec3, ImuSpec, NavState};
 
 use super::state::{
@@ -62,12 +62,34 @@ pub fn error_state_system_matrix_ecef(
     imu_spec: &ImuSpec,
     layout: ErrorStateLayout,
 ) -> Result<Vec<Vec<f64>>, FusionError> {
+    error_state_system_matrix_ecef_with_imu_to_body(
+        state,
+        kinematics,
+        imu_spec,
+        layout,
+        mat3_identity(),
+    )
+}
+
+/// Build the ECEF error-state system matrix with IMU axes rotated into body axes.
+pub fn error_state_system_matrix_ecef_with_imu_to_body(
+    state: &NavState,
+    kinematics: ErrorStateImuKinematics,
+    imu_spec: &ImuSpec,
+    layout: ErrorStateLayout,
+    imu_to_body_dcm: Mat3,
+) -> Result<Vec<Vec<f64>>, FusionError> {
     state.validate()?;
     imu_spec.validate()?;
+    validate_dcm_orthonormal(&imu_to_body_dcm, "imu_to_body_dcm").map_err(FusionError::from)?;
     let dimension = layout.dimension();
     let mut f = vec![vec![0.0; dimension]; dimension];
     let c_b_e = state.attitude_body_to_ecef;
+    let c_imu_e = crate::astro::math::mat3::inline_rxr(&c_b_e, &imu_to_body_dcm);
     let specific_force_ecef = mul_vec3(&c_b_e, kinematics.specific_force_body_mps2);
+    let body_to_imu_dcm = inline_tr(&imu_to_body_dcm);
+    let specific_force_imu = mul_vec3(&body_to_imu_dcm, kinematics.specific_force_body_mps2);
+    let angular_rate_imu = mul_vec3(&body_to_imu_dcm, kinematics.angular_rate_body_rps);
 
     for axis in 0..3 {
         f[ERROR_POSITION_INDEX + axis][ERROR_VELOCITY_INDEX + axis] = 1.0;
@@ -94,8 +116,8 @@ pub fn error_state_system_matrix_ecef(
         for col in 0..3 {
             f[ERROR_VELOCITY_INDEX + row][ERROR_ATTITUDE_INDEX + col] =
                 -specific_force_skew[row][col];
-            f[ERROR_VELOCITY_INDEX + row][ERROR_ACCEL_BIAS_INDEX + col] = c_b_e[row][col];
-            f[ERROR_ATTITUDE_INDEX + row][ERROR_GYRO_BIAS_INDEX + col] = -c_b_e[row][col];
+            f[ERROR_VELOCITY_INDEX + row][ERROR_ACCEL_BIAS_INDEX + col] = c_imu_e[row][col];
+            f[ERROR_ATTITUDE_INDEX + row][ERROR_GYRO_BIAS_INDEX + col] = -c_imu_e[row][col];
         }
     }
 
@@ -106,9 +128,9 @@ pub fn error_state_system_matrix_ecef(
         for row in 0..3 {
             for col in 0..3 {
                 f[ERROR_VELOCITY_INDEX + row][ERROR_ACCEL_SCALE_INDEX + col] =
-                    c_b_e[row][col] * kinematics.specific_force_body_mps2[col];
+                    c_imu_e[row][col] * specific_force_imu[col];
                 f[ERROR_ATTITUDE_INDEX + row][ERROR_GYRO_SCALE_INDEX + col] =
-                    -c_b_e[row][col] * kinematics.angular_rate_body_rps[col];
+                    -c_imu_e[row][col] * angular_rate_imu[col];
             }
         }
     }
@@ -198,7 +220,32 @@ pub fn linearize_error_state_ecef(
     dt_s: f64,
     layout: ErrorStateLayout,
 ) -> Result<ErrorStateLinearization, FusionError> {
-    let f = error_state_system_matrix_ecef(state, kinematics, imu_spec, layout)?;
+    linearize_error_state_ecef_with_imu_to_body(
+        state,
+        kinematics,
+        imu_spec,
+        dt_s,
+        layout,
+        mat3_identity(),
+    )
+}
+
+/// Build `F`, `Phi`, and `Q_d` for one predict step with IMU axes rotated into body axes.
+pub fn linearize_error_state_ecef_with_imu_to_body(
+    state: &NavState,
+    kinematics: ErrorStateImuKinematics,
+    imu_spec: &ImuSpec,
+    dt_s: f64,
+    layout: ErrorStateLayout,
+    imu_to_body_dcm: Mat3,
+) -> Result<ErrorStateLinearization, FusionError> {
+    let f = error_state_system_matrix_ecef_with_imu_to_body(
+        state,
+        kinematics,
+        imu_spec,
+        layout,
+        imu_to_body_dcm,
+    )?;
     let phi = error_state_transition_matrix(&f, dt_s)?;
     let q_d = error_state_process_noise_discrete(imu_spec, dt_s, layout)?;
     Ok(ErrorStateLinearization {
@@ -321,7 +368,7 @@ mod tests {
 
     use super::*;
     use crate::astro::constants::earth::WGS84_A_M;
-    use crate::astro::math::mat3::{inline_rxr, inline_tr};
+    use crate::astro::math::mat3::{inline_rxr, inline_tr, mul_vec3};
     use crate::inertial::mechanization::mechanize_ecef;
     use crate::inertial::state::{mat3_identity, reorthonormalize_dcm};
     use crate::inertial::{CorrectedImuIncrement, MechanizationConfig};
@@ -534,6 +581,45 @@ mod tests {
                 q_d[ERROR_VELOCITY_INDEX + axis][ERROR_VELOCITY_INDEX + axis].to_bits(),
                 (q_accel * dt).to_bits()
             );
+        }
+    }
+
+    #[test]
+    fn imu_to_body_dcm_rotates_bias_and_scale_jacobians() {
+        let state = reference_state();
+        let imu = ErrorStateImuKinematics::new([2.0, 3.0, 4.0], [0.1, 0.2, 0.3]).expect("imu");
+        let imu_to_body = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let body_to_imu = inline_tr(&imu_to_body);
+        let specific_force_imu = mul_vec3(&body_to_imu, imu.specific_force_body_mps2);
+        let angular_rate_imu = mul_vec3(&body_to_imu, imu.angular_rate_body_rps);
+        let f = error_state_system_matrix_ecef_with_imu_to_body(
+            &state,
+            imu,
+            &reference_spec(),
+            ErrorStateLayout::TwentyOne,
+            imu_to_body,
+        )
+        .expect("system matrix");
+
+        for row in 0..3 {
+            for col in 0..3 {
+                assert_eq!(
+                    f[ERROR_VELOCITY_INDEX + row][ERROR_ACCEL_BIAS_INDEX + col].to_bits(),
+                    imu_to_body[row][col].to_bits()
+                );
+                assert_eq!(
+                    f[ERROR_ATTITUDE_INDEX + row][ERROR_GYRO_BIAS_INDEX + col].to_bits(),
+                    (-imu_to_body[row][col]).to_bits()
+                );
+                assert_eq!(
+                    f[ERROR_VELOCITY_INDEX + row][ERROR_ACCEL_SCALE_INDEX + col].to_bits(),
+                    (imu_to_body[row][col] * specific_force_imu[col]).to_bits()
+                );
+                assert_eq!(
+                    f[ERROR_ATTITUDE_INDEX + row][ERROR_GYRO_SCALE_INDEX + col].to_bits(),
+                    (-imu_to_body[row][col] * angular_rate_imu[col]).to_bits()
+                );
+            }
         }
     }
 

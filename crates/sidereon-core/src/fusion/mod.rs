@@ -20,19 +20,23 @@ pub use ekf::{
 };
 pub use error_state::{
     error_state_process_noise_discrete, error_state_system_matrix_ecef,
-    error_state_transition_matrix, linearize_error_state_ecef, predict_error_state_covariance,
-    ErrorStateImuKinematics, ErrorStateLinearization,
+    error_state_system_matrix_ecef_with_imu_to_body, error_state_transition_matrix,
+    linearize_error_state_ecef, linearize_error_state_ecef_with_imu_to_body,
+    predict_error_state_covariance, ErrorStateImuKinematics, ErrorStateLinearization,
 };
 pub use loose::{
-    loose_coupling_correction, FusionUpdate, GnssFixMeasurement, IggIiiMeasurementReweighting,
-    InertialFilter, InertialFilterConfig, LooseCouplingConfig, YangPredictionAdaptiveFactor,
+    loose_coupling_correction, velocity_match_outage, FusionUpdate, GnssFixMeasurement,
+    GnssFixStatus, GnssFixStatusWeighting, IggIiiMeasurementReweighting, InertialFilter,
+    InertialFilterConfig, LooseCouplingConfig, NonHolonomicConstraintConfig,
+    StationaryDetectorConfig, StationaryUpdateConfig, VelocityMatchState,
+    VelocityMatchedTrajectory, VelocityMatchingConfig, YangPredictionAdaptiveFactor,
 };
 pub use serial::{
     F64Bits, FusionStateCodecError, SerializableErrorStateLayout, SerializableFusionSnapshot,
-    SerializableFusionState, SerializableImuSample, SerializableImuSampleKind,
-    SerializableInsFilterState, SerializableLooseMeasurement, SerializableNavState,
-    SerializableRateEndpoint, SerializableSatelliteId, SerializableStoredCheckpoint,
-    SerializableStoredGnssMeasurement, SerializableStoredImuSample,
+    SerializableFusionState, SerializableGnssFixStatus, SerializableImuSample,
+    SerializableImuSampleKind, SerializableInsFilterState, SerializableLooseMeasurement,
+    SerializableNavState, SerializableRateEndpoint, SerializableSatelliteId,
+    SerializableStoredCheckpoint, SerializableStoredGnssMeasurement, SerializableStoredImuSample,
     SerializableTightCarrierPhaseObservation, SerializableTightFilterState,
     SerializableTightGnssEpoch, SerializableTightGnssObservation,
     SerializableTightRangeRateObservation, SerializableTimeSyncHistory,

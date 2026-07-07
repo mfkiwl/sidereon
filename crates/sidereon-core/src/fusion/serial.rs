@@ -1,6 +1,6 @@
 //! Versioned serialization for fusion filter checkpoints.
 
-use super::loose::{GnssFixMeasurement, InertialFilter};
+use super::loose::{GnssFixMeasurement, GnssFixStatus, InertialFilter};
 use super::state::{
     validate_covariance_matrix, validate_finite_slice, ErrorStateLayout, ErrorStateVector,
     InsFilterState,
@@ -437,6 +437,42 @@ pub struct SerializableLooseMeasurement {
     pub satellites_used: u32,
     /// Whether the upstream GNSS solver reported a successful fix.
     pub solution_valid: bool,
+    /// Upstream fix class used for loose covariance scaling.
+    #[serde(default = "default_serializable_fix_status")]
+    pub fix_status: SerializableGnssFixStatus,
+}
+
+/// Serializable loose GNSS fix status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SerializableGnssFixStatus {
+    /// Code-only or standalone GNSS fix.
+    Single,
+    /// Float carrier-phase ambiguity solution.
+    Float,
+    /// Fixed carrier-phase ambiguity solution.
+    Fixed,
+}
+
+fn default_serializable_fix_status() -> SerializableGnssFixStatus {
+    SerializableGnssFixStatus::Single
+}
+
+impl SerializableGnssFixStatus {
+    fn from_native(status: GnssFixStatus) -> Self {
+        match status {
+            GnssFixStatus::Single => Self::Single,
+            GnssFixStatus::Float => Self::Float,
+            GnssFixStatus::Fixed => Self::Fixed,
+        }
+    }
+
+    const fn to_native(self) -> GnssFixStatus {
+        match self {
+            Self::Single => GnssFixStatus::Single,
+            Self::Float => GnssFixStatus::Float,
+            Self::Fixed => GnssFixStatus::Fixed,
+        }
+    }
 }
 
 impl SerializableLooseMeasurement {
@@ -449,6 +485,7 @@ impl SerializableLooseMeasurement {
             covariance: bits_matrix(&measurement.covariance),
             satellites_used: checked_u32(measurement.satellites_used)?,
             solution_valid: measurement.solution_valid,
+            fix_status: SerializableGnssFixStatus::from_native(measurement.fix_status),
         })
     }
 
@@ -461,6 +498,7 @@ impl SerializableLooseMeasurement {
             covariance: f64_matrix(&self.covariance),
             satellites_used: self.satellites_used as usize,
             solution_valid: self.solution_valid,
+            fix_status: self.fix_status.to_native(),
         };
         measurement.validate().map_err(invalid_state)?;
         Ok(measurement)
@@ -1389,7 +1427,7 @@ fn write_stored_measurement(
 ) -> Result<(), FusionStateCodecError> {
     match measurement {
         SerializableStoredGnssMeasurement::Loose(measurement) => {
-            bytes.push(0);
+            bytes.push(2);
             write_loose_measurement(bytes, measurement)
         }
         SerializableStoredGnssMeasurement::Tight(epoch) => {
@@ -1406,11 +1444,14 @@ fn read_stored_measurement(
 ) -> Result<SerializableStoredGnssMeasurement, FusionStateCodecError> {
     match read_u8(bytes, cursor, limit)? {
         0 => Ok(SerializableStoredGnssMeasurement::Loose(
-            read_loose_measurement(bytes, cursor, limit)?,
+            read_loose_measurement_with_default_status(bytes, cursor, limit)?,
         )),
         1 => Ok(SerializableStoredGnssMeasurement::Tight(read_tight_epoch(
             bytes, cursor, limit,
         )?)),
+        2 => Ok(SerializableStoredGnssMeasurement::Loose(
+            read_loose_measurement(bytes, cursor, limit)?,
+        )),
         _ => Err(FusionStateCodecError::InvalidState {
             reason: "invalid GNSS measurement tag".to_string(),
         }),
@@ -1433,6 +1474,7 @@ fn write_loose_measurement(
     write_f64_matrix(bytes, &measurement.covariance)?;
     write_u32_checked(bytes, measurement.satellites_used as usize)?;
     write_bool(bytes, measurement.solution_valid);
+    write_fix_status(bytes, measurement.fix_status);
     Ok(())
 }
 
@@ -1441,6 +1483,23 @@ fn read_loose_measurement(
     cursor: &mut usize,
     limit: usize,
 ) -> Result<SerializableLooseMeasurement, FusionStateCodecError> {
+    read_loose_measurement_core(bytes, cursor, limit, true)
+}
+
+fn read_loose_measurement_with_default_status(
+    bytes: &[u8],
+    cursor: &mut usize,
+    limit: usize,
+) -> Result<SerializableLooseMeasurement, FusionStateCodecError> {
+    read_loose_measurement_core(bytes, cursor, limit, false)
+}
+
+fn read_loose_measurement_core(
+    bytes: &[u8],
+    cursor: &mut usize,
+    limit: usize,
+    read_status: bool,
+) -> Result<SerializableLooseMeasurement, FusionStateCodecError> {
     let t_j2000_s = read_f64(bytes, cursor, limit)?;
     let position_ecef_m = read_f64_array(bytes, cursor, limit)?;
     let velocity_ecef_mps = if read_bool(bytes, cursor, limit)? {
@@ -1448,14 +1507,46 @@ fn read_loose_measurement(
     } else {
         None
     };
+    let covariance = read_f64_matrix(bytes, cursor, limit)?;
+    let satellites_used = read_u32(bytes, cursor, limit)?;
+    let solution_valid = read_bool(bytes, cursor, limit)?;
+    let fix_status = if read_status {
+        read_fix_status(bytes, cursor, limit)?
+    } else {
+        SerializableGnssFixStatus::Single
+    };
     Ok(SerializableLooseMeasurement {
         t_j2000_s,
         position_ecef_m,
         velocity_ecef_mps,
-        covariance: read_f64_matrix(bytes, cursor, limit)?,
-        satellites_used: read_u32(bytes, cursor, limit)?,
-        solution_valid: read_bool(bytes, cursor, limit)?,
+        covariance,
+        satellites_used,
+        solution_valid,
+        fix_status,
     })
+}
+
+fn write_fix_status(bytes: &mut Vec<u8>, status: SerializableGnssFixStatus) {
+    bytes.push(match status {
+        SerializableGnssFixStatus::Single => 0,
+        SerializableGnssFixStatus::Float => 1,
+        SerializableGnssFixStatus::Fixed => 2,
+    });
+}
+
+fn read_fix_status(
+    bytes: &[u8],
+    cursor: &mut usize,
+    limit: usize,
+) -> Result<SerializableGnssFixStatus, FusionStateCodecError> {
+    match read_u8(bytes, cursor, limit)? {
+        0 => Ok(SerializableGnssFixStatus::Single),
+        1 => Ok(SerializableGnssFixStatus::Float),
+        2 => Ok(SerializableGnssFixStatus::Fixed),
+        _ => Err(FusionStateCodecError::InvalidState {
+            reason: "invalid loose fix status".to_string(),
+        }),
+    }
 }
 
 fn write_tight_epoch(
@@ -1922,6 +2013,57 @@ mod tests {
             8,
         )
         .expect("measurement")
+    }
+
+    #[test]
+    fn binary_stored_loose_measurement_preserves_fix_status() {
+        let measurement = SerializableLooseMeasurement::from_native(
+            &measurement_at(13.0, [WGS84_A_M + 0.25, -0.125, 3.5])
+                .with_fix_status(GnssFixStatus::Float),
+        )
+        .expect("serial measurement");
+        let stored = SerializableStoredGnssMeasurement::Loose(measurement.clone());
+        let mut encoded = Vec::new();
+        write_stored_measurement(&mut encoded, &stored).expect("write measurement");
+
+        let mut cursor = 0usize;
+        let decoded = read_stored_measurement(&encoded, &mut cursor, encoded.len()).expect("read");
+
+        assert_eq!(decoded, stored);
+        assert_eq!(cursor, encoded.len());
+    }
+
+    #[test]
+    fn binary_stored_loose_measurement_old_tag_defaults_fix_status() {
+        let measurement = SerializableLooseMeasurement::from_native(
+            &measurement_at(13.0, [WGS84_A_M + 0.25, -0.125, 3.5])
+                .with_fix_status(GnssFixStatus::Fixed),
+        )
+        .expect("serial measurement");
+        let mut encoded = Vec::new();
+        encoded.push(0);
+        write_f64(&mut encoded, measurement.t_j2000_s);
+        write_f64_array(&mut encoded, &measurement.position_ecef_m);
+        if let Some(velocity) = measurement.velocity_ecef_mps {
+            write_bool(&mut encoded, true);
+            write_f64_array(&mut encoded, &velocity);
+        } else {
+            write_bool(&mut encoded, false);
+        }
+        write_f64_matrix(&mut encoded, &measurement.covariance).expect("covariance");
+        write_u32_checked(&mut encoded, measurement.satellites_used as usize).expect("satellites");
+        write_bool(&mut encoded, measurement.solution_valid);
+
+        let mut cursor = 0usize;
+        let decoded = read_stored_measurement(&encoded, &mut cursor, encoded.len()).expect("read");
+
+        let SerializableStoredGnssMeasurement::Loose(decoded) = decoded else {
+            panic!("expected loose measurement");
+        };
+        assert_eq!(decoded.fix_status, SerializableGnssFixStatus::Single);
+        assert_eq!(decoded.t_j2000_s, measurement.t_j2000_s);
+        assert_eq!(decoded.position_ecef_m, measurement.position_ecef_m);
+        assert_eq!(cursor, encoded.len());
     }
 
     #[test]

@@ -6,6 +6,14 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Added
 
+- Loose GNSS/INS field-mode options: stationary ZUPT/ZARU pseudo-updates with
+  a configurable accel and gyro magnitude window, wheeled-vehicle
+  non-holonomic lateral and vertical velocity constraints, first-fix
+  velocity matching for GNSS outage spans, and per-fix-status GNSS covariance
+  weighting for single, float, and fixed updates. The inertial filter config
+  also accepts a fixed IMU-to-body direction-cosine matrix for callers that do
+  not pre-rotate IMU samples.
+
 - RINEX-to-SPP assembly helpers that convert parsed observation epochs plus a
   broadcast or precise ephemeris context into per-epoch `SolveInputs`, with a
   serial batch solve convenience that preserves per-epoch solve errors.

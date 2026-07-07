@@ -6,12 +6,14 @@
 
 use crate::astro::constants::earth::OMEGA_E_DOT_RAD_S;
 use crate::astro::math::mat3::{inline_rxr, inline_tr, mul_vec3, Mat3};
-use crate::astro::math::vec3::{add3, cross3, scale3, sub3};
-use crate::inertial::state::skew;
+use crate::astro::math::vec3::{add3, cross3, norm3, scale3, sub3};
+use crate::inertial::frames::gravity_ecef_mps2;
+use crate::inertial::state::{mat3_identity, skew, validate_dcm_orthonormal};
 use crate::inertial::{
     mechanize_ecef, validate_finite, validate_vec3, ImuCalibration, ImuErrorModel, ImuSample,
     ImuSpec, MechanizationConfig,
 };
+use std::collections::VecDeque;
 
 use super::ekf::{
     ekf_correct_closed_loop, ekf_correct_closed_loop_with_predicted_covariance_scale,
@@ -19,14 +21,15 @@ use super::ekf::{
     EkfUpdateOptions,
 };
 use super::error_state::{
-    linearize_error_state_ecef, predict_error_state_covariance, ErrorStateImuKinematics,
+    linearize_error_state_ecef_with_imu_to_body, predict_error_state_covariance,
+    ErrorStateImuKinematics,
 };
 use super::smoother::FusionPredictionStep;
 use super::state::FusionFilterKind;
 use super::state::{
-    invalid_input, validate_covariance_matrix, validate_positive, FusionError, InsFilterState,
-    ERROR_ATTITUDE_INDEX, ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX, ERROR_STATE_DIMENSION_15,
-    ERROR_STATE_DIMENSION_21, ERROR_VELOCITY_INDEX,
+    invalid_input, validate_covariance_matrix, validate_nonnegative, validate_positive,
+    FusionError, InsFilterState, ERROR_ATTITUDE_INDEX, ERROR_GYRO_BIAS_INDEX, ERROR_POSITION_INDEX,
+    ERROR_STATE_DIMENSION_15, ERROR_STATE_DIMENSION_21, ERROR_VELOCITY_INDEX,
 };
 use super::tight::{TightCouplingConfig, TightFusionState};
 use super::timesync::TimeSyncHistory;
@@ -35,6 +38,8 @@ use super::ukf::{ukf_correct_closed_loop, UkfUpdateOptions};
 const LOOSE_MIN_SATELLITES: usize = 4;
 const POSITION_ROWS: usize = 3;
 const POSITION_VELOCITY_ROWS: usize = 6;
+const ZUPT_ZARU_ROWS: usize = 6;
+const NHC_ROWS: usize = 2;
 const IGG_III_REJECTION_VARIANCE_SCALE: f64 = 1.0e4;
 const DEFAULT_PREDICTION_ADAPTATION_GATE_PROBABILITY: f64 = 0.99;
 
@@ -57,6 +62,8 @@ pub struct GnssFixMeasurement {
     pub satellites_used: usize,
     /// Whether the upstream GNSS solver reported a successful fix.
     pub solution_valid: bool,
+    /// Upstream ambiguity or code-only fix class for covariance scaling.
+    pub fix_status: GnssFixStatus,
 }
 
 impl GnssFixMeasurement {
@@ -74,6 +81,7 @@ impl GnssFixMeasurement {
             covariance: mat3_to_rows(position_covariance_m2),
             satellites_used,
             solution_valid: true,
+            fix_status: GnssFixStatus::Single,
         };
         measurement.validate()?;
         Ok(measurement)
@@ -94,9 +102,16 @@ impl GnssFixMeasurement {
             covariance,
             satellites_used,
             solution_valid: true,
+            fix_status: GnssFixStatus::Single,
         };
         measurement.validate()?;
         Ok(measurement)
+    }
+
+    /// Return this measurement tagged with an upstream fix status.
+    pub fn with_fix_status(mut self, fix_status: GnssFixStatus) -> Self {
+        self.fix_status = fix_status;
+        self
     }
 
     /// Validate finite values, solver status, satellite count, and covariance.
@@ -131,6 +146,17 @@ impl GnssFixMeasurement {
     }
 }
 
+/// Upstream GNSS solution class used by loose measurement weighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GnssFixStatus {
+    /// Code-only or standalone GNSS fix.
+    Single,
+    /// Float carrier-phase ambiguity solution.
+    Float,
+    /// Fixed carrier-phase ambiguity solution.
+    Fixed,
+}
+
 /// Configuration for loose-coupled GNSS updates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LooseCouplingConfig {
@@ -138,10 +164,18 @@ pub struct LooseCouplingConfig {
     pub lever_arm_body_m: [f64; 3],
     /// Generic EKF correction options applied to each loose update.
     pub update_options: EkfUpdateOptions,
+    /// Per-fix-status sigma multipliers applied to GNSS covariance.
+    pub fix_status_weighting: GnssFixStatusWeighting,
     /// Optional IGG-III variance inflation on standardized innovation rows.
     pub measurement_reweighting: Option<IggIiiMeasurementReweighting>,
     /// Optional Yang two-segment predicted-covariance inflation.
     pub prediction_adaptation: Option<YangPredictionAdaptiveFactor>,
+    /// Optional stationary zero-velocity and zero-angular-rate updates.
+    pub stationary_updates: Option<StationaryUpdateConfig>,
+    /// Optional wheeled-vehicle lateral and vertical velocity constraints.
+    pub non_holonomic: Option<NonHolonomicConstraintConfig>,
+    /// Optional near-real-time outage endpoint matching configuration.
+    pub velocity_matching: Option<VelocityMatchingConfig>,
 }
 
 impl Default for LooseCouplingConfig {
@@ -149,8 +183,12 @@ impl Default for LooseCouplingConfig {
         Self {
             lever_arm_body_m: [0.0; 3],
             update_options: EkfUpdateOptions::default(),
+            fix_status_weighting: GnssFixStatusWeighting::default(),
             measurement_reweighting: None,
             prediction_adaptation: None,
+            stationary_updates: None,
+            non_holonomic: None,
+            velocity_matching: None,
         }
     }
 }
@@ -162,13 +200,164 @@ impl LooseCouplingConfig {
         if let Some(gate) = self.update_options.innovation_gate {
             gate.validate()?;
         }
+        self.fix_status_weighting.validate()?;
         if let Some(reweighting) = self.measurement_reweighting {
             reweighting.validate()?;
         }
         if let Some(adaptation) = self.prediction_adaptation {
             adaptation.validate()?;
         }
+        if let Some(stationary) = self.stationary_updates {
+            stationary.validate()?;
+        }
+        if let Some(non_holonomic) = self.non_holonomic {
+            non_holonomic.validate()?;
+        }
+        if let Some(velocity_matching) = self.velocity_matching {
+            velocity_matching.validate()?;
+        }
         Ok(())
+    }
+}
+
+/// Sigma multipliers selected by [`GnssFixStatus`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GnssFixStatusWeighting {
+    /// Sigma multiplier for standalone GNSS fixes.
+    pub single_sigma_multiplier: f64,
+    /// Sigma multiplier for float ambiguity fixes.
+    pub float_sigma_multiplier: f64,
+    /// Sigma multiplier for fixed ambiguity fixes.
+    pub fixed_sigma_multiplier: f64,
+}
+
+impl Default for GnssFixStatusWeighting {
+    fn default() -> Self {
+        Self {
+            single_sigma_multiplier: 1.0,
+            float_sigma_multiplier: 1.0,
+            fixed_sigma_multiplier: 1.0,
+        }
+    }
+}
+
+impl GnssFixStatusWeighting {
+    /// Return the sigma multiplier for a GNSS fix status.
+    pub fn multiplier(self, status: GnssFixStatus) -> f64 {
+        match status {
+            GnssFixStatus::Single => self.single_sigma_multiplier,
+            GnssFixStatus::Float => self.float_sigma_multiplier,
+            GnssFixStatus::Fixed => self.fixed_sigma_multiplier,
+        }
+    }
+
+    /// Validate that all multipliers are finite and positive.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        validate_positive(self.single_sigma_multiplier, "single_sigma_multiplier")?;
+        validate_positive(self.float_sigma_multiplier, "float_sigma_multiplier")?;
+        validate_positive(self.fixed_sigma_multiplier, "fixed_sigma_multiplier")
+    }
+}
+
+/// Stationarity detector and pseudo-measurement sigmas for ZUPT/ZARU.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationaryUpdateConfig {
+    /// Detector thresholds over a trailing IMU epoch window.
+    pub detector: StationaryDetectorConfig,
+    /// One-sigma zero-velocity pseudo-measurement noise in m/s.
+    pub zero_velocity_sigma_mps: f64,
+    /// One-sigma zero-angular-rate pseudo-measurement noise in rad/s.
+    pub zero_angular_rate_sigma_rps: f64,
+}
+
+impl StationaryUpdateConfig {
+    /// Validate detector settings and pseudo-measurement sigmas.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        self.detector.validate()?;
+        validate_positive(self.zero_velocity_sigma_mps, "zero_velocity_sigma_mps")?;
+        validate_positive(
+            self.zero_angular_rate_sigma_rps,
+            "zero_angular_rate_sigma_rps",
+        )
+    }
+}
+
+/// Windowed accel and gyro magnitude detector for stationary updates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StationaryDetectorConfig {
+    /// Number of propagated IMU epochs required before the detector can fire.
+    pub window_len: usize,
+    /// Maximum allowed specific-force norm error from local gravity.
+    pub max_specific_force_norm_error_mps2: f64,
+    /// Maximum body angular-rate norm relative to ECEF.
+    pub max_body_rate_wrt_ecef_norm_rps: f64,
+}
+
+impl StationaryDetectorConfig {
+    /// Validate finite, non-negative thresholds and non-empty window length.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        if self.window_len == 0 {
+            return Err(invalid_input("stationary_window_len", "must be nonzero"));
+        }
+        validate_nonnegative(
+            self.max_specific_force_norm_error_mps2,
+            "max_specific_force_norm_error_mps2",
+        )?;
+        validate_nonnegative(
+            self.max_body_rate_wrt_ecef_norm_rps,
+            "max_body_rate_wrt_ecef_norm_rps",
+        )
+    }
+}
+
+/// Non-holonomic wheeled-vehicle velocity constraint settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NonHolonomicConstraintConfig {
+    /// One-sigma lateral body velocity pseudo-measurement noise in m/s.
+    pub lateral_velocity_sigma_mps: f64,
+    /// One-sigma vertical body velocity pseudo-measurement noise in m/s.
+    pub vertical_velocity_sigma_mps: f64,
+    /// Minimum ECEF speed required before applying NHC.
+    pub min_speed_mps: f64,
+    /// Maximum body angular-rate norm relative to ECEF.
+    pub max_body_rate_wrt_ecef_norm_rps: f64,
+}
+
+impl NonHolonomicConstraintConfig {
+    /// Validate sigmas and motion gates.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        validate_positive(
+            self.lateral_velocity_sigma_mps,
+            "lateral_velocity_sigma_mps",
+        )?;
+        validate_positive(
+            self.vertical_velocity_sigma_mps,
+            "vertical_velocity_sigma_mps",
+        )?;
+        validate_nonnegative(self.min_speed_mps, "nhc_min_speed_mps")?;
+        validate_nonnegative(
+            self.max_body_rate_wrt_ecef_norm_rps,
+            "nhc_max_body_rate_wrt_ecef_norm_rps",
+        )
+    }
+}
+
+/// Endpoint matching settings for a GNSS outage span.
+///
+/// This is a near-real-time trajectory adjustment: it uses only the first good
+/// position and velocity fix after an outage to blend a correction back to the
+/// outage entry. It is not an RTS smoother because it does not recurse through
+/// covariance, dynamics transitions, or later measurements.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocityMatchingConfig {
+    /// Maximum outage interval accepted by the matcher.
+    pub max_outage_duration_s: f64,
+}
+
+impl VelocityMatchingConfig {
+    /// Validate finite, positive duration bound.
+    pub fn validate(&self) -> Result<(), FusionError> {
+        validate_positive(self.max_outage_duration_s, "max_outage_duration_s")
     }
 }
 
@@ -280,6 +469,12 @@ pub struct InertialFilterConfig {
     pub filter_kind: FusionFilterKind,
     /// Deterministic IMU calibration applied before mechanization.
     pub imu_model: ImuErrorModel,
+    /// Direction cosine matrix rotating IMU sensor axes into vehicle body axes.
+    ///
+    /// Bias and scale-factor error states remain resolved in IMU axes; corrected
+    /// samples are rotated into body axes before mechanization and covariance
+    /// prediction.
+    pub imu_to_body_dcm: Mat3,
     /// Strapdown mechanization options.
     pub mechanization: MechanizationConfig,
     /// Loose GNSS update options.
@@ -297,6 +492,7 @@ impl InertialFilterConfig {
             imu_spec,
             filter_kind: FusionFilterKind::Ekf,
             imu_model: ImuErrorModel::default(),
+            imu_to_body_dcm: mat3_identity(),
             mechanization: MechanizationConfig::default(),
             loose: LooseCouplingConfig::default(),
             tight: TightCouplingConfig::default(),
@@ -313,6 +509,8 @@ impl InertialFilterConfig {
         self.imu_model
             .calibration
             .validate()
+            .map_err(FusionError::from)?;
+        validate_dcm_orthonormal(&self.imu_to_body_dcm, "imu_to_body_dcm")
             .map_err(FusionError::from)?;
         self.loose.validate()?;
         if self.configures_ukf_prediction_adaptation() {
@@ -369,8 +567,15 @@ pub struct InertialFilter {
     pub(super) state: InsFilterState,
     pub(super) config: InertialFilterConfig,
     pub(super) last_body_rate_wrt_ecef_rps: [f64; 3],
+    stationarity_window: VecDeque<StationarityDetectorSample>,
     pub(super) time_sync: TimeSyncHistory,
     pub(super) tight: TightFusionState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StationarityDetectorSample {
+    specific_force_norm_error_mps2: f64,
+    body_rate_wrt_ecef_norm_rps: f64,
 }
 
 impl InertialFilter {
@@ -393,6 +598,7 @@ impl InertialFilter {
             state,
             config,
             last_body_rate_wrt_ecef_rps: [0.0; 3],
+            stationarity_window: VecDeque::new(),
             time_sync,
             tight,
         })
@@ -438,19 +644,23 @@ impl InertialFilter {
 
         let previous = self.state.nominal;
         let imu_model = self.effective_imu_model()?;
-        let increment = imu_model
-            .correct_sample(&sample, previous.t_j2000_s)
-            .map_err(FusionError::from)?;
+        let increment = rotate_increment_imu_to_body(
+            imu_model
+                .correct_sample(&sample, previous.t_j2000_s)
+                .map_err(FusionError::from)?,
+            self.config.imu_to_body_dcm,
+        );
         let kinematics = ErrorStateImuKinematics::new(
             scale3(increment.delta_velocity_mps, 1.0 / increment.dt_s),
             scale3(increment.delta_theta_rad, 1.0 / increment.dt_s),
         )?;
-        let linearization = linearize_error_state_ecef(
+        let linearization = linearize_error_state_ecef_with_imu_to_body(
             &previous,
             kinematics,
             &self.config.imu_spec,
             increment.dt_s,
             self.state.layout(),
+            self.config.imu_to_body_dcm,
         )?;
         let next_nominal = mechanize_ecef(&previous, &increment, self.config.mechanization)
             .map_err(FusionError::from)?;
@@ -474,6 +684,10 @@ impl InertialFilter {
         self.state.nominal = next_nominal;
         self.state.reset_error_state();
         self.last_body_rate_wrt_ecef_rps = body_rate_wrt_ecef_rps;
+        self.record_stationarity_sample(
+            kinematics.specific_force_body_mps2,
+            body_rate_wrt_ecef_rps,
+        )?;
         self.state.validate()?;
         Ok(FusionPredictionStep {
             transition: linearization.phi,
@@ -508,12 +722,54 @@ impl InertialFilter {
         &mut self,
         measurement: &GnssFixMeasurement,
     ) -> Result<FusionUpdate, FusionError> {
-        let correction = loose_coupling_correction(
+        let correction = loose_coupling_correction_with_imu_to_body(
             &self.state,
             measurement,
             self.config.loose.lever_arm_body_m,
             self.last_body_rate_wrt_ecef_rps,
+            self.config.imu_to_body_dcm,
         )?;
+        let correction = apply_fix_status_weighting(
+            correction,
+            measurement.fix_status,
+            self.config.loose.fix_status_weighting,
+        )?;
+        self.apply_loose_style_correction(correction)
+    }
+
+    /// Apply a gated zero-velocity and zero-angular-rate update.
+    pub fn update_stationary(&mut self) -> Result<Option<FusionUpdate>, FusionError> {
+        let Some(config) = self.config.loose.stationary_updates else {
+            return Ok(None);
+        };
+        if !self.is_stationary(config.detector)? {
+            return Ok(None);
+        }
+        let correction = stationary_correction(
+            &self.state,
+            self.last_body_rate_wrt_ecef_rps,
+            config,
+            self.config.imu_to_body_dcm,
+        )?;
+        self.apply_loose_style_correction(correction).map(Some)
+    }
+
+    /// Apply a gated wheeled-vehicle non-holonomic constraint update.
+    pub fn update_non_holonomic(&mut self) -> Result<Option<FusionUpdate>, FusionError> {
+        let Some(config) = self.config.loose.non_holonomic else {
+            return Ok(None);
+        };
+        if !self.nhc_motion_gate(config)? {
+            return Ok(None);
+        }
+        let correction = non_holonomic_correction(&self.state, config)?;
+        self.apply_loose_style_correction(correction).map(Some)
+    }
+
+    fn apply_loose_style_correction(
+        &mut self,
+        correction: EkfCorrection,
+    ) -> Result<FusionUpdate, FusionError> {
         let prepared = prepare_loose_correction(&self.state, correction, self.config.loose)?;
         let rows = prepared.correction.row_count();
         let filter_kind = self.config.filter_kind;
@@ -539,6 +795,64 @@ impl InertialFilter {
         self.tight
             .replace_base_covariance_and_clear_cross(&self.state.covariance)?;
         Ok(FusionUpdate::from_report(rows, report))
+    }
+
+    fn record_stationarity_sample(
+        &mut self,
+        specific_force_body_mps2: [f64; 3],
+        body_rate_wrt_ecef_rps: [f64; 3],
+    ) -> Result<(), FusionError> {
+        let gravity_norm_mps2 = norm3(gravity_ecef_mps2(self.state.nominal.position_ecef_m)?);
+        let sample = StationarityDetectorSample {
+            specific_force_norm_error_mps2: (norm3(specific_force_body_mps2) - gravity_norm_mps2)
+                .abs(),
+            body_rate_wrt_ecef_norm_rps: norm3(body_rate_wrt_ecef_rps),
+        };
+        validate_finite(
+            sample.specific_force_norm_error_mps2,
+            "specific_force_norm_error_mps2",
+        )
+        .map_err(FusionError::from)?;
+        validate_finite(
+            sample.body_rate_wrt_ecef_norm_rps,
+            "body_rate_wrt_ecef_norm_rps",
+        )
+        .map_err(FusionError::from)?;
+        self.stationarity_window.push_back(sample);
+        let max_len = self
+            .config
+            .loose
+            .stationary_updates
+            .map_or(1, |config| config.detector.window_len);
+        while self.stationarity_window.len() > max_len {
+            self.stationarity_window.pop_front();
+        }
+        Ok(())
+    }
+
+    fn is_stationary(&self, detector: StationaryDetectorConfig) -> Result<bool, FusionError> {
+        detector.validate()?;
+        if self.stationarity_window.len() < detector.window_len {
+            return Ok(false);
+        }
+        Ok(self
+            .stationarity_window
+            .iter()
+            .rev()
+            .take(detector.window_len)
+            .all(|sample| {
+                sample.specific_force_norm_error_mps2 <= detector.max_specific_force_norm_error_mps2
+                    && sample.body_rate_wrt_ecef_norm_rps
+                        <= detector.max_body_rate_wrt_ecef_norm_rps
+            }))
+    }
+
+    fn nhc_motion_gate(&self, config: NonHolonomicConstraintConfig) -> Result<bool, FusionError> {
+        config.validate()?;
+        let speed_mps = norm3(self.state.nominal.velocity_ecef_mps);
+        validate_finite(speed_mps, "nhc_speed_mps").map_err(FusionError::from)?;
+        Ok(speed_mps >= config.min_speed_mps
+            && norm3(self.last_body_rate_wrt_ecef_rps) <= config.max_body_rate_wrt_ecef_norm_rps)
     }
 
     fn effective_imu_model(&self) -> Result<ImuErrorModel, FusionError> {
@@ -574,10 +888,27 @@ pub fn loose_coupling_correction(
     lever_arm_body_m: [f64; 3],
     body_rate_wrt_ecef_rps: [f64; 3],
 ) -> Result<EkfCorrection, FusionError> {
+    loose_coupling_correction_with_imu_to_body(
+        state,
+        measurement,
+        lever_arm_body_m,
+        body_rate_wrt_ecef_rps,
+        mat3_identity(),
+    )
+}
+
+fn loose_coupling_correction_with_imu_to_body(
+    state: &InsFilterState,
+    measurement: &GnssFixMeasurement,
+    lever_arm_body_m: [f64; 3],
+    body_rate_wrt_ecef_rps: [f64; 3],
+    imu_to_body_dcm: Mat3,
+) -> Result<EkfCorrection, FusionError> {
     state.validate()?;
     measurement.validate()?;
     validate_vec3(lever_arm_body_m, "lever_arm_body_m").map_err(FusionError::from)?;
     validate_vec3(body_rate_wrt_ecef_rps, "body_rate_wrt_ecef_rps").map_err(FusionError::from)?;
+    validate_dcm_orthonormal(&imu_to_body_dcm, "imu_to_body_dcm").map_err(FusionError::from)?;
     if measurement.t_j2000_s != state.nominal.t_j2000_s {
         return Err(invalid_input("t_j2000_s", "must equal nominal state epoch"));
     }
@@ -606,7 +937,10 @@ pub fn loose_coupling_correction(
     if let Some(velocity_ecef_mps) = measurement.velocity_ecef_mps {
         let velocity_residual = sub3(velocity_ecef_mps, antenna_velocity_ecef_mps);
         let lever_velocity_skew = skew(lever_velocity_ecef_mps);
-        let gyro_bias_block = inline_rxr(&c_b_e, &skew(lever_arm_body_m));
+        let gyro_bias_block = inline_rxr(
+            &inline_rxr(&c_b_e, &skew(lever_arm_body_m)),
+            &imu_to_body_dcm,
+        );
         for axis in 0..3 {
             let mut row = vec![0.0; dimension];
             row[ERROR_VELOCITY_INDEX + axis] = -1.0;
@@ -620,6 +954,241 @@ pub fn loose_coupling_correction(
     }
 
     EkfCorrection::new(innovation, design, measurement.covariance.clone())
+}
+
+fn stationary_correction(
+    state: &InsFilterState,
+    body_rate_wrt_ecef_rps: [f64; 3],
+    config: StationaryUpdateConfig,
+    imu_to_body_dcm: Mat3,
+) -> Result<EkfCorrection, FusionError> {
+    state.validate()?;
+    config.validate()?;
+    validate_vec3(body_rate_wrt_ecef_rps, "body_rate_wrt_ecef_rps").map_err(FusionError::from)?;
+    validate_dcm_orthonormal(&imu_to_body_dcm, "imu_to_body_dcm").map_err(FusionError::from)?;
+    let dimension = state.dimension();
+    let mut innovation = Vec::with_capacity(ZUPT_ZARU_ROWS);
+    let mut design = Vec::with_capacity(ZUPT_ZARU_ROWS);
+    let mut covariance = vec![vec![0.0; ZUPT_ZARU_ROWS]; ZUPT_ZARU_ROWS];
+    let velocity_variance = config.zero_velocity_sigma_mps * config.zero_velocity_sigma_mps;
+    let rate_variance = config.zero_angular_rate_sigma_rps * config.zero_angular_rate_sigma_rps;
+
+    for axis in 0..3 {
+        let mut row = vec![0.0; dimension];
+        row[ERROR_VELOCITY_INDEX + axis] = -1.0;
+        innovation.push(-state.nominal.velocity_ecef_mps[axis]);
+        covariance[axis][axis] = velocity_variance;
+        design.push(row);
+    }
+    for axis in 0..3 {
+        let mut row = vec![0.0; dimension];
+        for col in 0..3 {
+            row[ERROR_GYRO_BIAS_INDEX + col] = -imu_to_body_dcm[axis][col];
+        }
+        innovation.push(-body_rate_wrt_ecef_rps[axis]);
+        covariance[3 + axis][3 + axis] = rate_variance;
+        design.push(row);
+    }
+
+    EkfCorrection::new(innovation, design, covariance)
+}
+
+fn non_holonomic_correction(
+    state: &InsFilterState,
+    config: NonHolonomicConstraintConfig,
+) -> Result<EkfCorrection, FusionError> {
+    state.validate()?;
+    config.validate()?;
+    let dimension = state.dimension();
+    let c_e_b = inline_tr(&state.nominal.attitude_body_to_ecef);
+    let velocity_body_mps = mul_vec3(&c_e_b, state.nominal.velocity_ecef_mps);
+    let attitude_block = inline_rxr(&c_e_b, &skew(state.nominal.velocity_ecef_mps));
+    let mut innovation = Vec::with_capacity(NHC_ROWS);
+    let mut design = Vec::with_capacity(NHC_ROWS);
+    let mut covariance = vec![vec![0.0; NHC_ROWS]; NHC_ROWS];
+    let constrained_axes = [1usize, 2usize];
+
+    for (row_idx, body_axis) in constrained_axes.into_iter().enumerate() {
+        let mut row = vec![0.0; dimension];
+        for axis in 0..3 {
+            row[ERROR_VELOCITY_INDEX + axis] = -c_e_b[body_axis][axis];
+            row[ERROR_ATTITUDE_INDEX + axis] = -attitude_block[body_axis][axis];
+        }
+        innovation.push(-velocity_body_mps[body_axis]);
+        design.push(row);
+        let sigma = if body_axis == 1 {
+            config.lateral_velocity_sigma_mps
+        } else {
+            config.vertical_velocity_sigma_mps
+        };
+        covariance[row_idx][row_idx] = sigma * sigma;
+    }
+
+    EkfCorrection::new(innovation, design, covariance)
+}
+
+fn apply_fix_status_weighting(
+    correction: EkfCorrection,
+    status: GnssFixStatus,
+    weighting: GnssFixStatusWeighting,
+) -> Result<EkfCorrection, FusionError> {
+    weighting.validate()?;
+    let multiplier = weighting.multiplier(status);
+    if multiplier.to_bits() == 1.0_f64.to_bits() {
+        return Ok(correction);
+    }
+    let variance_scale = multiplier * multiplier;
+    let covariance = correction
+        .measurement_covariance
+        .iter()
+        .map(|row| row.iter().map(|value| value * variance_scale).collect())
+        .collect();
+    EkfCorrection::new(correction.innovation, correction.design, covariance)
+}
+
+fn rotate_increment_imu_to_body(
+    increment: crate::inertial::CorrectedImuIncrement,
+    imu_to_body_dcm: Mat3,
+) -> crate::inertial::CorrectedImuIncrement {
+    if imu_to_body_dcm == mat3_identity() {
+        return increment;
+    }
+    crate::inertial::CorrectedImuIncrement {
+        delta_velocity_mps: mul_vec3(&imu_to_body_dcm, increment.delta_velocity_mps),
+        delta_theta_rad: mul_vec3(&imu_to_body_dcm, increment.delta_theta_rad),
+        ..increment
+    }
+}
+
+/// One position/velocity sample used by velocity matching.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VelocityMatchState {
+    /// Sample epoch in seconds since J2000.
+    pub t_j2000_s: f64,
+    /// INS position in ECEF meters.
+    pub position_ecef_m: [f64; 3],
+    /// INS velocity in ECEF meters per second.
+    pub velocity_ecef_mps: [f64; 3],
+}
+
+impl VelocityMatchState {
+    /// Build and validate one velocity-matching sample.
+    pub fn new(
+        t_j2000_s: f64,
+        position_ecef_m: [f64; 3],
+        velocity_ecef_mps: [f64; 3],
+    ) -> Result<Self, FusionError> {
+        validate_finite(t_j2000_s, "t_j2000_s").map_err(FusionError::from)?;
+        validate_vec3(position_ecef_m, "position_ecef_m").map_err(FusionError::from)?;
+        validate_vec3(velocity_ecef_mps, "velocity_ecef_mps").map_err(FusionError::from)?;
+        Ok(Self {
+            t_j2000_s,
+            position_ecef_m,
+            velocity_ecef_mps,
+        })
+    }
+}
+
+/// Output from endpoint velocity matching across one outage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VelocityMatchedTrajectory {
+    /// Corrected samples in the same order as the input span.
+    pub states: Vec<VelocityMatchState>,
+    /// Position correction applied at the return-fix endpoint.
+    pub endpoint_position_correction_ecef_m: [f64; 3],
+    /// Velocity correction applied at the return-fix endpoint.
+    pub endpoint_velocity_correction_ecef_mps: [f64; 3],
+}
+
+/// Blend a first good post-outage fix back over an outage span.
+///
+/// The input span starts at the last pre-outage state and ends at the
+/// pre-update return-fix state. The first sample keeps zero correction, the
+/// final sample matches the GNSS position and velocity, and interior samples
+/// receive a cubic Hermite endpoint correction.
+pub fn velocity_match_outage(
+    states: &[VelocityMatchState],
+    first_good_fix: &GnssFixMeasurement,
+    config: VelocityMatchingConfig,
+) -> Result<VelocityMatchedTrajectory, FusionError> {
+    config.validate()?;
+    first_good_fix.validate()?;
+    if states.len() < 2 {
+        return Err(invalid_input(
+            "velocity_match_states",
+            "must contain at least two states",
+        ));
+    }
+    for state in states {
+        VelocityMatchState::new(
+            state.t_j2000_s,
+            state.position_ecef_m,
+            state.velocity_ecef_mps,
+        )?;
+    }
+    for pair in states.windows(2) {
+        if pair[1].t_j2000_s <= pair[0].t_j2000_s {
+            return Err(invalid_input(
+                "velocity_match_states",
+                "epochs must be strictly increasing",
+            ));
+        }
+    }
+    let first = states[0];
+    let last = states[states.len() - 1];
+    if first_good_fix.t_j2000_s != last.t_j2000_s {
+        return Err(invalid_input(
+            "t_j2000_s",
+            "return fix must match the last state epoch",
+        ));
+    }
+    let Some(fix_velocity) = first_good_fix.velocity_ecef_mps else {
+        return Err(invalid_input(
+            "velocity_ecef_mps",
+            "return fix must include velocity",
+        ));
+    };
+    let duration_s = last.t_j2000_s - first.t_j2000_s;
+    validate_positive(duration_s, "velocity_match_duration_s")?;
+    if duration_s > config.max_outage_duration_s {
+        return Err(invalid_input(
+            "velocity_match_duration_s",
+            "exceeds configured maximum",
+        ));
+    }
+
+    let endpoint_position_correction_ecef_m =
+        sub3(first_good_fix.position_ecef_m, last.position_ecef_m);
+    let endpoint_velocity_correction_ecef_mps = sub3(fix_velocity, last.velocity_ecef_mps);
+    let mut matched = Vec::with_capacity(states.len());
+    for state in states {
+        let tau = (state.t_j2000_s - first.t_j2000_s) / duration_s;
+        let tau2 = tau * tau;
+        let tau3 = tau2 * tau;
+        let h01 = -2.0 * tau3 + 3.0 * tau2;
+        let h11 = tau3 - tau2;
+        let dh01 = (-6.0 * tau2 + 6.0 * tau) / duration_s;
+        let dh11 = 3.0 * tau2 - 2.0 * tau;
+        let mut position = state.position_ecef_m;
+        let mut velocity = state.velocity_ecef_mps;
+        for axis in 0..3 {
+            position[axis] += h01 * endpoint_position_correction_ecef_m[axis]
+                + duration_s * h11 * endpoint_velocity_correction_ecef_mps[axis];
+            velocity[axis] += dh01 * endpoint_position_correction_ecef_m[axis]
+                + dh11 * endpoint_velocity_correction_ecef_mps[axis];
+        }
+        matched.push(VelocityMatchState::new(
+            state.t_j2000_s,
+            position,
+            velocity,
+        )?);
+    }
+
+    Ok(VelocityMatchedTrajectory {
+        states: matched,
+        endpoint_position_correction_ecef_m,
+        endpoint_velocity_correction_ecef_mps,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -907,6 +1476,67 @@ mod tests {
     }
 
     #[test]
+    fn loose_and_zaru_jacobians_rotate_imu_bias_axes() {
+        let state = reference_filter_state(
+            NavState::new(10.0, [10.0, 20.0, 30.0], [1.0, 2.0, 3.0], mat3_identity())
+                .expect("state"),
+            &[1.0; ERROR_STATE_DIMENSION_15],
+        )
+        .expect("filter state");
+        let lever = [0.5, -1.0, 2.0];
+        let imu_to_body = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let measurement = GnssFixMeasurement::position_velocity(
+            10.0,
+            state.nominal.position_ecef_m,
+            state.nominal.velocity_ecef_mps,
+            covariance_from_diag(&[1.0; 6]),
+            6,
+        )
+        .expect("measurement");
+        let correction = loose_coupling_correction_with_imu_to_body(
+            &state,
+            &measurement,
+            lever,
+            [0.0; 3],
+            imu_to_body,
+        )
+        .expect("correction");
+        let expected_gyro_block = inline_rxr(&skew(lever), &imu_to_body);
+        for (row, expected_row) in expected_gyro_block.iter().enumerate() {
+            for (col, expected) in expected_row.iter().enumerate() {
+                assert_eq!(
+                    correction.design[3 + row][ERROR_GYRO_BIAS_INDEX + col].to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
+
+        let stationary = stationary_correction(
+            &state,
+            [0.01, -0.02, 0.03],
+            StationaryUpdateConfig {
+                detector: StationaryDetectorConfig {
+                    window_len: 1,
+                    max_specific_force_norm_error_mps2: 1.0,
+                    max_body_rate_wrt_ecef_norm_rps: 1.0,
+                },
+                zero_velocity_sigma_mps: 0.1,
+                zero_angular_rate_sigma_rps: 0.01,
+            },
+            imu_to_body,
+        )
+        .expect("stationary correction");
+        for (row, expected_row) in imu_to_body.iter().enumerate() {
+            for (col, expected) in expected_row.iter().enumerate() {
+                assert_eq!(
+                    stationary.design[3 + row][ERROR_GYRO_BIAS_INDEX + col].to_bits(),
+                    (-*expected).to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn propagated_static_ecef_body_reports_zero_lever_velocity() {
         let lever = [1.0, 0.5, -0.25];
         let truth =
@@ -970,6 +1600,7 @@ mod tests {
             covariance: covariance_from_diag(&[1.0, 1.0, 1.0]),
             satellites_used: 3,
             solution_valid: true,
+            fix_status: GnssFixStatus::Single,
         };
         assert!(matches!(
             measurement.validate(),
