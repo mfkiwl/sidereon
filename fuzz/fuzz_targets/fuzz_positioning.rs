@@ -363,6 +363,10 @@ fuzz_target!(|data: &[u8]| {
         code_rms_m: input.scalars[4],
         phase_rms_m: input.scalars[5],
         weighted_rms_m: input.scalars[6],
+        position_covariance: sidereon_core::dop::PositionCovariance {
+            ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        },
     };
     let fixed_config = FixedSolveConfig {
         weights: config.weights,
