@@ -4,6 +4,16 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Allocation-free warm hot path for high-rate serving: `emission_media_batch_at_j2000_s_into`
+  writes the correction bundle into caller buffers, and `EmissionMediaReceiverContext` plus
+  `emission_media_batch_at_j2000_s_with_receiver_context_into` cache the per-receiver setup so a
+  staged, repeated single-call path allocates nothing. Results are bit-identical to the allocating
+  form (gated across the fixture sweep). Staged precise-ephemeris interpolants gain
+  `EphemerisSource` impls; a bit-identity gate pins the staged-interpolant SPP solve to the raw
+  SP3 solve.
+
 ### Breaking
 
 - `FloatSolution` and `FixedSolution` in precise positioning gained a required

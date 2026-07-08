@@ -136,7 +136,7 @@ fn build_bundle_requests(
     let mut k = 0usize;
     while requests.len() < 64 && k < 512 {
         let epoch_index = 2 + (k * 7) % (epochs.len() - 4);
-        let epoch = if k % 2 == 0 {
+        let epoch = if k.is_multiple_of(2) {
             epochs[epoch_index]
         } else {
             0.5 * (epochs[epoch_index] + epochs[epoch_index + 1])
