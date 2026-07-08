@@ -117,7 +117,7 @@ mod sp3; // SP3-c / SP3-d parser + arbitrary-epoch interpolation
 mod spp; // single-point positioning (least-squares PVT)
 pub mod ssr; // SSR correction store and corrected broadcast ephemeris source
 pub mod staleness; // product-staleness graceful degradation for time-varying products
-mod static_positioning; // multi-epoch static position fusion
+pub mod static_positioning; // multi-epoch static position fusion
 mod static_reference_station; // RINEX reference-station static solve
 mod tropo; // Saastamoinen zenith + Niell (NMF) mapping troposphere
 pub mod velocity; // receiver velocity / clock-drift least-squares solve
@@ -250,6 +250,7 @@ pub use observables::{
     MediaPredictOptions, MediaPredictedObservables, MediaRangePrediction,
     ObservableIonosphereCorrection, ObservableMediaOptions, ObservableTroposphereCorrection,
 };
+pub use positioning::{RejectedSat, RejectionReason};
 pub use sbas_pl::{
     sbas_protection_levels, AirborneModel, DegradationParams, ProtectionGeometry, ProtectionRow,
     SbasErrorModel, SbasKMultipliers, SbasPlError, SbasProtection, SbasSisError,

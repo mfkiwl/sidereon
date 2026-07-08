@@ -5,6 +5,29 @@
 //! position. The measurement model is the existing SPP model. The only new
 //! layout is the parameter vector, ordered as a shared ECEF position followed
 //! by epoch-local receiver clocks.
+//!
+//! ```
+//! use sidereon_core::ephemeris::EphemerisSource;
+//! use sidereon_core::static_positioning::{
+//!     solve_static, StaticSolveError, StaticSolveOptions,
+//! };
+//! use sidereon_core::GnssSatelliteId;
+//!
+//! struct EmptyEphemeris;
+//!
+//! impl EphemerisSource for EmptyEphemeris {
+//!     fn position_clock_at_j2000_s(
+//!         &self,
+//!         _sat: GnssSatelliteId,
+//!         _t_j2000_s: f64,
+//!     ) -> Option<([f64; 3], f64)> {
+//!         None
+//!     }
+//! }
+//!
+//! let result = solve_static(&EmptyEphemeris, &[], StaticSolveOptions::default());
+//! assert!(matches!(result, Err(StaticSolveError::EmptyEpochs)));
+//! ```
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};

@@ -29,6 +29,8 @@
 //!   baselines from typed configs,
 //! - [`solve_ppp_float_with`] / [`solve_ppp_fixed_with`] solve static PPP arcs
 //!   from typed configs,
+//! - [`solve_static`] solves multi-epoch static pseudorange batches with
+//!   covariance and leave-one-out diagnostics,
 //! - GNSS utility modules such as [`frequencies`], [`combinations`],
 //!   [`quality`], [`carrier_phase`], [`signal`], [`velocity`],
 //!   [`broadcast_comparison`], [`constants`], [`navigation`], [`geometry`],
@@ -203,13 +205,18 @@ pub use sidereon_core::quality::{
     wtest_noncentrality_components, ObservationReliability, RangeReliabilityRow,
     ReliabilityOptions, ReliabilityReport, ReliabilitySummary, WtestNoncentralityComponents,
 };
+pub use sidereon_core::static_positioning::{
+    solve_static, StaticClockBias, StaticCovariance, StaticEpoch, StaticEpochInfluence,
+    StaticInfluenceStatus, StaticResidual, StaticSatelliteBatchInfluence, StaticSatelliteInfluence,
+    StaticSolution, StaticSolutionMetadata, StaticSolveError, StaticSolveOptions,
+};
 pub use sidereon_core::{
     antex, araim, astro, atmosphere, bias, broadcast_comparison, carrier_phase, clock_stability,
     combinations, constants, constellation, data, dgnss, dop, ephemeris, frame_catalog,
     frequencies, fusion, geodesic, geodetic_time_series, geofence, geometry, geometry_quality, ils,
     inertial, navigation, nmea, observables, orbit, positioning, ppp_corrections, qc_obs, quality,
     rinex, rtcm, rtk, sbas, sbas_pl, sidereal, signal, source_localization, ssr, staleness,
-    terrain, terrain_store, tides, velocity,
+    static_positioning, terrain, terrain_store, tides, velocity,
 };
 pub use sidereon_core::{
     catalog, catalog_entry, propagate_position, transform, transform_from_epoch, FrameCatalogError,
@@ -272,6 +279,7 @@ pub use sidereon_core::{
     SerializableTimeSyncHistoryConfig, UkfUpdateOptions, UnscentedTransformOptions,
     FUSION_STATE_CODEC_VERSION,
 };
+pub use sidereon_core::{RejectedSat, RejectionReason};
 
 /// Stable RTK input, result, option, status, and error types used by the
 /// ergonomic RTK solve wrappers.
