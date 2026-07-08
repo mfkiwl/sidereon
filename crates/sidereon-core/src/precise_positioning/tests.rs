@@ -191,11 +191,37 @@ fn assert_position_covariance_positive_definite(covariance: &crate::dop::Positio
     assert_matrix("ENU", covariance.enu_m2);
 }
 
+fn assert_position_covariance_scaled_by_factor(
+    scaled: &crate::dop::PositionCovariance,
+    formal: &crate::dop::PositionCovariance,
+    factor: f64,
+) {
+    fn assert_matrix(scaled: [[f64; 3]; 3], formal: [[f64; 3]; 3], factor: f64) {
+        for row in 0..3 {
+            for col in 0..3 {
+                let expected = formal[row][col] * factor;
+                let got = scaled[row][col];
+                let tolerance = expected.abs().max(got.abs()).max(1.0) * 1.0e-12;
+                assert!(
+                    (got - expected).abs() <= tolerance,
+                    "scaled covariance [{row}][{col}] {got} != formal * factor {expected}"
+                );
+            }
+        }
+    }
+
+    assert_matrix(scaled.ecef_m2, formal.ecef_m2, factor);
+    assert_matrix(scaled.enu_m2, formal.enu_m2, factor);
+}
+
 #[test]
 fn float_solution_output_validation_rejects_nonfinite_values() {
     let solution = FloatSolution {
         position_m: [0.0, f64::NAN, 0.0],
         position_covariance: unit_position_covariance(),
+        formal_position_covariance: unit_position_covariance(),
+        posterior_variance_factor: 1.0,
+        position_covariance_scale_factor: 1.0,
         epoch_clocks_m: vec![0.0],
         ambiguities_m: BTreeMap::new(),
         ztd_residual_m: None,
@@ -984,9 +1010,147 @@ fn static_float_solver_recovers_synthetic_arc() {
     for (sat, expected) in ambiguities {
         assert!((solution.ambiguities_m[&sat] - expected).abs() < 1.0e-4);
     }
-    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_position_covariance_positive_definite(&solution.formal_position_covariance);
+    assert_position_covariance_scaled_by_factor(
+        &solution.position_covariance,
+        &solution.formal_position_covariance,
+        solution.position_covariance_scale_factor,
+    );
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
+}
+
+#[test]
+fn static_float_solver_reports_unit_variance_factor_on_weighted_synthetic_noise() {
+    let sats = [
+        (1, [20_200_000.0, 13_000_000.0, 21_500_000.0]),
+        (2, [-21_300_000.0, 14_500_000.0, 20_700_000.0]),
+        (3, [15_200_000.0, -22_000_000.0, 19_500_000.0]),
+        (4, [-18_700_000.0, -18_200_000.0, 22_000_000.0]),
+        (5, [23_500_000.0, 3_200_000.0, -18_900_000.0]),
+        (6, [-7_500_000.0, 25_800_000.0, -16_000_000.0]),
+    ];
+    let ids: Vec<GnssSatelliteId> = sats
+        .iter()
+        .map(|(prn, _)| GnssSatelliteId::new(GnssSystem::Gps, *prn).expect("valid satellite id"))
+        .collect();
+    let source = FakeSource {
+        states: ids
+            .iter()
+            .zip(sats.iter())
+            .map(|(id, (_, pos))| (*id, *pos))
+            .collect(),
+    };
+    let truth = [3_512_900.0, 780_500.0, 5_248_700.0];
+    let ambiguities: BTreeMap<String, f64> = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.to_string(), 0.25 + idx as f64 * 0.1))
+        .collect();
+    let epoch_count = 20;
+    let mut epochs = Vec::new();
+    let mut sample_idx = 0;
+    for epoch_idx in 0..epoch_count {
+        let t_rx_j2000_s = epoch_idx as f64 * 30.0;
+        let clock = 12.5 + (epoch_idx % 11) as f64 * 0.15;
+        let observations = ids
+            .iter()
+            .map(|id| {
+                let pred = predict(
+                    &source,
+                    *id,
+                    truth,
+                    t_rx_j2000_s,
+                    PredictOptions {
+                        carrier_hz: F_L1_HZ,
+                        light_time: true,
+                        sagnac: true,
+                    },
+                )
+                .unwrap();
+                let code_noise_m = deterministic_unit_noise(sample_idx);
+                let phase_noise_m = deterministic_unit_noise(sample_idx + 17) / 100.0;
+                sample_idx += 1;
+                let code = pred.geometric_range_m + clock;
+                let ambiguity = ambiguities.get(&id.to_string()).copied().unwrap();
+                FloatObservation {
+                    sat: *id,
+                    satellite_id: id.to_string(),
+                    ambiguity_id: id.to_string(),
+                    code_m: code + code_noise_m,
+                    phase_m: code + ambiguity + phase_noise_m,
+                    freq1_hz: 0.0,
+                    freq2_hz: 0.0,
+                    glonass_channel: None,
+                }
+            })
+            .collect();
+        epochs.push(FloatEpoch {
+            epoch: CivilDateTime {
+                year: 2020,
+                month: 6,
+                day: 24,
+                hour: ((epoch_idx * 30) / 3600) as u8,
+                minute: (((epoch_idx * 30) % 3600) / 60) as u8,
+                second: ((epoch_idx * 30) % 60) as f64,
+            },
+            jd_whole: 2_459_024.5,
+            jd_fraction: 0.5 + t_rx_j2000_s / crate::constants::SECONDS_PER_DAY,
+            t_rx_j2000_s,
+            observations,
+        });
+    }
+    let initial = FloatState {
+        position_m: [truth[0] + 500.0, truth[1] - 400.0, truth[2] + 300.0],
+        clocks_m: vec![-20.0; epochs.len()],
+        ambiguities_m: initial_ambiguities(&epochs),
+        ztd_m: 0.0,
+    };
+    let solution = solve_float_epochs(
+        &source,
+        &epochs,
+        initial,
+        FloatSolveConfig {
+            weights: MeasurementWeights {
+                code: 1.0,
+                phase: 100.0,
+                elevation_weighting: false,
+            },
+            tropo: TroposphereOptions::disabled(),
+            corrections: RangeCorrections::disabled(),
+            opts: FloatSolveOptions {
+                max_iterations: 8,
+                position_tolerance_m: 1.0e-4,
+                clock_tolerance_m: 1.0e-4,
+                ambiguity_tolerance_m: 1.0e-4,
+                ztd_tolerance_m: 1.0e-4,
+            },
+            residual_screen: false,
+        },
+    )
+    .expect("weighted noisy synthetic PPP solve");
+    eprintln!(
+        "weighted synthetic PPP variance_factor={:.3}",
+        solution.posterior_variance_factor
+    );
+
+    assert!(
+        (0.5..=1.5).contains(&solution.posterior_variance_factor),
+        "variance factor {} outside clean synthetic band",
+        solution.posterior_variance_factor
+    );
+    assert_position_covariance_positive_definite(&solution.formal_position_covariance);
+    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_position_covariance_scaled_by_factor(
+        &solution.position_covariance,
+        &solution.formal_position_covariance,
+        solution.position_covariance_scale_factor,
+    );
+}
+
+fn deterministic_unit_noise(index: usize) -> f64 {
+    let centered = ((index * 37 + 13) % 101) as f64 - 50.0;
+    centered / 29.15
 }
 
 #[test]
@@ -1108,7 +1272,12 @@ fn static_float_solver_handles_multi_hundred_epoch_arc() {
     );
     assert!(norm3(sub3(solution.position_m, truth)) < 1.0e-3);
     assert!(solution.weighted_rms_m < 1.0e-6);
-    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_position_covariance_positive_definite(&solution.formal_position_covariance);
+    assert_position_covariance_scaled_by_factor(
+        &solution.position_covariance,
+        &solution.formal_position_covariance,
+        solution.position_covariance_scale_factor,
+    );
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
 }
@@ -1840,7 +2009,12 @@ fn single_epoch_float_solver_recovers_synthetic_snapshot() {
     assert!(solution.code_rms_m < 1.0e-8);
     assert!(solution.phase_rms_m < 1.0e-8);
     assert!(solution.weighted_rms_m < 1.0e-6);
-    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_position_covariance_positive_definite(&solution.formal_position_covariance);
+    assert_position_covariance_scaled_by_factor(
+        &solution.position_covariance,
+        &solution.formal_position_covariance,
+        solution.position_covariance_scale_factor,
+    );
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
     assert_eq!(solution.iterations, 3);
@@ -2155,7 +2329,12 @@ fn static_fixed_solver_recovers_synthetic_arc() {
         let float_cycles = solution.integer.ambiguity_search.float_cycles[sat];
         assert!((float_cycles - *cycles as f64).abs() < 1.0e-4);
     }
-    assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_position_covariance_positive_definite(&solution.formal_position_covariance);
+    assert_position_covariance_scaled_by_factor(
+        &solution.position_covariance,
+        &solution.formal_position_covariance,
+        solution.position_covariance_scale_factor,
+    );
     assert!(norm3(sub3(solution.position_m, truth)) < 1.0e-3);
     for (actual, expected) in solution.epoch_clocks_m.iter().zip(clocks) {
         assert!((actual - expected).abs() < 1.0e-4);
@@ -2170,6 +2349,9 @@ fn static_fixed_solver_rejects_short_float_solution_clock_vector() {
     let float_solution = FloatSolution {
         position_m: state.position_m,
         position_covariance: unit_position_covariance(),
+        formal_position_covariance: unit_position_covariance(),
+        posterior_variance_factor: 1.0,
+        position_covariance_scale_factor: 1.0,
         epoch_clocks_m: vec![0.0; epochs.len() - 1],
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
@@ -2227,6 +2409,9 @@ fn static_fixed_solver_rejects_nan_tolerance() {
     let float_solution = FloatSolution {
         position_m: state.position_m,
         position_covariance: unit_position_covariance(),
+        formal_position_covariance: unit_position_covariance(),
+        posterior_variance_factor: 1.0,
+        position_covariance_scale_factor: 1.0,
         epoch_clocks_m: vec![0.0; epochs.len()],
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
@@ -2286,6 +2471,9 @@ fn static_fixed_solver_rejects_nan_wavelength() {
     let float_solution = FloatSolution {
         position_m: state.position_m,
         position_covariance: unit_position_covariance(),
+        formal_position_covariance: unit_position_covariance(),
+        posterior_variance_factor: 1.0,
+        position_covariance_scale_factor: 1.0,
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,

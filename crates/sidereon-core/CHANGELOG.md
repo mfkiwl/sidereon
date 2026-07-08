@@ -17,27 +17,33 @@ All notable changes to `sidereon-core` are documented here.
 ### Breaking
 
 - `FloatSolution` and `FixedSolution` in precise positioning gained a required
-  `position_covariance` field. Callers constructing these structs directly must
-  populate it; callers only reading results are unaffected. The next release is
-  0.22.0 for this reason.
+  `position_covariance` field plus formal covariance and posterior variance
+  scale fields. Callers constructing these structs directly must populate them;
+  callers only reading results are unaffected. The next release is 0.22.0 for
+  this reason.
 
 ### Added
 
 - Static PPP float and fixed solutions now expose posterior receiver-position
   covariance in ECEF and ENU coordinates through `PositionCovariance`.
+- Static PPP float and fixed solutions now report the raw posterior
+  unit-variance factor and the applied position covariance scale factor. The
+  applied scale factor equals the reported posterior unit-variance factor.
+- SP3 multi-center merge coordinate-label reconciliation options:
+  caller-asserted label equivalence and catalog Helmert reconciliation between
+  known ITRF/IGS realizations, with merge-report audit fields for the selected
+  method, affected records, published parameters, rates, provenance, and catalog
+  direction.
 
 ### Changed
 
 - Static PPP eliminates per-epoch receiver clocks from the normal equations and
   back-substitutes them after solving the reduced static system, making
   day-length arcs tractable without changing the public clock output.
-### Added
-
-- SP3 multi-center merge coordinate-label reconciliation options:
-  caller-asserted label equivalence and catalog Helmert reconciliation between
-  known ITRF/IGS realizations, with merge-report audit fields for the selected
-  method, affected records, published parameters, rates, provenance, and catalog
-  direction.
+- Static PPP result covariance is now multiplied by the posterior residual
+  variance factor while retaining the unscaled formal covariance for callers.
+- PPP GF/MW cycle-slip splitting now confirms GF/MW-only events before creating
+  new ambiguity states, while LLI and data-gap splits remain immediate.
 
 ## [0.21.0]
 

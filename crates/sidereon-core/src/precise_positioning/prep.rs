@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ambiguity::{self, AmbiguityId, CycleSlipPolicy, NarrowLaneParams};
 use crate::carrier_phase::{
-    detect_cycle_slips, ArcEpoch, CarrierPhaseError, CycleSlipOptions, SlipReason,
+    detect_cycle_slips, wide_lane_wavelength, ArcEpoch, CarrierPhaseError, CycleSlipOptions,
+    SlipReason, SlipResult,
 };
 use crate::combinations::{self, IonosphereFreeError};
 
@@ -210,6 +211,21 @@ struct PreparedDualFrequencyEpoch {
 struct DualSlipEvent {
     epoch_index: usize,
     reasons: Vec<SlipReason>,
+}
+
+#[derive(Clone)]
+struct PendingGfMwSlip {
+    epoch_index: usize,
+    reasons: Vec<SlipReason>,
+    reference: SlipReference,
+}
+
+#[derive(Clone, Copy)]
+struct SlipReference {
+    gf_m: Option<f64>,
+    mw_m: Option<f64>,
+    f1_hz: Option<f64>,
+    f2_hz: Option<f64>,
 }
 
 type WideLanePrepPieces = (
@@ -445,22 +461,175 @@ fn cycle_slips_for_dual_arc<'a>(
 ) -> Vec<DualSlipEvent> {
     let arc_epochs = arc
         .iter()
-        .map(|sample| dual_arc_epoch(sample.observation, sample.gap_time_s))
+        .map(|sample| {
+            (
+                sample.epoch_index,
+                dual_arc_epoch(sample.observation, sample.gap_time_s),
+            )
+        })
         .collect::<Vec<_>>();
+    ppp_cycle_slip_events(&arc_epochs, options)
+}
+
+fn ppp_cycle_slip_events(
+    arc: &[(usize, ArcEpoch)],
+    options: CycleSlipOptions,
+) -> Vec<DualSlipEvent> {
+    let arc_epochs = arc.iter().map(|(_, epoch)| *epoch).collect::<Vec<_>>();
     let results = detect_cycle_slips(&arc_epochs, options).expect("validated cycle-slip arc");
-    arc.iter()
-        .zip(results)
-        .filter_map(|(sample, result)| {
-            if result.slip {
-                Some(DualSlipEvent {
-                    epoch_index: sample.epoch_index,
-                    reasons: result.reasons,
-                })
-            } else {
-                None
+    let mut events = Vec::new();
+    let mut reference = None;
+    let mut pending = None;
+
+    for ((epoch_index, epoch), result) in arc.iter().zip(results) {
+        if !ppp_slip_reference_usable(&result) {
+            continue;
+        }
+
+        if let Some(candidate) = pending.take() {
+            let immediate = immediate_split_reasons(&result.reasons);
+            if !immediate.is_empty() {
+                events.push(DualSlipEvent {
+                    epoch_index: *epoch_index,
+                    reasons: result.reasons.clone(),
+                });
+                reference = Some(SlipReference::from_result(&result, epoch));
+                continue;
             }
+            if confirms_gf_mw_slip(&candidate, &result, epoch, options) {
+                events.push(DualSlipEvent {
+                    epoch_index: candidate.epoch_index,
+                    reasons: candidate.reasons,
+                });
+                reference = Some(SlipReference::from_result(&result, epoch));
+                continue;
+            }
+            reference = Some(SlipReference::from_result(&result, epoch));
+            continue;
+        }
+
+        let immediate = immediate_split_reasons(&result.reasons);
+        if !immediate.is_empty() {
+            events.push(DualSlipEvent {
+                epoch_index: *epoch_index,
+                reasons: result.reasons.clone(),
+            });
+            reference = Some(SlipReference::from_result(&result, epoch));
+            continue;
+        }
+
+        let gf_mw = gf_mw_reasons(&result.reasons);
+        if !gf_mw.is_empty() {
+            if let Some(reference) = reference {
+                pending = Some(PendingGfMwSlip {
+                    epoch_index: *epoch_index,
+                    reasons: gf_mw,
+                    reference,
+                });
+            } else {
+                reference = Some(SlipReference::from_result(&result, epoch));
+            }
+            continue;
+        }
+
+        reference = Some(SlipReference::from_result(&result, epoch));
+    }
+
+    if let Some(candidate) = pending {
+        events.push(DualSlipEvent {
+            epoch_index: candidate.epoch_index,
+            reasons: candidate.reasons,
+        });
+    }
+
+    events
+}
+
+fn ppp_slip_reference_usable(result: &SlipResult) -> bool {
+    !result.skipped && (result.gf_m.is_some() || result.mw_m.is_some())
+}
+
+fn immediate_split_reasons(reasons: &[SlipReason]) -> Vec<SlipReason> {
+    reasons
+        .iter()
+        .copied()
+        .filter(|reason| matches!(reason, SlipReason::Lli | SlipReason::DataGap))
+        .collect()
+}
+
+fn gf_mw_reasons(reasons: &[SlipReason]) -> Vec<SlipReason> {
+    reasons
+        .iter()
+        .copied()
+        .filter(|reason| {
+            matches!(
+                reason,
+                SlipReason::GeometryFree | SlipReason::MelbourneWubbena
+            )
         })
         .collect()
+}
+
+fn confirms_gf_mw_slip(
+    pending: &PendingGfMwSlip,
+    result: &SlipResult,
+    epoch: &ArcEpoch,
+    options: CycleSlipOptions,
+) -> bool {
+    pending.reasons.iter().any(|reason| match reason {
+        SlipReason::GeometryFree => {
+            geometry_free_crosses(result.gf_m, pending.reference.gf_m, options.gf_threshold_m)
+        }
+        SlipReason::MelbourneWubbena => melbourne_wubbena_crosses(
+            result.mw_m,
+            pending.reference.mw_m,
+            epoch
+                .f1_hz
+                .or(pending.reference.f1_hz)
+                .zip(epoch.f2_hz.or(pending.reference.f2_hz)),
+            options.mw_threshold_cycles,
+        ),
+        SlipReason::Lli | SlipReason::DataGap => false,
+    })
+}
+
+fn geometry_free_crosses(
+    current_m: Option<f64>,
+    reference_m: Option<f64>,
+    threshold_m: f64,
+) -> bool {
+    match (current_m, reference_m) {
+        (Some(current_m), Some(reference_m)) => (current_m - reference_m).abs() > threshold_m,
+        _ => false,
+    }
+}
+
+fn melbourne_wubbena_crosses(
+    current_m: Option<f64>,
+    reference_m: Option<f64>,
+    frequencies_hz: Option<(f64, f64)>,
+    threshold_cycles: f64,
+) -> bool {
+    let (Some(current_m), Some(reference_m), Some((f1_hz, f2_hz))) =
+        (current_m, reference_m, frequencies_hz)
+    else {
+        return false;
+    };
+    let Ok(lambda_wl) = wide_lane_wavelength(f1_hz, f2_hz) else {
+        return false;
+    };
+    ((current_m - reference_m).abs() / lambda_wl.abs()) > threshold_cycles
+}
+
+impl SlipReference {
+    fn from_result(result: &SlipResult, epoch: &ArcEpoch) -> Self {
+        Self {
+            gf_m: result.gf_m,
+            mw_m: result.mw_m,
+            f1_hz: epoch.f1_hz,
+            f2_hz: epoch.f2_hz,
+        }
+    }
 }
 
 fn dual_arc_epoch(observation: &DualFrequencyObservation, gap_time_s: Option<f64>) -> ArcEpoch {
@@ -733,15 +902,9 @@ fn float_arc_tags(
     if carrier_phase_samples.is_empty() {
         return BTreeMap::new();
     }
-    let arc_epochs = carrier_phase_samples
-        .iter()
-        .map(|(_, epoch)| *epoch)
-        .collect::<Vec<_>>();
-    let slip_epochs = detect_cycle_slips(&arc_epochs, options)
-        .expect("validated cycle-slip arc")
+    let slip_epochs = ppp_cycle_slip_events(&carrier_phase_samples, options)
         .into_iter()
-        .zip(carrier_phase_samples.iter())
-        .filter_map(|(result, (epoch_index, _))| result.slip.then_some(*epoch_index))
+        .map(|event| event.epoch_index)
         .collect::<BTreeSet<_>>();
     if slip_epochs.is_empty() {
         return BTreeMap::new();

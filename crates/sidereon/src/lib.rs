@@ -1476,6 +1476,12 @@ mod tests {
                 ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             },
+            formal_position_covariance: sidereon_core::dop::PositionCovariance {
+                ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            },
+            posterior_variance_factor: 1.0,
+            position_covariance_scale_factor: 1.0,
             epoch_clocks_m: Vec::new(),
             ambiguities_m: BTreeMap::new(),
             ztd_residual_m: None,

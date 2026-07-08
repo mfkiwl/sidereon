@@ -24,9 +24,17 @@ use crate::frame::{itrf_to_geodetic, ItrfPositionM};
 use super::{FixedSolveError, FloatSolveError};
 
 /// One weighted measurement row: design coefficients `h`, prefit residual `y`,
-/// and the diagonal weight (inverse variance). The PPP solver row is the shared
+/// and the diagonal weight as an inverse sigma. The PPP solver row is the shared
 /// substrate [`ResidualRow`].
 pub(super) type Row = ResidualRow;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PppPositionCovariance {
+    pub(super) scaled: crate::dop::PositionCovariance,
+    pub(super) formal: crate::dop::PositionCovariance,
+    pub(super) posterior_variance_factor: f64,
+    pub(super) covariance_scale_factor: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PppNormalLayout {
@@ -112,7 +120,7 @@ pub(super) fn ppp_position_covariance(
     rows: &[Row],
     layout: PppNormalLayout,
     position_m: [f64; 3],
-) -> Result<crate::dop::PositionCovariance, FloatSolveError> {
+) -> Result<PppPositionCovariance, FloatSolveError> {
     let (normal, _) = clock_eliminated_normal_equations(rows, layout)?;
     let ecef_m2 = position_covariance_ecef_m2(&normal)?;
     let receiver = ItrfPositionM::new(position_m[0], position_m[1], position_m[2])
@@ -121,7 +129,66 @@ pub(super) fn ppp_position_covariance(
     let mut enu_m2 = crate::dop::rotate_covariance_ecef_to_enu_m2(ecef_m2, geodetic)
         .map_err(|_| FloatSolveError::SingularGeometry)?;
     symmetrize_3x3(&mut enu_m2);
-    Ok(crate::dop::PositionCovariance { ecef_m2, enu_m2 })
+    let formal = crate::dop::PositionCovariance { ecef_m2, enu_m2 };
+    let posterior_variance_factor = posterior_variance_factor(rows, layout)?;
+    let covariance_scale_factor = posterior_variance_factor;
+    let scaled = scale_position_covariance(formal, covariance_scale_factor);
+    Ok(PppPositionCovariance {
+        scaled,
+        formal,
+        posterior_variance_factor,
+        covariance_scale_factor,
+    })
+}
+
+pub(super) fn posterior_variance_factor(
+    rows: &[Row],
+    layout: PppNormalLayout,
+) -> Result<f64, FloatSolveError> {
+    let dof = rows
+        .len()
+        .checked_sub(layout.full_dim())
+        .ok_or(FloatSolveError::SingularGeometry)?;
+    if dof == 0 {
+        return Err(FloatSolveError::SingularGeometry);
+    }
+    let weighted_ssr = rows.iter().try_fold(0.0_f64, |sum, row| {
+        let weighted = row.y * row.weight;
+        let contribution = weighted * weighted;
+        if contribution.is_finite() {
+            Some(sum + contribution)
+        } else {
+            None
+        }
+    });
+    let Some(weighted_ssr) = weighted_ssr else {
+        return Err(FloatSolveError::SingularGeometry);
+    };
+    let factor = weighted_ssr / dof as f64;
+    if factor.is_finite() && factor >= 0.0 {
+        Ok(factor)
+    } else {
+        Err(FloatSolveError::SingularGeometry)
+    }
+}
+
+fn scale_position_covariance(
+    covariance: crate::dop::PositionCovariance,
+    factor: f64,
+) -> crate::dop::PositionCovariance {
+    crate::dop::PositionCovariance {
+        ecef_m2: scale_3x3(covariance.ecef_m2, factor),
+        enu_m2: scale_3x3(covariance.enu_m2, factor),
+    }
+}
+
+fn scale_3x3(mut matrix: [[f64; 3]; 3], factor: f64) -> [[f64; 3]; 3] {
+    for row in &mut matrix {
+        for value in row {
+            *value *= factor;
+        }
+    }
+    matrix
 }
 
 fn position_covariance_ecef_m2(normal: &[Vec<f64>]) -> Result<[[f64; 3]; 3], FloatSolveError> {
@@ -420,18 +487,45 @@ mod tests {
         let position_m = [4_075_580.0, 931_854.0, 4_801_568.0];
         let covariance =
             ppp_position_covariance(&rows, layout, position_m).expect("reduced covariance");
+        assert_eq!(
+            covariance.covariance_scale_factor.to_bits(),
+            covariance.posterior_variance_factor.to_bits()
+        );
 
         for i in 0..3 {
             for j in 0..3 {
                 let oracle = dense_inverse[i][j];
-                let got = covariance.ecef_m2[i][j];
+                let got = covariance.formal.ecef_m2[i][j];
                 let scale = oracle.abs().max(1.0e-12);
                 assert!(
                     ((got - oracle) / scale).abs() < 1.0e-6,
                     "covariance [{i}][{j}] = {got} differs from dense inverse {oracle}"
                 );
+                let scaled = covariance.scaled.ecef_m2[i][j];
+                let expected_scaled = got * covariance.covariance_scale_factor;
+                let scaled_scale = expected_scaled.abs().max(1.0e-12);
+                assert!(
+                    ((scaled - expected_scaled) / scaled_scale).abs() < 1.0e-12,
+                    "scaled covariance [{i}][{j}] = {scaled} differs from formal * factor {expected_scaled}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn ppp_posterior_variance_factor_counts_eliminated_clocks() {
+        let n_epochs = 10;
+        let n_ambiguities = 6;
+        let layout = PppNormalLayout::new(n_epochs, 1, n_ambiguities);
+        let rows = ppp_schur_rows(n_epochs, n_ambiguities);
+        let weighted_ssr = rows
+            .iter()
+            .map(|row| (row.y * row.weight).powi(2))
+            .sum::<f64>();
+        let dof = rows.len() - layout.full_dim();
+        let factor = posterior_variance_factor(&rows, layout).expect("posterior variance factor");
+        assert_eq!(dof, rows.len() - (3 + n_epochs + 1 + n_ambiguities));
+        assert_eq!(factor.to_bits(), (weighted_ssr / dof as f64).to_bits());
     }
 
     fn ppp_schur_rows(n_epochs: usize, n_ambiguities: usize) -> Vec<Row> {

@@ -506,26 +506,48 @@ impl Finite for sidereon_core::precise_positioning::FloatResidual {
     }
 }
 
+impl Finite for sidereon_core::dop::PositionCovariance {
+    fn push_finite_values(&self, out: &mut Vec<f64>) {
+        for matrix in [self.ecef_m2, self.enu_m2] {
+            for row in matrix {
+                out.extend(row);
+            }
+        }
+    }
+}
+
 impl Finite for sidereon_core::precise_positioning::FloatSolution {
     fn push_finite_values(&self, out: &mut Vec<f64>) {
         self.position_m.push_finite_values(out);
+        self.position_covariance.push_finite_values(out);
+        self.formal_position_covariance.push_finite_values(out);
         out.extend(self.epoch_clocks_m.iter().copied());
         out.extend(self.ambiguities_m.values().copied());
         self.ztd_residual_m.push_finite_values(out);
         self.residuals_m.push_finite_values(out);
-        out.extend([self.code_rms_m, self.phase_rms_m, self.weighted_rms_m]);
+        out.extend([
+            self.posterior_variance_factor,
+            self.position_covariance_scale_factor,
+            self.code_rms_m,
+            self.phase_rms_m,
+            self.weighted_rms_m,
+        ]);
     }
 }
 
 impl Finite for sidereon_core::precise_positioning::FixedSolution {
     fn push_finite_values(&self, out: &mut Vec<f64>) {
         self.position_m.push_finite_values(out);
+        self.position_covariance.push_finite_values(out);
+        self.formal_position_covariance.push_finite_values(out);
         out.extend(self.epoch_clocks_m.iter().copied());
         out.extend(self.fixed_ambiguities_m.values().copied());
         self.ztd_residual_m.push_finite_values(out);
         self.float_solution.push_finite_values(out);
         self.residuals_m.push_finite_values(out);
         out.extend([
+            self.posterior_variance_factor,
+            self.position_covariance_scale_factor,
             self.code_rms_m,
             self.phase_rms_m,
             self.weighted_rms_m,

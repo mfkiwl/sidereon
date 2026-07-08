@@ -358,7 +358,7 @@ fn finalize_multi(
         values: &state.ambiguities_m,
     };
     let rows = build_rows(ctx, epochs, &binding, &state).map_err(PppRowError::into_float)?;
-    let position_covariance = ppp_position_covariance(
+    let covariance = ppp_position_covariance(
         &rows,
         PppNormalLayout::new(
             epochs.len(),
@@ -371,7 +371,10 @@ fn finalize_multi(
     let phase: Vec<f64> = residuals.iter().map(|r| r.phase_m).collect();
     let solution = FloatSolution {
         position_m: state.position_m,
-        position_covariance,
+        position_covariance: covariance.scaled,
+        formal_position_covariance: covariance.formal,
+        posterior_variance_factor: covariance.posterior_variance_factor,
+        position_covariance_scale_factor: covariance.covariance_scale_factor,
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: if estimates_ztd(ctx.tropo) {

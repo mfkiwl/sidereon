@@ -346,6 +346,7 @@ fuzz_target!(|data: &[u8]| {
             protection_levels(&geometry, geodetic, raim_config),
         );
     }
+    let posterior_variance_factor = input.scalars[14].abs();
     let float_solution = FloatSolution {
         position_m: receiver,
         epoch_clocks_m: vec![input.receiver[3]],
@@ -367,6 +368,12 @@ fuzz_target!(|data: &[u8]| {
             ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         },
+        formal_position_covariance: sidereon_core::dop::PositionCovariance {
+            ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        },
+        posterior_variance_factor,
+        position_covariance_scale_factor: posterior_variance_factor,
     };
     let fixed_config = FixedSolveConfig {
         weights: config.weights,
