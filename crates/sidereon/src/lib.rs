@@ -1444,6 +1444,7 @@ mod tests {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         }
     }
 
@@ -1460,6 +1461,7 @@ mod tests {
                 offsets_m: BTreeMap::new(),
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         }
     }
 
@@ -1469,6 +1471,9 @@ mod tests {
             clocks_m: Vec::new(),
             ambiguities_m: BTreeMap::new(),
             ztd_m: 0.0,
+            tropo_gradient_north_m: 0.0,
+            tropo_gradient_east_m: 0.0,
+            residual_ionosphere_m: BTreeMap::new(),
         }
     }
 
@@ -1501,7 +1506,12 @@ mod tests {
             },
             epoch_clocks_m: Vec::new(),
             ambiguities_m: BTreeMap::new(),
+            residual_ionosphere_m: BTreeMap::new(),
             ztd_residual_m: None,
+            tropo_gradient_north_m: None,
+            tropo_gradient_east_m: None,
+            tropo_gradient_covariance_m2: None,
+            formal_tropo_gradient_covariance_m2: None,
             residuals_m: Vec::new(),
             used_sats: Vec::new(),
             iterations: 0,

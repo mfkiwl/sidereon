@@ -21,7 +21,8 @@ use super::normal::{
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
 use super::temporal::{estimate_temporal_correlation, temporal_position_covariance};
 use super::{
-    apply_elevation_cutoff, estimates_ztd, max_abs, rms, state_from_solution,
+    apply_elevation_cutoff, estimates_tropo_gradients, estimates_ztd, max_abs,
+    residual_ionosphere_unknown_count, rms, state_from_solution, tropo_gradient_unknown_count,
     validate_fixed_solve_boundary, weighted_rms, ztd_unknown_count, AmbiguitySearch,
     FixedIntegerMetadata, FixedSolution, FixedSolveConfig, FixedSolveError, FloatEpoch,
     FloatSolution, FloatSolveError, FloatSolveOptions, FloatState, FloatStatus, IntegerStatus,
@@ -77,9 +78,15 @@ pub(crate) fn run_fixed_from_float(
     let initial_state = fixed_state_from_float(&float_solution);
     let filtered_epochs;
     let solve_epochs = if let Some(cutoff_deg) = config.elevation_cutoff_deg {
-        filtered_epochs =
-            apply_elevation_cutoff(source, epochs, &initial_state, cutoff_deg, config.tropo)
-                .map_err(FixedSolveError::Float)?;
+        filtered_epochs = apply_elevation_cutoff(
+            source,
+            epochs,
+            &initial_state,
+            cutoff_deg,
+            config.tropo,
+            config.estimate_residual_ionosphere,
+        )
+        .map_err(FixedSolveError::Float)?;
         filtered_epochs.as_slice()
     } else {
         epochs
@@ -104,6 +111,7 @@ pub(crate) fn run_fixed_from_float(
         tropo: config.tropo,
         corrections: &config.corrections,
         normal: recipe.normal,
+        estimate_residual_ionosphere: config.estimate_residual_ionosphere,
     };
     let resolve = iterate_fixed_multi(ctx, solve_epochs, &fixed_m, initial_state, config.opts, 1)?;
     finalize_fixed_multi(
@@ -228,14 +236,33 @@ fn iterate_fixed_multi(
     loop {
         let binding = AmbiguityBinding::Held { values: fixed_m };
         let rows = build_rows(ctx, epochs, &binding, &current).map_err(PppRowError::into_fixed)?;
-        let layout = PppNormalLayout::new(epochs.len(), ztd_unknown_count(ctx.tropo), 0);
+        let layout = PppNormalLayout::new(
+            epochs.len(),
+            ztd_unknown_count(ctx.tropo),
+            tropo_gradient_unknown_count(ctx.tropo),
+            residual_ionosphere_unknown_count(ctx.estimate_residual_ionosphere, fixed_m.len()),
+            0,
+        );
         let dx = solve_normal_equations(&rows, layout, ctx.normal)?;
-        let next = apply_fixed_multi_delta(&current, epochs.len(), &dx, ctx.tropo);
-        let (pos_step, clock_step, ztd_step) = fixed_multi_step_norms(&dx, ctx.tropo);
+        let next = apply_fixed_multi_delta(
+            &current,
+            epochs.len(),
+            fixed_m,
+            &dx,
+            ctx.tropo,
+            ctx.estimate_residual_ionosphere,
+        );
+        let (pos_step, clock_step, ztd_step, gradient_step) = fixed_multi_step_norms(
+            &dx,
+            ctx.tropo,
+            ctx.estimate_residual_ionosphere,
+            fixed_m.len(),
+        );
 
         if pos_step <= opts.position_tolerance_m
             && clock_step <= opts.clock_tolerance_m
             && ztd_step <= opts.ztd_tolerance_m
+            && gradient_step <= opts.ztd_tolerance_m
         {
             return Ok(FixedResolve {
                 state: next,
@@ -262,13 +289,38 @@ fn iterate_fixed_multi(
 fn apply_fixed_multi_delta(
     state: &FloatState,
     n_epochs: usize,
+    fixed_m: &BTreeMap<String, f64>,
     dx: &[f64],
     tropo: TroposphereOptions,
+    estimate_residual_ionosphere: bool,
 ) -> FloatState {
     let mut idx = 3;
     let clock_deltas = &dx[idx..idx + n_epochs];
     idx += n_epochs;
-    let ztd_delta = if estimates_ztd(tropo) { dx[idx] } else { 0.0 };
+    let ztd_delta = if estimates_ztd(tropo) {
+        let v = dx[idx];
+        idx += 1;
+        v
+    } else {
+        0.0
+    };
+    let (tropo_gradient_north_delta, tropo_gradient_east_delta) =
+        if estimates_tropo_gradients(tropo) {
+            let north = dx[idx];
+            let east = dx[idx + 1];
+            idx += 2;
+            (north, east)
+        } else {
+            (0.0, 0.0)
+        };
+    let mut residual_ionosphere_m = BTreeMap::new();
+    if estimate_residual_ionosphere {
+        let ionosphere_deltas = &dx[idx..idx + fixed_m.len()];
+        for ((id, _), delta) in fixed_m.iter().zip(ionosphere_deltas) {
+            let prior = state.residual_ionosphere_m.get(id).copied().unwrap_or(0.0);
+            residual_ionosphere_m.insert(id.clone(), prior + delta);
+        }
+    }
     let clocks_m = state
         .clocks_m
         .iter()
@@ -284,20 +336,46 @@ fn apply_fixed_multi_delta(
         clocks_m,
         ambiguities_m: BTreeMap::new(),
         ztd_m: state.ztd_m + ztd_delta,
+        tropo_gradient_north_m: state.tropo_gradient_north_m + tropo_gradient_north_delta,
+        tropo_gradient_east_m: state.tropo_gradient_east_m + tropo_gradient_east_delta,
+        residual_ionosphere_m,
     }
 }
 
-fn fixed_multi_step_norms(dx: &[f64], tropo: TroposphereOptions) -> (f64, f64, f64) {
+fn fixed_multi_step_norms(
+    dx: &[f64],
+    tropo: TroposphereOptions,
+    estimate_residual_ionosphere: bool,
+    n_residual_ionosphere: usize,
+) -> (f64, f64, f64, f64) {
     let pos = vec3::norm3([dx[0], dx[1], dx[2]]);
     let n_ztd = ztd_unknown_count(tropo);
-    let n_clocks = dx.len() - 3 - n_ztd;
+    let n_gradients = tropo_gradient_unknown_count(tropo);
+    let n_ionosphere =
+        residual_ionosphere_unknown_count(estimate_residual_ionosphere, n_residual_ionosphere);
+    let n_clocks = dx.len() - 3 - n_ztd - n_gradients - n_ionosphere;
     let clock = max_abs(&dx[3..3 + n_clocks]);
+    let mut idx = 3 + n_clocks;
     let ztd = if estimates_ztd(tropo) {
-        dx[3 + n_clocks].abs()
+        let v = dx[idx].abs();
+        idx += 1;
+        v
     } else {
         0.0
     };
-    (pos, clock, ztd)
+    let gradient = if estimates_tropo_gradients(tropo) {
+        let v = max_abs(&dx[idx..idx + 2]);
+        idx += 2;
+        v
+    } else {
+        0.0
+    };
+    let ionosphere = if estimate_residual_ionosphere {
+        max_abs(&dx[idx..idx + n_residual_ionosphere])
+    } else {
+        0.0
+    };
+    (pos, clock, ztd, gradient.max(ionosphere))
 }
 
 fn finalize_fixed_multi(
@@ -320,7 +398,13 @@ fn finalize_fixed_multi(
     let rows = build_rows(ctx, epochs, &binding, &state).map_err(PppRowError::into_fixed)?;
     let covariance = ppp_position_covariance(
         &rows,
-        PppNormalLayout::new(epochs.len(), ztd_unknown_count(ctx.tropo), 0),
+        PppNormalLayout::new(
+            epochs.len(),
+            ztd_unknown_count(ctx.tropo),
+            tropo_gradient_unknown_count(ctx.tropo),
+            residual_ionosphere_unknown_count(ctx.estimate_residual_ionosphere, fixed_m.len()),
+            0,
+        ),
         state.position_m,
     )?;
     let code: Vec<f64> = residuals.iter().map(|r| r.code_m).collect();
@@ -344,11 +428,28 @@ fn finalize_fixed_multi(
         epoch_clocks_m: state.clocks_m,
         fixed_ambiguities_cycles: search.fixed_cycles,
         fixed_ambiguities_m: fixed_m,
+        residual_ionosphere_m: if ctx.estimate_residual_ionosphere {
+            state.residual_ionosphere_m
+        } else {
+            BTreeMap::new()
+        },
         ztd_residual_m: if estimates_ztd(ctx.tropo) {
             Some(state.ztd_m)
         } else {
             None
         },
+        tropo_gradient_north_m: if estimates_tropo_gradients(ctx.tropo) {
+            Some(state.tropo_gradient_north_m)
+        } else {
+            None
+        },
+        tropo_gradient_east_m: if estimates_tropo_gradients(ctx.tropo) {
+            Some(state.tropo_gradient_east_m)
+        } else {
+            None
+        },
+        tropo_gradient_covariance_m2: covariance.tropo_gradient_scaled_m2,
+        formal_tropo_gradient_covariance_m2: covariance.tropo_gradient_formal_m2,
         float_solution,
         residuals_m: residuals.clone(),
         used_sats: search
@@ -372,6 +473,9 @@ fn fixed_state_from_float(solution: &FloatSolution) -> FloatState {
         clocks_m: solution.epoch_clocks_m.clone(),
         ambiguities_m: BTreeMap::new(),
         ztd_m: solution.ztd_residual_m.unwrap_or(0.0),
+        tropo_gradient_north_m: solution.tropo_gradient_north_m.unwrap_or(0.0),
+        tropo_gradient_east_m: solution.tropo_gradient_east_m.unwrap_or(0.0),
+        residual_ionosphere_m: solution.residual_ionosphere_m.clone(),
     }
 }
 
@@ -429,6 +533,8 @@ fn ambiguity_covariance_cycles(
     let layout = PppNormalLayout::new(
         epochs.len(),
         ztd_unknown_count(config.tropo),
+        tropo_gradient_unknown_count(config.tropo),
+        residual_ionosphere_unknown_count(config.estimate_residual_ionosphere, ambiguity_ids.len()),
         ambiguity_ids.len(),
     );
     let start = layout.reduced_ambiguity_offset();
@@ -440,6 +546,7 @@ fn ambiguity_covariance_cycles(
         // Covariance assembly uses the const last-tie assembler directly; the
         // recipe field is the PPP reference and unused on this path.
         normal: NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: config.estimate_residual_ionosphere,
     };
     let binding = AmbiguityBinding::Estimated {
         ids: ambiguity_ids,

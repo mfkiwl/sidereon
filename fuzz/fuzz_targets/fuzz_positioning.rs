@@ -164,6 +164,9 @@ fn ppp_state(input: &Input, epoch: &FloatEpoch) -> FloatState {
             .map(|obs| (obs.ambiguity_id.clone(), input.scalars[12]))
             .collect(),
         ztd_m: input.scalars[13],
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+                residual_ionosphere_m: BTreeMap::new(),
     }
 }
 
@@ -185,6 +188,7 @@ fn float_config(input: &Input) -> FloatSolveConfig {
         },
         elevation_cutoff_deg: None,
         residual_screen: input.bits[4] & 1 == 1,
+        estimate_residual_ionosphere: false,
     }
 }
 
@@ -352,7 +356,12 @@ fuzz_target!(|data: &[u8]| {
         position_m: receiver,
         epoch_clocks_m: vec![input.receiver[3]],
         ambiguities_m: state.ambiguities_m.clone(),
+        residual_ionosphere_m: BTreeMap::new(),
         ztd_residual_m: Some(input.scalars[13]),
+        tropo_gradient_north_m: Some(0.0),
+        tropo_gradient_east_m: Some(0.0),
+        tropo_gradient_covariance_m2: Some([[1.0, 0.0], [0.0, 1.0]]),
+        formal_tropo_gradient_covariance_m2: Some([[1.0, 0.0], [0.0, 1.0]]),
         residuals_m: residuals.clone(),
         used_sats: epoch
             .observations
@@ -405,6 +414,7 @@ fuzz_target!(|data: &[u8]| {
             offsets_m: BTreeMap::new(),
             ratio_threshold: input.scalars[8],
         },
+            estimate_residual_ionosphere: false,
     };
     assert_ok_finite_or_err(
         "precise_positioning::solve_fixed_from_float",

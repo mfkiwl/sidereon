@@ -366,6 +366,7 @@ pub fn correct_kinematic_state(
         tropo: config.tropo,
         corrections,
         normal: NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     let ambiguity_ids = state
         .ambiguities_m
@@ -457,6 +458,12 @@ fn validate_ordered_epochs(epochs: &[FloatEpoch]) -> Result<(), KinematicSolveEr
 fn validate_measurement_config(config: &KinematicConfig) -> Result<(), KinematicSolveError> {
     super::validate_measurement_weights(config.weights).map_err(kinematic_error_from_float)?;
     super::validate_troposphere_options(config.tropo).map_err(kinematic_error_from_float)?;
+    if super::estimates_tropo_gradients(config.tropo) {
+        return Err(KinematicSolveError::InvalidInput {
+            field: "kinematic PPP tropo gradients",
+            reason: "static PPP only",
+        });
+    }
     super::validate_range_corrections(&config.corrections).map_err(kinematic_error_from_float)
 }
 
@@ -1016,6 +1023,9 @@ fn float_state_from_kinematic(state: &KinematicState) -> FloatState {
         clocks_m: vec![state.clock_m],
         ambiguities_m: state.ambiguities_m.clone(),
         ztd_m: state.ztd_residual_m,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     }
 }
 
@@ -1493,6 +1503,7 @@ mod tests {
                 },
                 elevation_cutoff_deg: None,
                 residual_screen: false,
+                estimate_residual_ionosphere: false,
             },
         )
         .expect("static float solve should converge");
@@ -1660,6 +1671,9 @@ mod tests {
                 clocks_m: vec![initial_state.clock_m; epochs.len()],
                 ambiguities_m,
                 ztd_m: 0.0,
+                tropo_gradient_north_m: 0.0,
+                tropo_gradient_east_m: 0.0,
+                residual_ionosphere_m: BTreeMap::new(),
             },
             float_config_from_kinematic(&config),
         )
@@ -1952,6 +1966,7 @@ mod tests {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         }
     }
 

@@ -22,10 +22,10 @@ use crate::tropo::{tropo_mapping_unchecked, tropo_slant_with_mapping_unchecked, 
 use crate::{GnssSatelliteId, Wgs84Geodetic};
 
 use super::{
-    estimates_ztd, missing_correction, missing_satellite_clock, FloatEpoch, FloatObservation,
-    FloatSolveError, FloatState, MeasurementWeights, MissingCorrection, PppCorrectionLookup,
-    RangeCorrections, ReceiverAntennaFrequency, ReceiverAntennaOptions, SatelliteClockCorrections,
-    TropoMapping, TroposphereOptions,
+    estimates_tropo_gradients, estimates_ztd, missing_correction, missing_satellite_clock,
+    FloatEpoch, FloatObservation, FloatSolveError, FloatState, MeasurementWeights,
+    MissingCorrection, PppCorrectionLookup, RangeCorrections, ReceiverAntennaFrequency,
+    ReceiverAntennaOptions, SatelliteClockCorrections, TropoMapping, TroposphereOptions,
 };
 
 const MIN_ELEVATION_WEIGHT_SCALE: f64 = 1.0e-3;
@@ -34,6 +34,7 @@ const MIN_ELEVATION_WEIGHT_SCALE: f64 = 1.0e-3;
 pub(super) struct TropoModelState {
     slant_m: f64,
     pub(super) ztd_mapping: f64,
+    pub(super) gradient_mapping: [f64; 2],
 }
 
 pub(super) fn model_troposphere(
@@ -46,6 +47,7 @@ pub(super) fn model_troposphere(
         return Ok(TropoModelState {
             slant_m: 0.0,
             ztd_mapping: 0.0,
+            gradient_mapping: [0.0; 2],
         });
     }
 
@@ -96,10 +98,25 @@ pub(super) fn model_troposphere(
     } else {
         0.0
     };
+    let gradient_mapping = if estimates_tropo_gradients(tropo) {
+        tropo_gradient_mapping(elevation_rad, pred.azimuth_deg.to_radians())
+    } else {
+        [0.0; 2]
+    };
     Ok(TropoModelState {
         slant_m,
         ztd_mapping,
+        gradient_mapping,
     })
+}
+
+/// Chen and Herring (1997) horizontal-gradient mapping:
+/// `m_grad(el) = 1 / (sin(el) * tan(el) + 0.0032)`, with azimuth measured
+/// clockwise from north, so the north/east partials are
+/// `m_grad * cos(az)` and `m_grad * sin(az)`.
+pub(super) fn tropo_gradient_mapping(elevation_rad: f64, azimuth_rad: f64) -> [f64; 2] {
+    let mapping = 1.0 / (elevation_rad.sin() * elevation_rad.tan() + 0.0032);
+    [mapping * azimuth_rad.cos(), mapping * azimuth_rad.sin()]
 }
 
 fn ppp_tropo_invalid_julian_split(error: TimeModelError) -> FloatSolveError {
@@ -113,7 +130,10 @@ fn ppp_tropo_invalid_julian_split(error: TimeModelError) -> FloatSolveError {
 }
 
 fn applied_troposphere_m(tropo_model: &TropoModelState, state: &FloatState) -> f64 {
-    tropo_model.slant_m + state.ztd_m * tropo_model.ztd_mapping
+    tropo_model.slant_m
+        + state.ztd_m * tropo_model.ztd_mapping
+        + state.tropo_gradient_north_m * tropo_model.gradient_mapping[0]
+        + state.tropo_gradient_east_m * tropo_model.gradient_mapping[1]
 }
 
 pub(super) fn range_corrections_m(

@@ -1,6 +1,6 @@
 use super::*;
 use crate::ambiguity::AmbiguityId;
-use crate::astro::math::vec3::{norm3, sub3};
+use crate::astro::math::vec3::{add3, cross3, norm3, scale3, sub3, unit3};
 use crate::carrier_phase::{CycleSlipOptions, SlipReason};
 use crate::constants::{C_M_S, F_L1_HZ, F_L2_HZ};
 use crate::has::{
@@ -11,6 +11,7 @@ use crate::observables::{predict, ObservableState, ObservablesError};
 use crate::ppp_corrections::{CivilDateTime, CodeBiasOptions, PppCorrectionsOptions};
 use crate::ssr::SsrCorrectionStore;
 use crate::{GnssSatelliteId, GnssSystem};
+use std::collections::BTreeSet;
 
 const REAL_CODE_BIA: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -93,6 +94,9 @@ fn single_obs_clock_state(epoch: &FloatEpoch) -> FloatState {
         clocks_m: vec![0.0],
         ambiguities_m: initial_ambiguities(std::slice::from_ref(epoch)),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     }
 }
 
@@ -114,6 +118,7 @@ fn single_obs_clock_config(corrections: RangeCorrections) -> FloatSolveConfig {
         },
         elevation_cutoff_deg: None,
         residual_screen: false,
+        estimate_residual_ionosphere: false,
     }
 }
 
@@ -340,6 +345,9 @@ fn ppp_elevation_cutoff_arc() -> (FakeSource, Vec<FloatEpoch>, FloatState, Vec<S
         clocks_m: vec![0.0; epochs.len()],
         ambiguities_m: initial_ambiguities(&epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let low_sats = ["G05", "G06"].iter().map(|sat| sat.to_string()).collect();
     (source, epochs, state, low_sats)
@@ -363,6 +371,7 @@ fn ppp_cutoff_config(cutoff_deg: Option<f64>) -> FloatSolveConfig {
         },
         elevation_cutoff_deg: cutoff_deg,
         residual_screen: false,
+        estimate_residual_ionosphere: false,
     }
 }
 
@@ -396,7 +405,12 @@ fn float_solution_output_validation_rejects_nonfinite_values() {
         temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: vec![0.0],
         ambiguities_m: BTreeMap::new(),
+        residual_ionosphere_m: BTreeMap::new(),
         ztd_residual_m: None,
+        tropo_gradient_north_m: None,
+        tropo_gradient_east_m: None,
+        tropo_gradient_covariance_m2: None,
+        formal_tropo_gradient_covariance_m2: None,
         residuals_m: Vec::new(),
         used_sats: Vec::new(),
         iterations: 1,
@@ -1142,6 +1156,9 @@ fn static_float_solver_recovers_synthetic_arc() {
         clocks_m: vec![-20.0; epochs.len()],
         ambiguities_m: initial_ambiguities(&epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let solution = solve_float_epochs(
         &source,
@@ -1164,6 +1181,7 @@ fn static_float_solver_recovers_synthetic_arc() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .unwrap();
@@ -1197,11 +1215,17 @@ fn static_float_solver_recovers_synthetic_arc() {
 #[test]
 fn elevation_cutoff_none_preserves_static_float_fixture_bits() {
     let (source, epochs, initial, _) = ppp_elevation_cutoff_arc();
-    let solution = solve_float_epochs(&source, &epochs, initial, ppp_cutoff_config(None)).unwrap();
+    let config = ppp_cutoff_config(None);
+    assert!(!config.tropo.estimate_tropo_gradients);
+    let solution = solve_float_epochs(&source, &epochs, initial, config).unwrap();
     assert_eq!(
         solution.used_sats,
         ["G01", "G02", "G03", "G04", "G05", "G06"]
     );
+    assert_eq!(solution.tropo_gradient_north_m, None);
+    assert_eq!(solution.tropo_gradient_east_m, None);
+    assert_eq!(solution.tropo_gradient_covariance_m2, None);
+    assert_eq!(solution.formal_tropo_gradient_covariance_m2, None);
     assert_eq!(
         ppp_float_solution_bits(&solution),
         vec![
@@ -1389,6 +1413,7 @@ fn aggressive_elevation_cutoff_returns_typed_error() {
                 offsets_m,
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("over-masked fixed PPP solve should fail before integer search");
@@ -1489,6 +1514,9 @@ fn static_float_solver_reports_unit_variance_factor_on_weighted_synthetic_noise(
         clocks_m: vec![-20.0; epochs.len()],
         ambiguities_m: initial_ambiguities(&epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let solution = solve_float_epochs(
         &source,
@@ -1511,6 +1539,7 @@ fn static_float_solver_reports_unit_variance_factor_on_weighted_synthetic_noise(
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect("weighted noisy synthetic PPP solve");
@@ -1624,6 +1653,9 @@ fn static_float_solver_handles_multi_hundred_epoch_arc() {
         clocks_m: vec![-20.0; epochs.len()],
         ambiguities_m: initial_ambiguities(&epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let start = std::time::Instant::now();
     let solution = solve_float_epochs(
@@ -1647,6 +1679,7 @@ fn static_float_solver_handles_multi_hundred_epoch_arc() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect("multi-hundred epoch static PPP solve");
@@ -1691,6 +1724,7 @@ fn static_float_solver_rejects_short_clock_vector() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("short PPP clock vector must be rejected");
@@ -1719,6 +1753,7 @@ fn static_float_solver_rejects_nan_tolerance() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("NaN PPP tolerance must be rejected");
@@ -1747,6 +1782,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("zero PPP max_iterations must be rejected");
@@ -1769,6 +1805,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("oversized PPP max_iterations must be rejected");
@@ -1791,6 +1828,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("zero PPP tolerance must be rejected");
@@ -1813,6 +1851,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("negative PPP tolerance must be rejected");
@@ -1841,6 +1880,7 @@ fn static_float_solver_rejects_nan_observation() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("NaN PPP observation must be rejected");
@@ -1870,6 +1910,7 @@ fn static_float_solver_rejects_nan_initial_state() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("NaN PPP initial state must be rejected");
@@ -1902,6 +1943,7 @@ fn static_float_solver_rejects_zero_measurement_weight() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("non-positive PPP measurement weight must be rejected");
@@ -1948,6 +1990,7 @@ fn static_float_solver_rejects_nonfinite_measurement_weights() {
                 },
                 elevation_cutoff_deg: None,
                 residual_screen: false,
+                estimate_residual_ionosphere: false,
             },
         )
         .expect_err("non-finite PPP measurement weight must be rejected");
@@ -2021,6 +2064,7 @@ fn static_float_design_rows_keep_enabled_ztd_estimation_column() {
         tropo,
         corrections: &corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     let binding = super::rows::AmbiguityBinding::Estimated {
         ids: &ambiguity_ids,
@@ -2032,6 +2076,350 @@ fn static_float_design_rows_keep_enabled_ztd_estimation_column() {
     let ztd_column = 3 + epochs.len();
     assert_eq!(rows[0].h.len(), 3 + epochs.len() + 1 + ambiguity_ids.len());
     assert!(rows.iter().any(|row| row.h[ztd_column] > 0.0));
+}
+
+#[test]
+fn static_float_solver_recovers_injected_tropo_gradients_and_partials() {
+    let injected = [0.012, -0.007];
+    let (source, epochs, initial, _truth, _ambiguities) = tropo_gradient_synthetic_arc(injected);
+    let solution = solve_float_epochs(
+        &source,
+        &epochs,
+        initial.clone(),
+        tropo_gradient_float_config(true),
+    )
+    .expect("gradient synthetic PPP solve");
+
+    let north = solution
+        .tropo_gradient_north_m
+        .expect("north gradient estimate");
+    let east = solution
+        .tropo_gradient_east_m
+        .expect("east gradient estimate");
+    let north_error = north - injected[0];
+    let east_error = east - injected[1];
+    eprintln!(
+        "synthetic gradient recovery north={north:.6} east={east:.6} north_error={north_error:.3e} east_error={east_error:.3e}"
+    );
+    assert_abs_close(north, injected[0], 2.0e-5, "north gradient recovery");
+    assert_abs_close(east, injected[1], 2.0e-5, "east gradient recovery");
+    assert!(solution.tropo_gradient_covariance_m2.is_some());
+    assert!(solution.formal_tropo_gradient_covariance_m2.is_some());
+
+    let ambiguity_ids = test_ambiguity_ids(&epochs);
+    let corrections = RangeCorrections::disabled();
+    let ctx = ModelContext {
+        source: &source,
+        weights: ppp_row_trace_weights(),
+        tropo: tropo_gradient_options(true),
+        corrections: &corrections,
+        normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
+    };
+    let binding = super::rows::AmbiguityBinding::Estimated {
+        ids: &ambiguity_ids,
+        values: &initial.ambiguities_m,
+    };
+    let rows =
+        super::rows::build_rows(ctx, &epochs, &binding, &initial).expect("gradient design rows");
+    let gradient_column = 3 + epochs.len();
+    finite_difference_gradient_partial(ctx, &epochs, &binding, &initial, 0, gradient_column, true);
+    finite_difference_gradient_partial(
+        ctx,
+        &epochs,
+        &binding,
+        &initial,
+        0,
+        gradient_column + 1,
+        false,
+    );
+    finite_difference_gradient_partial(ctx, &epochs, &binding, &initial, 1, gradient_column, true);
+    finite_difference_gradient_partial(
+        ctx,
+        &epochs,
+        &binding,
+        &initial,
+        1,
+        gradient_column + 1,
+        false,
+    );
+    assert!(rows[0].h[gradient_column].abs() > 0.0);
+    assert!(rows[0].h[gradient_column + 1].abs() > 0.0);
+}
+
+#[test]
+fn static_float_zero_tropo_gradient_matches_no_gradient_solve() {
+    let (source, epochs, initial, _truth, _ambiguities) = tropo_gradient_synthetic_arc([0.0, 0.0]);
+    let enabled = solve_float_epochs(
+        &source,
+        &epochs,
+        initial.clone(),
+        tropo_gradient_float_config(true),
+    )
+    .expect("zero-gradient enabled solve");
+    let disabled = solve_float_epochs(
+        &source,
+        &epochs,
+        initial,
+        tropo_gradient_float_config(false),
+    )
+    .expect("zero-gradient disabled solve");
+
+    let north = enabled
+        .tropo_gradient_north_m
+        .expect("north gradient estimate");
+    let east = enabled
+        .tropo_gradient_east_m
+        .expect("east gradient estimate");
+    eprintln!("zero synthetic gradient recovery north={north:.3e} east={east:.3e}");
+    assert_abs_close(north, 0.0, 2.0e-5, "zero north gradient");
+    assert_abs_close(east, 0.0, 2.0e-5, "zero east gradient");
+    assert_eq!(disabled.tropo_gradient_north_m, None);
+    assert_eq!(disabled.tropo_gradient_east_m, None);
+    assert_vec3_close(
+        enabled.position_m,
+        disabled.position_m,
+        2.0e-5,
+        "zero-gradient position",
+    );
+    for (enabled_clock, disabled_clock) in
+        enabled.epoch_clocks_m.iter().zip(&disabled.epoch_clocks_m)
+    {
+        assert_abs_close(
+            *enabled_clock,
+            *disabled_clock,
+            2.0e-5,
+            "zero-gradient clock",
+        );
+    }
+}
+
+fn tropo_gradient_options(estimate_tropo_gradients: bool) -> TroposphereOptions {
+    TroposphereOptions {
+        enabled: true,
+        estimate_ztd: false,
+        estimate_tropo_gradients,
+        met: crate::tropo::Met::new(1013.25, 288.15, 0.5).expect("valid met"),
+        mapping: TropoMapping::Niell,
+    }
+}
+
+fn tropo_gradient_float_config(estimate_tropo_gradients: bool) -> FloatSolveConfig {
+    FloatSolveConfig {
+        weights: ppp_row_trace_weights(),
+        tropo: tropo_gradient_options(estimate_tropo_gradients),
+        corrections: RangeCorrections::disabled(),
+        opts: FloatSolveOptions {
+            max_iterations: 12,
+            position_tolerance_m: 1.0e-7,
+            clock_tolerance_m: 1.0e-7,
+            ambiguity_tolerance_m: 1.0e-7,
+            ztd_tolerance_m: 1.0e-7,
+        },
+        elevation_cutoff_deg: None,
+        residual_screen: false,
+        estimate_residual_ionosphere: false,
+    }
+}
+
+fn tropo_gradient_synthetic_arc(
+    injected_gradient_m: [f64; 2],
+) -> (
+    FakeSource,
+    Vec<FloatEpoch>,
+    FloatState,
+    [f64; 3],
+    BTreeMap<String, f64>,
+) {
+    let truth = [3_512_900.0, 780_500.0, 5_248_700.0];
+    let az_el = [
+        (15.0, 38.0),
+        (55.0, 52.0),
+        (105.0, 33.0),
+        (145.0, 47.0),
+        (205.0, 31.0),
+        (250.0, 56.0),
+        (300.0, 42.0),
+        (335.0, 64.0),
+    ];
+    let ids = (1..=az_el.len())
+        .map(|prn| GnssSatelliteId::new(GnssSystem::Gps, prn as u8).expect("valid GPS id"))
+        .collect::<Vec<_>>();
+    let states = ids
+        .iter()
+        .zip(az_el)
+        .map(|(id, (az_deg, el_deg))| (*id, synthetic_satellite_position(truth, az_deg, el_deg)))
+        .collect::<BTreeMap<_, _>>();
+    let source = FakeSource { states };
+    let ambiguities = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.to_string(), 0.35 + idx as f64 * 0.08))
+        .collect::<BTreeMap<_, _>>();
+    let corrections = RangeCorrections::disabled();
+    let tropo = tropo_gradient_options(true);
+    let epoch_count = 6;
+    let truth_state = FloatState {
+        position_m: truth,
+        clocks_m: vec![0.0; epoch_count],
+        ambiguities_m: ambiguities.clone(),
+        ztd_m: 0.0,
+        tropo_gradient_north_m: injected_gradient_m[0],
+        tropo_gradient_east_m: injected_gradient_m[1],
+        residual_ionosphere_m: BTreeMap::new(),
+    };
+    let mut epochs = Vec::new();
+    for epoch_idx in 0..epoch_count {
+        let t_rx_j2000_s = epoch_idx as f64 * 300.0;
+        let clock_m = 4.0 + epoch_idx as f64 * 0.17;
+        let mut epoch = FloatEpoch {
+            epoch: CivilDateTime {
+                year: 2020,
+                month: 6,
+                day: 24,
+                hour: 12,
+                minute: (epoch_idx * 5) as u8,
+                second: 0.0,
+            },
+            jd_whole: 2_459_024.5,
+            jd_fraction: 0.5 + t_rx_j2000_s / crate::constants::SECONDS_PER_DAY,
+            t_rx_j2000_s,
+            observations: Vec::new(),
+        };
+        for id in &ids {
+            let mut obs = FloatObservation {
+                sat: *id,
+                satellite_id: id.to_string(),
+                ambiguity_id: id.to_string(),
+                code_m: 0.0,
+                phase_m: 0.0,
+                freq1_hz: 0.0,
+                freq2_hz: 0.0,
+                glonass_channel: None,
+            };
+            let pred = predict(
+                &source,
+                *id,
+                truth,
+                t_rx_j2000_s,
+                PredictOptions {
+                    carrier_hz: F_L1_HZ,
+                    light_time: true,
+                    sagnac: true,
+                },
+            )
+            .expect("synthetic prediction");
+            let tropo_model = super::model::model_troposphere(&pred, truth, &epoch, tropo)
+                .expect("synthetic tropo model");
+            let corrections_m = super::model::range_corrections_m(
+                &pred,
+                truth,
+                epoch_idx,
+                &obs,
+                &tropo_model,
+                &truth_state,
+                &corrections,
+            )
+            .expect("synthetic range corrections");
+            let model_range_m = pred.geometric_range_m + clock_m + corrections_m;
+            let ambiguity_m = ambiguities[&id.to_string()];
+            obs.code_m = model_range_m;
+            obs.phase_m = model_range_m + ambiguity_m;
+            epoch.observations.push(obs);
+        }
+        epochs.push(epoch);
+    }
+    let initial = FloatState {
+        position_m: [truth[0] + 3.0, truth[1] - 2.5, truth[2] + 1.5],
+        clocks_m: vec![0.0; epochs.len()],
+        ambiguities_m: initial_ambiguities(&epochs),
+        ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
+    };
+    (source, epochs, initial, truth, ambiguities)
+}
+
+fn synthetic_satellite_position(receiver_m: [f64; 3], az_deg: f64, el_deg: f64) -> [f64; 3] {
+    let up = unit3(receiver_m).expect("nonzero receiver vector");
+    let east = unit3([-receiver_m[1], receiver_m[0], 0.0]).expect("non-polar receiver");
+    let north = cross3(up, east);
+    let az = az_deg.to_radians();
+    let el = el_deg.to_radians();
+    let horizontal = el.cos();
+    let los = add3(
+        add3(
+            scale3(north, horizontal * az.cos()),
+            scale3(east, horizontal * az.sin()),
+        ),
+        scale3(up, el.sin()),
+    );
+    add3(receiver_m, scale3(los, 26_000_000.0))
+}
+
+fn test_ambiguity_ids(epochs: &[FloatEpoch]) -> Vec<AmbiguityId> {
+    epochs
+        .iter()
+        .flat_map(|epoch| {
+            epoch
+                .observations
+                .iter()
+                .map(|obs| AmbiguityId::new(obs.ambiguity_id.clone()))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn finite_difference_gradient_partial(
+    ctx: ModelContext,
+    epochs: &[FloatEpoch],
+    binding: &super::rows::AmbiguityBinding<'_>,
+    state: &FloatState,
+    row_idx: usize,
+    column_idx: usize,
+    north: bool,
+) {
+    let eps_m = 1.0e-2;
+    let base_rows =
+        super::rows::build_rows(ctx, epochs, binding, state).expect("base gradient rows");
+    let mut minus = state.clone();
+    let mut plus = state.clone();
+    if north {
+        minus.tropo_gradient_north_m -= eps_m;
+        plus.tropo_gradient_north_m += eps_m;
+    } else {
+        minus.tropo_gradient_east_m -= eps_m;
+        plus.tropo_gradient_east_m += eps_m;
+    }
+    let minus_rows =
+        super::rows::build_rows(ctx, epochs, binding, &minus).expect("minus gradient rows");
+    let plus_rows =
+        super::rows::build_rows(ctx, epochs, binding, &plus).expect("plus gradient rows");
+    let finite_difference_model_partial =
+        -(plus_rows[row_idx].y - minus_rows[row_idx].y) / (2.0 * eps_m);
+    assert_abs_close(
+        finite_difference_model_partial,
+        base_rows[row_idx].h[column_idx],
+        1.0e-6,
+        "gradient finite-difference partial",
+    );
+}
+
+fn assert_abs_close(actual: f64, expected: f64, tolerance: f64, label: &str) {
+    let delta = (actual - expected).abs();
+    assert!(
+        delta <= tolerance,
+        "{label}: actual {actual:.12e}, expected {expected:.12e}, delta {delta:.3e}, tolerance {tolerance:.3e}"
+    );
+}
+
+fn assert_vec3_close(actual: [f64; 3], expected: [f64; 3], tolerance: f64, label: &str) {
+    for idx in 0..3 {
+        assert_abs_close(actual[idx], expected[idx], tolerance, label);
+        assert_abs_close(expected[idx], actual[idx], tolerance, label);
+    }
 }
 
 #[test]
@@ -2052,6 +2440,7 @@ fn static_float_rows_apply_ssr_code_and_phase_biases_with_expected_signs() {
         tropo: TroposphereOptions::disabled(),
         corrections: &base_corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     let binding = super::rows::AmbiguityBinding::Estimated {
         ids: &ambiguity_ids,
@@ -2158,6 +2547,7 @@ fn static_float_rows_apply_ssr_code_and_phase_biases_with_expected_signs() {
         tropo: TroposphereOptions::disabled(),
         corrections: &biased_corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     let biased_rows = super::rows::build_rows(biased_ctx, &epochs, &binding, &state).unwrap();
 
@@ -2192,6 +2582,7 @@ fn static_float_design_rows_handle_antimeridian_tropo_receiver() {
         tropo,
         corrections: &corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     let binding = super::rows::AmbiguityBinding::Estimated {
         ids: &ambiguity_ids,
@@ -2225,6 +2616,7 @@ fn static_float_design_rows_reject_invalid_tropo_julian_split_without_panic() {
         tropo,
         corrections: &corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     let binding = super::rows::AmbiguityBinding::Estimated {
         ids: &ambiguity_ids,
@@ -2253,6 +2645,7 @@ fn static_float_solver_rejects_invalid_met_when_troposphere_enabled() {
     let tropo = TroposphereOptions {
         enabled: true,
         estimate_ztd: false,
+        estimate_tropo_gradients: false,
         met: crate::tropo::Met::new_unchecked(0.0, 288.15, 0.5),
         mapping: TropoMapping::Niell,
     };
@@ -2287,6 +2680,7 @@ fn static_float_solver_rejects_nan_correction_table_value() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("NaN PPP correction table value must be rejected");
@@ -2370,6 +2764,9 @@ fn single_epoch_float_solver_recovers_synthetic_snapshot() {
         clocks_m: vec![-20.0],
         ambiguities_m: initial_ambiguities(std::slice::from_ref(&epoch)),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let solution = solve_float_epoch(
         &source,
@@ -2392,6 +2789,7 @@ fn single_epoch_float_solver_recovers_synthetic_snapshot() {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .unwrap();
@@ -2508,6 +2906,9 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
         clocks_m: vec![-20.0],
         ambiguities_m: initial_ambiguities(&epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let weights = MeasurementWeights {
         code: 1.0,
@@ -2534,6 +2935,7 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
             opts,
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .unwrap();
@@ -2562,6 +2964,7 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
                 offsets_m,
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         },
     )
     .unwrap();
@@ -2651,6 +3054,9 @@ fn static_fixed_solver_recovers_synthetic_arc() {
         clocks_m: vec![-20.0; epochs.len()],
         ambiguities_m: initial_ambiguities(&epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let weights = MeasurementWeights {
         code: 1.0,
@@ -2677,6 +3083,7 @@ fn static_fixed_solver_recovers_synthetic_arc() {
             opts,
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         },
     )
     .unwrap();
@@ -2700,6 +3107,7 @@ fn static_fixed_solver_recovers_synthetic_arc() {
                 offsets_m,
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         },
     )
     .unwrap();
@@ -2760,7 +3168,12 @@ fn static_fixed_solver_rejects_short_float_solution_clock_vector() {
         temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: vec![0.0; epochs.len() - 1],
         ambiguities_m: state.ambiguities_m,
+        residual_ionosphere_m: BTreeMap::new(),
         ztd_residual_m: None,
+        tropo_gradient_north_m: None,
+        tropo_gradient_east_m: None,
+        tropo_gradient_covariance_m2: None,
+        formal_tropo_gradient_covariance_m2: None,
         residuals_m: Vec::new(),
         used_sats: used_sats.clone(),
         iterations: 1,
@@ -2795,6 +3208,7 @@ fn static_fixed_solver_rejects_short_float_solution_clock_vector() {
                 offsets_m: used_sats.iter().map(|sat| (sat.clone(), 0.0)).collect(),
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("short fixed PPP float-solution clock vector must be rejected");
@@ -2824,7 +3238,12 @@ fn static_fixed_solver_rejects_nan_tolerance() {
         temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: vec![0.0; epochs.len()],
         ambiguities_m: state.ambiguities_m,
+        residual_ionosphere_m: BTreeMap::new(),
         ztd_residual_m: None,
+        tropo_gradient_north_m: None,
+        tropo_gradient_east_m: None,
+        tropo_gradient_covariance_m2: None,
+        formal_tropo_gradient_covariance_m2: None,
         residuals_m: Vec::new(),
         used_sats: used_sats.clone(),
         iterations: 1,
@@ -2859,6 +3278,7 @@ fn static_fixed_solver_rejects_nan_tolerance() {
                 offsets_m: used_sats.iter().map(|sat| (sat.clone(), 0.0)).collect(),
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("NaN fixed PPP tolerance must be rejected");
@@ -2890,7 +3310,12 @@ fn static_fixed_solver_rejects_nan_wavelength() {
         temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
+        residual_ionosphere_m: BTreeMap::new(),
         ztd_residual_m: None,
+        tropo_gradient_north_m: None,
+        tropo_gradient_east_m: None,
+        tropo_gradient_covariance_m2: None,
+        formal_tropo_gradient_covariance_m2: None,
         residuals_m: Vec::new(),
         used_sats: used_sats.clone(),
         iterations: 0,
@@ -2922,6 +3347,7 @@ fn static_fixed_solver_rejects_nan_wavelength() {
                 offsets_m: used_sats.iter().map(|sat| (sat.clone(), 0.0)).collect(),
                 ratio_threshold: 3.0,
             },
+            estimate_residual_ionosphere: false,
         },
     )
     .expect_err("NaN fixed PPP wavelength must be rejected");
@@ -3026,6 +3452,9 @@ fn ppp_row_trace_arc() -> (FakeSource, Vec<FloatEpoch>, FloatState, Vec<Ambiguit
         clocks_m: vec![-20.0; epochs.len()],
         ambiguities_m: ambiguities,
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     };
     let ambiguity_ids = ids
         .iter()
@@ -3056,6 +3485,7 @@ fn ppp_row_trace_float_config(tropo: TroposphereOptions) -> FloatSolveConfig {
         },
         elevation_cutoff_deg: None,
         residual_screen: false,
+        estimate_residual_ionosphere: false,
     }
 }
 
@@ -3081,6 +3511,7 @@ fn float_design_rows_have_frozen_bits_golden() {
         tropo: TroposphereOptions::disabled(),
         corrections: &corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
 
     let binding = super::rows::AmbiguityBinding::Estimated {
@@ -3106,6 +3537,7 @@ fn fixed_design_rows_have_frozen_bits_golden() {
         tropo: TroposphereOptions::disabled(),
         corrections: &corrections,
         normal: crate::estimation::recipe::NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: false,
     };
     // The fixed solver holds every ambiguity; here at its truth value.
     let fixed_m: BTreeMap<String, f64> = state.ambiguities_m.clone();

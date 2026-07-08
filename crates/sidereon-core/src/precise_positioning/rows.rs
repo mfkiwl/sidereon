@@ -20,7 +20,9 @@
 use std::collections::BTreeMap;
 
 use crate::ambiguity::AmbiguityId;
-use crate::estimation::substrate::parameters::undifferenced_design_row;
+use crate::estimation::substrate::parameters::{
+    undifferenced_design_row, UndifferencedDesignOptions,
+};
 use crate::observables::{predict, PredictedObservables};
 use crate::validate::{self, FieldError};
 
@@ -30,9 +32,9 @@ use super::model::{
 };
 use super::normal::Row;
 use super::{
-    estimates_ztd, invalid_clock_count, invalid_input, no_ephemeris, predict_default,
-    validate_state_clock_count, FixedSolveError, FloatEpoch, FloatObservation, FloatResidual,
-    FloatSolveError, FloatState, ModelContext,
+    estimates_tropo_gradients, estimates_ztd, invalid_clock_count, invalid_input, no_ephemeris,
+    predict_default, validate_state_clock_count, FixedSolveError, FloatEpoch, FloatObservation,
+    FloatResidual, FloatSolveError, FloatState, ModelContext,
 };
 
 /// How the carrier ambiguity is bound for this assembly: the single degree of
@@ -68,6 +70,15 @@ impl<'a> AmbiguityBinding<'a> {
         }
     }
 
+    /// Number of residual ionosphere columns. Unlike ambiguity columns, these
+    /// are still estimated when carrier ambiguities are held fixed.
+    fn residual_ionosphere_columns(&self) -> usize {
+        match self {
+            Self::Estimated { ids, .. } => ids.len(),
+            Self::Held { values } => values.len(),
+        }
+    }
+
     /// The design column index of `obs`'s own ambiguity on the phase row, or
     /// `None` for the code row / a held-integer solve.
     fn active_column(&self, obs: &FloatObservation) -> Option<usize> {
@@ -77,6 +88,27 @@ impl<'a> AmbiguityBinding<'a> {
             }
             Self::Held { .. } => None,
         }
+    }
+
+    fn active_residual_ionosphere_column(&self, obs: &FloatObservation) -> Option<usize> {
+        match self {
+            Self::Estimated { ids, .. } => {
+                ids.iter().position(|id| id.as_str() == obs.ambiguity_id)
+            }
+            Self::Held { values } => values.keys().position(|id| id == &obs.ambiguity_id),
+        }
+    }
+}
+
+fn residual_ionosphere_m(state: &FloatState, obs: &FloatObservation, enabled: bool) -> f64 {
+    if enabled {
+        state
+            .residual_ionosphere_m
+            .get(&obs.ambiguity_id)
+            .copied()
+            .unwrap_or(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -133,6 +165,8 @@ struct UndiffModel {
     phase_weight: f64,
     los_base: [f64; 3],
     ztd_mapping: f64,
+    tropo_gradient_mapping: [f64; 2],
+    residual_ionosphere_m: f64,
 }
 
 fn undifferenced_model(
@@ -182,17 +216,24 @@ fn undifferenced_model(
     validate::finite(phase_windup_m, "ppp row phase_windup_m").map_err(row_invalid)?;
     let phase_bias_m = phase_bias_m(obs, epoch_idx, ctx.corrections).map_err(PppRowError::Model)?;
     validate::finite(phase_bias_m, "ppp row phase_bias_m").map_err(row_invalid)?;
+    let residual_ionosphere_m = residual_ionosphere_m(state, obs, ctx.estimate_residual_ionosphere);
+    validate::finite(residual_ionosphere_m, "ppp row residual_ionosphere_m")
+        .map_err(row_invalid)?;
     let model_range = pred.geometric_range_m + clock_m - sat_clock_m + corrections_m;
-    let model_code = model_range + ssr_code_bias_m;
+    let model_code = model_range + ssr_code_bias_m + residual_ionosphere_m;
     validate::finite(model_code, "ppp row model_code_m").map_err(row_invalid)?;
     validate::finite(model_range, "ppp row model_range_m").map_err(row_invalid)?;
     let model = UndiffModel {
         code_prefit: obs.code_m - model_code,
-        phase_prefit: obs.phase_m + phase_bias_m - phase_windup_m - (model_range + ambiguity_m),
+        phase_prefit: obs.phase_m + phase_bias_m
+            - phase_windup_m
+            - (model_range + ambiguity_m - residual_ionosphere_m),
         code_weight: measurement_weight(ctx.weights, true, pred.elevation_deg),
         phase_weight: measurement_weight(ctx.weights, false, pred.elevation_deg),
         los_base: [-pred.los_unit[0], -pred.los_unit[1], -pred.los_unit[2]],
         ztd_mapping: tropo_model.ztd_mapping,
+        tropo_gradient_mapping: tropo_model.gradient_mapping,
+        residual_ionosphere_m,
     };
     validate_undifferenced_model(&model)?;
     Ok(model)
@@ -233,6 +274,13 @@ fn validate_undifferenced_model(model: &UndiffModel) -> Result<(), PppRowError> 
     validate::finite_positive(model.phase_weight, "ppp row phase_weight").map_err(row_invalid)?;
     validate::finite_vec3(model.los_base, "ppp row los_base").map_err(row_invalid)?;
     validate::finite(model.ztd_mapping, "ppp row ztd_mapping").map_err(row_invalid)?;
+    validate::finite_slice(
+        &model.tropo_gradient_mapping,
+        "ppp row tropo_gradient_mapping",
+    )
+    .map_err(row_invalid)?;
+    validate::finite(model.residual_ionosphere_m, "ppp row residual_ionosphere_m")
+        .map_err(row_invalid)?;
     Ok(())
 }
 
@@ -253,14 +301,34 @@ pub(super) fn build_rows(
             let ambiguity_m = bound_ambiguity(binding.values(), obs)?;
             let model = undifferenced_model(ctx, epoch, epoch_idx, obs, state, ambiguity_m)?;
             let ztd_mapping = estimates_ztd(ctx.tropo).then_some(model.ztd_mapping);
+            let tropo_gradient_mapping =
+                estimates_tropo_gradients(ctx.tropo).then_some(model.tropo_gradient_mapping);
+            let n_residual_ionosphere = if ctx.estimate_residual_ionosphere {
+                binding.residual_ionosphere_columns()
+            } else {
+                0
+            };
+            let active_ionosphere = ctx
+                .estimate_residual_ionosphere
+                .then(|| {
+                    binding
+                        .active_residual_ionosphere_column(obs)
+                        .map(|idx| (idx, 1.0))
+                })
+                .flatten();
             rows.push(Row {
                 h: undifferenced_design_row(
                     model.los_base,
                     epoch_idx,
                     epochs.len(),
-                    ztd_mapping,
-                    n_ambiguities,
-                    None,
+                    UndifferencedDesignOptions {
+                        ztd_mapping,
+                        tropo_gradient_mapping,
+                        residual_ionosphere_columns: n_residual_ionosphere,
+                        active_residual_ionosphere: active_ionosphere,
+                        ambiguity_columns: n_ambiguities,
+                        active_ambiguity: None,
+                    },
                 ),
                 y: model.code_prefit,
                 weight: model.code_weight,
@@ -270,9 +338,14 @@ pub(super) fn build_rows(
                     model.los_base,
                     epoch_idx,
                     epochs.len(),
-                    ztd_mapping,
-                    n_ambiguities,
-                    binding.active_column(obs),
+                    UndifferencedDesignOptions {
+                        ztd_mapping,
+                        tropo_gradient_mapping,
+                        residual_ionosphere_columns: n_residual_ionosphere,
+                        active_residual_ionosphere: active_ionosphere.map(|(idx, _)| (idx, -1.0)),
+                        ambiguity_columns: n_ambiguities,
+                        active_ambiguity: binding.active_column(obs),
+                    },
                 ),
                 y: model.phase_prefit,
                 weight: model.phase_weight,
