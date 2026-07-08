@@ -94,6 +94,8 @@ pub enum NavMessage {
     GpsCnav,
     /// GPS CNAV-2 message (L1C), RINEX 4 token `CNV2`.
     GpsCnav2,
+    /// QZSS legacy navigation message.
+    QzssLnav,
     /// QZSS CNAV message, RINEX 4 token `CNAV`.
     QzssCnav,
     /// QZSS CNAV-2 message, RINEX 4 token `CNV2`.
@@ -318,7 +320,9 @@ impl BroadcastGroupDelays {
     /// [`Self::cnav_single_frequency_correction_s`].
     pub const fn for_message(self, system: GnssSystem, message: NavMessage) -> Option<f64> {
         match (system, message) {
-            (GnssSystem::Gps, NavMessage::GpsLnav) => self.get(BroadcastGroupDelayTerm::GpsTgd),
+            (GnssSystem::Gps, NavMessage::GpsLnav) | (GnssSystem::Qzss, NavMessage::QzssLnav) => {
+                self.get(BroadcastGroupDelayTerm::GpsTgd)
+            }
             (GnssSystem::Galileo, NavMessage::GalileoFnav) => {
                 self.get(BroadcastGroupDelayTerm::GalileoBgdE5aE1)
             }
@@ -658,7 +662,7 @@ impl BroadcastRecord {
 /// the URA band the index represents. Index 15 carries no accuracy prediction
 /// (the SV is not to be used for safe navigation) and has no usable meters
 /// bound, so it returns `None` rather than a fabricated finite value.
-fn gps_ura_index_to_meters(index: i64) -> Option<f64> {
+pub(crate) fn gps_ura_index_to_meters(index: i64) -> Option<f64> {
     let meters = match index {
         0 => 2.4,
         1 => 3.4,
@@ -696,7 +700,7 @@ const GPS_FIT_INTERVAL_26H_S: f64 = 26.0 * SECONDS_PER_HOUR;
 /// long-term extended operations (`IODE` in `240..=255`), and for the long-term
 /// case the IODC range selects 8, 14, or 26 hours. Reserved IODC values and any
 /// other flag/IODE/IODC combination are rejected.
-fn gps_fit_interval_from_flag(
+pub(crate) fn gps_fit_interval_from_flag(
     fit_interval_flag: i64,
     iode: i64,
     iodc: i64,
@@ -909,9 +913,10 @@ where
     for block in &blocks {
         let letter = block[0].as_bytes()[0] as char;
         match GnssSystem::from_letter(letter) {
-            Some(GnssSystem::Gps) | Some(GnssSystem::Galileo) | Some(GnssSystem::BeiDou) => {
-                records.push(parse_keplerian_block(block, None, version)?);
-            }
+            Some(GnssSystem::Gps)
+            | Some(GnssSystem::Galileo)
+            | Some(GnssSystem::BeiDou)
+            | Some(GnssSystem::Qzss) => records.push(parse_keplerian_block(block, None, version)?),
             // Recognized boundary, unsupported model (GLONASS state-vector, SBAS): skip.
             _ => {}
         }
@@ -940,15 +945,16 @@ where
     for block in &blocks {
         let letter = block[0].as_bytes()[0] as char;
         match GnssSystem::from_letter(letter) {
-            Some(GnssSystem::Gps) | Some(GnssSystem::Galileo) | Some(GnssSystem::BeiDou) => {
-                match parse_keplerian_block(block, None, version) {
-                    Ok(record) => records.push(record),
-                    Err(error) => skipped.push(SkippedNavBlock {
-                        satellite: nav_block_satellite(block),
-                        message: error.to_string(),
-                    }),
-                }
-            }
+            Some(GnssSystem::Gps)
+            | Some(GnssSystem::Galileo)
+            | Some(GnssSystem::BeiDou)
+            | Some(GnssSystem::Qzss) => match parse_keplerian_block(block, None, version) {
+                Ok(record) => records.push(record),
+                Err(error) => skipped.push(SkippedNavBlock {
+                    satellite: nav_block_satellite(block),
+                    message: error.to_string(),
+                }),
+            },
             _ => {}
         }
     }
@@ -1102,6 +1108,7 @@ fn nav_message_from_v4_token(token: &str, system: GnssSystem) -> Option<NavMessa
         ("LNAV", GnssSystem::Gps) => Some(NavMessage::GpsLnav),
         ("CNAV", GnssSystem::Gps) => Some(NavMessage::GpsCnav),
         ("CNV2", GnssSystem::Gps) => Some(NavMessage::GpsCnav2),
+        ("LNAV", GnssSystem::Qzss) => Some(NavMessage::QzssLnav),
         ("CNAV", GnssSystem::Qzss) => Some(NavMessage::QzssCnav),
         ("CNV2", GnssSystem::Qzss) => Some(NavMessage::QzssCnav2),
         ("INAV", GnssSystem::Galileo) => Some(NavMessage::GalileoInav),
@@ -1122,7 +1129,7 @@ fn known_v4_ephemeris_token(token: &str) -> bool {
 fn explicitly_skipped_v4_message(token: &str, system: GnssSystem) -> bool {
     matches!(
         (token, system),
-        ("LNAV", GnssSystem::Qzss) | ("CNV1" | "CNV2" | "CNV3", GnssSystem::BeiDou)
+        ("CNV1" | "CNV2" | "CNV3", GnssSystem::BeiDou)
     )
 }
 
@@ -1178,6 +1185,7 @@ fn nav_message_matches_system(message: NavMessage, system: GnssSystem) -> bool {
         (message, system),
         (NavMessage::GpsLnav, GnssSystem::Gps)
             | (NavMessage::GpsCnav | NavMessage::GpsCnav2, GnssSystem::Gps)
+            | (NavMessage::QzssLnav, GnssSystem::Qzss)
             | (
                 NavMessage::QzssCnav | NavMessage::QzssCnav2,
                 GnssSystem::Qzss,
@@ -1676,6 +1684,7 @@ fn parse_keplerian_block(
                     NavMessage::BeidouD1
                 }
             }
+            GnssSystem::Qzss => NavMessage::QzssLnav,
             _ => NavMessage::GpsLnav,
         }
     };

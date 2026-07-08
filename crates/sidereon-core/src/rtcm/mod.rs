@@ -26,13 +26,15 @@
 //! | Antenna / receiver | 1007 / 1008 / 1033                       | [`AntennaDescriptor`] |
 //! | GPS ephemeris      | 1019                                     | [`GpsEphemeris`] |
 //! | GLONASS ephemeris  | 1020                                     | [`GlonassEphemeris`] |
+//! | BeiDou ephemeris   | 1042                                     | [`BeidouEphemeris`] |
+//! | QZSS ephemeris     | 1044                                     | [`QzssEphemeris`] |
+//! | Galileo ephemeris  | 1045 / 1046                              | [`GalileoFnavEphemeris`] / [`GalileoInavEphemeris`] |
 //!
 //! Any other message number is preserved losslessly as [`Message::Unsupported`]
 //! (its raw body is kept so the frame still round-trips). Deferred message types
 //! include the other MSM variants (MSM1/2/3/5/6), the legacy L1/L1-L2
 //! observation messages (1001-1004, 1009-1012), the network-RTK and SSR
-//! correction families, and the Galileo / BeiDou / QZSS ephemerides
-//! (1042-1046). They decode as `Unsupported` rather than erroring.
+//! correction families. They decode as `Unsupported` rather than erroring.
 //!
 //! ## Quick start
 //!
@@ -89,7 +91,10 @@ use crate::error::Result;
 use bits::BitReader;
 
 pub use antenna::AntennaDescriptor;
-pub use ephemeris::{GlonassEphemeris, GpsEphemeris};
+pub use ephemeris::{
+    BeidouEphemeris, GalileoFnavEphemeris, GalileoInavEphemeris, GlonassEphemeris, GpsEphemeris,
+    QzssEphemeris,
+};
 pub use framing::{
     decode_frame, encode_frame, DecodedFrame, FrameScanner, FRAME_OVERHEAD, MAX_BODY_LEN, PREAMBLE,
 };
@@ -206,6 +211,14 @@ pub enum Message {
     GpsEphemeris(GpsEphemeris),
     /// A 1020 GLONASS broadcast ephemeris.
     GlonassEphemeris(GlonassEphemeris),
+    /// A 1042 BeiDou broadcast ephemeris.
+    BeidouEphemeris(BeidouEphemeris),
+    /// A 1044 QZSS broadcast ephemeris.
+    QzssEphemeris(QzssEphemeris),
+    /// A 1045 Galileo F/NAV broadcast ephemeris.
+    GalileoFnavEphemeris(GalileoFnavEphemeris),
+    /// A 1046 Galileo I/NAV broadcast ephemeris.
+    GalileoInavEphemeris(GalileoInavEphemeris),
     /// A supported RTCM SSR correction message.
     Ssr(SsrMessage),
     /// A recognized-but-undecoded message, preserved verbatim.
@@ -244,6 +257,10 @@ impl Message {
             }
             1019 => Message::GpsEphemeris(GpsEphemeris::decode_inner(body)?),
             1020 => Message::GlonassEphemeris(GlonassEphemeris::decode_inner(body)?),
+            1042 => Message::BeidouEphemeris(BeidouEphemeris::decode_inner(body)?),
+            1044 => Message::QzssEphemeris(QzssEphemeris::decode_inner(body)?),
+            1045 => Message::GalileoFnavEphemeris(GalileoFnavEphemeris::decode_inner(body)?),
+            1046 => Message::GalileoInavEphemeris(GalileoInavEphemeris::decode_inner(body)?),
             n if msm::is_supported_msm(n) => Message::Msm(MsmMessage::decode_inner(body)?),
             n if ssr::is_supported_ssr(n) => Message::Ssr(SsrMessage::decode_inner(body)?),
             _ => Message::Unsupported(UnsupportedMessage {
@@ -274,6 +291,10 @@ impl Message {
             Message::AntennaDescriptor(a) => a.encode(),
             Message::GpsEphemeris(e) => e.encode(),
             Message::GlonassEphemeris(e) => e.encode(),
+            Message::BeidouEphemeris(e) => e.encode(),
+            Message::QzssEphemeris(e) => e.encode(),
+            Message::GalileoFnavEphemeris(e) => e.encode(),
+            Message::GalileoInavEphemeris(e) => e.encode(),
             Message::Ssr(s) => s.encode(),
             Message::Unsupported(u) => u.body.clone(),
         }
@@ -287,6 +308,10 @@ impl Message {
             Message::AntennaDescriptor(a) => a.message_number,
             Message::GpsEphemeris(_) => 1019,
             Message::GlonassEphemeris(_) => 1020,
+            Message::BeidouEphemeris(_) => 1042,
+            Message::QzssEphemeris(_) => 1044,
+            Message::GalileoFnavEphemeris(_) => 1045,
+            Message::GalileoInavEphemeris(_) => 1046,
             Message::Ssr(s) => s.message_number,
             Message::Unsupported(u) => u.message_number,
         }

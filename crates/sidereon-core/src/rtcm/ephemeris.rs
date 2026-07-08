@@ -1,4 +1,5 @@
-//! RTCM 3 broadcast ephemeris messages 1019 (GPS) and 1020 (GLONASS).
+//! RTCM 3 broadcast ephemeris messages 1019 (GPS), 1020 (GLONASS),
+//! 1042 (BeiDou), 1044 (QZSS), and 1045/1046 (Galileo).
 //!
 //! Message 1019 (RTCM 10403.3 Table 3.5-21) carries one complete set of GPS
 //! LNAV ephemeris and clock parameters; message 1020 (Table 3.5-22) carries one
@@ -12,11 +13,66 @@
 //! the struct docs; applying them yields the engineering-unit ephemeris that
 //! [`crate::broadcast`] consumes.
 
+use crate::astro::time::model::{GnssWeekTow, TimeScale};
+use crate::broadcast::{ClockPolynomial, KeplerianElements};
+use crate::constants::SECONDS_PER_HOUR;
 use crate::error::{Error, Result};
 use crate::id::{GnssSatelliteId, GnssSystem};
+use crate::rinex_nav::{
+    gps_fit_interval_from_flag, gps_ura_index_to_meters, BroadcastGroupDelays, BroadcastIssue,
+    BroadcastRecord, NavMessage,
+};
 
 use super::bits::{BitReader, BitWriter};
 use super::DecodeResult;
+
+const SEMICIRCLE_TO_RAD: f64 = core::f64::consts::PI;
+const GALILEO_WEEK_OFFSET_TO_GPS: u32 = 1024;
+
+fn scaled_i(value: impl Into<i64>, exponent: i32) -> f64 {
+    (value.into() as f64) * 2.0_f64.powi(exponent)
+}
+
+fn scaled_u(value: u64, exponent: i32) -> f64 {
+    (value as f64) * 2.0_f64.powi(exponent)
+}
+
+fn scaled_semicircle(value: impl Into<i64>, exponent: i32) -> f64 {
+    scaled_i(value, exponent) * SEMICIRCLE_TO_RAD
+}
+
+fn gnss_week_tow(
+    system: TimeScale,
+    week: u32,
+    tow_s: f64,
+    field: &'static str,
+) -> Result<GnssWeekTow> {
+    GnssWeekTow::new(system, week, tow_s)
+        .and_then(GnssWeekTow::normalized)
+        .map_err(|_| Error::InvalidInput(format!("RTCM broadcast {field} is not representable")))
+}
+
+fn galileo_sisa_m(index: u8) -> f64 {
+    match index {
+        0..=49 => f64::from(index) * 0.01,
+        50..=74 => 0.50 + f64::from(index - 50) * 0.02,
+        75..=99 => 1.00 + f64::from(index - 75) * 0.04,
+        100..=125 => 2.00 + f64::from(index - 100) * 0.16,
+        _ => 8192.0,
+    }
+}
+
+fn ura_or_wide(index: u8) -> f64 {
+    gps_ura_index_to_meters(i64::from(index)).unwrap_or(8192.0)
+}
+
+fn raw_health(healthy: bool) -> f64 {
+    if healthy {
+        0.0
+    } else {
+        1.0
+    }
+}
 
 /// A decoded GPS broadcast ephemeris (message 1019).
 ///
@@ -177,6 +233,826 @@ impl GpsEphemeris {
         w.push_flag(self.l2_p_data_flag);
         w.push_flag(self.fit_interval);
         w.into_bytes()
+    }
+
+    /// Convert this decoded RTCM ephemeris to the broadcast record consumed by
+    /// the solver. `full_week` is the caller-unrolled GPS week and must agree
+    /// with the 10-bit RTCM week residue.
+    pub fn to_broadcast_record(&self, full_week: u32) -> Result<BroadcastRecord> {
+        if full_week % 1024 != u32::from(self.week_number) {
+            return Err(Error::InvalidInput(format!(
+                "GPS full week {full_week} disagrees with 10-bit RTCM week {}",
+                self.week_number
+            )));
+        }
+        let satellite_id = self.satellite()?;
+        let toe_sow = f64::from(self.t_oe) * 16.0;
+        let toc_sow = f64::from(self.t_oc) * 16.0;
+        let toe = gnss_week_tow(TimeScale::Gpst, full_week, toe_sow, "GPS toe")?;
+        let toc = gnss_week_tow(TimeScale::Gpst, full_week, toc_sow, "GPS toc")?;
+        let fit_interval_s = gps_fit_interval_from_flag(
+            i64::from(u8::from(self.fit_interval)),
+            i64::from(self.iode),
+            i64::from(self.iodc),
+        )
+        .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        Ok(BroadcastRecord {
+            satellite_id,
+            message: NavMessage::GpsLnav,
+            issue_of_data: BroadcastIssue {
+                issue: u32::from(self.iode),
+                message: NavMessage::GpsLnav,
+            },
+            week: full_week,
+            toe,
+            toc,
+            elements: KeplerianElements {
+                sqrt_a: scaled_u(self.sqrt_a, -19),
+                e: scaled_u(self.eccentricity, -33),
+                m0: scaled_semicircle(self.m0, -31),
+                delta_n: scaled_semicircle(self.delta_n, -43),
+                omega0: scaled_semicircle(self.omega0, -31),
+                i0: scaled_semicircle(self.i0, -31),
+                omega: scaled_semicircle(self.omega, -31),
+                omega_dot: scaled_semicircle(self.omega_dot, -43),
+                idot: scaled_semicircle(self.idot, -43),
+                cuc: scaled_i(self.c_uc, -29),
+                cus: scaled_i(self.c_us, -29),
+                crc: scaled_i(self.c_rc, -5),
+                crs: scaled_i(self.c_rs, -5),
+                cic: scaled_i(self.c_ic, -29),
+                cis: scaled_i(self.c_is, -29),
+                toe_sow,
+            },
+            clock: ClockPolynomial {
+                af0: scaled_i(self.a_f0, -31),
+                af1: scaled_i(self.a_f1, -43),
+                af2: scaled_i(self.a_f2, -55),
+                toc_sow,
+            },
+            group_delays: BroadcastGroupDelays::gps_lnav(scaled_i(self.t_gd, -31)),
+            cnav: None,
+            sv_health: f64::from(self.sv_health),
+            sv_accuracy_m: ura_or_wide(self.sv_accuracy),
+            fit_interval_s: Some(fit_interval_s),
+        })
+    }
+}
+
+/// A decoded Galileo F/NAV broadcast ephemeris (message 1045).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GalileoFnavEphemeris {
+    pub satellite_id: u8,
+    pub week_number: u16,
+    pub iod_nav: u16,
+    pub sisa: u8,
+    pub idot: i32,
+    pub t_oc: u16,
+    pub a_f2: i16,
+    pub a_f1: i32,
+    pub a_f0: i64,
+    pub c_rs: i32,
+    pub delta_n: i32,
+    pub m0: i64,
+    pub c_uc: i32,
+    pub eccentricity: u64,
+    pub c_us: i32,
+    pub sqrt_a: u64,
+    pub t_oe: u16,
+    pub c_ic: i32,
+    pub omega0: i64,
+    pub c_is: i32,
+    pub i0: i64,
+    pub c_rc: i32,
+    pub omega: i64,
+    pub omega_dot: i32,
+    pub bgd_e5a_e1: i16,
+    pub e5a_signal_health: u8,
+    pub e5a_data_validity: bool,
+    pub reserved: u8,
+}
+
+impl GalileoFnavEphemeris {
+    pub fn satellite(&self) -> Result<GnssSatelliteId> {
+        GnssSatelliteId::new(GnssSystem::Galileo, self.satellite_id)
+            .map_err(|e| Error::Parse(format!("invalid Galileo SVID in 1045: {e}")))
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
+        let mut r = BitReader::new(body);
+        let message_number = r.u(12)? as u16;
+        if message_number != 1045 {
+            return Err(Error::Parse(format!(
+                "message {message_number} is not Galileo F/NAV ephemeris 1045"
+            ))
+            .into());
+        }
+        Ok(Self {
+            satellite_id: r.u(6)? as u8,
+            week_number: r.u(12)? as u16,
+            iod_nav: r.u(10)? as u16,
+            sisa: r.u(8)? as u8,
+            idot: r.i(14)? as i32,
+            t_oc: r.u(14)? as u16,
+            a_f2: r.i(6)? as i16,
+            a_f1: r.i(21)? as i32,
+            a_f0: r.i(31)?,
+            c_rs: r.i(16)? as i32,
+            delta_n: r.i(16)? as i32,
+            m0: r.i(32)?,
+            c_uc: r.i(16)? as i32,
+            eccentricity: r.u(32)?,
+            c_us: r.i(16)? as i32,
+            sqrt_a: r.u(32)?,
+            t_oe: r.u(14)? as u16,
+            c_ic: r.i(16)? as i32,
+            omega0: r.i(32)?,
+            c_is: r.i(16)? as i32,
+            i0: r.i(32)?,
+            c_rc: r.i(16)? as i32,
+            omega: r.i(32)?,
+            omega_dot: r.i(24)? as i32,
+            bgd_e5a_e1: r.i(10)? as i16,
+            e5a_signal_health: r.u(2)? as u8,
+            e5a_data_validity: r.flag()?,
+            reserved: r.u(7)? as u8,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push_u(1045, 12);
+        w.push_u(u64::from(self.satellite_id), 6);
+        w.push_u(u64::from(self.week_number), 12);
+        w.push_u(u64::from(self.iod_nav), 10);
+        w.push_u(u64::from(self.sisa), 8);
+        w.push_i(i64::from(self.idot), 14);
+        w.push_u(u64::from(self.t_oc), 14);
+        w.push_i(i64::from(self.a_f2), 6);
+        w.push_i(i64::from(self.a_f1), 21);
+        w.push_i(self.a_f0, 31);
+        w.push_i(i64::from(self.c_rs), 16);
+        w.push_i(i64::from(self.delta_n), 16);
+        w.push_i(self.m0, 32);
+        w.push_i(i64::from(self.c_uc), 16);
+        w.push_u(self.eccentricity, 32);
+        w.push_i(i64::from(self.c_us), 16);
+        w.push_u(self.sqrt_a, 32);
+        w.push_u(u64::from(self.t_oe), 14);
+        w.push_i(i64::from(self.c_ic), 16);
+        w.push_i(self.omega0, 32);
+        w.push_i(i64::from(self.c_is), 16);
+        w.push_i(self.i0, 32);
+        w.push_i(i64::from(self.c_rc), 16);
+        w.push_i(self.omega, 32);
+        w.push_i(i64::from(self.omega_dot), 24);
+        w.push_i(i64::from(self.bgd_e5a_e1), 10);
+        w.push_u(u64::from(self.e5a_signal_health), 2);
+        w.push_flag(self.e5a_data_validity);
+        w.push_u(u64::from(self.reserved), 7);
+        w.into_bytes()
+    }
+
+    pub fn to_broadcast_record(&self) -> Result<BroadcastRecord> {
+        galileo_to_record(
+            self.satellite()?,
+            u32::from(self.week_number),
+            self.iod_nav,
+            self.sisa,
+            self.idot,
+            self.t_oc,
+            self.a_f2,
+            self.a_f1,
+            self.a_f0,
+            self.c_rs,
+            self.delta_n,
+            self.m0,
+            self.c_uc,
+            self.eccentricity,
+            self.c_us,
+            self.sqrt_a,
+            self.t_oe,
+            self.c_ic,
+            self.omega0,
+            self.c_is,
+            self.i0,
+            self.c_rc,
+            self.omega,
+            self.omega_dot,
+            self.bgd_e5a_e1,
+            0,
+            raw_health(self.e5a_signal_health == 0 && !self.e5a_data_validity),
+            NavMessage::GalileoFnav,
+        )
+    }
+}
+
+/// A decoded Galileo I/NAV broadcast ephemeris (message 1046).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GalileoInavEphemeris {
+    pub satellite_id: u8,
+    pub week_number: u16,
+    pub iod_nav: u16,
+    pub sisa_index: u8,
+    pub idot: i32,
+    pub t_oc: u16,
+    pub a_f2: i16,
+    pub a_f1: i32,
+    pub a_f0: i64,
+    pub c_rs: i32,
+    pub delta_n: i32,
+    pub m0: i64,
+    pub c_uc: i32,
+    pub eccentricity: u64,
+    pub c_us: i32,
+    pub sqrt_a: u64,
+    pub t_oe: u16,
+    pub c_ic: i32,
+    pub omega0: i64,
+    pub c_is: i32,
+    pub i0: i64,
+    pub c_rc: i32,
+    pub omega: i64,
+    pub omega_dot: i32,
+    pub bgd_e5a_e1: i16,
+    pub bgd_e5b_e1: i16,
+    pub e5b_signal_health: u8,
+    pub e5b_data_validity: bool,
+    pub e1b_signal_health: u8,
+    pub e1b_data_validity: bool,
+    pub reserved: u8,
+}
+
+impl GalileoInavEphemeris {
+    pub fn satellite(&self) -> Result<GnssSatelliteId> {
+        GnssSatelliteId::new(GnssSystem::Galileo, self.satellite_id)
+            .map_err(|e| Error::Parse(format!("invalid Galileo SVID in 1046: {e}")))
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
+        let mut r = BitReader::new(body);
+        let message_number = r.u(12)? as u16;
+        if message_number != 1046 {
+            return Err(Error::Parse(format!(
+                "message {message_number} is not Galileo I/NAV ephemeris 1046"
+            ))
+            .into());
+        }
+        Ok(Self {
+            satellite_id: r.u(6)? as u8,
+            week_number: r.u(12)? as u16,
+            iod_nav: r.u(10)? as u16,
+            sisa_index: r.u(8)? as u8,
+            idot: r.i(14)? as i32,
+            t_oc: r.u(14)? as u16,
+            a_f2: r.i(6)? as i16,
+            a_f1: r.i(21)? as i32,
+            a_f0: r.i(31)?,
+            c_rs: r.i(16)? as i32,
+            delta_n: r.i(16)? as i32,
+            m0: r.i(32)?,
+            c_uc: r.i(16)? as i32,
+            eccentricity: r.u(32)?,
+            c_us: r.i(16)? as i32,
+            sqrt_a: r.u(32)?,
+            t_oe: r.u(14)? as u16,
+            c_ic: r.i(16)? as i32,
+            omega0: r.i(32)?,
+            c_is: r.i(16)? as i32,
+            i0: r.i(32)?,
+            c_rc: r.i(16)? as i32,
+            omega: r.i(32)?,
+            omega_dot: r.i(24)? as i32,
+            bgd_e5a_e1: r.i(10)? as i16,
+            bgd_e5b_e1: r.i(10)? as i16,
+            e5b_signal_health: r.u(2)? as u8,
+            e5b_data_validity: r.flag()?,
+            e1b_signal_health: r.u(2)? as u8,
+            e1b_data_validity: r.flag()?,
+            reserved: r.u(2)? as u8,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push_u(1046, 12);
+        w.push_u(u64::from(self.satellite_id), 6);
+        w.push_u(u64::from(self.week_number), 12);
+        w.push_u(u64::from(self.iod_nav), 10);
+        w.push_u(u64::from(self.sisa_index), 8);
+        w.push_i(i64::from(self.idot), 14);
+        w.push_u(u64::from(self.t_oc), 14);
+        w.push_i(i64::from(self.a_f2), 6);
+        w.push_i(i64::from(self.a_f1), 21);
+        w.push_i(self.a_f0, 31);
+        w.push_i(i64::from(self.c_rs), 16);
+        w.push_i(i64::from(self.delta_n), 16);
+        w.push_i(self.m0, 32);
+        w.push_i(i64::from(self.c_uc), 16);
+        w.push_u(self.eccentricity, 32);
+        w.push_i(i64::from(self.c_us), 16);
+        w.push_u(self.sqrt_a, 32);
+        w.push_u(u64::from(self.t_oe), 14);
+        w.push_i(i64::from(self.c_ic), 16);
+        w.push_i(self.omega0, 32);
+        w.push_i(i64::from(self.c_is), 16);
+        w.push_i(self.i0, 32);
+        w.push_i(i64::from(self.c_rc), 16);
+        w.push_i(self.omega, 32);
+        w.push_i(i64::from(self.omega_dot), 24);
+        w.push_i(i64::from(self.bgd_e5a_e1), 10);
+        w.push_i(i64::from(self.bgd_e5b_e1), 10);
+        w.push_u(u64::from(self.e5b_signal_health), 2);
+        w.push_flag(self.e5b_data_validity);
+        w.push_u(u64::from(self.e1b_signal_health), 2);
+        w.push_flag(self.e1b_data_validity);
+        w.push_u(u64::from(self.reserved), 2);
+        w.into_bytes()
+    }
+
+    pub fn to_broadcast_record(&self) -> Result<BroadcastRecord> {
+        galileo_to_record(
+            self.satellite()?,
+            u32::from(self.week_number),
+            self.iod_nav,
+            self.sisa_index,
+            self.idot,
+            self.t_oc,
+            self.a_f2,
+            self.a_f1,
+            self.a_f0,
+            self.c_rs,
+            self.delta_n,
+            self.m0,
+            self.c_uc,
+            self.eccentricity,
+            self.c_us,
+            self.sqrt_a,
+            self.t_oe,
+            self.c_ic,
+            self.omega0,
+            self.c_is,
+            self.i0,
+            self.c_rc,
+            self.omega,
+            self.omega_dot,
+            self.bgd_e5a_e1,
+            self.bgd_e5b_e1,
+            raw_health(
+                self.e1b_signal_health == 0
+                    && !self.e1b_data_validity
+                    && self.e5b_signal_health == 0
+                    && !self.e5b_data_validity,
+            ),
+            NavMessage::GalileoInav,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn galileo_to_record(
+    satellite_id: GnssSatelliteId,
+    week: u32,
+    iod_nav: u16,
+    sisa: u8,
+    idot: i32,
+    t_oc: u16,
+    a_f2: i16,
+    a_f1: i32,
+    a_f0: i64,
+    c_rs: i32,
+    delta_n: i32,
+    m0: i64,
+    c_uc: i32,
+    eccentricity: u64,
+    c_us: i32,
+    sqrt_a: u64,
+    t_oe: u16,
+    c_ic: i32,
+    omega0: i64,
+    c_is: i32,
+    i0: i64,
+    c_rc: i32,
+    omega: i64,
+    omega_dot: i32,
+    bgd_e5a_e1: i16,
+    bgd_e5b_e1: i16,
+    sv_health: f64,
+    message: NavMessage,
+) -> Result<BroadcastRecord> {
+    let toe_sow = f64::from(t_oe) * 60.0;
+    let toc_sow = f64::from(t_oc) * 60.0;
+    let gps_aligned_week = week
+        .checked_add(GALILEO_WEEK_OFFSET_TO_GPS)
+        .ok_or_else(|| Error::InvalidInput("RTCM Galileo week overflows GPST axis".to_string()))?;
+    let toe = gnss_week_tow(TimeScale::Gst, gps_aligned_week, toe_sow, "Galileo toe")?;
+    let toc = gnss_week_tow(TimeScale::Gst, gps_aligned_week, toc_sow, "Galileo toc")?;
+    Ok(BroadcastRecord {
+        satellite_id,
+        message,
+        issue_of_data: BroadcastIssue {
+            issue: u32::from(iod_nav),
+            message,
+        },
+        week: gps_aligned_week,
+        toe,
+        toc,
+        elements: KeplerianElements {
+            sqrt_a: scaled_u(sqrt_a, -19),
+            e: scaled_u(eccentricity, -33),
+            m0: scaled_semicircle(m0, -31),
+            delta_n: scaled_semicircle(delta_n, -43),
+            omega0: scaled_semicircle(omega0, -31),
+            i0: scaled_semicircle(i0, -31),
+            omega: scaled_semicircle(omega, -31),
+            omega_dot: scaled_semicircle(omega_dot, -43),
+            idot: scaled_semicircle(idot, -43),
+            cuc: scaled_i(c_uc, -29),
+            cus: scaled_i(c_us, -29),
+            crc: scaled_i(c_rc, -5),
+            crs: scaled_i(c_rs, -5),
+            cic: scaled_i(c_ic, -29),
+            cis: scaled_i(c_is, -29),
+            toe_sow,
+        },
+        clock: ClockPolynomial {
+            af0: scaled_i(a_f0, -34),
+            af1: scaled_i(a_f1, -46),
+            af2: scaled_i(a_f2, -59),
+            toc_sow,
+        },
+        group_delays: BroadcastGroupDelays::galileo(
+            scaled_i(bgd_e5a_e1, -32),
+            scaled_i(bgd_e5b_e1, -32),
+        ),
+        cnav: None,
+        sv_health,
+        sv_accuracy_m: galileo_sisa_m(sisa),
+        fit_interval_s: None,
+    })
+}
+
+/// A decoded BeiDou broadcast ephemeris (message 1042).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BeidouEphemeris {
+    pub satellite_id: u8,
+    pub week_number: u16,
+    pub sv_urai: u8,
+    pub idot: i32,
+    pub aode: u8,
+    pub t_oc: u32,
+    pub a_f2: i16,
+    pub a_f1: i32,
+    pub a_f0: i32,
+    pub aodc: u8,
+    pub c_rs: i32,
+    pub delta_n: i32,
+    pub m0: i64,
+    pub c_uc: i32,
+    pub eccentricity: u64,
+    pub c_us: i32,
+    pub sqrt_a: u64,
+    pub t_oe: u32,
+    pub c_ic: i32,
+    pub omega0: i64,
+    pub c_is: i32,
+    pub i0: i64,
+    pub c_rc: i32,
+    pub omega: i64,
+    pub omega_dot: i32,
+    pub t_gd1: i16,
+    pub t_gd2: i16,
+    pub sv_health: bool,
+}
+
+impl BeidouEphemeris {
+    pub fn satellite(&self) -> Result<GnssSatelliteId> {
+        GnssSatelliteId::new(GnssSystem::BeiDou, self.satellite_id)
+            .map_err(|e| Error::Parse(format!("invalid BeiDou satellite ID in 1042: {e}")))
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
+        let mut r = BitReader::new(body);
+        let message_number = r.u(12)? as u16;
+        if message_number != 1042 {
+            return Err(Error::Parse(format!(
+                "message {message_number} is not BeiDou ephemeris 1042"
+            ))
+            .into());
+        }
+        Ok(Self {
+            satellite_id: r.u(6)? as u8,
+            week_number: r.u(13)? as u16,
+            sv_urai: r.u(4)? as u8,
+            idot: r.i(14)? as i32,
+            aode: r.u(5)? as u8,
+            t_oc: r.u(17)? as u32,
+            a_f2: r.i(11)? as i16,
+            a_f1: r.i(22)? as i32,
+            a_f0: r.i(24)? as i32,
+            aodc: r.u(5)? as u8,
+            c_rs: r.i(18)? as i32,
+            delta_n: r.i(16)? as i32,
+            m0: r.i(32)?,
+            c_uc: r.i(18)? as i32,
+            eccentricity: r.u(32)?,
+            c_us: r.i(18)? as i32,
+            sqrt_a: r.u(32)?,
+            t_oe: r.u(17)? as u32,
+            c_ic: r.i(18)? as i32,
+            omega0: r.i(32)?,
+            c_is: r.i(18)? as i32,
+            i0: r.i(32)?,
+            c_rc: r.i(18)? as i32,
+            omega: r.i(32)?,
+            omega_dot: r.i(24)? as i32,
+            t_gd1: r.i(10)? as i16,
+            t_gd2: r.i(10)? as i16,
+            sv_health: r.flag()?,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push_u(1042, 12);
+        w.push_u(u64::from(self.satellite_id), 6);
+        w.push_u(u64::from(self.week_number), 13);
+        w.push_u(u64::from(self.sv_urai), 4);
+        w.push_i(i64::from(self.idot), 14);
+        w.push_u(u64::from(self.aode), 5);
+        w.push_u(u64::from(self.t_oc), 17);
+        w.push_i(i64::from(self.a_f2), 11);
+        w.push_i(i64::from(self.a_f1), 22);
+        w.push_i(i64::from(self.a_f0), 24);
+        w.push_u(u64::from(self.aodc), 5);
+        w.push_i(i64::from(self.c_rs), 18);
+        w.push_i(i64::from(self.delta_n), 16);
+        w.push_i(self.m0, 32);
+        w.push_i(i64::from(self.c_uc), 18);
+        w.push_u(self.eccentricity, 32);
+        w.push_i(i64::from(self.c_us), 18);
+        w.push_u(self.sqrt_a, 32);
+        w.push_u(u64::from(self.t_oe), 17);
+        w.push_i(i64::from(self.c_ic), 18);
+        w.push_i(self.omega0, 32);
+        w.push_i(i64::from(self.c_is), 18);
+        w.push_i(self.i0, 32);
+        w.push_i(i64::from(self.c_rc), 18);
+        w.push_i(self.omega, 32);
+        w.push_i(i64::from(self.omega_dot), 24);
+        w.push_i(i64::from(self.t_gd1), 10);
+        w.push_i(i64::from(self.t_gd2), 10);
+        w.push_flag(self.sv_health);
+        w.into_bytes()
+    }
+
+    pub fn to_broadcast_record(&self) -> Result<BroadcastRecord> {
+        let satellite_id = self.satellite()?;
+        let week = u32::from(self.week_number);
+        let toe_sow = f64::from(self.t_oe) * 8.0;
+        let toc_sow = f64::from(self.t_oc) * 8.0;
+        let toe = gnss_week_tow(TimeScale::Bdt, week, toe_sow, "BeiDou toe")?;
+        let toc = gnss_week_tow(TimeScale::Bdt, week, toc_sow, "BeiDou toc")?;
+        let message = if crate::rinex_nav::is_beidou_geo(satellite_id) {
+            NavMessage::BeidouD2
+        } else {
+            NavMessage::BeidouD1
+        };
+        Ok(BroadcastRecord {
+            satellite_id,
+            message,
+            issue_of_data: BroadcastIssue {
+                issue: u32::from(self.aode),
+                message,
+            },
+            week,
+            toe,
+            toc,
+            elements: KeplerianElements {
+                sqrt_a: scaled_u(self.sqrt_a, -19),
+                e: scaled_u(self.eccentricity, -33),
+                m0: scaled_semicircle(self.m0, -31),
+                delta_n: scaled_semicircle(self.delta_n, -43),
+                omega0: scaled_semicircle(self.omega0, -31),
+                i0: scaled_semicircle(self.i0, -31),
+                omega: scaled_semicircle(self.omega, -31),
+                omega_dot: scaled_semicircle(self.omega_dot, -43),
+                idot: scaled_semicircle(self.idot, -43),
+                cuc: scaled_i(self.c_uc, -31),
+                cus: scaled_i(self.c_us, -31),
+                crc: scaled_i(self.c_rc, -6),
+                crs: scaled_i(self.c_rs, -6),
+                cic: scaled_i(self.c_ic, -31),
+                cis: scaled_i(self.c_is, -31),
+                toe_sow,
+            },
+            clock: ClockPolynomial {
+                af0: scaled_i(self.a_f0, -33),
+                af1: scaled_i(self.a_f1, -50),
+                af2: scaled_i(self.a_f2, -66),
+                toc_sow,
+            },
+            group_delays: BroadcastGroupDelays::beidou(
+                f64::from(self.t_gd1) * 1.0e-10,
+                f64::from(self.t_gd2) * 1.0e-10,
+            ),
+            cnav: None,
+            sv_health: f64::from(u8::from(self.sv_health)),
+            sv_accuracy_m: ura_or_wide(self.sv_urai),
+            fit_interval_s: None,
+        })
+    }
+}
+
+/// A decoded QZSS broadcast ephemeris (message 1044).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QzssEphemeris {
+    pub satellite_id: u8,
+    pub t_oc: u16,
+    pub a_f2: i16,
+    pub a_f1: i32,
+    pub a_f0: i32,
+    pub iode: u8,
+    pub c_rs: i32,
+    pub delta_n: i32,
+    pub m0: i64,
+    pub c_uc: i32,
+    pub eccentricity: u64,
+    pub c_us: i32,
+    pub sqrt_a: u64,
+    pub t_oe: u16,
+    pub c_ic: i32,
+    pub omega0: i64,
+    pub c_is: i32,
+    pub i0: i64,
+    pub c_rc: i32,
+    pub omega: i64,
+    pub omega_dot: i32,
+    pub idot: i32,
+    pub codes_on_l2: u8,
+    pub week_number: u16,
+    pub ura: u8,
+    pub sv_health: u8,
+    pub t_gd: i16,
+    pub iodc: u16,
+    pub fit_interval: bool,
+}
+
+impl QzssEphemeris {
+    pub fn satellite(&self) -> Result<GnssSatelliteId> {
+        GnssSatelliteId::new(GnssSystem::Qzss, self.satellite_id)
+            .map_err(|e| Error::Parse(format!("invalid QZSS satellite ID in 1044: {e}")))
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        Self::decode_inner(body).map_err(Into::into)
+    }
+
+    pub(crate) fn decode_inner(body: &[u8]) -> DecodeResult<Self> {
+        let mut r = BitReader::new(body);
+        let message_number = r.u(12)? as u16;
+        if message_number != 1044 {
+            return Err(Error::Parse(format!(
+                "message {message_number} is not QZSS ephemeris 1044"
+            ))
+            .into());
+        }
+        Ok(Self {
+            satellite_id: r.u(4)? as u8,
+            t_oc: r.u(16)? as u16,
+            a_f2: r.i(8)? as i16,
+            a_f1: r.i(16)? as i32,
+            a_f0: r.i(22)? as i32,
+            iode: r.u(8)? as u8,
+            c_rs: r.i(16)? as i32,
+            delta_n: r.i(16)? as i32,
+            m0: r.i(32)?,
+            c_uc: r.i(16)? as i32,
+            eccentricity: r.u(32)?,
+            c_us: r.i(16)? as i32,
+            sqrt_a: r.u(32)?,
+            t_oe: r.u(16)? as u16,
+            c_ic: r.i(16)? as i32,
+            omega0: r.i(32)?,
+            c_is: r.i(16)? as i32,
+            i0: r.i(32)?,
+            c_rc: r.i(16)? as i32,
+            omega: r.i(32)?,
+            omega_dot: r.i(24)? as i32,
+            idot: r.i(14)? as i32,
+            codes_on_l2: r.u(2)? as u8,
+            week_number: r.u(10)? as u16,
+            ura: r.u(4)? as u8,
+            sv_health: r.u(6)? as u8,
+            t_gd: r.i(8)? as i16,
+            iodc: r.u(10)? as u16,
+            fit_interval: r.flag()?,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push_u(1044, 12);
+        w.push_u(u64::from(self.satellite_id), 4);
+        w.push_u(u64::from(self.t_oc), 16);
+        w.push_i(i64::from(self.a_f2), 8);
+        w.push_i(i64::from(self.a_f1), 16);
+        w.push_i(i64::from(self.a_f0), 22);
+        w.push_u(u64::from(self.iode), 8);
+        w.push_i(i64::from(self.c_rs), 16);
+        w.push_i(i64::from(self.delta_n), 16);
+        w.push_i(self.m0, 32);
+        w.push_i(i64::from(self.c_uc), 16);
+        w.push_u(self.eccentricity, 32);
+        w.push_i(i64::from(self.c_us), 16);
+        w.push_u(self.sqrt_a, 32);
+        w.push_u(u64::from(self.t_oe), 16);
+        w.push_i(i64::from(self.c_ic), 16);
+        w.push_i(self.omega0, 32);
+        w.push_i(i64::from(self.c_is), 16);
+        w.push_i(self.i0, 32);
+        w.push_i(i64::from(self.c_rc), 16);
+        w.push_i(self.omega, 32);
+        w.push_i(i64::from(self.omega_dot), 24);
+        w.push_i(i64::from(self.idot), 14);
+        w.push_u(u64::from(self.codes_on_l2), 2);
+        w.push_u(u64::from(self.week_number), 10);
+        w.push_u(u64::from(self.ura), 4);
+        w.push_u(u64::from(self.sv_health), 6);
+        w.push_i(i64::from(self.t_gd), 8);
+        w.push_u(u64::from(self.iodc), 10);
+        w.push_flag(self.fit_interval);
+        w.into_bytes()
+    }
+
+    pub fn to_broadcast_record(&self, full_week: u32) -> Result<BroadcastRecord> {
+        if full_week % 1024 != u32::from(self.week_number) {
+            return Err(Error::InvalidInput(format!(
+                "QZSS full week {full_week} disagrees with 10-bit RTCM week {}",
+                self.week_number
+            )));
+        }
+        let satellite_id = self.satellite()?;
+        let toe_sow = f64::from(self.t_oe) * 16.0;
+        let toc_sow = f64::from(self.t_oc) * 16.0;
+        let toe = gnss_week_tow(TimeScale::Gpst, full_week, toe_sow, "QZSS toe")?;
+        let toc = gnss_week_tow(TimeScale::Gpst, full_week, toc_sow, "QZSS toc")?;
+        Ok(BroadcastRecord {
+            satellite_id,
+            message: NavMessage::QzssLnav,
+            issue_of_data: BroadcastIssue {
+                issue: u32::from(self.iode),
+                message: NavMessage::QzssLnav,
+            },
+            week: full_week,
+            toe,
+            toc,
+            elements: KeplerianElements {
+                sqrt_a: scaled_u(self.sqrt_a, -19),
+                e: scaled_u(self.eccentricity, -33),
+                m0: scaled_semicircle(self.m0, -31),
+                delta_n: scaled_semicircle(self.delta_n, -43),
+                omega0: scaled_semicircle(self.omega0, -31),
+                i0: scaled_semicircle(self.i0, -31),
+                omega: scaled_semicircle(self.omega, -31),
+                omega_dot: scaled_semicircle(self.omega_dot, -43),
+                idot: scaled_semicircle(self.idot, -43),
+                cuc: scaled_i(self.c_uc, -29),
+                cus: scaled_i(self.c_us, -29),
+                crc: scaled_i(self.c_rc, -5),
+                crs: scaled_i(self.c_rs, -5),
+                cic: scaled_i(self.c_ic, -29),
+                cis: scaled_i(self.c_is, -29),
+                toe_sow,
+            },
+            clock: ClockPolynomial {
+                af0: scaled_i(self.a_f0, -31),
+                af1: scaled_i(self.a_f1, -43),
+                af2: scaled_i(self.a_f2, -55),
+                toc_sow,
+            },
+            group_delays: BroadcastGroupDelays::gps_lnav(scaled_i(self.t_gd, -31)),
+            cnav: None,
+            sv_health: f64::from(self.sv_health),
+            sv_accuracy_m: ura_or_wide(self.ura),
+            fit_interval_s: Some(if self.fit_interval {
+                6.0 * SECONDS_PER_HOUR
+            } else {
+                2.0 * SECONDS_PER_HOUR
+            }),
+        })
     }
 }
 

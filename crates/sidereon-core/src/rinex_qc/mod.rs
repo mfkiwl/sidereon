@@ -2098,12 +2098,13 @@ const fn nav_message_rank(message: NavMessage) -> u8 {
         NavMessage::GpsLnav => 0,
         NavMessage::GpsCnav => 1,
         NavMessage::GpsCnav2 => 2,
-        NavMessage::QzssCnav => 3,
-        NavMessage::QzssCnav2 => 4,
-        NavMessage::GalileoInav => 5,
-        NavMessage::GalileoFnav => 6,
-        NavMessage::BeidouD1 => 7,
-        NavMessage::BeidouD2 => 8,
+        NavMessage::QzssLnav => 3,
+        NavMessage::QzssCnav => 4,
+        NavMessage::QzssCnav2 => 5,
+        NavMessage::GalileoInav => 6,
+        NavMessage::GalileoFnav => 7,
+        NavMessage::BeidouD1 => 8,
+        NavMessage::BeidouD2 => 9,
     }
 }
 

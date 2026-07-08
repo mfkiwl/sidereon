@@ -6,6 +6,11 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Added
 
+- RTCM 3 broadcast ephemeris decode/encode and solver conversion for Galileo
+  1045/1046, BeiDou 1042, and QZSS 1044. Galileo 1046 is covered by a real HAS
+  IDD capture propagated against a CNES/CLS ultra-rapid SP3 trim; BeiDou 1042,
+  QZSS 1044, and Galileo F/NAV 1045 are covered by a real BKG BCEP capture
+  propagated against matching CNES/CLS and QZSS ultra-rapid SP3 trims.
 - Static PPP float and fixed solve configs now accept an optional
   `elevation_cutoff_deg`; when set, observations below the seed-position
   elevation cutoff are removed before ambiguity ids, residual rows, normal rows,
