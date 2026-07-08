@@ -554,6 +554,7 @@ mod tests {
             tropo: TroposphereOptions::disabled(),
             corrections: RangeCorrections::disabled(),
             opts: FloatSolveOptions::default(),
+            elevation_cutoff_deg: None,
             residual_screen: false,
         }
     }
@@ -569,6 +570,7 @@ mod tests {
             tropo: float_config().tropo,
             corrections: float_config().corrections,
             opts: float_config().opts,
+            elevation_cutoff_deg: None,
             ambiguity: FixedAmbiguityOptions {
                 wavelengths_m,
                 offsets_m,

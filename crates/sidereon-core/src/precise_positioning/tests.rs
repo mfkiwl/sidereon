@@ -112,6 +112,7 @@ fn single_obs_clock_config(corrections: RangeCorrections) -> FloatSolveConfig {
             ambiguity_tolerance_m: 1.0e-4,
             ztd_tolerance_m: 1.0e-4,
         },
+        elevation_cutoff_deg: None,
         residual_screen: false,
     }
 }
@@ -244,6 +245,142 @@ fn assert_temporal_covariance_not_smaller(solution: &FloatSolution) {
             "ENU temporal covariance diagonal {idx} was below formal"
         );
     }
+}
+
+fn ppp_cutoff_sat_position(receiver_m: [f64; 3], az_deg: f64, el_deg: f64) -> [f64; 3] {
+    let az = az_deg.to_radians();
+    let el = el_deg.to_radians();
+    let range_m = 26_000_000.0;
+    let los = [el.sin(), el.cos() * az.sin(), el.cos() * az.cos()];
+    [
+        receiver_m[0] + range_m * los[0],
+        receiver_m[1] + range_m * los[1],
+        receiver_m[2] + range_m * los[2],
+    ]
+}
+
+fn ppp_elevation_cutoff_arc() -> (FakeSource, Vec<FloatEpoch>, FloatState, Vec<String>) {
+    let truth = [6_378_137.0, 0.0, 0.0];
+    let sat_specs = [
+        (1u8, 0.0, 60.0),
+        (2, 90.0, 55.0),
+        (3, 180.0, 50.0),
+        (4, 270.0, 45.0),
+        (5, 45.0, 10.0),
+        (6, 225.0, 5.0),
+    ];
+    let ids = sat_specs
+        .iter()
+        .map(|(prn, _, _)| GnssSatelliteId::new(GnssSystem::Gps, *prn).unwrap())
+        .collect::<Vec<_>>();
+    let source = FakeSource {
+        states: ids
+            .iter()
+            .zip(sat_specs.iter())
+            .map(|(id, (_, az_deg, el_deg))| {
+                (*id, ppp_cutoff_sat_position(truth, *az_deg, *el_deg))
+            })
+            .collect(),
+    };
+    let clocks = [12.5, -8.25, 4.0];
+    let ambiguities = ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.to_string(), 0.25 + idx as f64 * 0.1))
+        .collect::<BTreeMap<_, _>>();
+    let mut epochs = Vec::new();
+    for (epoch_idx, clock) in clocks.iter().enumerate() {
+        let t_rx_j2000_s = epoch_idx as f64 * 900.0;
+        let observations = ids
+            .iter()
+            .map(|id| {
+                let pred = predict(
+                    &source,
+                    *id,
+                    truth,
+                    t_rx_j2000_s,
+                    PredictOptions {
+                        carrier_hz: F_L1_HZ,
+                        light_time: true,
+                        sagnac: true,
+                    },
+                )
+                .unwrap();
+                let code_m = pred.geometric_range_m + clock;
+                let ambiguity_m = ambiguities[id.to_string().as_str()];
+                FloatObservation {
+                    sat: *id,
+                    satellite_id: id.to_string(),
+                    ambiguity_id: id.to_string(),
+                    code_m,
+                    phase_m: code_m + ambiguity_m,
+                    freq1_hz: 0.0,
+                    freq2_hz: 0.0,
+                    glonass_channel: None,
+                }
+            })
+            .collect();
+        epochs.push(FloatEpoch {
+            epoch: CivilDateTime {
+                year: 2020,
+                month: 6,
+                day: 24,
+                hour: 12,
+                minute: epoch_idx as u8 * 15,
+                second: 0.0,
+            },
+            jd_whole: 2_459_024.5,
+            jd_fraction: 0.5 + t_rx_j2000_s / crate::constants::SECONDS_PER_DAY,
+            t_rx_j2000_s,
+            observations,
+        });
+    }
+    let state = FloatState {
+        position_m: truth,
+        clocks_m: vec![0.0; epochs.len()],
+        ambiguities_m: initial_ambiguities(&epochs),
+        ztd_m: 0.0,
+    };
+    let low_sats = ["G05", "G06"].iter().map(|sat| sat.to_string()).collect();
+    (source, epochs, state, low_sats)
+}
+
+fn ppp_cutoff_config(cutoff_deg: Option<f64>) -> FloatSolveConfig {
+    FloatSolveConfig {
+        weights: MeasurementWeights {
+            code: 1.0,
+            phase: 100.0,
+            elevation_weighting: true,
+        },
+        tropo: TroposphereOptions::disabled(),
+        corrections: RangeCorrections::disabled(),
+        opts: FloatSolveOptions {
+            max_iterations: 8,
+            position_tolerance_m: 1.0e-4,
+            clock_tolerance_m: 1.0e-4,
+            ambiguity_tolerance_m: 1.0e-4,
+            ztd_tolerance_m: 1.0e-4,
+        },
+        elevation_cutoff_deg: cutoff_deg,
+        residual_screen: false,
+    }
+}
+
+fn ppp_float_solution_bits(solution: &FloatSolution) -> Vec<u64> {
+    let mut bits = Vec::new();
+    bits.extend(solution.position_m.iter().map(|v| v.to_bits()));
+    bits.extend(solution.epoch_clocks_m.iter().map(|v| v.to_bits()));
+    bits.extend(solution.ambiguities_m.values().map(|v| v.to_bits()));
+    for residual in &solution.residuals_m {
+        bits.push(residual.code_m.to_bits());
+        bits.push(residual.phase_m.to_bits());
+        bits.push(residual.code_weight.to_bits());
+        bits.push(residual.phase_weight.to_bits());
+    }
+    bits.push(solution.code_rms_m.to_bits());
+    bits.push(solution.phase_rms_m.to_bits());
+    bits.push(solution.weighted_rms_m.to_bits());
+    bits
 }
 
 #[test]
@@ -1025,6 +1162,7 @@ fn static_float_solver_recovers_synthetic_arc() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1054,6 +1192,216 @@ fn static_float_solver_recovers_synthetic_arc() {
     assert_temporal_covariance_not_smaller(&solution);
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
+}
+
+#[test]
+fn elevation_cutoff_none_preserves_static_float_fixture_bits() {
+    let (source, epochs, initial, _) = ppp_elevation_cutoff_arc();
+    let solution = solve_float_epochs(&source, &epochs, initial, ppp_cutoff_config(None)).unwrap();
+    assert_eq!(
+        solution.used_sats,
+        ["G01", "G02", "G03", "G04", "G05", "G06"]
+    );
+    assert_eq!(
+        ppp_float_solution_bits(&solution),
+        vec![
+            4708606483430899711,
+            4452733082576154772,
+            4453493932956835639,
+            4623226492472189013,
+            13844205992025595820,
+            4616189618053415252,
+            4598175219544437634,
+            4599976659423301089,
+            4601778099233554315,
+            4603129179142392862,
+            4604029899052293746,
+            4604930618990457261,
+            0,
+            0,
+            4605975682916587671,
+            4635794528945706806,
+            0,
+            0,
+            4605553524466321826,
+            4635464717656436615,
+            0,
+            0,
+            4605075134482219749,
+            4635090975481356867,
+            0,
+            0,
+            4604544223951464880,
+            4634676201629204626,
+            0,
+            0,
+            4595424520664219441,
+            4625581108599069534,
+            0,
+            0,
+            4590944325920908238,
+            4621095794037370361,
+            0,
+            0,
+            4605975682916587671,
+            4635794528945706806,
+            0,
+            0,
+            4605553524466321826,
+            4635464717656436615,
+            0,
+            0,
+            4605075134482219749,
+            4635090975481356867,
+            0,
+            0,
+            4604544223951464880,
+            4634676201629204626,
+            0,
+            0,
+            4595424520664219441,
+            4625581108599069534,
+            0,
+            0,
+            4590944325920908238,
+            4621095794037370361,
+            0,
+            0,
+            4605975682916587671,
+            4635794528945706806,
+            0,
+            0,
+            4605553524466321826,
+            4635464717656436615,
+            0,
+            0,
+            4605075134482219749,
+            4635090975481356867,
+            0,
+            0,
+            4604544223951464880,
+            4634676201629204626,
+            0,
+            0,
+            4595424520664219441,
+            4625581108599069534,
+            0,
+            0,
+            4590944325920908238,
+            4621095794037370361,
+            0,
+            0,
+            0,
+        ]
+    );
+}
+
+#[test]
+fn elevation_cutoff_removes_low_satellites_before_solve() {
+    let (source, epochs, initial, low_sats) = ppp_elevation_cutoff_arc();
+    let low_count = epochs[0]
+        .observations
+        .iter()
+        .filter(|obs| {
+            let pred = predict(
+                &source,
+                obs.sat,
+                initial.position_m,
+                epochs[0].t_rx_j2000_s,
+                PredictOptions {
+                    carrier_hz: F_L1_HZ,
+                    light_time: true,
+                    sagnac: true,
+                },
+            )
+            .unwrap();
+            pred.elevation_deg < 15.0
+        })
+        .count();
+    assert_eq!(low_count, 2);
+    assert_eq!(low_sats, ["G05", "G06"]);
+
+    let no_cutoff =
+        solve_float_epochs(&source, &epochs, initial.clone(), ppp_cutoff_config(None)).unwrap();
+    let cutoff =
+        solve_float_epochs(&source, &epochs, initial, ppp_cutoff_config(Some(15.0))).unwrap();
+
+    assert_eq!(no_cutoff.residuals_m.len(), 18);
+    assert_eq!(cutoff.residuals_m.len(), 12);
+    assert_eq!(
+        no_cutoff.used_sats,
+        ["G01", "G02", "G03", "G04", "G05", "G06"]
+    );
+    assert_eq!(cutoff.used_sats, ["G01", "G02", "G03", "G04"]);
+    assert!(cutoff.converged);
+    assert_eq!(cutoff.status, FloatStatus::StateTolerance);
+}
+
+#[test]
+fn aggressive_elevation_cutoff_returns_typed_error() {
+    let (source, epochs, initial, _) = ppp_elevation_cutoff_arc();
+    let err = solve_float_epochs(
+        &source,
+        &epochs,
+        initial.clone(),
+        ppp_cutoff_config(Some(89.0)),
+    )
+    .expect_err("over-masked PPP solve should fail before normal assembly");
+    assert_eq!(
+        err,
+        FloatSolveError::InsufficientObservationsAfterElevationCutoff {
+            cutoff_deg: 89.0,
+            retained_observations: 0,
+            required_observations: 4,
+        }
+    );
+
+    let float_solution =
+        solve_float_epochs(&source, &epochs, initial, ppp_cutoff_config(None)).unwrap();
+    let wavelengths_m = float_solution
+        .used_sats
+        .iter()
+        .map(|sat| (sat.clone(), 0.190_293_672_798_365))
+        .collect();
+    let offsets_m = float_solution
+        .used_sats
+        .iter()
+        .map(|sat| (sat.clone(), 0.0))
+        .collect();
+    let fixed_err = solve_fixed_from_float(
+        &source,
+        &epochs,
+        float_solution,
+        FixedSolveConfig {
+            weights: ppp_cutoff_config(None).weights,
+            tropo: TroposphereOptions::disabled(),
+            corrections: RangeCorrections::disabled(),
+            opts: FloatSolveOptions {
+                max_iterations: 8,
+                position_tolerance_m: 1.0e-4,
+                clock_tolerance_m: 1.0e-4,
+                ambiguity_tolerance_m: 1.0e-4,
+                ztd_tolerance_m: 1.0e-4,
+            },
+            elevation_cutoff_deg: Some(89.0),
+            ambiguity: FixedAmbiguityOptions {
+                wavelengths_m,
+                offsets_m,
+                ratio_threshold: 3.0,
+            },
+        },
+    )
+    .expect_err("over-masked fixed PPP solve should fail before integer search");
+    assert_eq!(
+        fixed_err,
+        FixedSolveError::Float(
+            FloatSolveError::InsufficientObservationsAfterElevationCutoff {
+                cutoff_deg: 89.0,
+                retained_observations: 0,
+                required_observations: 4,
+            }
+        )
+    );
 }
 
 #[test]
@@ -1161,6 +1509,7 @@ fn static_float_solver_reports_unit_variance_factor_on_weighted_synthetic_noise(
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1296,6 +1645,7 @@ fn static_float_solver_handles_multi_hundred_epoch_arc() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1339,6 +1689,7 @@ fn static_float_solver_rejects_short_clock_vector() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1366,6 +1717,7 @@ fn static_float_solver_rejects_nan_tolerance() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1393,6 +1745,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1414,6 +1767,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1435,6 +1789,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1456,6 +1811,7 @@ fn static_float_solver_rejects_iteration_cap_and_nonpositive_tolerances() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1483,6 +1839,7 @@ fn static_float_solver_rejects_nan_observation() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1511,6 +1868,7 @@ fn static_float_solver_rejects_nan_initial_state() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1542,6 +1900,7 @@ fn static_float_solver_rejects_zero_measurement_weight() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -1587,6 +1946,7 @@ fn static_float_solver_rejects_nonfinite_measurement_weights() {
                     ambiguity_tolerance_m: 1.0e-4,
                     ztd_tolerance_m: 1.0e-4,
                 },
+                elevation_cutoff_deg: None,
                 residual_screen: false,
             },
         )
@@ -1925,6 +2285,7 @@ fn static_float_solver_rejects_nan_correction_table_value() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -2029,6 +2390,7 @@ fn single_epoch_float_solver_recovers_synthetic_snapshot() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -2170,6 +2532,7 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
             tropo,
             corrections: corrections.clone(),
             opts,
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -2193,6 +2556,7 @@ fn single_epoch_fixed_solver_uses_custom_ambiguity_ids() {
             tropo,
             corrections,
             opts,
+            elevation_cutoff_deg: None,
             ambiguity: FixedAmbiguityOptions {
                 wavelengths_m,
                 offsets_m,
@@ -2311,6 +2675,7 @@ fn static_fixed_solver_recovers_synthetic_arc() {
             tropo,
             corrections: corrections.clone(),
             opts,
+            elevation_cutoff_deg: None,
             residual_screen: false,
         },
     )
@@ -2329,6 +2694,7 @@ fn static_fixed_solver_recovers_synthetic_arc() {
             tropo,
             corrections,
             opts,
+            elevation_cutoff_deg: None,
             ambiguity: FixedAmbiguityOptions {
                 wavelengths_m,
                 offsets_m,
@@ -2420,6 +2786,7 @@ fn static_fixed_solver_rejects_short_float_solution_clock_vector() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             ambiguity: FixedAmbiguityOptions {
                 wavelengths_m: used_sats
                     .iter()
@@ -2483,6 +2850,7 @@ fn static_fixed_solver_rejects_nan_tolerance() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             ambiguity: FixedAmbiguityOptions {
                 wavelengths_m: used_sats
                     .iter()
@@ -2548,6 +2916,7 @@ fn static_fixed_solver_rejects_nan_wavelength() {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             ambiguity: FixedAmbiguityOptions {
                 wavelengths_m,
                 offsets_m: used_sats.iter().map(|sat| (sat.clone(), 0.0)).collect(),
@@ -2685,6 +3054,7 @@ fn ppp_row_trace_float_config(tropo: TroposphereOptions) -> FloatSolveConfig {
             ambiguity_tolerance_m: 1.0e-4,
             ztd_tolerance_m: 1.0e-4,
         },
+        elevation_cutoff_deg: None,
         residual_screen: false,
     }
 }

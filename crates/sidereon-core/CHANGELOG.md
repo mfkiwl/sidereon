@@ -2,6 +2,16 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Static PPP float and fixed solve configs now accept an optional
+  `elevation_cutoff_deg`; when set, observations below the seed-position
+  elevation cutoff are removed before ambiguity ids, residual rows, normal rows,
+  and fixed ambiguity search are assembled. `None` preserves the existing
+  observation set.
+
 ## [0.22.0]
 
 ### Added

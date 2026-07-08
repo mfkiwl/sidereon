@@ -1442,6 +1442,7 @@ mod tests {
                 ambiguity_tolerance_m: 1.0e-4,
                 ztd_tolerance_m: 1.0e-4,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         }
     }
@@ -1453,6 +1454,7 @@ mod tests {
             tropo: float.tropo,
             corrections: float.corrections,
             opts: float.opts,
+            elevation_cutoff_deg: None,
             ambiguity: precise_positioning::FixedAmbiguityOptions {
                 wavelengths_m: BTreeMap::new(),
                 offsets_m: BTreeMap::new(),

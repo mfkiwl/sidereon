@@ -692,6 +692,9 @@ fn kinematic_error_from_float(error: FloatSolveError) -> KinematicSolveError {
         FloatSolveError::InvalidInput { field, reason } => {
             KinematicSolveError::InvalidInput { field, reason }
         }
+        FloatSolveError::InsufficientObservationsAfterElevationCutoff { .. } => {
+            KinematicSolveError::SingularGeometry
+        }
         FloatSolveError::MissingCorrection {
             satellite_id,
             correction,
@@ -1488,6 +1491,7 @@ mod tests {
                     ambiguity_tolerance_m: 1.0e-8,
                     ztd_tolerance_m: 1.0e-8,
                 },
+                elevation_cutoff_deg: None,
                 residual_screen: false,
             },
         )
@@ -1946,6 +1950,7 @@ mod tests {
                 ambiguity_tolerance_m: 1.0e-8,
                 ztd_tolerance_m: 1.0e-8,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         }
     }

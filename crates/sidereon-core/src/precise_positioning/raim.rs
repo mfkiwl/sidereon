@@ -1305,6 +1305,7 @@ mod tests {
                 ambiguity_tolerance_m: 1.0e-7,
                 ztd_tolerance_m: 1.0e-7,
             },
+            elevation_cutoff_deg: None,
             residual_screen: false,
         }
     }

@@ -20,10 +20,10 @@ use super::normal::{ppp_position_covariance, solve_normal_equations, PppNormalLa
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
 use super::temporal::{estimate_temporal_correlation, temporal_position_covariance};
 use super::{
-    estimates_ztd, max_abs, rms, state_from_solution, validate_float_solution_output,
-    validate_float_solve_boundary, weighted_rms, ztd_unknown_count, FloatEpoch, FloatSolution,
-    FloatSolveConfig, FloatSolveError, FloatSolveOptions, FloatState, FloatStatus, ModelContext,
-    TroposphereOptions,
+    apply_elevation_cutoff, estimates_ztd, max_abs, rms, state_from_solution,
+    validate_float_solution_output, validate_float_solve_boundary, weighted_rms, ztd_unknown_count,
+    FloatEpoch, FloatSolution, FloatSolveConfig, FloatSolveError, FloatSolveOptions, FloatState,
+    FloatStatus, ModelContext, TroposphereOptions,
 };
 
 const RESIDUAL_SCREEN_THRESHOLD: f64 = 4.0;
@@ -90,7 +90,15 @@ pub fn solve_float_epoch(
 ) -> Result<FloatSolution, FloatSolveError> {
     let epochs = [epoch];
     validate_float_solve_boundary(&epochs, &initial_state, &config)?;
-    let ambiguity_ids = epochs[0]
+    let filtered_epochs;
+    let solve_epochs = if let Some(cutoff_deg) = config.elevation_cutoff_deg {
+        filtered_epochs =
+            apply_elevation_cutoff(source, &epochs, &initial_state, cutoff_deg, config.tropo)?;
+        filtered_epochs.as_slice()
+    } else {
+        &epochs
+    };
+    let ambiguity_ids = solve_epochs[0]
         .observations
         .iter()
         .map(|obs| AmbiguityId::new(obs.ambiguity_id.clone()))
@@ -103,7 +111,14 @@ pub fn solve_float_epoch(
         corrections: &config.corrections,
         normal: NormalRecipe::PppDenseLastTie,
     };
-    iterate_multi(ctx, &epochs, &ambiguity_ids, initial_state, config.opts, 1)
+    iterate_multi(
+        ctx,
+        solve_epochs,
+        &ambiguity_ids,
+        initial_state,
+        config.opts,
+        1,
+    )
 }
 
 fn solve_float_multi_screened(
@@ -119,6 +134,7 @@ fn solve_float_multi_screened(
         tropo,
         corrections,
         opts,
+        elevation_cutoff_deg,
         residual_screen,
     } = config;
     let ctx = ModelContext {
@@ -128,15 +144,22 @@ fn solve_float_multi_screened(
         corrections: &corrections,
         normal,
     };
-    let ambiguity_ids = multi_ambiguity_ids(epochs);
-    let solution = iterate_multi(ctx, epochs, &ambiguity_ids, state.clone(), opts, 1)?;
+    let filtered_epochs;
+    let solve_epochs = if let Some(cutoff_deg) = elevation_cutoff_deg {
+        filtered_epochs = apply_elevation_cutoff(source, epochs, &state, cutoff_deg, tropo)?;
+        filtered_epochs.as_slice()
+    } else {
+        epochs
+    };
+    let ambiguity_ids = multi_ambiguity_ids(solve_epochs);
+    let solution = iterate_multi(ctx, solve_epochs, &ambiguity_ids, state.clone(), opts, 1)?;
 
     if !residual_screen {
         return Ok(solution);
     }
 
-    let unscreened_wrms = solution_weighted_rms(ctx, epochs, &solution, &state);
-    match run_residual_screen(ctx, epochs.to_vec(), state, opts, solution.clone(), 1)? {
+    let unscreened_wrms = solution_weighted_rms(ctx, solve_epochs, &solution, &state);
+    match run_residual_screen(ctx, solve_epochs.to_vec(), state, opts, solution.clone(), 1)? {
         ScreenResult::Clean => Ok(solution),
         ScreenResult::Screened {
             solution: screened,
