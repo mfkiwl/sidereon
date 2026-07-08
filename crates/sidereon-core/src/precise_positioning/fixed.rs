@@ -19,6 +19,7 @@ use super::normal::{
     solve_normal_equations, PppNormalLayout,
 };
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
+use super::temporal::{estimate_temporal_correlation, temporal_position_covariance};
 use super::{
     estimates_ztd, max_abs, rms, state_from_solution, validate_fixed_solve_boundary, weighted_rms,
     ztd_unknown_count, AmbiguitySearch, FixedIntegerMetadata, FixedSolution, FixedSolveConfig,
@@ -280,12 +281,22 @@ fn finalize_fixed_multi(
     )?;
     let code: Vec<f64> = residuals.iter().map(|r| r.code_m).collect();
     let phase: Vec<f64> = residuals.iter().map(|r| r.phase_m).collect();
+    let temporal_correlation = estimate_temporal_correlation(&residuals, epochs);
+    let (temporal_position_covariance, temporal_position_covariance_scale_factor) =
+        temporal_position_covariance(
+            covariance.formal,
+            covariance.posterior_variance_factor,
+            temporal_correlation,
+        );
     Ok(FixedSolution {
         position_m: state.position_m,
         position_covariance: covariance.scaled,
         formal_position_covariance: covariance.formal,
         posterior_variance_factor: covariance.posterior_variance_factor,
         position_covariance_scale_factor: covariance.covariance_scale_factor,
+        temporal_position_covariance,
+        temporal_position_covariance_scale_factor,
+        temporal_correlation,
         epoch_clocks_m: state.clocks_m,
         fixed_ambiguities_cycles: search.fixed_cycles,
         fixed_ambiguities_m: fixed_m,

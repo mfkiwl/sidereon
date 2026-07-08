@@ -545,6 +545,35 @@ pub struct FloatResidual {
     pub phase_weight: f64,
 }
 
+/// Temporal correlation estimate used to deflate static PPP sample count.
+///
+/// The estimator pools lag-1 autocorrelation from standardized post-fit code
+/// and phase residual arcs, split by satellite and observable. It models the
+/// residual sequence as AR(1) in epoch units and converts the fitted lag-1
+/// coefficient into an effective independent sample count. This captures
+/// short-memory temporal correlation such as multipath, residual troposphere,
+/// and orbit or clock interpolation errors that persist for minutes. It does
+/// not model spatially correlated or day-constant systematics, antenna effects,
+/// loading errors, or reference-frame errors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TemporalCorrelationSummary {
+    /// Pooled nonnegative lag-1 autocorrelation coefficient.
+    pub lag1_autocorrelation: f64,
+    /// AR(1) decorrelation time in epoch spacings, computed as `-1 / ln(rho)`.
+    pub decorrelation_time_epochs: f64,
+    /// AR(1) decorrelation time in seconds when the input epochs have a regular
+    /// positive spacing.
+    pub decorrelation_time_s: Option<f64>,
+    /// Number of residual samples contributing to the temporal estimate.
+    pub nominal_sample_count: usize,
+    /// Effective independent sample count after AR(1) deflation.
+    pub effective_sample_count: f64,
+    /// Multiplier applied to covariance to account for temporal correlation.
+    pub variance_inflation_factor: f64,
+    /// Number of satellite and observable arcs used in the pooled estimate.
+    pub arcs_used: usize,
+}
+
 /// Static float solution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatSolution {
@@ -577,6 +606,21 @@ pub struct FloatSolution {
     /// [`Self::position_covariance`]. This equals
     /// [`Self::posterior_variance_factor`].
     pub position_covariance_scale_factor: f64,
+    /// Position covariance with temporal-correlation sample-count deflation.
+    ///
+    /// This additive field does not change [`Self::position_covariance`]. It is
+    /// the formal covariance multiplied by the larger of 1.0 and the posterior
+    /// variance factor, and then by
+    /// [`Self::temporal_correlation`]'s variance inflation factor. The floor
+    /// keeps this conservative covariance from shrinking below the formal
+    /// normal-equation covariance.
+    pub temporal_position_covariance: PositionCovariance,
+    /// Multiplier applied to [`Self::formal_position_covariance`] to produce
+    /// [`Self::temporal_position_covariance`].
+    pub temporal_position_covariance_scale_factor: f64,
+    /// Residual temporal-correlation estimate used by
+    /// [`Self::temporal_position_covariance`].
+    pub temporal_correlation: TemporalCorrelationSummary,
     pub epoch_clocks_m: Vec<f64>,
     pub ambiguities_m: BTreeMap<String, f64>,
     pub ztd_residual_m: Option<f64>,
@@ -786,6 +830,21 @@ pub struct FixedSolution {
     /// [`Self::position_covariance`]. This equals
     /// [`Self::posterior_variance_factor`].
     pub position_covariance_scale_factor: f64,
+    /// Position covariance with temporal-correlation sample-count deflation.
+    ///
+    /// This additive field does not change [`Self::position_covariance`]. It is
+    /// the formal covariance multiplied by the larger of 1.0 and the posterior
+    /// variance factor, and then by
+    /// [`Self::temporal_correlation`]'s variance inflation factor. The floor
+    /// keeps this conservative covariance from shrinking below the formal
+    /// normal-equation covariance.
+    pub temporal_position_covariance: PositionCovariance,
+    /// Multiplier applied to [`Self::formal_position_covariance`] to produce
+    /// [`Self::temporal_position_covariance`].
+    pub temporal_position_covariance_scale_factor: f64,
+    /// Residual temporal-correlation estimate used by
+    /// [`Self::temporal_position_covariance`].
+    pub temporal_correlation: TemporalCorrelationSummary,
     pub epoch_clocks_m: Vec<f64>,
     pub fixed_ambiguities_cycles: BTreeMap<String, i64>,
     pub fixed_ambiguities_m: BTreeMap<String, f64>,

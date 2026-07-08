@@ -162,6 +162,18 @@ fn unit_position_covariance() -> crate::dop::PositionCovariance {
     }
 }
 
+fn unit_temporal_correlation() -> TemporalCorrelationSummary {
+    TemporalCorrelationSummary {
+        lag1_autocorrelation: 0.0,
+        decorrelation_time_epochs: 0.0,
+        decorrelation_time_s: None,
+        nominal_sample_count: 0,
+        effective_sample_count: 0.0,
+        variance_inflation_factor: 1.0,
+        arcs_used: 0,
+    }
+}
+
 fn assert_position_covariance_positive_definite(covariance: &crate::dop::PositionCovariance) {
     fn assert_matrix(name: &str, matrix: [[f64; 3]; 3]) {
         for (idx, row) in matrix.iter().enumerate() {
@@ -214,6 +226,26 @@ fn assert_position_covariance_scaled_by_factor(
     assert_matrix(scaled.enu_m2, formal.enu_m2, factor);
 }
 
+fn assert_temporal_covariance_not_smaller(solution: &FloatSolution) {
+    assert!(
+        solution.temporal_position_covariance_scale_factor >= 1.0,
+        "temporal covariance scale factor {} was below one",
+        solution.temporal_position_covariance_scale_factor
+    );
+    for idx in 0..3 {
+        assert!(
+            solution.temporal_position_covariance.ecef_m2[idx][idx]
+                >= solution.formal_position_covariance.ecef_m2[idx][idx],
+            "ECEF temporal covariance diagonal {idx} was below formal"
+        );
+        assert!(
+            solution.temporal_position_covariance.enu_m2[idx][idx]
+                >= solution.formal_position_covariance.enu_m2[idx][idx],
+            "ENU temporal covariance diagonal {idx} was below formal"
+        );
+    }
+}
+
 #[test]
 fn float_solution_output_validation_rejects_nonfinite_values() {
     let solution = FloatSolution {
@@ -222,6 +254,9 @@ fn float_solution_output_validation_rejects_nonfinite_values() {
         formal_position_covariance: unit_position_covariance(),
         posterior_variance_factor: 1.0,
         position_covariance_scale_factor: 1.0,
+        temporal_position_covariance: unit_position_covariance(),
+        temporal_position_covariance_scale_factor: 1.0,
+        temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: vec![0.0],
         ambiguities_m: BTreeMap::new(),
         ztd_residual_m: None,
@@ -1016,6 +1051,7 @@ fn static_float_solver_recovers_synthetic_arc() {
         &solution.formal_position_covariance,
         solution.position_covariance_scale_factor,
     );
+    assert_temporal_covariance_not_smaller(&solution);
     assert_eq!(solution.status, FloatStatus::StateTolerance);
     assert!(solution.converged);
 }
@@ -1146,6 +1182,7 @@ fn static_float_solver_reports_unit_variance_factor_on_weighted_synthetic_noise(
         &solution.formal_position_covariance,
         solution.position_covariance_scale_factor,
     );
+    assert_temporal_covariance_not_smaller(&solution);
 }
 
 fn deterministic_unit_noise(index: usize) -> f64 {
@@ -2352,6 +2389,9 @@ fn static_fixed_solver_rejects_short_float_solution_clock_vector() {
         formal_position_covariance: unit_position_covariance(),
         posterior_variance_factor: 1.0,
         position_covariance_scale_factor: 1.0,
+        temporal_position_covariance: unit_position_covariance(),
+        temporal_position_covariance_scale_factor: 1.0,
+        temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: vec![0.0; epochs.len() - 1],
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
@@ -2412,6 +2452,9 @@ fn static_fixed_solver_rejects_nan_tolerance() {
         formal_position_covariance: unit_position_covariance(),
         posterior_variance_factor: 1.0,
         position_covariance_scale_factor: 1.0,
+        temporal_position_covariance: unit_position_covariance(),
+        temporal_position_covariance_scale_factor: 1.0,
+        temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: vec![0.0; epochs.len()],
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,
@@ -2474,6 +2517,9 @@ fn static_fixed_solver_rejects_nan_wavelength() {
         formal_position_covariance: unit_position_covariance(),
         posterior_variance_factor: 1.0,
         position_covariance_scale_factor: 1.0,
+        temporal_position_covariance: unit_position_covariance(),
+        temporal_position_covariance_scale_factor: 1.0,
+        temporal_correlation: unit_temporal_correlation(),
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
         ztd_residual_m: None,

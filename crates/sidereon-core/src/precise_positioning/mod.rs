@@ -140,6 +140,7 @@ mod prep;
 pub mod raim;
 mod rows;
 pub mod tec;
+mod temporal;
 mod types;
 pub mod velocity;
 
@@ -466,6 +467,22 @@ fn validate_float_solution(
         "ppp float_solution position_covariance_scale_factor",
     )
     .map_err(invalid_fixed_input)?;
+    validate_position_covariance(
+        &solution.temporal_position_covariance,
+        "ppp float_solution temporal_position_covariance",
+        true,
+    )
+    .map_err(FixedSolveError::Float)?;
+    validate::finite_nonneg(
+        solution.temporal_position_covariance_scale_factor,
+        "ppp float_solution temporal_position_covariance_scale_factor",
+    )
+    .map_err(invalid_fixed_input)?;
+    validate_temporal_correlation(
+        solution.temporal_correlation,
+        "ppp float_solution temporal_correlation",
+    )
+    .map_err(FixedSolveError::Float)?;
     validate::finite_slice(
         &solution.epoch_clocks_m,
         "ppp float_solution epoch_clocks_m",
@@ -531,6 +548,20 @@ pub(super) fn validate_float_solution_output(
         "ppp float_solution position_covariance_scale_factor",
     )
     .map_err(invalid_input)?;
+    validate_position_covariance(
+        &solution.temporal_position_covariance,
+        "ppp float_solution temporal_position_covariance",
+        true,
+    )?;
+    validate::finite_nonneg(
+        solution.temporal_position_covariance_scale_factor,
+        "ppp float_solution temporal_position_covariance_scale_factor",
+    )
+    .map_err(invalid_input)?;
+    validate_temporal_correlation(
+        solution.temporal_correlation,
+        "ppp float_solution temporal_correlation",
+    )?;
     validate::finite_slice(
         &solution.epoch_clocks_m,
         "ppp float_solution epoch_clocks_m",
@@ -610,6 +641,38 @@ fn validate_covariance_matrix(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_temporal_correlation(
+    temporal: TemporalCorrelationSummary,
+    label: &'static str,
+) -> Result<(), FloatSolveError> {
+    validate::finite_nonneg(temporal.lag1_autocorrelation, label).map_err(invalid_input)?;
+    if temporal.lag1_autocorrelation > 0.99 {
+        return Err(FloatSolveError::InvalidInput {
+            field: label,
+            reason: "lag1_autocorrelation",
+        });
+    }
+    validate::finite_nonneg(temporal.decorrelation_time_epochs, label).map_err(invalid_input)?;
+    if let Some(seconds) = temporal.decorrelation_time_s {
+        validate::finite_nonneg(seconds, label).map_err(invalid_input)?;
+    }
+    validate::finite_nonneg(temporal.effective_sample_count, label).map_err(invalid_input)?;
+    validate::finite_nonneg(temporal.variance_inflation_factor, label).map_err(invalid_input)?;
+    if temporal.variance_inflation_factor < 1.0 {
+        return Err(FloatSolveError::InvalidInput {
+            field: label,
+            reason: "variance_inflation_factor",
+        });
+    }
+    if temporal.effective_sample_count > temporal.nominal_sample_count as f64 + 1.0e-9 {
+        return Err(FloatSolveError::InvalidInput {
+            field: label,
+            reason: "effective_sample_count",
+        });
     }
     Ok(())
 }

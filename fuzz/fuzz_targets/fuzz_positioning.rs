@@ -374,6 +374,20 @@ fuzz_target!(|data: &[u8]| {
         },
         posterior_variance_factor,
         position_covariance_scale_factor: posterior_variance_factor,
+        temporal_position_covariance: sidereon_core::dop::PositionCovariance {
+            ecef_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            enu_m2: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        },
+        temporal_position_covariance_scale_factor: 1.0,
+        temporal_correlation: sidereon_core::precise_positioning::TemporalCorrelationSummary {
+            lag1_autocorrelation: 0.0,
+            decorrelation_time_epochs: 0.0,
+            decorrelation_time_s: None,
+            nominal_sample_count: 0,
+            effective_sample_count: 0.0,
+            variance_inflation_factor: 1.0,
+            arcs_used: 0,
+        },
     };
     let fixed_config = FixedSolveConfig {
         weights: config.weights,
