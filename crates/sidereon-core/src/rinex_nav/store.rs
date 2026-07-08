@@ -143,6 +143,7 @@ impl BroadcastStore {
                 NavMessage::GpsLnav
                     | NavMessage::GpsCnav
                     | NavMessage::GpsCnav2
+                    | NavMessage::QzssLnav
                     | NavMessage::QzssCnav
                     | NavMessage::QzssCnav2
                     | NavMessage::GalileoInav
@@ -492,6 +493,7 @@ const fn cnav_tie_rank(message: NavMessage) -> u8 {
     match message {
         NavMessage::GpsCnav | NavMessage::QzssCnav => 0,
         NavMessage::GpsCnav2 | NavMessage::QzssCnav2 => 1,
+        NavMessage::QzssLnav => 0,
         _ => 0,
     }
 }

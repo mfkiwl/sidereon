@@ -27,7 +27,7 @@
 //!     159), committed verbatim (decompressed) from nav-solutions/data NAV/V4
 //!     (gz sha256 2bae4217cb71ad4a2b9c0067bd1c5b56915e42d2007a94e91eb408468cc4763f).
 //!     Tests version-4 frame-marker parsing; 174 supported Keplerian records parsed,
-//!     GLONASS/QZSS/SBAS/STO/ION skipped.
+//!     GLONASS/SBAS/STO/ION skipped.
 //!   * `BRD400DLR_S_20261800000_01H_MN_trim.rnx`: RINEX 4.02 mixed broadcast
 //!     product from
 //!     `https://igs.bkg.bund.de/root_ftp/IGS/BRDC/2026/180/BRD400DLR_S_20261800000_01D_MN.rnx.gz`
@@ -615,20 +615,23 @@ fn parses_a_real_rinex_v4_file() {
     let count = |sys| recs.iter().filter(|r| r.satellite_id.system == sys).count();
     let msg = |m| recs.iter().filter(|r| r.message == m).count();
 
-    // Supported Keplerian records only: GPS LNAV, Galileo I/NAV + F/NAV, BeiDou
-    // D1 + D2. GLONASS (FDMA), QZSS, SBAS, STO and ION frames are skipped.
+    // Supported Keplerian records only: GPS LNAV, QZSS LNAV, Galileo I/NAV +
+    // F/NAV, BeiDou D1 + D2. GLONASS (FDMA), SBAS, STO and ION frames are
+    // skipped.
     assert_eq!(count(GnssSystem::Gps), 30, "GPS LNAV count");
+    assert_eq!(count(GnssSystem::Qzss), 1, "QZSS LNAV count");
     assert_eq!(count(GnssSystem::Galileo), 108, "Galileo count");
     assert_eq!(count(GnssSystem::BeiDou), 36, "BeiDou count");
-    assert_eq!(recs.len(), 174, "only G/E/C are parsed");
+    assert_eq!(recs.len(), 175, "only G/J/E/C are parsed");
     assert_eq!(
-        count(GnssSystem::Glonass) + count(GnssSystem::Qzss) + count(GnssSystem::Sbas),
+        count(GnssSystem::Glonass) + count(GnssSystem::Sbas),
         0,
-        "GLONASS/QZSS/SBAS must be skipped"
+        "GLONASS/SBAS must be skipped"
     );
 
     // Message type comes from the v4 marker token.
     assert_eq!(msg(NavMessage::GpsLnav), 30);
+    assert_eq!(msg(NavMessage::QzssLnav), 1);
     assert_eq!(msg(NavMessage::GalileoInav), 55);
     assert_eq!(msg(NavMessage::GalileoFnav), 53);
     assert_eq!(msg(NavMessage::BeidouD1), 33);
@@ -2468,12 +2471,18 @@ fn cnav_records_round_trip_through_rinex4_writer() {
 #[test]
 fn real_brdc4_cnav_fixture_counts_and_skips_unsupported_frames() {
     let recs = cnav_fixture_records();
-    assert_eq!(recs.len(), 6);
+    assert_eq!(recs.len(), 7);
     assert_eq!(
         recs.iter()
             .filter(|record| record.message == NavMessage::GpsLnav)
             .count(),
         2
+    );
+    assert_eq!(
+        recs.iter()
+            .filter(|record| record.message == NavMessage::QzssLnav)
+            .count(),
+        1
     );
     assert_eq!(
         recs.iter()
@@ -3071,8 +3080,8 @@ fn from_nav_keeps_only_healthy_supported_messages() {
     let recs = store.records();
     assert!(!recs.is_empty());
     // Every kept record is healthy and a supported single-frequency message:
-    // GPS LNAV, Galileo I/NAV, or BeiDou D1/D2. Galileo F/NAV and unhealthy
-    // satellites are dropped.
+    // GPS/QZSS LNAV, Galileo I/NAV, or BeiDou D1/D2. Galileo F/NAV and
+    // unhealthy satellites are dropped.
     assert!(
         recs.iter().all(|r| r.sv_health == 0.0),
         "unhealthy record kept"
@@ -3081,6 +3090,7 @@ fn from_nav_keeps_only_healthy_supported_messages() {
         recs.iter().all(|r| matches!(
             r.message,
             NavMessage::GpsLnav
+                | NavMessage::QzssLnav
                 | NavMessage::GalileoInav
                 | NavMessage::BeidouD1
                 | NavMessage::BeidouD2

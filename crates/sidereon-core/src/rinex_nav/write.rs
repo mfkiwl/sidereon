@@ -271,7 +271,7 @@ fn write_orbit_opt(out: &mut String, values: [Option<f64>; 4]) {
 
 fn message_token(message: NavMessage) -> &'static str {
     match message {
-        NavMessage::GpsLnav => "LNAV",
+        NavMessage::GpsLnav | NavMessage::QzssLnav => "LNAV",
         NavMessage::GpsCnav | NavMessage::QzssCnav => "CNAV",
         NavMessage::GpsCnav2 | NavMessage::QzssCnav2 => "CNV2",
         NavMessage::GalileoInav => "INAV",

@@ -1087,6 +1087,204 @@ fn build_glonass_ephemeris_from_scratch_round_trips() {
 }
 
 #[test]
+fn build_galileo_fnav_ephemeris_from_scratch_round_trips_and_evaluates() {
+    let eph = GalileoFnavEphemeris {
+        satellite_id: 11,
+        week_number: 1380,
+        iod_nav: 321,
+        sisa: 73,
+        idot: -120,
+        t_oc: 1200,
+        a_f2: -2,
+        a_f1: 3456,
+        a_f0: -456_789,
+        c_rs: -2000,
+        delta_n: 3200,
+        m0: -500_000_000,
+        c_uc: -120,
+        eccentricity: 85_899_345,
+        c_us: 145,
+        sqrt_a: 2_852_126_720,
+        t_oe: 1200,
+        c_ic: -55,
+        omega0: 400_000_000,
+        c_is: 42,
+        i0: 650_000_000,
+        c_rc: 9000,
+        omega: -300_000_000,
+        omega_dot: -2400,
+        bgd_e5a_e1: -8,
+        e5a_signal_health: 0,
+        e5a_data_validity: false,
+        reserved: 0,
+    };
+    let body = eph.encode();
+    assert_eq!(body.len(), 62);
+    let decoded = GalileoFnavEphemeris::decode(&body).unwrap();
+    assert_eq!(decoded, eph);
+    assert_eq!(decoded.encode(), body);
+    assert_round_trips(Message::GalileoFnavEphemeris(eph));
+    assert_broadcast_record_is_nontrivial(decoded.to_broadcast_record().unwrap());
+}
+
+#[test]
+fn build_galileo_inav_ephemeris_from_scratch_round_trips_and_evaluates() {
+    let eph = GalileoInavEphemeris {
+        satellite_id: 12,
+        week_number: 1380,
+        iod_nav: 322,
+        sisa_index: 74,
+        idot: -125,
+        t_oc: 1200,
+        a_f2: -1,
+        a_f1: 2345,
+        a_f0: -345_678,
+        c_rs: -2100,
+        delta_n: 3100,
+        m0: -450_000_000,
+        c_uc: -118,
+        eccentricity: 82_000_000,
+        c_us: 140,
+        sqrt_a: 2_852_126_720,
+        t_oe: 1200,
+        c_ic: -53,
+        omega0: 420_000_000,
+        c_is: 41,
+        i0: 650_000_000,
+        c_rc: 8800,
+        omega: -310_000_000,
+        omega_dot: -2300,
+        bgd_e5a_e1: -8,
+        bgd_e5b_e1: 6,
+        e5b_signal_health: 0,
+        e5b_data_validity: false,
+        e1b_signal_health: 0,
+        e1b_data_validity: false,
+        reserved: 0,
+    };
+    let body = eph.encode();
+    assert_eq!(body.len(), 63);
+    let decoded = GalileoInavEphemeris::decode(&body).unwrap();
+    assert_eq!(decoded, eph);
+    assert_eq!(decoded.encode(), body);
+    assert_round_trips(Message::GalileoInavEphemeris(eph));
+    assert_broadcast_record_is_nontrivial(decoded.to_broadcast_record().unwrap());
+}
+
+#[test]
+fn build_beidou_ephemeris_from_scratch_round_trips_and_evaluates() {
+    let eph = BeidouEphemeris {
+        satellite_id: 19,
+        week_number: 1070,
+        sv_urai: 2,
+        idot: 115,
+        aode: 17,
+        t_oc: 9000,
+        a_f2: -12,
+        a_f1: 45_000,
+        a_f0: -123_456,
+        aodc: 18,
+        c_rs: -12_000,
+        delta_n: 2200,
+        m0: 300_000_000,
+        c_uc: -11_000,
+        eccentricity: 70_000_000,
+        c_us: 10_000,
+        sqrt_a: 3_404_333_056,
+        t_oe: 9000,
+        c_ic: -9000,
+        omega0: -600_000_000,
+        c_is: 8500,
+        i0: 620_000_000,
+        c_rc: 11_500,
+        omega: 500_000_000,
+        omega_dot: -1800,
+        t_gd1: -16,
+        t_gd2: 12,
+        sv_health: false,
+    };
+    let body = eph.encode();
+    assert_eq!(body.len(), 64);
+    let decoded = BeidouEphemeris::decode(&body).unwrap();
+    assert_eq!(decoded, eph);
+    assert_eq!(decoded.encode(), body);
+    assert_round_trips(Message::BeidouEphemeris(eph));
+    assert_broadcast_record_is_nontrivial(decoded.to_broadcast_record().unwrap());
+}
+
+#[test]
+fn build_qzss_ephemeris_from_scratch_round_trips_and_evaluates() {
+    let eph = QzssEphemeris {
+        satellite_id: 2,
+        t_oc: 4500,
+        a_f2: -1,
+        a_f1: 1234,
+        a_f0: -234_567,
+        iode: 44,
+        c_rs: -1500,
+        delta_n: 2400,
+        m0: 250_000_000,
+        c_uc: -100,
+        eccentricity: 65_000_000,
+        c_us: 130,
+        sqrt_a: 2_701_770_752,
+        t_oe: 3000,
+        c_ic: -40,
+        omega0: 350_000_000,
+        c_is: 38,
+        i0: 610_000_000,
+        c_rc: 7100,
+        omega: -260_000_000,
+        omega_dot: -1600,
+        idot: 110,
+        codes_on_l2: 2,
+        week_number: 386,
+        ura: 1,
+        sv_health: 0,
+        t_gd: -4,
+        iodc: 44,
+        fit_interval: false,
+    };
+    let body = eph.encode();
+    assert_eq!(body.len(), 61);
+    let decoded = QzssEphemeris::decode(&body).unwrap();
+    assert_eq!(decoded, eph);
+    assert_eq!(decoded.encode(), body);
+    assert_round_trips(Message::QzssEphemeris(eph));
+    assert_broadcast_record_is_nontrivial(decoded.to_broadcast_record(2434).unwrap());
+}
+
+fn assert_broadcast_record_is_nontrivial(record: crate::rinex_nav::BroadcastRecord) {
+    use crate::spp::EphemerisSource;
+
+    assert!(record.elements.sqrt_a > 4000.0);
+    assert!(record.elements.e > 0.0);
+    assert!(record.elements.i0.abs() > 0.1);
+    let toe_continuous =
+        f64::from(record.toe.week) * crate::constants::SECONDS_PER_WEEK + record.toe.tow_s;
+    let query = if record.satellite_id.system == crate::id::GnssSystem::BeiDou {
+        toe_continuous
+            + crate::constants::GPST_MINUS_BDT_S
+            + crate::constants::BDS_EPOCH_MINUS_GPS_EPOCH_S
+            - crate::constants::GPS_EPOCH_TO_J2000_S
+    } else {
+        toe_continuous - crate::constants::GPS_EPOCH_TO_J2000_S
+    };
+    let store = crate::rinex_nav::BroadcastStore::new(vec![record]).unwrap();
+    let (position, clock) = store
+        .position_clock_at_j2000_s(record.satellite_id, query)
+        .expect("converted RTCM broadcast record evaluates at toe");
+    assert!(position.iter().all(|value| value.is_finite()));
+    assert!(clock.is_finite());
+    let radius =
+        (position[0] * position[0] + position[1] * position[1] + position[2] * position[2]).sqrt();
+    assert!(
+        (20_000_000.0..=50_000_000.0).contains(&radius),
+        "broadcast radius {radius}"
+    );
+}
+
+#[test]
 fn build_msm4_from_scratch_round_trips() {
     let satellites = vec![
         MsmSatellite {
@@ -1186,6 +1384,10 @@ fn message_enum_is_matched_exhaustively_without_wildcard() {
         Message::AntennaDescriptor(a) => a.message_number,
         Message::GpsEphemeris(_) => 1019,
         Message::GlonassEphemeris(_) => 1020,
+        Message::BeidouEphemeris(_) => 1042,
+        Message::QzssEphemeris(_) => 1044,
+        Message::GalileoFnavEphemeris(_) => 1045,
+        Message::GalileoInavEphemeris(_) => 1046,
         Message::Ssr(s) => s.message_number,
         Message::Unsupported(u) => u.message_number,
     };
