@@ -6,7 +6,7 @@
 //! measurement model lives in [`super::model`], the dense normal-equation kernel
 //! in [`super::normal`], and the row staging / shared scalar helpers in [`super`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ambiguity::AmbiguityId;
 use crate::astro::math::vec3;
@@ -21,10 +21,11 @@ use super::normal::{
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
 use super::temporal::{estimate_temporal_correlation, temporal_position_covariance};
 use super::{
-    estimates_ztd, max_abs, rms, state_from_solution, validate_fixed_solve_boundary, weighted_rms,
-    ztd_unknown_count, AmbiguitySearch, FixedIntegerMetadata, FixedSolution, FixedSolveConfig,
-    FixedSolveError, FloatEpoch, FloatSolution, FloatSolveError, FloatSolveOptions, FloatState,
-    FloatStatus, IntegerStatus, ModelContext, TroposphereOptions,
+    apply_elevation_cutoff, estimates_ztd, max_abs, rms, state_from_solution,
+    validate_fixed_solve_boundary, weighted_rms, ztd_unknown_count, AmbiguitySearch,
+    FixedIntegerMetadata, FixedSolution, FixedSolveConfig, FixedSolveError, FloatEpoch,
+    FloatSolution, FloatSolveError, FloatSolveOptions, FloatState, FloatStatus, IntegerStatus,
+    ModelContext, TroposphereOptions,
 };
 
 /// Search integer ambiguities from an existing float PPP solution and re-solve
@@ -73,13 +74,30 @@ pub(crate) fn run_fixed_from_float(
     config: FixedSolveConfig,
 ) -> Result<FixedSolution, FixedSolveError> {
     validate_fixed_solve_boundary(epochs, &float_solution, &config)?;
-    let fixed_meta = search_integer_ambiguities(source, epochs, &float_solution, &config)?;
+    let initial_state = fixed_state_from_float(&float_solution);
+    let filtered_epochs;
+    let solve_epochs = if let Some(cutoff_deg) = config.elevation_cutoff_deg {
+        filtered_epochs =
+            apply_elevation_cutoff(source, epochs, &initial_state, cutoff_deg, config.tropo)
+                .map_err(FixedSolveError::Float)?;
+        filtered_epochs.as_slice()
+    } else {
+        epochs
+    };
+    let active_order;
+    let search_order = if config.elevation_cutoff_deg.is_some() {
+        active_order = active_ambiguity_ids(solve_epochs);
+        Some(active_order.as_slice())
+    } else {
+        None
+    };
+    let fixed_meta =
+        search_integer_ambiguities(source, solve_epochs, &float_solution, &config, search_order)?;
     let fixed_m = fixed_ambiguities_m(
         &fixed_meta.fixed_cycles,
         &config.ambiguity.wavelengths_m,
         &config.ambiguity.offsets_m,
     )?;
-    let initial_state = fixed_state_from_float(&float_solution);
     let ctx = ModelContext {
         source,
         weights: config.weights,
@@ -87,8 +105,15 @@ pub(crate) fn run_fixed_from_float(
         corrections: &config.corrections,
         normal: recipe.normal,
     };
-    let resolve = iterate_fixed_multi(ctx, epochs, &fixed_m, initial_state, config.opts, 1)?;
-    finalize_fixed_multi(ctx, epochs, fixed_meta, fixed_m, float_solution, resolve)
+    let resolve = iterate_fixed_multi(ctx, solve_epochs, &fixed_m, initial_state, config.opts, 1)?;
+    finalize_fixed_multi(
+        ctx,
+        solve_epochs,
+        fixed_meta,
+        fixed_m,
+        float_solution,
+        resolve,
+    )
 }
 
 struct FixedSearchResult {
@@ -117,12 +142,18 @@ fn search_integer_ambiguities(
     epochs: &[FloatEpoch],
     float_solution: &FloatSolution,
     config: &FixedSolveConfig,
+    active_order: Option<&[AmbiguityId]>,
 ) -> Result<FixedSearchResult, FixedSolveError> {
-    let order: Vec<AmbiguityId> = float_solution
-        .used_sats
-        .iter()
-        .map(|sat| AmbiguityId::new(sat.clone()))
-        .collect();
+    let order: Vec<AmbiguityId> = active_order.map_or_else(
+        || {
+            float_solution
+                .used_sats
+                .iter()
+                .map(|sat| AmbiguityId::new(sat.clone()))
+                .collect()
+        },
+        |order| order.to_vec(),
+    );
     let covariance_cycles =
         ambiguity_covariance_cycles(source, epochs, &order, float_solution, config)?;
     let float_cycles = float_ambiguities_cycles(
@@ -167,6 +198,19 @@ fn search_integer_ambiguities(
             },
         },
     })
+}
+
+fn active_ambiguity_ids(epochs: &[FloatEpoch]) -> Vec<AmbiguityId> {
+    epochs
+        .iter()
+        .flat_map(|e| {
+            e.observations
+                .iter()
+                .map(|o| AmbiguityId::new(o.ambiguity_id.clone()))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn iterate_fixed_multi(

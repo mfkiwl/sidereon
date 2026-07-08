@@ -247,11 +247,11 @@ pub mod defaults {
     pub const RATIO_THRESHOLD: f64 = 3.0;
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::constants::F_L1_HZ;
 use crate::estimation::recipe::NormalRecipe;
-use crate::observables::{ObservableEphemerisSource, ObservablesError, PredictOptions};
+use crate::observables::{predict, ObservableEphemerisSource, ObservablesError, PredictOptions};
 use crate::ppp_corrections::{
     self, PppCorrectionEpoch, PppCorrectionObservation, PppCorrectionsError, PppCorrectionsOptions,
 };
@@ -358,6 +358,18 @@ fn invalid_clock_count(expected: usize, actual: usize) -> FloatSolveError {
 
 fn invalid_solve_option(field: &'static str, reason: &'static str) -> FloatSolveError {
     FloatSolveError::InvalidSolveOption { field, reason }
+}
+
+fn insufficient_after_elevation_cutoff(
+    cutoff_deg: f64,
+    retained_observations: usize,
+    required_observations: usize,
+) -> FloatSolveError {
+    FloatSolveError::InsufficientObservationsAfterElevationCutoff {
+        cutoff_deg,
+        retained_observations,
+        required_observations,
+    }
 }
 
 pub(super) fn invalid_input(error: FieldError) -> FloatSolveError {
@@ -683,6 +695,7 @@ fn validate_float_config(config: &FloatSolveConfig) -> Result<(), FloatSolveErro
         config.tropo,
         &config.corrections,
         config.opts,
+        config.elevation_cutoff_deg,
     )
 }
 
@@ -692,6 +705,7 @@ fn validate_fixed_config(config: &FixedSolveConfig) -> Result<(), FixedSolveErro
         config.tropo,
         &config.corrections,
         config.opts,
+        config.elevation_cutoff_deg,
     )
     .map_err(FixedSolveError::Float)?;
     validate_fixed_ambiguity_options(&config.ambiguity)
@@ -702,11 +716,21 @@ fn validate_common_config(
     tropo: TroposphereOptions,
     corrections: &RangeCorrections,
     opts: FloatSolveOptions,
+    elevation_cutoff_deg: Option<f64>,
 ) -> Result<(), FloatSolveError> {
     validate_measurement_weights(weights)?;
     validate_troposphere_options(tropo)?;
     validate_range_corrections(corrections)?;
+    validate_elevation_cutoff(elevation_cutoff_deg)?;
     validate_float_solve_options(opts)
+}
+
+fn validate_elevation_cutoff(cutoff_deg: Option<f64>) -> Result<(), FloatSolveError> {
+    if let Some(cutoff_deg) = cutoff_deg {
+        validate::finite_in_range(cutoff_deg, -90.0, 90.0, "elevation_cutoff_deg")
+            .map_err(invalid_input)?;
+    }
+    Ok(())
 }
 
 fn validate_measurement_weights(weights: MeasurementWeights) -> Result<(), FloatSolveError> {
@@ -909,6 +933,71 @@ fn estimates_ztd(tropo: TroposphereOptions) -> bool {
 
 fn ztd_unknown_count(tropo: TroposphereOptions) -> usize {
     usize::from(estimates_ztd(tropo))
+}
+
+/// Apply the optional PPP elevation cutoff at the solve boundary: after input
+/// validation and before active ambiguity ids, residual rows, normal rows, or
+/// fixed ambiguity-search covariance rows are assembled.
+fn apply_elevation_cutoff(
+    source: &dyn ObservableEphemerisSource,
+    epochs: &[FloatEpoch],
+    state: &FloatState,
+    cutoff_deg: f64,
+    tropo: TroposphereOptions,
+) -> Result<Vec<FloatEpoch>, FloatSolveError> {
+    let mut retained = Vec::with_capacity(epochs.len());
+    for (epoch_idx, epoch) in epochs.iter().enumerate() {
+        let mut observations = Vec::with_capacity(epoch.observations.len());
+        for obs in &epoch.observations {
+            let options = predict_default(source, obs)?;
+            let pred = predict(
+                source,
+                obs.sat,
+                state.position_m,
+                epoch.t_rx_j2000_s,
+                options,
+            )
+            .map_err(|e| no_ephemeris(obs, e))?;
+            validate::finite(pred.elevation_deg, "ppp predicted elevation_deg")
+                .map_err(invalid_input)?;
+            if pred.elevation_deg >= cutoff_deg {
+                observations.push(obs.clone());
+            }
+        }
+        let mut epoch = epoch.clone();
+        epoch.observations = observations;
+        retained.push(epoch);
+        debug_assert_eq!(retained.len(), epoch_idx + 1);
+    }
+    validate_elevation_cutoff_retained(&retained, cutoff_deg, tropo)?;
+    Ok(retained)
+}
+
+fn validate_elevation_cutoff_retained(
+    epochs: &[FloatEpoch],
+    cutoff_deg: f64,
+    tropo: TroposphereOptions,
+) -> Result<(), FloatSolveError> {
+    let retained_observations = epochs.iter().map(|e| e.observations.len()).sum::<usize>();
+    let active_sats = epochs
+        .iter()
+        .flat_map(|e| e.observations.iter().map(|o| o.ambiguity_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let unknowns = crate::estimation::substrate::parameters::ParameterLayout::ppp(
+        epochs.len(),
+        ztd_unknown_count(tropo),
+        active_sats.len(),
+    )
+    .dim();
+    let required_observations = unknowns.div_ceil(2).max(4);
+    if active_sats.len() < 4 || retained_observations < required_observations {
+        return Err(insufficient_after_elevation_cutoff(
+            cutoff_deg,
+            retained_observations,
+            required_observations,
+        ));
+    }
+    Ok(())
 }
 
 fn rms(values: &[f64]) -> f64 {

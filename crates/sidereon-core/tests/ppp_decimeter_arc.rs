@@ -681,6 +681,7 @@ fn full_stack_config_mapping(
             ambiguity_tolerance_m: 1.0e-4,
             ztd_tolerance_m: 1.0e-4,
         },
+        elevation_cutoff_deg: None,
         residual_screen: false,
     }
 }

@@ -334,6 +334,14 @@ pub struct FloatSolveConfig {
     pub tropo: TroposphereOptions,
     pub corrections: RangeCorrections,
     pub opts: FloatSolveOptions,
+    /// Optional PPP observation elevation cutoff in degrees.
+    ///
+    /// `None` preserves the historical observation set. When set, the static
+    /// solver predicts each observation's elevation at the seed receiver
+    /// position and removes observations below the cutoff before active
+    /// ambiguity ids, residual rows, normal rows, or fixed ambiguity search are
+    /// assembled.
+    pub elevation_cutoff_deg: Option<f64>,
     pub residual_screen: bool,
 }
 
@@ -661,6 +669,11 @@ pub enum FloatSolveError {
         field: &'static str,
         reason: &'static str,
     },
+    InsufficientObservationsAfterElevationCutoff {
+        cutoff_deg: f64,
+        retained_observations: usize,
+        required_observations: usize,
+    },
     MissingAmbiguity(String),
     MissingCorrection {
         satellite_id: String,
@@ -689,6 +702,14 @@ impl core::fmt::Display for FloatSolveError {
             Self::InvalidInput { field, reason } => {
                 write!(f, "invalid PPP input {field}: {reason}")
             }
+            Self::InsufficientObservationsAfterElevationCutoff {
+                cutoff_deg,
+                retained_observations,
+                required_observations,
+            } => write!(
+                f,
+                "PPP elevation cutoff {cutoff_deg} deg retained {retained_observations} observations; at least {required_observations} are required"
+            ),
             Self::MissingAmbiguity(id) => write!(f, "missing PPP ambiguity {id}"),
             Self::MissingCorrection {
                 satellite_id,
@@ -772,6 +793,12 @@ pub struct FixedSolveConfig {
     pub tropo: TroposphereOptions,
     pub corrections: RangeCorrections,
     pub opts: FloatSolveOptions,
+    /// Optional PPP observation elevation cutoff in degrees.
+    ///
+    /// `None` preserves the historical observation set. When set, the fixed
+    /// path applies the cutoff before active ambiguity ids, integer covariance
+    /// assembly, residual rows, and normal rows are built.
+    pub elevation_cutoff_deg: Option<f64>,
     pub ambiguity: FixedAmbiguityOptions,
 }
 

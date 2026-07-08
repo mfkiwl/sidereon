@@ -183,6 +183,7 @@ fn float_config(input: &Input) -> FloatSolveConfig {
             ambiguity_tolerance_m: input.scalars[4],
             ztd_tolerance_m: input.scalars[5],
         },
+        elevation_cutoff_deg: None,
         residual_screen: input.bits[4] & 1 == 1,
     }
 }
@@ -394,6 +395,7 @@ fuzz_target!(|data: &[u8]| {
         tropo: config.tropo,
         corrections: config.corrections.clone(),
         opts: config.opts,
+        elevation_cutoff_deg: None,
         ambiguity: FixedAmbiguityOptions {
             wavelengths_m: epoch
                 .observations

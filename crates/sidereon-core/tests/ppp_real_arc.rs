@@ -268,6 +268,7 @@ fn float_config(
             ambiguity_tolerance_m: 1.0e-4,
             ztd_tolerance_m: 1.0e-4,
         },
+        elevation_cutoff_deg: None,
         residual_screen: false,
     }
 }
@@ -294,6 +295,7 @@ fn fixed_config(
             ambiguity_tolerance_m: 1.0e-4,
             ztd_tolerance_m: 1.0e-4,
         },
+        elevation_cutoff_deg: None,
         ambiguity: FixedAmbiguityOptions {
             wavelengths_m,
             offsets_m,
