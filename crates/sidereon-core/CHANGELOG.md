@@ -13,6 +13,8 @@ All notable changes to `sidereon-core` are documented here.
   observation set.
 - optional tropospheric horizontal gradient estimation for static PPP (off by
   default).
+- static multi-epoch positioning (`solve_static`) is now public, with
+  covariance, leave-one-out redundancy diagnostics, and robust weighting.
 
 ## [0.22.0]
 
