@@ -521,6 +521,7 @@ impl Finite for sidereon_core::precise_positioning::FloatSolution {
         self.position_m.push_finite_values(out);
         self.position_covariance.push_finite_values(out);
         self.formal_position_covariance.push_finite_values(out);
+        self.temporal_position_covariance.push_finite_values(out);
         out.extend(self.epoch_clocks_m.iter().copied());
         out.extend(self.ambiguities_m.values().copied());
         self.ztd_residual_m.push_finite_values(out);
@@ -528,10 +529,18 @@ impl Finite for sidereon_core::precise_positioning::FloatSolution {
         out.extend([
             self.posterior_variance_factor,
             self.position_covariance_scale_factor,
+            self.temporal_position_covariance_scale_factor,
+            self.temporal_correlation.lag1_autocorrelation,
+            self.temporal_correlation.decorrelation_time_epochs,
+            self.temporal_correlation.effective_sample_count,
+            self.temporal_correlation.variance_inflation_factor,
             self.code_rms_m,
             self.phase_rms_m,
             self.weighted_rms_m,
         ]);
+        self.temporal_correlation
+            .decorrelation_time_s
+            .push_finite_values(out);
     }
 }
 
@@ -540,6 +549,7 @@ impl Finite for sidereon_core::precise_positioning::FixedSolution {
         self.position_m.push_finite_values(out);
         self.position_covariance.push_finite_values(out);
         self.formal_position_covariance.push_finite_values(out);
+        self.temporal_position_covariance.push_finite_values(out);
         out.extend(self.epoch_clocks_m.iter().copied());
         out.extend(self.fixed_ambiguities_m.values().copied());
         self.ztd_residual_m.push_finite_values(out);
@@ -548,12 +558,20 @@ impl Finite for sidereon_core::precise_positioning::FixedSolution {
         out.extend([
             self.posterior_variance_factor,
             self.position_covariance_scale_factor,
+            self.temporal_position_covariance_scale_factor,
+            self.temporal_correlation.lag1_autocorrelation,
+            self.temporal_correlation.decorrelation_time_epochs,
+            self.temporal_correlation.effective_sample_count,
+            self.temporal_correlation.variance_inflation_factor,
             self.code_rms_m,
             self.phase_rms_m,
             self.weighted_rms_m,
             self.integer.integer_ratio,
             self.integer.integer_best_score,
         ]);
+        self.temporal_correlation
+            .decorrelation_time_s
+            .push_finite_values(out);
         self.integer
             .integer_second_best_score
             .push_finite_values(out);
