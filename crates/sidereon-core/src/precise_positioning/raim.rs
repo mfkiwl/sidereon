@@ -129,6 +129,7 @@
 //! #         ztd_tolerance_m: 1.0e-7,
 //! #     },
 //! #     residual_screen: false,
+//! #     elevation_cutoff_deg: None,
 //! # };
 //! let result = solve_float_epoch_with_raim(
 //! #   &source,
