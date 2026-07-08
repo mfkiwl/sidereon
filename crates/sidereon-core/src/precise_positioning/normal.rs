@@ -32,6 +32,8 @@ pub(super) type Row = ResidualRow;
 pub(super) struct PppPositionCovariance {
     pub(super) scaled: crate::dop::PositionCovariance,
     pub(super) formal: crate::dop::PositionCovariance,
+    pub(super) tropo_gradient_scaled_m2: Option<[[f64; 2]; 2]>,
+    pub(super) tropo_gradient_formal_m2: Option<[[f64; 2]; 2]>,
     pub(super) posterior_variance_factor: f64,
     pub(super) covariance_scale_factor: f64,
 }
@@ -40,27 +42,45 @@ pub(super) struct PppPositionCovariance {
 pub(super) struct PppNormalLayout {
     n_epochs: usize,
     n_ztd: usize,
+    n_tropo_gradients: usize,
+    n_residual_ionosphere: usize,
     n_ambiguities: usize,
 }
 
 impl PppNormalLayout {
-    pub(super) const fn new(n_epochs: usize, n_ztd: usize, n_ambiguities: usize) -> Self {
+    pub(super) const fn new(
+        n_epochs: usize,
+        n_ztd: usize,
+        n_tropo_gradients: usize,
+        n_residual_ionosphere: usize,
+        n_ambiguities: usize,
+    ) -> Self {
         Self {
             n_epochs,
             n_ztd,
+            n_tropo_gradients,
+            n_residual_ionosphere,
             n_ambiguities,
         }
     }
 
     pub(super) const fn full_dim(&self) -> usize {
-        3 + self.n_epochs + self.n_ztd + self.n_ambiguities
+        3 + self.n_epochs
+            + self.n_ztd
+            + self.n_tropo_gradients
+            + self.n_residual_ionosphere
+            + self.n_ambiguities
     }
 
     pub(super) const fn reduced_dim(&self) -> usize {
-        3 + self.n_ztd + self.n_ambiguities
+        3 + self.n_ztd + self.n_tropo_gradients + self.n_residual_ionosphere + self.n_ambiguities
     }
 
     pub(super) const fn reduced_ambiguity_offset(&self) -> usize {
+        3 + self.n_ztd + self.n_tropo_gradients + self.n_residual_ionosphere
+    }
+
+    const fn reduced_tropo_gradient_offset(&self) -> usize {
         3 + self.n_ztd
     }
 
@@ -123,6 +143,7 @@ pub(super) fn ppp_position_covariance(
 ) -> Result<PppPositionCovariance, FloatSolveError> {
     let (normal, _) = clock_eliminated_normal_equations(rows, layout)?;
     let ecef_m2 = position_covariance_ecef_m2(&normal)?;
+    let tropo_gradient_formal_m2 = tropo_gradient_covariance_m2(&normal, layout)?;
     let receiver = ItrfPositionM::new(position_m[0], position_m[1], position_m[2])
         .map_err(|_| FloatSolveError::SingularGeometry)?;
     let geodetic = itrf_to_geodetic(receiver).map_err(|_| FloatSolveError::SingularGeometry)?;
@@ -133,9 +154,13 @@ pub(super) fn ppp_position_covariance(
     let posterior_variance_factor = posterior_variance_factor(rows, layout)?;
     let covariance_scale_factor = posterior_variance_factor;
     let scaled = scale_position_covariance(formal, covariance_scale_factor);
+    let tropo_gradient_scaled_m2 =
+        tropo_gradient_formal_m2.map(|covariance| scale_2x2(covariance, covariance_scale_factor));
     Ok(PppPositionCovariance {
         scaled,
         formal,
+        tropo_gradient_scaled_m2,
+        tropo_gradient_formal_m2,
         posterior_variance_factor,
         covariance_scale_factor,
     })
@@ -191,6 +216,15 @@ fn scale_3x3(mut matrix: [[f64; 3]; 3], factor: f64) -> [[f64; 3]; 3] {
     matrix
 }
 
+fn scale_2x2(mut matrix: [[f64; 2]; 2], factor: f64) -> [[f64; 2]; 2] {
+    for row in &mut matrix {
+        for value in row {
+            *value *= factor;
+        }
+    }
+    matrix
+}
+
 fn position_covariance_ecef_m2(normal: &[Vec<f64>]) -> Result<[[f64; 3]; 3], FloatSolveError> {
     if normal.len() < 3 {
         return Err(FloatSolveError::SingularGeometry);
@@ -220,6 +254,27 @@ fn position_covariance_ecef_m2(normal: &[Vec<f64>]) -> Result<[[f64; 3]; 3], Flo
     Ok(ecef_m2)
 }
 
+fn tropo_gradient_covariance_m2(
+    normal: &[Vec<f64>],
+    layout: PppNormalLayout,
+) -> Result<Option<[[f64; 2]; 2]>, FloatSolveError> {
+    if layout.n_tropo_gradients == 0 {
+        return Ok(None);
+    }
+    if layout.n_tropo_gradients != 2 {
+        return Err(FloatSolveError::SingularGeometry);
+    }
+    let start = layout.reduced_tropo_gradient_offset();
+    let covariance = covariance_block_from_normal(normal, start, 2)
+        .map_err(|_| FloatSolveError::SingularGeometry)?;
+    let mut out = [
+        [covariance[0][0], covariance[0][1]],
+        [covariance[1][0], covariance[1][1]],
+    ];
+    symmetrize_2x2(&mut out);
+    Ok(Some(out))
+}
+
 #[allow(clippy::needless_range_loop)]
 fn symmetrize_square(matrix: &mut [Vec<f64>]) {
     for i in 0..matrix.len() {
@@ -240,6 +295,12 @@ fn symmetrize_3x3(matrix: &mut [[f64; 3]; 3]) {
             matrix[j][i] = symmetric;
         }
     }
+}
+
+fn symmetrize_2x2(matrix: &mut [[f64; 2]; 2]) {
+    let symmetric = 0.5 * (matrix[0][1] + matrix[1][0]);
+    matrix[0][1] = symmetric;
+    matrix[1][0] = symmetric;
 }
 
 fn solve_clock_eliminated_last_tie(rows: &[Row], layout: PppNormalLayout) -> Option<Vec<f64>> {
@@ -420,17 +481,45 @@ pub(super) fn ambiguity_covariance_from_normal(
     start: usize,
     n_ambiguities: usize,
 ) -> Result<Vec<Vec<f64>>, FixedSolveError> {
-    let a = submatrix(normal, 0, start, 0, start);
-    let b = submatrix(normal, 0, start, start, n_ambiguities);
-    let c = submatrix(normal, start, n_ambiguities, start, n_ambiguities);
-    let a_inv_b = solve_matrix_last_tie(&a, &b)
-        .ok_or(FixedSolveError::Float(FloatSolveError::SingularGeometry))?;
-    let b_t = transpose(&b).ok_or(FixedSolveError::Float(FloatSolveError::SingularGeometry))?;
-    let bt_a_inv_b =
-        matmul(&b_t, &a_inv_b).ok_or(FixedSolveError::Float(FloatSolveError::SingularGeometry))?;
-    let schur = matrix_sub(&c, &bt_a_inv_b)
-        .ok_or(FixedSolveError::Float(FloatSolveError::SingularGeometry))?;
-    invert_matrix_last_tie(&schur).ok_or(FixedSolveError::Float(FloatSolveError::SingularGeometry))
+    covariance_block_from_normal(normal, start, n_ambiguities)
+        .map_err(|_| FixedSolveError::Float(FloatSolveError::SingularGeometry))
+}
+
+fn covariance_block_from_normal(
+    normal: &[Vec<f64>],
+    start: usize,
+    count: usize,
+) -> Result<Vec<Vec<f64>>, ()> {
+    if count == 0 || start + count > normal.len() {
+        return Err(());
+    }
+    for row in normal {
+        if row.len() != normal.len() {
+            return Err(());
+        }
+    }
+    let other = (0..normal.len())
+        .filter(|idx| *idx < start || *idx >= start + count)
+        .collect::<Vec<_>>();
+    let block = (start..start + count).collect::<Vec<_>>();
+    if other.is_empty() {
+        return invert_matrix_last_tie(&indexed_submatrix(normal, &block, &block)).ok_or(());
+    }
+    let a = indexed_submatrix(normal, &other, &other);
+    let b = indexed_submatrix(normal, &other, &block);
+    let c = indexed_submatrix(normal, &block, &block);
+    let a_inv_b = solve_matrix_last_tie(&a, &b).ok_or(())?;
+    let b_t = transpose(&b).ok_or(())?;
+    let bt_a_inv_b = matmul(&b_t, &a_inv_b).ok_or(())?;
+    let mut schur = matrix_sub(&c, &bt_a_inv_b).ok_or(())?;
+    symmetrize_square(&mut schur);
+    invert_matrix_last_tie(&schur).ok_or(())
+}
+
+fn indexed_submatrix(matrix: &[Vec<f64>], rows: &[usize], cols: &[usize]) -> Vec<Vec<f64>> {
+    rows.iter()
+        .map(|&row| cols.iter().map(|&col| matrix[row][col]).collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -441,7 +530,7 @@ mod tests {
     fn ppp_clock_elimination_matches_unreduced_dense_solve() {
         let n_epochs = 10;
         let n_ambiguities = 6;
-        let layout = PppNormalLayout::new(n_epochs, 1, n_ambiguities);
+        let layout = PppNormalLayout::new(n_epochs, 1, 0, 0, n_ambiguities);
         let rows = ppp_schur_rows(n_epochs, n_ambiguities);
         let dense = NormalAssembler::new(NormalRecipe::PppDenseLastTie)
             .solve_dense_last_tie(rows.iter().map(Row::as_weighted), layout.full_dim())
@@ -465,7 +554,7 @@ mod tests {
     fn ppp_position_covariance_matches_unreduced_dense_inverse() {
         let n_epochs = 10;
         let n_ambiguities = 6;
-        let layout = PppNormalLayout::new(n_epochs, 1, n_ambiguities);
+        let layout = PppNormalLayout::new(n_epochs, 1, 0, 0, n_ambiguities);
         let rows = ppp_schur_rows(n_epochs, n_ambiguities);
 
         // Dense oracle: assemble the full unreduced normal matrix, invert it,
@@ -516,7 +605,7 @@ mod tests {
     fn ppp_posterior_variance_factor_counts_eliminated_clocks() {
         let n_epochs = 10;
         let n_ambiguities = 6;
-        let layout = PppNormalLayout::new(n_epochs, 1, n_ambiguities);
+        let layout = PppNormalLayout::new(n_epochs, 1, 0, 0, n_ambiguities);
         let rows = ppp_schur_rows(n_epochs, n_ambiguities);
         let weighted_ssr = rows
             .iter()

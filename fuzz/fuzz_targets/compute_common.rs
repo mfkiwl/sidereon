@@ -525,6 +525,11 @@ impl Finite for sidereon_core::precise_positioning::FloatSolution {
         out.extend(self.epoch_clocks_m.iter().copied());
         out.extend(self.ambiguities_m.values().copied());
         self.ztd_residual_m.push_finite_values(out);
+        self.tropo_gradient_north_m.push_finite_values(out);
+        self.tropo_gradient_east_m.push_finite_values(out);
+        self.tropo_gradient_covariance_m2.push_finite_values(out);
+        self.formal_tropo_gradient_covariance_m2
+            .push_finite_values(out);
         self.residuals_m.push_finite_values(out);
         out.extend([
             self.posterior_variance_factor,
@@ -553,6 +558,11 @@ impl Finite for sidereon_core::precise_positioning::FixedSolution {
         out.extend(self.epoch_clocks_m.iter().copied());
         out.extend(self.fixed_ambiguities_m.values().copied());
         self.ztd_residual_m.push_finite_values(out);
+        self.tropo_gradient_north_m.push_finite_values(out);
+        self.tropo_gradient_east_m.push_finite_values(out);
+        self.tropo_gradient_covariance_m2.push_finite_values(out);
+        self.formal_tropo_gradient_covariance_m2
+            .push_finite_values(out);
         self.float_solution.push_finite_values(out);
         self.residuals_m.push_finite_values(out);
         out.extend([

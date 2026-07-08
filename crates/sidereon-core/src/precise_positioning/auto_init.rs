@@ -301,6 +301,9 @@ where
         clocks_m,
         ambiguities_m: initial_ambiguities(epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     })
 }
 
@@ -556,6 +559,7 @@ mod tests {
             opts: FloatSolveOptions::default(),
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         }
     }
 
@@ -576,6 +580,7 @@ mod tests {
                 offsets_m,
                 ratio_threshold: super::super::defaults::RATIO_THRESHOLD,
             },
+            estimate_residual_ionosphere: false,
         }
     }
 

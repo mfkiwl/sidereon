@@ -52,6 +52,13 @@ pub struct FloatState {
     pub clocks_m: Vec<f64>,
     pub ambiguities_m: BTreeMap<String, f64>,
     pub ztd_m: f64,
+    /// North horizontal troposphere gradient state, in metres.
+    pub tropo_gradient_north_m: f64,
+    /// East horizontal troposphere gradient state, in metres.
+    pub tropo_gradient_east_m: f64,
+    /// Optional post-combination residual ionosphere states, keyed by ambiguity
+    /// arc and expressed in metres on the ionosphere-free observable.
+    pub residual_ionosphere_m: BTreeMap<String, f64>,
 }
 
 /// Measurement weighting options. Values are inverse sigmas, matching Sidereon'
@@ -94,6 +101,10 @@ impl Default for FloatSolveOptions {
 pub struct TroposphereOptions {
     pub enabled: bool,
     pub estimate_ztd: bool,
+    /// Estimate constant north/east horizontal tropospheric gradients over a
+    /// static PPP arc. This can help at sites with strong horizontal delay
+    /// gradients, but is off by default because it adds two solve states.
+    pub estimate_tropo_gradients: bool,
     pub met: Met,
     /// Mapping function applied to the zenith delays and the estimated ZTD.
     pub mapping: TropoMapping,
@@ -104,6 +115,7 @@ impl TroposphereOptions {
         Self {
             enabled: false,
             estimate_ztd: false,
+            estimate_tropo_gradients: false,
             met: Met::new_unchecked(1013.25, 288.15, 0.5),
             mapping: TropoMapping::Niell,
         }
@@ -343,6 +355,11 @@ pub struct FloatSolveConfig {
     /// assembled.
     pub elevation_cutoff_deg: Option<f64>,
     pub residual_screen: bool,
+    /// Estimate one post-combination residual ionosphere state per ambiguity
+    /// arc. This is disabled by default in repository configs and is intended
+    /// for diagnosing residual dispersive error after ionosphere-free
+    /// combination.
+    pub estimate_residual_ionosphere: bool,
 }
 
 /// Indexed static PPP correction lookup tables.
@@ -631,7 +648,17 @@ pub struct FloatSolution {
     pub temporal_correlation: TemporalCorrelationSummary,
     pub epoch_clocks_m: Vec<f64>,
     pub ambiguities_m: BTreeMap<String, f64>,
+    pub residual_ionosphere_m: BTreeMap<String, f64>,
     pub ztd_residual_m: Option<f64>,
+    /// Estimated north horizontal troposphere gradient, in metres.
+    pub tropo_gradient_north_m: Option<f64>,
+    /// Estimated east horizontal troposphere gradient, in metres.
+    pub tropo_gradient_east_m: Option<f64>,
+    /// Posterior covariance of north/east troposphere gradients, in square
+    /// metres, scaled by [`Self::position_covariance_scale_factor`].
+    pub tropo_gradient_covariance_m2: Option<[[f64; 2]; 2]>,
+    /// Unscaled formal covariance of north/east troposphere gradients.
+    pub formal_tropo_gradient_covariance_m2: Option<[[f64; 2]; 2]>,
     pub residuals_m: Vec<FloatResidual>,
     pub used_sats: Vec<String>,
     pub iterations: usize,
@@ -800,6 +827,9 @@ pub struct FixedSolveConfig {
     /// assembly, residual rows, and normal rows are built.
     pub elevation_cutoff_deg: Option<f64>,
     pub ambiguity: FixedAmbiguityOptions,
+    /// Estimate one post-combination residual ionosphere state per ambiguity
+    /// arc during the fixed re-solve.
+    pub estimate_residual_ionosphere: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -875,7 +905,17 @@ pub struct FixedSolution {
     pub epoch_clocks_m: Vec<f64>,
     pub fixed_ambiguities_cycles: BTreeMap<String, i64>,
     pub fixed_ambiguities_m: BTreeMap<String, f64>,
+    pub residual_ionosphere_m: BTreeMap<String, f64>,
     pub ztd_residual_m: Option<f64>,
+    /// Estimated north horizontal troposphere gradient, in metres.
+    pub tropo_gradient_north_m: Option<f64>,
+    /// Estimated east horizontal troposphere gradient, in metres.
+    pub tropo_gradient_east_m: Option<f64>,
+    /// Posterior covariance of north/east troposphere gradients, in square
+    /// metres, scaled by [`Self::position_covariance_scale_factor`].
+    pub tropo_gradient_covariance_m2: Option<[[f64; 2]; 2]>,
+    /// Unscaled formal covariance of north/east troposphere gradients.
+    pub formal_tropo_gradient_covariance_m2: Option<[[f64; 2]; 2]>,
     pub float_solution: FloatSolution,
     pub residuals_m: Vec<FloatResidual>,
     pub used_sats: Vec<String>,

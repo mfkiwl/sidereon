@@ -11,6 +11,8 @@ All notable changes to `sidereon-core` are documented here.
   elevation cutoff are removed before ambiguity ids, residual rows, normal rows,
   and fixed ambiguity search are assembled. `None` preserves the existing
   observation set.
+- optional tropospheric horizontal gradient estimation for static PPP (off by
+  default).
 
 ## [0.22.0]
 

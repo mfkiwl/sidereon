@@ -191,6 +191,9 @@ fn initial_state(epochs: &[FloatEpoch], approx: [f64; 3]) -> FloatState {
         clocks_m: vec![0.0; epochs.len()],
         ambiguities_m: initial_ambiguities(epochs),
         ztd_m: 0.0,
+        tropo_gradient_north_m: 0.0,
+        tropo_gradient_east_m: 0.0,
+        residual_ionosphere_m: BTreeMap::new(),
     }
 }
 
@@ -221,6 +224,7 @@ fn float_config() -> FloatSolveConfig {
         },
         elevation_cutoff_deg: None,
         residual_screen: false,
+        estimate_residual_ionosphere: false,
     }
 }
 

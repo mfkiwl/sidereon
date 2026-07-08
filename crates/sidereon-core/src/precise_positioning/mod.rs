@@ -295,6 +295,9 @@ impl FloatState {
             clocks_m: vec![0.0; epochs.len()],
             ambiguities_m: BTreeMap::new(),
             ztd_m: 0.0,
+            tropo_gradient_north_m: 0.0,
+            tropo_gradient_east_m: 0.0,
+            residual_ionosphere_m: BTreeMap::new(),
         }
     }
 }
@@ -313,6 +316,7 @@ struct ModelContext<'a> {
     tropo: TroposphereOptions,
     corrections: &'a RangeCorrections,
     normal: NormalRecipe,
+    estimate_residual_ionosphere: bool,
 }
 
 fn predict_default(
@@ -446,7 +450,20 @@ fn validate_float_state(state: &FloatState, n_epochs: usize) -> Result<(), Float
     for value in state.ambiguities_m.values() {
         validate::finite(*value, "ppp state ambiguities_m").map_err(invalid_input)?;
     }
+    for value in state.residual_ionosphere_m.values() {
+        validate::finite(*value, "ppp state residual_ionosphere_m").map_err(invalid_input)?;
+    }
     validate::finite(state.ztd_m, "ppp state ztd_m").map_err(invalid_input)?;
+    validate::finite(
+        state.tropo_gradient_north_m,
+        "ppp state tropo_gradient_north_m",
+    )
+    .map_err(invalid_input)?;
+    validate::finite(
+        state.tropo_gradient_east_m,
+        "ppp state tropo_gradient_east_m",
+    )
+    .map_err(invalid_input)?;
     Ok(())
 }
 
@@ -504,10 +521,15 @@ fn validate_float_solution(
         validate::finite(*value, "ppp float_solution ambiguities_m")
             .map_err(invalid_fixed_input)?;
     }
+    for value in solution.residual_ionosphere_m.values() {
+        validate::finite(*value, "ppp float_solution residual_ionosphere_m")
+            .map_err(invalid_fixed_input)?;
+    }
     if let Some(ztd_m) = solution.ztd_residual_m {
         validate::finite(ztd_m, "ppp float_solution ztd_residual_m")
             .map_err(invalid_fixed_input)?;
     }
+    validate_optional_tropo_gradient_solution(solution).map_err(FixedSolveError::Float)?;
     for residual in &solution.residuals_m {
         validate::finite(residual.code_m, "ppp float_solution residual code_m")
             .map_err(invalid_fixed_input)?;
@@ -582,9 +604,14 @@ pub(super) fn validate_float_solution_output(
     for value in solution.ambiguities_m.values() {
         validate::finite(*value, "ppp float_solution ambiguities_m").map_err(invalid_input)?;
     }
+    for value in solution.residual_ionosphere_m.values() {
+        validate::finite(*value, "ppp float_solution residual_ionosphere_m")
+            .map_err(invalid_input)?;
+    }
     if let Some(ztd_m) = solution.ztd_residual_m {
         validate::finite(ztd_m, "ppp float_solution ztd_residual_m").map_err(invalid_input)?;
     }
+    validate_optional_tropo_gradient_solution(solution)?;
     for residual in &solution.residuals_m {
         validate::finite(residual.code_m, "ppp float_solution residual code_m")
             .map_err(invalid_input)?;
@@ -607,6 +634,66 @@ pub(super) fn validate_float_solution_output(
         .map_err(invalid_input)?;
     validate::finite_nonneg(solution.weighted_rms_m, "ppp float_solution weighted_rms_m")
         .map_err(invalid_input)?;
+    Ok(())
+}
+
+fn validate_optional_tropo_gradient_solution(
+    solution: &FloatSolution,
+) -> Result<(), FloatSolveError> {
+    match (
+        solution.tropo_gradient_north_m,
+        solution.tropo_gradient_east_m,
+        solution.tropo_gradient_covariance_m2,
+        solution.formal_tropo_gradient_covariance_m2,
+    ) {
+        (None, None, None, None) => Ok(()),
+        (Some(north), Some(east), Some(covariance), Some(formal_covariance)) => {
+            validate::finite(north, "ppp float_solution tropo_gradient_north_m")
+                .map_err(invalid_input)?;
+            validate::finite(east, "ppp float_solution tropo_gradient_east_m")
+                .map_err(invalid_input)?;
+            validate_2x2_covariance_matrix(
+                covariance,
+                "ppp float_solution tropo_gradient_covariance_m2",
+                false,
+            )?;
+            validate_2x2_covariance_matrix(
+                formal_covariance,
+                "ppp float_solution formal_tropo_gradient_covariance_m2",
+                true,
+            )
+        }
+        _ => Err(FloatSolveError::InvalidInput {
+            field: "ppp float_solution tropo gradients",
+            reason: "must be all present or all absent",
+        }),
+    }
+}
+
+fn validate_2x2_covariance_matrix(
+    matrix: [[f64; 2]; 2],
+    label: &'static str,
+    require_positive_diagonal: bool,
+) -> Result<(), FloatSolveError> {
+    for row in matrix {
+        validate::finite_slice(&row, label).map_err(invalid_input)?;
+    }
+    for (idx, row) in matrix.iter().enumerate() {
+        if require_positive_diagonal {
+            validate::finite_positive(row[idx], label).map_err(invalid_input)?;
+        } else {
+            validate::finite_nonneg(row[idx], label).map_err(invalid_input)?;
+        }
+        for (jdx, other_row) in matrix.iter().enumerate().skip(idx + 1) {
+            let scale = row[jdx].abs().max(other_row[idx].abs()).max(1.0);
+            if (row[jdx] - other_row[idx]).abs() > 1.0e-10 * scale {
+                return Err(FloatSolveError::InvalidInput {
+                    field: label,
+                    reason: "symmetric",
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -924,11 +1011,26 @@ fn state_from_solution(solution: &FloatSolution, prior: &FloatState) -> FloatSta
         clocks_m: solution.epoch_clocks_m.clone(),
         ambiguities_m: solution.ambiguities_m.clone(),
         ztd_m: solution.ztd_residual_m.unwrap_or(prior.ztd_m),
+        tropo_gradient_north_m: solution
+            .tropo_gradient_north_m
+            .unwrap_or(prior.tropo_gradient_north_m),
+        tropo_gradient_east_m: solution
+            .tropo_gradient_east_m
+            .unwrap_or(prior.tropo_gradient_east_m),
+        residual_ionosphere_m: if solution.residual_ionosphere_m.is_empty() {
+            prior.residual_ionosphere_m.clone()
+        } else {
+            solution.residual_ionosphere_m.clone()
+        },
     }
 }
 
 fn estimates_ztd(tropo: TroposphereOptions) -> bool {
     tropo.enabled && tropo.estimate_ztd
+}
+
+fn estimates_tropo_gradients(tropo: TroposphereOptions) -> bool {
+    tropo.enabled && tropo.estimate_tropo_gradients
 }
 
 fn ztd_unknown_count(tropo: TroposphereOptions) -> usize {
@@ -944,6 +1046,7 @@ fn apply_elevation_cutoff(
     state: &FloatState,
     cutoff_deg: f64,
     tropo: TroposphereOptions,
+    estimate_residual_ionosphere: bool,
 ) -> Result<Vec<FloatEpoch>, FloatSolveError> {
     let mut retained = Vec::with_capacity(epochs.len());
     for (epoch_idx, epoch) in epochs.iter().enumerate() {
@@ -969,7 +1072,7 @@ fn apply_elevation_cutoff(
         retained.push(epoch);
         debug_assert_eq!(retained.len(), epoch_idx + 1);
     }
-    validate_elevation_cutoff_retained(&retained, cutoff_deg, tropo)?;
+    validate_elevation_cutoff_retained(&retained, cutoff_deg, tropo, estimate_residual_ionosphere)?;
     Ok(retained)
 }
 
@@ -977,6 +1080,7 @@ fn validate_elevation_cutoff_retained(
     epochs: &[FloatEpoch],
     cutoff_deg: f64,
     tropo: TroposphereOptions,
+    estimate_residual_ionosphere: bool,
 ) -> Result<(), FloatSolveError> {
     let retained_observations = epochs.iter().map(|e| e.observations.len()).sum::<usize>();
     let active_sats = epochs
@@ -986,6 +1090,8 @@ fn validate_elevation_cutoff_retained(
     let unknowns = crate::estimation::substrate::parameters::ParameterLayout::ppp(
         epochs.len(),
         ztd_unknown_count(tropo),
+        tropo_gradient_unknown_count(tropo),
+        residual_ionosphere_unknown_count(estimate_residual_ionosphere, active_sats.len()),
         active_sats.len(),
     )
     .dim();
@@ -998,6 +1104,22 @@ fn validate_elevation_cutoff_retained(
         ));
     }
     Ok(())
+}
+
+fn tropo_gradient_unknown_count(tropo: TroposphereOptions) -> usize {
+    if estimates_tropo_gradients(tropo) {
+        2
+    } else {
+        0
+    }
+}
+
+fn residual_ionosphere_unknown_count(estimate: bool, ambiguity_count: usize) -> usize {
+    if estimate {
+        ambiguity_count
+    } else {
+        0
+    }
 }
 
 fn rms(values: &[f64]) -> f64 {

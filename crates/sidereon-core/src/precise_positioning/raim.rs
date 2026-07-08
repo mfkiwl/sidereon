@@ -112,6 +112,9 @@
 //! #     clocks_m: vec![0.0],
 //! #     ambiguities_m: initial_ambiguities,
 //! #     ztd_m: 0.0,
+//! #     tropo_gradient_north_m: 0.0,
+//! #     tropo_gradient_east_m: 0.0,
+//! #     residual_ionosphere_m: BTreeMap::new(),
 //! # };
 //! # let solve_config = FloatSolveConfig {
 //! #     weights: MeasurementWeights {
@@ -130,6 +133,7 @@
 //! #     },
 //! #     residual_screen: false,
 //! #     elevation_cutoff_deg: None,
+//! #     estimate_residual_ionosphere: false,
 //! # };
 //! let result = solve_float_epoch_with_raim(
 //! #   &source,
@@ -149,7 +153,9 @@
 use crate::astro::frames::transforms::itrs_to_geodetic_compute;
 use crate::astro::math::linear::{invert_matrix_last_tie, invert_symmetric_pd};
 use crate::constants::F_L1_HZ;
-use crate::estimation::substrate::parameters::undifferenced_design_row;
+use crate::estimation::substrate::parameters::{
+    undifferenced_design_row, UndifferencedDesignOptions,
+};
 use crate::geometry::{dop, DopError, LineOfSight, Wgs84Geodetic};
 use crate::observables::{predict, ObservableEphemerisSource, PredictOptions};
 use crate::quality::{chi2_inv, DEFAULT_P_FA};
@@ -1132,9 +1138,14 @@ fn weighted_snapshot_row(
         [-line_of_sight.e_x, -line_of_sight.e_y, -line_of_sight.e_z],
         0,
         1,
-        ztd_mapping,
-        n_ambiguities,
-        active_ambiguity,
+        UndifferencedDesignOptions {
+            ztd_mapping,
+            tropo_gradient_mapping: None,
+            residual_ionosphere_columns: 0,
+            active_residual_ionosphere: None,
+            ambiguity_columns: n_ambiguities,
+            active_ambiguity,
+        },
     );
     for value in &mut row {
         *value *= weight;
@@ -1308,6 +1319,7 @@ mod tests {
             },
             elevation_cutoff_deg: None,
             residual_screen: false,
+            estimate_residual_ionosphere: false,
         }
     }
 
@@ -1409,6 +1421,9 @@ mod tests {
             clocks_m: vec![0.0],
             ambiguities_m: initial_ambiguities,
             ztd_m: 0.0,
+            tropo_gradient_north_m: 0.0,
+            tropo_gradient_east_m: 0.0,
+            residual_ionosphere_m: BTreeMap::new(),
         };
         (source, epoch, state)
     }

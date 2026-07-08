@@ -20,7 +20,8 @@ use super::normal::{ppp_position_covariance, solve_normal_equations, PppNormalLa
 use super::rows::{build_rows, residual_rows, AmbiguityBinding, PppRowError};
 use super::temporal::{estimate_temporal_correlation, temporal_position_covariance};
 use super::{
-    apply_elevation_cutoff, estimates_ztd, max_abs, rms, state_from_solution,
+    apply_elevation_cutoff, estimates_tropo_gradients, estimates_ztd, max_abs,
+    residual_ionosphere_unknown_count, rms, state_from_solution, tropo_gradient_unknown_count,
     validate_float_solution_output, validate_float_solve_boundary, weighted_rms, ztd_unknown_count,
     FloatEpoch, FloatSolution, FloatSolveConfig, FloatSolveError, FloatSolveOptions, FloatState,
     FloatStatus, ModelContext, TroposphereOptions,
@@ -92,8 +93,14 @@ pub fn solve_float_epoch(
     validate_float_solve_boundary(&epochs, &initial_state, &config)?;
     let filtered_epochs;
     let solve_epochs = if let Some(cutoff_deg) = config.elevation_cutoff_deg {
-        filtered_epochs =
-            apply_elevation_cutoff(source, &epochs, &initial_state, cutoff_deg, config.tropo)?;
+        filtered_epochs = apply_elevation_cutoff(
+            source,
+            &epochs,
+            &initial_state,
+            cutoff_deg,
+            config.tropo,
+            config.estimate_residual_ionosphere,
+        )?;
         filtered_epochs.as_slice()
     } else {
         &epochs
@@ -110,6 +117,7 @@ pub fn solve_float_epoch(
         tropo: config.tropo,
         corrections: &config.corrections,
         normal: NormalRecipe::PppDenseLastTie,
+        estimate_residual_ionosphere: config.estimate_residual_ionosphere,
     };
     iterate_multi(
         ctx,
@@ -136,6 +144,7 @@ fn solve_float_multi_screened(
         opts,
         elevation_cutoff_deg,
         residual_screen,
+        estimate_residual_ionosphere,
     } = config;
     let ctx = ModelContext {
         source,
@@ -143,10 +152,18 @@ fn solve_float_multi_screened(
         tropo,
         corrections: &corrections,
         normal,
+        estimate_residual_ionosphere,
     };
     let filtered_epochs;
     let solve_epochs = if let Some(cutoff_deg) = elevation_cutoff_deg {
-        filtered_epochs = apply_elevation_cutoff(source, epochs, &state, cutoff_deg, tropo)?;
+        filtered_epochs = apply_elevation_cutoff(
+            source,
+            epochs,
+            &state,
+            cutoff_deg,
+            tropo,
+            estimate_residual_ionosphere,
+        )?;
         filtered_epochs.as_slice()
     } else {
         epochs
@@ -210,7 +227,7 @@ fn run_residual_screen(
     match worst_multi_residual(ctx, &epochs, &candidate_state)? {
         Some((epoch_idx, sat)) => {
             let pruned = exclude_observation(&epochs, epoch_idx, &sat);
-            if !multi_enough_after_prune(&pruned, ctx.tropo) {
+            if !multi_enough_after_prune(&pruned, ctx.tropo, ctx.estimate_residual_ionosphere) {
                 return Ok(ScreenResult::Screened {
                     solution: Box::new(solution),
                     epochs,
@@ -261,16 +278,34 @@ fn iterate_multi(
         let layout = PppNormalLayout::new(
             epochs.len(),
             ztd_unknown_count(ctx.tropo),
+            tropo_gradient_unknown_count(ctx.tropo),
+            residual_ionosphere_unknown_count(
+                ctx.estimate_residual_ionosphere,
+                ambiguity_ids.len(),
+            ),
             ambiguity_ids.len(),
         );
         let dx = solve_normal_equations(&rows, layout, ctx.normal)?;
-        let next = apply_multi_delta(&current, epochs.len(), ambiguity_ids, &dx, ctx.tropo)?;
-        let (pos_step, clock_step, ztd_step, ambiguity_step) =
-            multi_step_norms(&dx, epochs.len(), ctx.tropo);
+        let next = apply_multi_delta(
+            &current,
+            epochs.len(),
+            ambiguity_ids,
+            &dx,
+            ctx.tropo,
+            ctx.estimate_residual_ionosphere,
+        )?;
+        let (pos_step, clock_step, ztd_step, gradient_step, ambiguity_step) = multi_step_norms(
+            &dx,
+            epochs.len(),
+            ctx.tropo,
+            ctx.estimate_residual_ionosphere,
+            ambiguity_ids.len(),
+        );
 
         if pos_step <= opts.position_tolerance_m
             && clock_step <= opts.clock_tolerance_m
             && ztd_step <= opts.ztd_tolerance_m
+            && gradient_step <= opts.ztd_tolerance_m
             && ambiguity_step <= opts.ambiguity_tolerance_m
         {
             return finalize_multi(
@@ -307,6 +342,7 @@ fn apply_multi_delta(
     ambiguity_ids: &[AmbiguityId],
     dx: &[f64],
     tropo: TroposphereOptions,
+    estimate_residual_ionosphere: bool,
 ) -> Result<FloatState, FloatSolveError> {
     let mut idx = 3;
     let clock_deltas = &dx[idx..idx + n_epochs];
@@ -318,6 +354,28 @@ fn apply_multi_delta(
     } else {
         0.0
     };
+    let (tropo_gradient_north_delta, tropo_gradient_east_delta) =
+        if estimates_tropo_gradients(tropo) {
+            let north = dx[idx];
+            let east = dx[idx + 1];
+            idx += 2;
+            (north, east)
+        } else {
+            (0.0, 0.0)
+        };
+    let mut residual_ionosphere_m = BTreeMap::new();
+    if estimate_residual_ionosphere {
+        let ionosphere_deltas = &dx[idx..idx + ambiguity_ids.len()];
+        idx += ambiguity_ids.len();
+        for (id, delta) in ambiguity_ids.iter().zip(ionosphere_deltas) {
+            let prior = state
+                .residual_ionosphere_m
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            residual_ionosphere_m.insert(id.as_str().to_string(), prior + delta);
+        }
+    }
     let ambiguity_deltas = &dx[idx..];
     let clocks_m = state
         .clocks_m
@@ -343,6 +401,9 @@ fn apply_multi_delta(
         clocks_m,
         ambiguities_m,
         ztd_m: state.ztd_m + ztd_delta,
+        tropo_gradient_north_m: state.tropo_gradient_north_m + tropo_gradient_north_delta,
+        tropo_gradient_east_m: state.tropo_gradient_east_m + tropo_gradient_east_delta,
+        residual_ionosphere_m,
     })
 }
 
@@ -350,7 +411,9 @@ fn multi_step_norms(
     dx: &[f64],
     n_epochs: usize,
     tropo: TroposphereOptions,
-) -> (f64, f64, f64, f64) {
+    estimate_residual_ionosphere: bool,
+    n_ambiguities: usize,
+) -> (f64, f64, f64, f64, f64) {
     let pos = vec3::norm3([dx[0], dx[1], dx[2]]);
     let mut idx = 3;
     let clock = max_abs(&dx[idx..idx + n_epochs]);
@@ -362,8 +425,22 @@ fn multi_step_norms(
     } else {
         0.0
     };
+    let gradient = if estimates_tropo_gradients(tropo) {
+        let v = max_abs(&dx[idx..idx + 2]);
+        idx += 2;
+        v
+    } else {
+        0.0
+    };
+    let ionosphere = if estimate_residual_ionosphere {
+        let v = max_abs(&dx[idx..idx + n_ambiguities]);
+        idx += n_ambiguities;
+        v
+    } else {
+        0.0
+    };
     let ambiguity = max_abs(&dx[idx..]);
-    (pos, clock, ztd, ambiguity)
+    (pos, clock, ztd, gradient, ambiguity.max(ionosphere))
 }
 
 fn finalize_multi(
@@ -387,6 +464,11 @@ fn finalize_multi(
         PppNormalLayout::new(
             epochs.len(),
             ztd_unknown_count(ctx.tropo),
+            tropo_gradient_unknown_count(ctx.tropo),
+            residual_ionosphere_unknown_count(
+                ctx.estimate_residual_ionosphere,
+                ambiguity_ids.len(),
+            ),
             ambiguity_ids.len(),
         ),
         state.position_m,
@@ -411,11 +493,28 @@ fn finalize_multi(
         temporal_correlation,
         epoch_clocks_m: state.clocks_m,
         ambiguities_m: state.ambiguities_m,
+        residual_ionosphere_m: if ctx.estimate_residual_ionosphere {
+            state.residual_ionosphere_m
+        } else {
+            BTreeMap::new()
+        },
         ztd_residual_m: if estimates_ztd(ctx.tropo) {
             Some(state.ztd_m)
         } else {
             None
         },
+        tropo_gradient_north_m: if estimates_tropo_gradients(ctx.tropo) {
+            Some(state.tropo_gradient_north_m)
+        } else {
+            None
+        },
+        tropo_gradient_east_m: if estimates_tropo_gradients(ctx.tropo) {
+            Some(state.tropo_gradient_east_m)
+        } else {
+            None
+        },
+        tropo_gradient_covariance_m2: covariance.tropo_gradient_scaled_m2,
+        formal_tropo_gradient_covariance_m2: covariance.tropo_gradient_formal_m2,
         residuals_m: residuals.clone(),
         used_sats: ambiguity_ids
             .iter()
@@ -509,14 +608,25 @@ fn exclude_observation(
         .collect()
 }
 
-fn multi_enough_after_prune(epochs: &[FloatEpoch], tropo: TroposphereOptions) -> bool {
+fn multi_enough_after_prune(
+    epochs: &[FloatEpoch],
+    tropo: TroposphereOptions,
+    estimate_residual_ionosphere: bool,
+) -> bool {
     if epochs.len() < 2 {
         return false;
     }
     let n_sats = multi_ambiguity_ids(epochs).len();
     let n_obs: usize = epochs.iter().map(|e| e.observations.len()).sum();
     let equations = 2 * n_obs;
-    let unknowns = ParameterLayout::ppp(epochs.len(), ztd_unknown_count(tropo), n_sats).dim();
+    let unknowns = ParameterLayout::ppp(
+        epochs.len(),
+        ztd_unknown_count(tropo),
+        tropo_gradient_unknown_count(tropo),
+        residual_ionosphere_unknown_count(estimate_residual_ionosphere, n_sats),
+        n_sats,
+    )
+    .dim();
     n_sats >= 4 && equations >= unknowns
 }
 
@@ -526,6 +636,9 @@ fn reseed_state(state: &FloatState, epochs: &[FloatEpoch]) -> FloatState {
         clocks_m: vec![state.clocks_m[0]; epochs.len()],
         ambiguities_m: initial_ambiguities(epochs),
         ztd_m: state.ztd_m,
+        tropo_gradient_north_m: state.tropo_gradient_north_m,
+        tropo_gradient_east_m: state.tropo_gradient_east_m,
+        residual_ionosphere_m: BTreeMap::new(),
     }
 }
 
