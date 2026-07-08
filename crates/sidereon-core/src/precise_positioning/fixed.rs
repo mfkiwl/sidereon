@@ -273,7 +273,7 @@ fn finalize_fixed_multi(
         residual_rows(ctx, epochs, &fixed_m, &state).map_err(PppRowError::into_fixed)?;
     let binding = AmbiguityBinding::Held { values: &fixed_m };
     let rows = build_rows(ctx, epochs, &binding, &state).map_err(PppRowError::into_fixed)?;
-    let position_covariance = ppp_position_covariance(
+    let covariance = ppp_position_covariance(
         &rows,
         PppNormalLayout::new(epochs.len(), ztd_unknown_count(ctx.tropo), 0),
         state.position_m,
@@ -282,7 +282,10 @@ fn finalize_fixed_multi(
     let phase: Vec<f64> = residuals.iter().map(|r| r.phase_m).collect();
     Ok(FixedSolution {
         position_m: state.position_m,
-        position_covariance,
+        position_covariance: covariance.scaled,
+        formal_position_covariance: covariance.formal,
+        posterior_variance_factor: covariance.posterior_variance_factor,
+        position_covariance_scale_factor: covariance.covariance_scale_factor,
         epoch_clocks_m: state.clocks_m,
         fixed_ambiguities_cycles: search.fixed_cycles,
         fixed_ambiguities_m: fixed_m,

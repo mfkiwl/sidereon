@@ -550,14 +550,33 @@ pub struct FloatResidual {
 pub struct FloatSolution {
     /// Estimated static receiver position in ECEF/ITRF metres.
     pub position_m: [f64; 3],
-    /// Posterior covariance of [`Self::position_m`].
+    /// Posterior covariance of [`Self::position_m`], scaled by
+    /// [`Self::position_covariance_scale_factor`].
     ///
     /// The ECEF and ENU matrices follow [`PositionCovariance`]. They are the
     /// top-left position block of the inverse final weighted normal matrix after
     /// the per-epoch receiver clocks are eliminated and the remaining static
-    /// states are marginalized. The scale is therefore set by the supplied PPP
-    /// measurement weights, not by a post-fit residual multiplier.
+    /// states are marginalized, then multiplied by the a-posteriori residual
+    /// variance factor reported in [`Self::posterior_variance_factor`]. This
+    /// calibrates the covariance to the residual scale of this solve, but can
+    /// still be optimistic when residuals are temporally correlated or dominated
+    /// by multipath, antenna, loading, or other unmodelled systematics. When the
+    /// residual factor is below 1.0, this covariance is smaller than the formal
+    /// covariance.
     pub position_covariance: PositionCovariance,
+    /// Unscaled formal covariance from the final weighted normal matrix.
+    ///
+    /// This is the unit-variance covariance before applying
+    /// [`Self::posterior_variance_factor`].
+    pub formal_position_covariance: PositionCovariance,
+    /// A-posteriori unit-variance factor, computed as weighted SSR divided by
+    /// unreduced degrees of freedom. Eliminated receiver clocks still count as
+    /// estimated parameters in the denominator.
+    pub posterior_variance_factor: f64,
+    /// Multiplier applied to [`Self::formal_position_covariance`] to produce
+    /// [`Self::position_covariance`]. This equals
+    /// [`Self::posterior_variance_factor`].
+    pub position_covariance_scale_factor: f64,
     pub epoch_clocks_m: Vec<f64>,
     pub ambiguities_m: BTreeMap<String, f64>,
     pub ztd_residual_m: Option<f64>,
@@ -744,11 +763,29 @@ pub struct FixedSolution {
     /// Estimated static receiver position in ECEF/ITRF metres.
     pub position_m: [f64; 3],
     /// Posterior covariance of [`Self::position_m`] after fixed ambiguities are
-    /// held and the per-epoch receiver clocks are eliminated.
+    /// held and the per-epoch receiver clocks are eliminated, scaled by
+    /// [`Self::position_covariance_scale_factor`].
     ///
-    /// The ECEF and ENU matrices follow [`PositionCovariance`]. The scale is set
-    /// by the supplied PPP measurement weights, matching the float PPP result.
+    /// The ECEF and ENU matrices follow [`PositionCovariance`]. The raw residual
+    /// factor is reported in [`Self::posterior_variance_factor`]. This can still
+    /// be optimistic when residuals are temporally correlated or dominated by
+    /// multipath, antenna, loading, or other unmodelled systematics. When the
+    /// residual factor is below 1.0, this covariance is smaller than the formal
+    /// covariance.
     pub position_covariance: PositionCovariance,
+    /// Unscaled formal covariance from the final weighted normal matrix.
+    ///
+    /// This is the unit-variance covariance before applying
+    /// [`Self::posterior_variance_factor`].
+    pub formal_position_covariance: PositionCovariance,
+    /// A-posteriori unit-variance factor, computed as weighted SSR divided by
+    /// unreduced degrees of freedom. Eliminated receiver clocks still count as
+    /// estimated parameters in the denominator.
+    pub posterior_variance_factor: f64,
+    /// Multiplier applied to [`Self::formal_position_covariance`] to produce
+    /// [`Self::position_covariance`]. This equals
+    /// [`Self::posterior_variance_factor`].
+    pub position_covariance_scale_factor: f64,
     pub epoch_clocks_m: Vec<f64>,
     pub fixed_ambiguities_cycles: BTreeMap<String, i64>,
     pub fixed_ambiguities_m: BTreeMap<String, f64>,

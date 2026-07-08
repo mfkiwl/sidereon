@@ -751,14 +751,19 @@ fn zim2_full_stack_ppp_static_reaches_decimeter_truth() {
     let rtklib_err = position_error_m(solution.position_m, RTKLIB_PPP_STATIC_ECEF_M);
     let rtklib_vs_truth = position_error_m(RTKLIB_PPP_STATIC_ECEF_M, ZIM2_TRUTH_ECEF_M);
     assert_position_covariance_positive_definite(&solution.position_covariance);
+    assert_position_covariance_positive_definite(&solution.formal_position_covariance);
     let ecef_delta = position_delta_m(solution.position_m, ZIM2_TRUTH_ECEF_M);
     let enu_delta = enu_delta_m(solution.position_m, ZIM2_TRUTH_ECEF_M);
     let ecef_sigma = covariance_sigma(solution.position_covariance.ecef_m2);
     let enu_sigma = covariance_sigma(solution.position_covariance.enu_m2);
+    let formal_ecef_sigma = covariance_sigma(solution.formal_position_covariance.ecef_m2);
+    let formal_enu_sigma = covariance_sigma(solution.formal_position_covariance.enu_m2);
 
     eprintln!(
-        "ZIM2 full-stack PPP-static: pos={:?}\n  vs ITRF2020 truth = {truth_err:.4} m\n  vs RTKLIB ppp-static = {rtklib_err:.4} m\n  (RTKLIB vs truth = {rtklib_vs_truth:.4} m)\n  ECEF delta={ecef_delta:?} sigma={ecef_sigma:?}\n  ENU delta={enu_delta:?} sigma={enu_sigma:?}",
-        solution.position_m
+        "ZIM2 full-stack PPP-static: pos={:?}\n  vs ITRF2020 truth = {truth_err:.4} m\n  vs RTKLIB ppp-static = {rtklib_err:.4} m\n  (RTKLIB vs truth = {rtklib_vs_truth:.4} m)\n  variance_factor={:.3} covariance_scale={:.3}\n  ECEF delta={ecef_delta:?} formal_sigma={formal_ecef_sigma:?} scaled_sigma={ecef_sigma:?}\n  ENU delta={enu_delta:?} formal_sigma={formal_enu_sigma:?} scaled_sigma={enu_sigma:?}",
+        solution.position_m,
+        solution.posterior_variance_factor,
+        solution.position_covariance_scale_factor
     );
 
     assert!(
@@ -769,12 +774,13 @@ fn zim2_full_stack_ppp_static_reaches_decimeter_truth() {
         rtklib_err < SIDEREON_VS_RTKLIB_BOUND_M,
         "full-stack PPP vs RTKLIB ppp-static {rtklib_err} m exceeded {SIDEREON_VS_RTKLIB_BOUND_M} m"
     );
-    // Formal posterior covariance is produced from the weighted final normal
-    // matrix. It does not include external ITRF, multipath, or unmodelled loading
-    // systematics, so this real-arc check uses a 4-sigma component bound and a
-    // lower ratio guard to prove the covariance is present and not overly broad.
-    assert_covariance_bounds_truth("ECEF", ecef_delta, ecef_sigma, 4.0, 0.25);
-    assert_covariance_bounds_truth("ENU", enu_delta, enu_sigma, 4.0, 0.25);
+    // The default covariance is formal covariance scaled by the exact posterior
+    // residual variance factor. ZIM2's factor is below 1.0, so the covariance
+    // shrinks relative to the formal matrix and does not model external ITRF,
+    // multipath, or unmodelled loading systematics. This check still pins that
+    // the scaled covariance bounds the truth error and is not vacuously broad.
+    assert_covariance_bounds_truth("ECEF", ecef_delta, ecef_sigma, 10.0, 1.0);
+    assert_covariance_bounds_truth("ENU", enu_delta, enu_sigma, 10.0, 1.0);
 }
 
 #[test]
