@@ -18,6 +18,9 @@ categories = ["science", "simulation"]
 # published tarball. Clone the git repo to run the parity suite.
 exclude = [
     "tests/fixtures/**",
+    # hotpath is a dev-only benchmark that compile-time-embeds trimmed test
+    # fixtures (kept out of the tarball above); consumers do not need it.
+    "benches/hotpath.rs",
     "tests/cpp/**",
     "tests/sgp4_diagnostic.rs",
     "tests/sgp4_oracle_diff.rs",

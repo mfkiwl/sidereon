@@ -16,6 +16,10 @@ All notable changes to `sidereon-core` are documented here.
 - static multi-epoch positioning (`solve_static`) is now public, with
   covariance, leave-one-out redundancy diagnostics, and robust weighting.
 
+- Static PPP float and fixed solutions add temporal-correlation covariance
+  reporting: `temporal_position_covariance`,
+  `temporal_position_covariance_scale_factor`, and `temporal_correlation`.
+
 ## [0.22.0]
 
 ### Added
@@ -25,9 +29,6 @@ All notable changes to `sidereon-core` are documented here.
   raw posterior unit-variance factor and the applied covariance scale factor
   (which equals that factor). Every solver in the library now reports position
   covariance.
-- Static PPP float and fixed solutions add temporal-correlation covariance
-  reporting: `temporal_position_covariance`,
-  `temporal_position_covariance_scale_factor`, and `temporal_correlation`.
   The estimator pools lag-1 post-fit residual autocorrelation by satellite arc
   and observable, reports AR(1) effective sample count and decorrelation time,
   and keeps the existing posterior-scaled covariance fields unchanged.
