@@ -1,7 +1,7 @@
 //! Ephemeris-source abstraction for SPP.
 
 use crate::id::GnssSatelliteId;
-use crate::sp3::Sp3;
+use crate::sp3::{MmapPreciseEphemerisInterpolant, PreciseEphemerisInterpolant, Sp3};
 
 /// A source of satellite position and clock at a transmit epoch.
 ///
@@ -21,6 +21,30 @@ pub trait EphemerisSource {
 }
 
 impl EphemerisSource for Sp3 {
+    fn position_clock_at_j2000_s(
+        &self,
+        sat: GnssSatelliteId,
+        t_j2000_s: f64,
+    ) -> Option<([f64; 3], f64)> {
+        let state = self.position_at_j2000_seconds(sat, t_j2000_s).ok()?;
+        let clk = state.clock_s?;
+        Some((state.position.as_array(), clk))
+    }
+}
+
+impl EphemerisSource for PreciseEphemerisInterpolant {
+    fn position_clock_at_j2000_s(
+        &self,
+        sat: GnssSatelliteId,
+        t_j2000_s: f64,
+    ) -> Option<([f64; 3], f64)> {
+        let state = self.position_at_j2000_seconds(sat, t_j2000_s).ok()?;
+        let clk = state.clock_s?;
+        Some((state.position.as_array(), clk))
+    }
+}
+
+impl EphemerisSource for MmapPreciseEphemerisInterpolant<'_> {
     fn position_clock_at_j2000_s(
         &self,
         sat: GnssSatelliteId,

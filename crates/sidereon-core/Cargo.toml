@@ -45,6 +45,11 @@ cc = "1"
 approx = "0.5"
 # Reads the hex-float golden vectors for the bit-exact parity tests.
 serde_json = { version = "1", features = ["preserve_order"] }
+criterion = "0.5"
+
+[[bench]]
+name = "hotpath"
+harness = false
 
 [features]
 # Test-only oracle. Compiles the Vallado C++ reference via cc and exposes it to

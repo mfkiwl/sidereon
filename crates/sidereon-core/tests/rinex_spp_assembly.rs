@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
-use sidereon_core::ephemeris::{BroadcastEphemeris, Sp3};
+use sidereon_core::ephemeris::{BroadcastEphemeris, PreciseEphemerisInterpolant, Sp3};
 use sidereon_core::positioning::{
-    solve_spp_from_rinex_obs, spp_inputs_from_rinex_obs, Corrections, RinexSppOptions, SolvePolicy,
+    solve_spp_from_rinex_obs, spp_inputs_from_rinex_obs, Corrections, Dop, ReceiverSolution,
+    RinexSppOptions, SolvePolicy,
 };
 use sidereon_core::rinex::observations::{ObservationFile, SignalPolicy};
 use sidereon_core::{GnssSatelliteId, GnssSystem};
@@ -66,6 +67,127 @@ fn distance_m(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
+fn assert_f64_bits_eq(left: f64, right: f64) {
+    assert_eq!(left.to_bits(), right.to_bits());
+}
+
+fn assert_f64_vec_bits_eq(left: &[f64], right: &[f64]) {
+    assert_eq!(
+        left.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+        right
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn assert_matrix3_bits_eq(left: &[[f64; 3]; 3], right: &[[f64; 3]; 3]) {
+    assert_eq!(
+        left.iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        right
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn assert_geodetic_bits_eq(
+    left: Option<sidereon_core::Wgs84Geodetic>,
+    right: Option<sidereon_core::Wgs84Geodetic>,
+) {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            assert_f64_bits_eq(left.lat_rad, right.lat_rad);
+            assert_f64_bits_eq(left.lon_rad, right.lon_rad);
+            assert_f64_bits_eq(left.height_m, right.height_m);
+        }
+        (None, None) => {}
+        _ => panic!("geodetic presence mismatch"),
+    }
+}
+
+fn assert_dop_bits_eq(left: &Option<Dop>, right: &Option<Dop>) {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            assert_f64_bits_eq(left.gdop, right.gdop);
+            assert_f64_bits_eq(left.pdop, right.pdop);
+            assert_f64_bits_eq(left.hdop, right.hdop);
+            assert_f64_bits_eq(left.vdop, right.vdop);
+            assert_f64_bits_eq(left.tdop, right.tdop);
+            assert_eq!(left.system_tdops.len(), right.system_tdops.len());
+            for ((left_system, left_tdop), (right_system, right_tdop)) in
+                left.system_tdops.iter().zip(right.system_tdops.iter())
+            {
+                assert_eq!(left_system, right_system);
+                assert_f64_bits_eq(*left_tdop, *right_tdop);
+            }
+        }
+        (None, None) => {}
+        _ => panic!("DOP presence mismatch"),
+    }
+}
+
+fn assert_receiver_solution_bits_eq(left: &ReceiverSolution, right: &ReceiverSolution) {
+    assert_f64_bits_eq(left.position.x_m, right.position.x_m);
+    assert_f64_bits_eq(left.position.y_m, right.position.y_m);
+    assert_f64_bits_eq(left.position.z_m, right.position.z_m);
+    assert_geodetic_bits_eq(left.geodetic, right.geodetic);
+    assert_f64_bits_eq(left.rx_clock_s, right.rx_clock_s);
+    assert_eq!(left.rx_clock_drift_s_s, right.rx_clock_drift_s_s);
+    assert_eq!(left.system_clocks_s.len(), right.system_clocks_s.len());
+    for ((left_system, left_clock), (right_system, right_clock)) in left
+        .system_clocks_s
+        .iter()
+        .zip(right.system_clocks_s.iter())
+    {
+        assert_eq!(left_system, right_system);
+        assert_f64_bits_eq(*left_clock, *right_clock);
+    }
+    assert_dop_bits_eq(&left.dop, &right.dop);
+    assert_eq!(left.system_tdops.len(), right.system_tdops.len());
+    for ((left_system, left_tdop), (right_system, right_tdop)) in
+        left.system_tdops.iter().zip(right.system_tdops.iter())
+    {
+        assert_eq!(left_system, right_system);
+        assert_f64_bits_eq(*left_tdop, *right_tdop);
+    }
+    assert_matrix3_bits_eq(
+        &left.position_covariance.ecef_m2,
+        &right.position_covariance.ecef_m2,
+    );
+    assert_matrix3_bits_eq(
+        &left.position_covariance.enu_m2,
+        &right.position_covariance.enu_m2,
+    );
+    assert_f64_vec_bits_eq(&left.residuals_m, &right.residuals_m);
+    assert_eq!(left.used_sats, right.used_sats);
+    assert_eq!(left.rejected_sats, right.rejected_sats);
+    assert_eq!(left.geometry_quality.tier, right.geometry_quality.tier);
+    assert_eq!(
+        left.geometry_quality.redundancy,
+        right.geometry_quality.redundancy
+    );
+    assert_eq!(left.geometry_quality.rank, right.geometry_quality.rank);
+    assert_f64_bits_eq(
+        left.geometry_quality.condition_number,
+        right.geometry_quality.condition_number,
+    );
+    assert_f64_bits_eq(left.geometry_quality.gdop, right.geometry_quality.gdop);
+    assert_eq!(
+        left.geometry_quality.raim_checkable,
+        right.geometry_quality.raim_checkable
+    );
+    assert_eq!(
+        left.geometry_quality.covariance_validated,
+        right.geometry_quality.covariance_validated
+    );
+    assert_eq!(left.metadata, right.metadata);
+}
+
 #[test]
 fn spp_inputs_from_rinex_obs_assembles_esbc_first_epoch() {
     let obs = load_obs();
@@ -106,6 +228,30 @@ fn spp_inputs_from_rinex_obs_assembles_esbc_first_epoch() {
     assert_eq!(first.inputs.t_rx_j2000_s, 646315200.0);
     assert_eq!(first.inputs.t_rx_second_of_day_s, 0.0);
     assert_eq!(first.inputs.day_of_year, 177.0);
+}
+
+#[test]
+fn staged_precise_interpolant_spp_is_bit_identical_to_sp3() {
+    let obs = load_obs();
+    let sp3 = load_sp3();
+    let precise = PreciseEphemerisInterpolant::from_sp3(&sp3);
+    let options = RinexSppOptions::new(SignalPolicy {
+        codes: [(GnssSystem::Gps, vec!["C1C".to_string()])].into(),
+    })
+    .with_corrections(Corrections {
+        ionosphere: false,
+        troposphere: true,
+    });
+
+    let epochs = spp_inputs_from_rinex_obs(&obs, &sp3, &options).expect("assemble SPP inputs");
+    assert!(!epochs.is_empty());
+    for epoch in epochs {
+        let sp3_solution =
+            sidereon_core::positioning::solve(&sp3, &epoch.inputs, true).expect("SP3 solve");
+        let staged_solution = sidereon_core::positioning::solve(&precise, &epoch.inputs, true)
+            .expect("staged precise solve");
+        assert_receiver_solution_bits_eq(&sp3_solution, &staged_solution);
+    }
 }
 
 #[test]

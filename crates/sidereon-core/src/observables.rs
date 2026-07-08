@@ -136,6 +136,37 @@ pub struct EmissionMediaBatch {
     pub element_errors: Vec<Option<ObservablesError>>,
 }
 
+/// Receiver-dependent setup for repeated emission/media batch calls.
+///
+/// Construct this once for a fixed receiver and pass it to
+/// [`emission_media_batch_at_j2000_s_with_receiver_context_into`] to avoid
+/// repeating the ECEF-to-geodetic conversion and local-frame trigonometry in
+/// every row of every call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmissionMediaReceiverContext {
+    topocentric: TopocentricReceiver,
+}
+
+impl EmissionMediaReceiverContext {
+    /// Build receiver setup for emission/media batch evaluation.
+    pub fn new(receiver_ecef_m: [f64; 3]) -> Result<Self, ObservablesError> {
+        validate::finite_vec3(receiver_ecef_m, "receiver_ecef_m").map_err(map_input_error)?;
+        Ok(Self {
+            topocentric: topocentric_receiver(receiver_ecef_m)?,
+        })
+    }
+
+    /// Receiver ECEF position in meters.
+    pub fn receiver_ecef_m(&self) -> [f64; 3] {
+        self.topocentric.ecef_m
+    }
+
+    /// Receiver geodetic position used by media models.
+    pub fn receiver_geodetic(&self) -> Wgs84Geodetic {
+        self.topocentric.geodetic
+    }
+}
+
 /// An ephemeris product usable by [`predict`].
 pub trait ObservableEphemerisSource {
     /// ECEF position and optional satellite clock at seconds since J2000.
@@ -394,6 +425,26 @@ impl EmissionMediaBatch {
         self.statuses.is_empty()
     }
 
+    /// Remove all rows while retaining allocated storage for reuse.
+    pub fn clear(&mut self) {
+        self.positions_ecef_m.clear();
+        self.clocks_s.clear();
+        self.ionosphere_slant_delays_m.clear();
+        self.troposphere_delays_m.clear();
+        self.statuses.clear();
+        self.element_errors.clear();
+    }
+
+    /// Ensure each output vector can hold at least `capacity` elements.
+    pub fn reserve(&mut self, capacity: usize) {
+        reserve_at_least(&mut self.positions_ecef_m, capacity);
+        reserve_at_least(&mut self.clocks_s, capacity);
+        reserve_at_least(&mut self.ionosphere_slant_delays_m, capacity);
+        reserve_at_least(&mut self.troposphere_delays_m, capacity);
+        reserve_at_least(&mut self.statuses, capacity);
+        reserve_at_least(&mut self.element_errors, capacity);
+    }
+
     /// Status category for element `index`.
     ///
     /// Returns `None` when `index` is out of range.
@@ -438,6 +489,12 @@ impl EmissionMediaBatch {
         self.troposphere_delays_m.push(None);
         self.statuses.push(EmissionMediaStatus::Error);
         self.element_errors.push(Some(error));
+    }
+}
+
+fn reserve_at_least<T>(values: &mut Vec<T>, capacity: usize) {
+    if values.capacity() < capacity {
+        values.reserve(capacity - values.capacity());
     }
 }
 
@@ -824,16 +881,146 @@ pub fn emission_media_batch_at_j2000_s(
     receiver_ecef_m: [f64; 3],
     options: EmissionMediaBatchOptions<'_>,
 ) -> Result<EmissionMediaBatch, ObservablesError> {
+    validate_emission_media_batch_inputs(
+        satellites,
+        emission_epochs_j2000_s,
+        receiver_ecef_m,
+        options,
+    )?;
+
+    let mut batch = EmissionMediaBatch::with_capacity(satellites.len());
+    emission_media_batch_at_j2000_s_unchecked(
+        source,
+        satellites,
+        emission_epochs_j2000_s,
+        receiver_ecef_m,
+        options,
+        &mut batch,
+    );
+    Ok(batch)
+}
+
+/// Evaluate emission-epoch states and media delays into caller-owned storage.
+///
+/// This is the allocation-reuse variant of [`emission_media_batch_at_j2000_s`].
+/// On success, `output` contains exactly the rows for the supplied inputs. Its
+/// vectors retain capacity across calls, so repeated calls with stable maximum
+/// lengths can run without heap allocation after warm-up.
+pub fn emission_media_batch_at_j2000_s_into(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    receiver_ecef_m: [f64; 3],
+    options: EmissionMediaBatchOptions<'_>,
+    output: &mut EmissionMediaBatch,
+) -> Result<(), ObservablesError> {
+    validate_emission_media_batch_inputs(
+        satellites,
+        emission_epochs_j2000_s,
+        receiver_ecef_m,
+        options,
+    )?;
+    output.clear();
+    output.reserve(satellites.len());
+    emission_media_batch_at_j2000_s_unchecked(
+        source,
+        satellites,
+        emission_epochs_j2000_s,
+        receiver_ecef_m,
+        options,
+        output,
+    );
+    Ok(())
+}
+
+/// Evaluate emission-epoch states and media delays using cached receiver setup.
+///
+/// This combines receiver setup reuse with caller-owned output reuse. On a warm
+/// call with enough output capacity, this path performs no heap allocation.
+pub fn emission_media_batch_at_j2000_s_with_receiver_context_into(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    receiver: &EmissionMediaReceiverContext,
+    options: EmissionMediaBatchOptions<'_>,
+    output: &mut EmissionMediaBatch,
+) -> Result<(), ObservablesError> {
+    validate_emission_media_batch_context_inputs(satellites, emission_epochs_j2000_s, options)?;
+    output.clear();
+    output.reserve(satellites.len());
+    emission_media_batch_at_j2000_s_with_receiver_unchecked(
+        source,
+        satellites,
+        emission_epochs_j2000_s,
+        TopocentricReceiverSource::Cached(&receiver.topocentric),
+        options,
+        output,
+    );
+    Ok(())
+}
+
+fn validate_emission_media_batch_inputs(
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    receiver_ecef_m: [f64; 3],
+    options: EmissionMediaBatchOptions<'_>,
+) -> Result<(), ObservablesError> {
+    validate_emission_media_batch_context_inputs(satellites, emission_epochs_j2000_s, options)?;
+    validate::finite_vec3(receiver_ecef_m, "receiver_ecef_m").map_err(map_input_error)?;
+    Ok(())
+}
+
+fn validate_emission_media_batch_context_inputs(
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    options: EmissionMediaBatchOptions<'_>,
+) -> Result<(), ObservablesError> {
     if satellites.len() != emission_epochs_j2000_s.len() {
         return Err(ObservablesError::InvalidInput {
             field: "emission_epochs_j2000_s",
             kind: ObservablesInputErrorKind::OutOfRange,
         });
     }
-    validate::finite_vec3(receiver_ecef_m, "receiver_ecef_m").map_err(map_input_error)?;
     validate_emission_media_batch_options(options)?;
+    Ok(())
+}
 
-    let mut batch = EmissionMediaBatch::with_capacity(satellites.len());
+fn emission_media_batch_at_j2000_s_unchecked(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    receiver_ecef_m: [f64; 3],
+    options: EmissionMediaBatchOptions<'_>,
+    batch: &mut EmissionMediaBatch,
+) {
+    match topocentric_receiver(receiver_ecef_m) {
+        Ok(receiver) => emission_media_batch_at_j2000_s_with_receiver_unchecked(
+            source,
+            satellites,
+            emission_epochs_j2000_s,
+            TopocentricReceiverSource::Cached(&receiver),
+            options,
+            batch,
+        ),
+        Err(_) => emission_media_batch_at_j2000_s_with_receiver_unchecked(
+            source,
+            satellites,
+            emission_epochs_j2000_s,
+            TopocentricReceiverSource::Ecef(receiver_ecef_m),
+            options,
+            batch,
+        ),
+    }
+}
+
+fn emission_media_batch_at_j2000_s_with_receiver_unchecked(
+    source: &dyn ObservableEphemerisSource,
+    satellites: &[GnssSatelliteId],
+    emission_epochs_j2000_s: &[f64],
+    receiver: TopocentricReceiverSource<'_>,
+    options: EmissionMediaBatchOptions<'_>,
+    batch: &mut EmissionMediaBatch,
+) {
     for (&sat, &emission_epoch_j2000_s) in satellites.iter().zip(emission_epochs_j2000_s.iter()) {
         let state = match source.observable_state_at_j2000_s(sat, emission_epoch_j2000_s) {
             Ok(state) => state,
@@ -852,6 +1039,7 @@ pub fn emission_media_batch_at_j2000_s(
             continue;
         }
 
+        let receiver_ecef_m = receiver.ecef_m();
         let dx = state.position_ecef_m[0] - receiver_ecef_m[0];
         let dy = state.position_ecef_m[1] - receiver_ecef_m[1];
         let dz = state.position_ecef_m[2] - receiver_ecef_m[2];
@@ -863,7 +1051,7 @@ pub fn emission_media_batch_at_j2000_s(
                 continue;
             }
         };
-        let topocentric = match topocentric(receiver_ecef_m, line_of_sight_m, range) {
+        let topocentric = match receiver.topocentric(line_of_sight_m, range) {
             Ok(topocentric) => topocentric,
             Err(error) => {
                 batch.push_error(Some(state), error);
@@ -892,7 +1080,6 @@ pub fn emission_media_batch_at_j2000_s(
             Err(error) => batch.push_error(Some(state), error),
         }
     }
-    Ok(batch)
 }
 
 /// Evaluate a satellite's transmit-time ECEF state for one static receiver.
@@ -1583,6 +1770,42 @@ fn sagnac_rotate(pos: [f64; 3], tau_s: f64, apply: bool) -> [f64; 3] {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct TopocentricReceiver {
+    ecef_m: [f64; 3],
+    geodetic: Wgs84Geodetic,
+    sin_lat: f64,
+    cos_lat: f64,
+    sin_lon: f64,
+    cos_lon: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TopocentricReceiverSource<'a> {
+    Cached(&'a TopocentricReceiver),
+    Ecef([f64; 3]),
+}
+
+impl TopocentricReceiverSource<'_> {
+    fn ecef_m(self) -> [f64; 3] {
+        match self {
+            Self::Cached(receiver) => receiver.ecef_m,
+            Self::Ecef(receiver_ecef_m) => receiver_ecef_m,
+        }
+    }
+
+    fn topocentric(
+        self,
+        delta_ecef_m: [f64; 3],
+        range_m: f64,
+    ) -> Result<TopocentricGeometry, ObservablesError> {
+        match self {
+            Self::Cached(receiver) => topocentric_with_receiver(receiver, delta_ecef_m, range_m),
+            Self::Ecef(receiver_ecef_m) => topocentric(receiver_ecef_m, delta_ecef_m, range_m),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct TopocentricGeometry {
     receiver: Wgs84Geodetic,
     elevation_rad: f64,
@@ -1596,6 +1819,13 @@ fn topocentric(
     delta_ecef_m: [f64; 3],
     range_m: f64,
 ) -> Result<TopocentricGeometry, ObservablesError> {
+    let receiver = topocentric_receiver(receiver_ecef_m)?;
+    topocentric_with_receiver(&receiver, delta_ecef_m, range_m)
+}
+
+fn topocentric_receiver(
+    receiver_ecef_m: [f64; 3],
+) -> Result<TopocentricReceiver, ObservablesError> {
     let (lat_deg, lon_deg, height_km) = itrs_to_geodetic_compute(
         receiver_ecef_m[0] / KM_TO_M,
         receiver_ecef_m[1] / KM_TO_M,
@@ -1615,18 +1845,31 @@ fn topocentric(
         }
     })?;
 
-    let sl = lat.sin();
-    let cl = lat.cos();
-    let so = lon.sin();
-    let co = lon.cos();
+    Ok(TopocentricReceiver {
+        ecef_m: receiver_ecef_m,
+        geodetic: receiver,
+        sin_lat: lat.sin(),
+        cos_lat: lat.cos(),
+        sin_lon: lon.sin(),
+        cos_lon: lon.cos(),
+    })
+}
 
+fn topocentric_with_receiver(
+    receiver: &TopocentricReceiver,
+    delta_ecef_m: [f64; 3],
+    range_m: f64,
+) -> Result<TopocentricGeometry, ObservablesError> {
     let dx = delta_ecef_m[0];
     let dy = delta_ecef_m[1];
     let dz = delta_ecef_m[2];
 
-    let e = -so * dx + co * dy;
-    let n = -sl * co * dx - sl * so * dy + cl * dz;
-    let u = cl * co * dx + cl * so * dy + sl * dz;
+    let e = -receiver.sin_lon * dx + receiver.cos_lon * dy;
+    let n = -receiver.sin_lat * receiver.cos_lon * dx - receiver.sin_lat * receiver.sin_lon * dy
+        + receiver.cos_lat * dz;
+    let u = receiver.cos_lat * receiver.cos_lon * dx
+        + receiver.cos_lat * receiver.sin_lon * dy
+        + receiver.sin_lat * dz;
 
     // Near the zenith the horizontal projection (e, n) is pure rounding noise,
     // so azimuth is degenerate and defined to be 0.0 (RTKLIB satazel semantics).
@@ -1662,7 +1905,7 @@ fn topocentric(
     validate::finite(azimuth_rad, "azimuth_rad").map_err(map_input_error)?;
     validate::finite(azimuth_deg, "azimuth_deg").map_err(map_input_error)?;
     Ok(TopocentricGeometry {
-        receiver,
+        receiver: receiver.geodetic,
         elevation_rad,
         azimuth_rad,
         elevation_deg,
