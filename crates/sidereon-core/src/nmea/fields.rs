@@ -352,7 +352,7 @@ impl NmeaTalker {
             b"GI" => Self::System(GnssSystem::Navic),
             b"GN" => Self::Combined,
             [a, b] => Self::Other([*a, *b]),
-            _ => Self::Other([b'?', b'?']),
+            _ => Self::Other(*b"??"),
         }
     }
 

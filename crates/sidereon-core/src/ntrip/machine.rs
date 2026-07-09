@@ -506,10 +506,9 @@ fn parse_prefixed_status<'a>(text: &'a str, prefix: &str) -> Option<(u16, &'a st
 fn parse_http_status(text: &str) -> Option<(NtripVersion, u16, &str)> {
     let rest = if let Some(rest) = text.strip_prefix("HTTP/1.1 ") {
         (NtripVersion::Rev2, rest)
-    } else if let Some(rest) = text.strip_prefix("HTTP/1.0 ") {
-        (NtripVersion::Rev1, rest)
     } else {
-        return None;
+        let rest = text.strip_prefix("HTTP/1.0 ")?;
+        (NtripVersion::Rev1, rest)
     };
     let mut parts = rest.1.splitn(2, char::is_whitespace);
     let status = parts.next()?.parse().ok()?;
