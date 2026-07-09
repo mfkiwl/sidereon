@@ -76,9 +76,9 @@ A typical run prints something like:
 
 Each [`SatellitePass`] gives you acquisition (`aos`), loss (`los`), culmination
 time, and peak elevation. The same `sidereon::passes` module has `look_angle`
-(azimuth / elevation / range to a satellite at an instant) and `propagate_teme_arc`
-for raw state vectors; `Satellite` from `sidereon::sgp4` is the propagator behind
-all of it.
+(azimuth / elevation / range to a satellite at an instant), `ground_track`, and
+`propagate_teme_arc` for raw state vectors; `Satellite` from `sidereon::sgp4` is
+the propagator behind all of it.
 
 ## Precise positioning
 
@@ -117,20 +117,22 @@ of epochs across a rayon pool, bit-identical to the serial path.
 
 ## What's in the box
 
-- **Orbits:** SGP4/TLE and OMM, numerical propagation with atmospheric drag and decay/reentry prediction, Kepler and anomaly conversions, classical and equinoctial elements, passes, look angles
-- **Frames, time & geodesy:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, UTC/TT/TDB/UT1, EGM96 geoid, DTED terrain elevation
-- **Bodies & almanac:** Sun/Moon/planet apparent places (geocentric or topocentric RA/Dec), Sun and Moon rise/set, seasons, moon phases, eclipses, planetary transits, plus JPL SPK (DAF/.bsp) kernels
+- **Orbits:** SGP4/TLE and OMM, numerical propagation with atmospheric drag and decay/reentry prediction, Kepler and anomaly conversions, classical and equinoctial elements, passes, look angles, ground tracks
+- **Frames, time & geodesy:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, topocentric coordinates, UTC/TT/TDB/UT1, EGM96 geoid, DTED terrain elevation
+- **Bodies & almanac:** Sun/Moon/planet apparent places (geocentric or topocentric RA/Dec and az/el), Sun and Moon rise/set, Moon illumination, seasons, moon phases, eclipses, planetary transits, plus JPL SPK (DAF/.bsp) kernels
 - **Observation geometry:** angular separation and position angle, phase/beta/parallactic angles, sub-solar and sub-observer points, terminator, satellite visual magnitude
-- **Positioning:** SPP, RTK (float/fixed), PPP (float/fixed), DOP, velocity, robust fault detection and exclusion
+- **Positioning:** SPP, RINEX observation to SPP assembly and solve helpers, RTK (float/fixed), PPP (float/fixed), DOP, velocity, robust fault detection and exclusion
 - **GNSS/INS fusion:** loose and tight updates, inertial checkpoint serialization, RTS smoothing, outage velocity matching, stationary and non-holonomic pseudo-updates
-- **GNSS data:** SP3, RINEX (obs/nav/clock), CRINEX, ANTEX, broadcast ephemeris, Bias-SINEX / CODE DCB biases, source-agnostic ephemeris sampling
+- **GNSS data:** SP3, RINEX (obs/nav/clock), CRINEX encode/decode, ANTEX, broadcast ephemeris, Bias-SINEX / CODE DCB biases, source-agnostic ephemeris sampling
 - **Corrections:** SBAS, RTCM SSR and Galileo HAS orbit/clock/bias correction stores
 - **Space situational awareness:** conjunction/TCA screening, collision probability, CDM, covariance, relative motion (RIC/RTN/LVLH, Clohessy-Wiltshire)
 - **RF:** link budget (FSPL, EIRP, C/N0, antenna gain)
 
-The product parsers, look-angle helpers, and propagation shortcuts live at the
-crate root (`load_sp3`, `solve_spp`, `passes`, `sgp4`, `tle`, `tca`, `relative`,
-`almanac`, `InertialFilter`, `velocity_match_outage_to_state`); the full astrodynamics tree is under `sidereon::astro`. Lower-level RTK/PPP internals stay
+The product parsers, CRINEX encoder, Sun/Moon sky helpers, look-angle,
+ground-track, geodetic/topocentric, Doppler, and propagation shortcuts live at
+the crate root (`load_sp3`, `encode_crinex`, `solve_spp`, `passes`, `sgp4`,
+`tle`, `tca`, `relative`, `almanac`, `InertialFilter`,
+`velocity_match_outage_to_state`); the full astrodynamics tree is under `sidereon::astro`. Lower-level RTK/PPP internals stay
 behind the explicit `sidereon::raw` escape hatch so the ergonomic surface stays
 small.
 
