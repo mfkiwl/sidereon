@@ -2,6 +2,17 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- The `sidereon` facade root now exposes the CRINEX encoder convenience
+  `encode_crinex`, matching the existing lower core module and bindings.
+- The `sidereon` facade root now re-exports existing Sun/Moon azimuth/elevation
+  helpers, geodetic/topocentric transform helpers, TLE look-angle and
+  ground-track helpers, and Doppler shift helpers that were already available
+  through lower core modules.
+
 ## [0.24.0]
 
 ### Changed
