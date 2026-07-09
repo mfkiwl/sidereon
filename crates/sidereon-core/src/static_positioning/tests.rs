@@ -600,3 +600,71 @@ fn clock_system_for(satellite_id: GnssSatelliteId) -> GnssSystem {
         system => system,
     }
 }
+
+// A single measurement-starved epoch (3 usable measurements) is underdetermined
+// (3 meas < 4 unknowns = position3 + clock1) -> singular normal matrix -> no
+// valid covariance -> rejected. Stacking N static epochs shares ONE position
+// across per-epoch clocks: 3N measurements vs (3 + N) unknowns -> redundancy
+// 2N-3. This proves stacking restores redundancy, yields a finite covariance,
+// and recovers truth where the single snapshot cannot.
+#[test]
+fn starved_epochs_stack_to_recover_redundancy_and_truth() {
+    let eph = make_store(3);
+    let starved = |n: usize| -> Vec<StaticEpoch> {
+        (0..n)
+            .map(|i| {
+                let mut e = make_epoch(&eph, i, 12.0 + i as f64 * 4.0, &[]);
+                e.measurements.truncate(3); // starve to 3 satellites
+                e
+            })
+            .collect()
+    };
+
+    // 1 starved epoch: 3 meas, 4 unknowns -> underdetermined -> no valid fix.
+    let one = solve_static(&eph, &starved(1), options());
+    match &one {
+        Err(_) => {}
+        Ok(s) => assert!(
+            s.metadata.redundancy < 0,
+            "single 3-sat epoch must be underdetermined, got redundancy {}",
+            s.metadata.redundancy
+        ),
+    }
+    eprintln!(
+        "N=1 (single starved snapshot): {}",
+        match &one {
+            Err(e) => format!("REJECTED ({e:?})"),
+            Ok(s) => format!("redundancy {}", s.metadata.redundancy),
+        }
+    );
+
+    // Stacking N starved (3-sat) epochs: redundancy 2N-3, finite covariance, recovers truth.
+    // (Covariance magnitude follows geometry, not naive epoch count, so it is not
+    // asserted monotonic here -- see covariance_shrinks_by_geometry_not_naive_epoch_count.)
+    for n in 2..=3 {
+        let sol = solve_static(&eph, &starved(n), options())
+            .unwrap_or_else(|e| panic!("{n} stacked 3-sat epochs should solve, got {e:?}"));
+        let p = sol.position.as_array();
+        let err_m =
+            ((p[0] - TRUTH[0]).powi(2) + (p[1] - TRUTH[1]).powi(2) + (p[2] - TRUTH[2]).powi(2))
+                .sqrt();
+        let std_m = trace3(sol.covariance.position_ecef_m2).sqrt();
+        eprintln!(
+            "N={n}: redundancy {:>2}  pos_err {err_m:8.2} m  cov_std {std_m:8.2} m",
+            sol.metadata.redundancy
+        );
+        assert_eq!(
+            sol.metadata.redundancy,
+            2 * n as isize - 3,
+            "redundancy should be 2N-3"
+        );
+        assert!(
+            std_m.is_finite() && std_m > 0.0,
+            "stacked covariance must be finite and positive, got {std_m}"
+        );
+        assert!(
+            err_m < 100.0,
+            "stacked fix should recover truth within 100 m, got {err_m} m"
+        );
+    }
+}
