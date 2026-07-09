@@ -2,6 +2,14 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- ARAIM now returns an unavailable `AraimResult` with `available: false` when
+  geometry cannot support the integrity budget, instead of returning
+  `UnmonitorableFaultMass`.
+
 ## [0.23.0]
 
 ### Added
