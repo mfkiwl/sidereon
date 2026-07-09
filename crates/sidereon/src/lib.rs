@@ -16,7 +16,7 @@
 //! - [`parse_rinex_clock`] / [`load_rinex_clock`] parse RINEX clock products,
 //!   with lossy variants for best-effort recovery,
 //! - [`decode_crinex`] / [`load_crinex`] expand Hatanaka-compressed
-//!   observation files,
+//!   observation files, and [`encode_crinex`] compacts plain RINEX OBS text,
 //! - [`spp_inputs_from_rinex_obs`] assembles parsed RINEX observations into SPP
 //!   solve inputs, with [`solve_spp_from_rinex_obs`] as the serial batch
 //!   convenience,
@@ -187,6 +187,10 @@ pub use sidereon_core::astro::forces::{
     ThirdBodyBodies, ThirdBodyGravity, ZonalCoefficients, ZonalDegrees, ZonalGravity,
     EGM96_DEGREE_ORDER_36, EGM96_EMBEDDED_MAX_DEGREE, EGM96_EMBEDDED_MAX_ORDER, EGM96_MU_KM3_S2,
     EGM96_REFERENCE_RADIUS_KM,
+};
+pub use sidereon_core::astro::frames::transforms::{
+    gcrs_to_topocentric_compute, geodetic_from_ecef_proj, geodetic_to_itrs,
+    itrs_to_geodetic_compute, itrs_to_topocentric, FrameTransformError, GeodeticStationKm,
 };
 pub use sidereon_core::astro::frames::{
     EarthOrientation, EarthOrientationProvider, TdbEarthOrientationProvider,
@@ -364,8 +368,20 @@ pub use sidereon_core::astro::anomaly::{
     solve_kepler, true_to_eccentric, true_to_mean, AnomalyError, KeplerSolution,
 };
 pub use sidereon_core::astro::bodies::{
-    observe, observe_spk_body, Ecliptic, Equatorial, Horizontal, Observation, ObserveOptions,
-    Refraction, Target,
+    find_moon_elevation_crossings, find_moon_transits, find_sun_elevation_crossings, moon_az_el,
+    moon_elevation_deg, moon_illumination, observe, observe_spk_body, sun_az_el, sun_elevation_deg,
+    BodyAzEl, BodyObservationError, Ecliptic, Equatorial, Horizontal, MoonElevationCrossing,
+    MoonElevationCrossingKind, MoonElevationOptions, MoonIllumination, MoonTransit,
+    MoonTransitKind, Observation, ObserveOptions, Refraction, SunElevationCrossing,
+    SunElevationCrossingKind, SunElevationOptions, Target,
+};
+pub use sidereon_core::astro::doppler::{
+    doppler_shift, range_rate_and_ratio, DopplerError, DopplerShift,
+};
+pub use sidereon_core::astro::passes::{
+    ground_track, look_angle, look_angle_arc, look_angle_batch_parallel, look_angle_batch_serial,
+    GroundStation, LookAngle, LookAngleError, PassError, PassPredictionOptions, PredictedPass,
+    UtcInstant, VisibleSatellite,
 };
 pub mod covariance {
     pub use sidereon_core::astro::covariance::{
@@ -1005,6 +1021,15 @@ pub fn decode_crinex(text: &str) -> Result<String> {
     rinex::decode_crinex(text).map_err(Error::Crinex)
 }
 
+/// Encode plain RINEX OBS text into Compact RINEX (Hatanaka) text.
+///
+/// The lower core encoder emits a canonical CRINEX stream, so it is not
+/// expected to byte-match an arbitrary `RNX2CRX` product. It does guarantee that
+/// decoding the emitted CRINEX reconstructs the input RINEX observation text.
+pub fn encode_crinex(text: &str) -> Result<String> {
+    rinex::encode_crinex(text).map_err(Error::Crinex)
+}
+
 /// Read and decode a Compact RINEX (Hatanaka) OBS file.
 pub fn load_crinex(path: impl AsRef<Path>) -> Result<String> {
     let text = std::fs::read_to_string(path)?;
@@ -1612,6 +1637,9 @@ mod tests {
 
         let decoded = decode_crinex(CRINEX_TEXT).expect("decode CRINEX fixture");
         assert!(decoded.contains("RINEX VERSION / TYPE"));
+        let encoded = encode_crinex(&decoded).expect("encode decoded RINEX fixture");
+        let round_tripped = decode_crinex(&encoded).expect("decode encoded CRINEX fixture");
+        assert_eq!(round_tripped, decoded);
         let loaded_decoded = load_crinex(fixture_path(&[
             "obs",
             "ESBC00DNK_R_20201770000_01D_30S_MO_trim.crx",
@@ -1750,13 +1778,6 @@ mod tests {
 
     #[test]
     fn ground_site_sun_moon_helpers_reachable_through_facade() {
-        use astro::bodies::{
-            find_moon_elevation_crossings, find_moon_transits, moon_az_el, moon_illumination,
-            sun_az_el, MoonElevationOptions,
-        };
-        use astro::frames::transforms::{itrs_to_topocentric, GeodeticStationKm};
-        use astro::passes::UtcInstant;
-
         let station = GeodeticStationKm {
             latitude_deg: 51.4769,
             longitude_deg: 0.0,
@@ -1823,6 +1844,55 @@ mod tests {
         let (teme_pos, _) = gcrs_to_teme_compute(&gcrs_state, &observe_time.time_scales(), false)
             .expect("TEME inverse transform");
         assert!(teme_pos.0.is_finite());
+    }
+
+    #[test]
+    fn root_geodetic_look_angle_and_doppler_helpers_reachable_through_facade() {
+        let station = GroundStation {
+            latitude_deg: 51.5,
+            longitude_deg: -0.1,
+            altitude_m: 11.0,
+        };
+        let datetime = UtcInstant::from_utc(2024, 1, 1, 12, 0, 0, 0).expect("valid UTC");
+        let tle = station_tle("ISS (ZARYA)");
+        let elements = tle::parse(tle.line1, tle.line2)
+            .expect("ISS TLE parses")
+            .elements
+            .to_element_set()
+            .expect("ISS TLE converts to SGP4 elements");
+        let look = look_angle(&elements, station, datetime).expect("ISS look angle");
+        assert!(look.azimuth_deg.is_finite());
+        assert!((-90.0..=90.0).contains(&look.elevation_deg));
+        assert!(look.range_km > 100.0);
+
+        let satellite = sgp4::Satellite::from_tle(tle.line1, tle.line2).expect("ISS TLE parses");
+        let track = ground_track(&satellite, &[datetime]).expect("ISS ground track");
+        assert_eq!(track.len(), 1);
+        assert!(track[0].lat_rad.is_finite());
+        assert!(track[0].lon_rad.is_finite());
+
+        let ecef = geodetic_to_itrs(51.5, -0.1, 0.011).expect("geodetic to ITRS");
+        let geodetic = itrs_to_geodetic_compute(ecef.0, ecef.1, ecef.2).expect("ITRS to geodetic");
+        assert!((geodetic.0 - 51.5).abs() < 1.0e-6);
+        assert!((geodetic.1 + 0.1).abs() < 1.0e-6);
+        let projected = geodetic_from_ecef_proj(ecef.0 * 1000.0, ecef.1 * 1000.0, ecef.2 * 1000.0)
+            .expect("projected geodetic");
+        assert!((projected[0] + 0.1).abs() < 1.0e-6);
+        assert!((projected[1] - 51.5).abs() < 1.0e-6);
+
+        let ts = datetime.time_scales();
+        let shifted = doppler_shift(
+            [3700.2112112039954, 2015.9122181206055, 5309.513078070448],
+            [-3.398428894395407, 6.869656830559572, -0.239850181126689],
+            40.0,
+            -74.0,
+            0.0,
+            &ts,
+            437.0e6,
+        )
+        .expect("Doppler shift");
+        assert!(shifted.range_rate_km_s.is_finite());
+        assert!(shifted.doppler_hz.is_finite());
     }
 
     #[test]
