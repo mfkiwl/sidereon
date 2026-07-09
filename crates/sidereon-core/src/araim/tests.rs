@@ -145,6 +145,7 @@ fn fault_free_only_reduces_to_closed_form_pl() {
     let expected_hpl = (expected_e * expected_e + expected_n * expected_n).sqrt();
     assert_abs_diff(result.hpl_m, expected_hpl, 1.0e-9);
     assert_eq!(result.emt_m, 0.0);
+    assert!(result.available);
     assert!(result.availability);
 }
 
@@ -292,6 +293,30 @@ fn constellation_fault_modes_drop_excluded_clock_and_stay_monitorable() {
         .find(|mode| mode.excluded_constellation == Some(GnssSystem::Galileo))
         .expect("Galileo constellation mode");
     assert!(galileo_constellation.monitorable);
+}
+
+#[test]
+fn araim_availability_distinguishes_budget_support_from_bad_input() {
+    let allocation = IntegrityAllocation::lpv_200();
+
+    let sparse_result =
+        araim(&gps_geometry(), &reference_gps_ism(), &allocation).expect("sparse ARAIM result");
+    assert!(!sparse_result.available);
+    assert!(!sparse_result.availability);
+    assert!(sparse_result.hpl_m.is_infinite());
+    assert!(sparse_result.vpl_m.is_infinite());
+    assert!(sparse_result.p_unmonitored > allocation.p_threshold_unmonitored);
+
+    let full_result = araim(&reference_gps_geometry(), &reference_gps_ism(), &allocation)
+        .expect("full ARAIM result");
+    assert!(full_result.available);
+    assert!(full_result.availability);
+
+    let mut bad_geometry = reference_gps_geometry();
+    bad_geometry.rows[0].line_of_sight.e_x = f64::NAN;
+    let error = araim(&bad_geometry, &reference_gps_ism(), &allocation)
+        .expect_err("NaN LOS remains invalid input");
+    assert_eq!(error, AraimError::InsufficientGeometry);
 }
 
 #[test]

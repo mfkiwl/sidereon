@@ -38,6 +38,8 @@ pub struct FaultMode {
 /// ARAIM protection-level result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AraimResult {
+    /// True when ARAIM met the allocation and all PL roots converged.
+    pub available: bool,
     /// Horizontal protection level, meters.
     pub hpl_m: f64,
     /// Vertical protection level, meters.
@@ -52,7 +54,10 @@ pub struct AraimResult {
     pub fault_modes: Vec<FaultMode>,
     /// Unenumerated plus unmonitorable fault probability mass.
     pub p_unmonitored: f64,
-    /// True when the solve met the allocation and all PL roots converged.
+    /// True when ARAIM met the allocation and all PL roots converged.
+    ///
+    /// Prefer [`AraimResult::available`]. This field is kept as an alias for
+    /// existing callers.
     pub availability: bool,
 }
 
@@ -133,10 +138,30 @@ pub fn araim(
     }
 
     if p_unmonitored > allocation.p_threshold_unmonitored {
-        return Err(AraimError::UnmonitorableFaultMass);
+        return Ok(unavailable_result(
+            fault_modes,
+            p_unmonitored,
+            sigma_acc_e,
+            sigma_acc_n,
+            sigma_acc_u,
+            allocation,
+        ));
     }
 
-    let budget_scale = integrity_budget_scale(allocation, p_unmonitored)?;
+    let budget_scale = match integrity_budget_scale(allocation, p_unmonitored) {
+        Ok(scale) => scale,
+        Err(AraimError::UnmonitorableFaultMass) => {
+            return Ok(unavailable_result(
+                fault_modes,
+                p_unmonitored,
+                sigma_acc_e,
+                sigma_acc_n,
+                sigma_acc_u,
+                allocation,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let pl_e = solve_coord_pl(
         &fault_modes,
         0,
@@ -167,7 +192,9 @@ pub fn araim(
         .map(|mode| mode.monitorable)
         .unwrap_or(false);
 
+    let available = fault_free_full_rank && roots_converged;
     Ok(AraimResult {
+        available,
         hpl_m: (pl_e.value_m * pl_e.value_m + pl_n.value_m * pl_n.value_m).sqrt(),
         vpl_m: pl_u.value_m,
         sigma_acc_h_m: (sigma_acc_e * sigma_acc_e + sigma_acc_n * sigma_acc_n).sqrt(),
@@ -175,8 +202,35 @@ pub fn araim(
         emt_m,
         fault_modes,
         p_unmonitored,
-        availability: fault_free_full_rank && roots_converged,
+        availability: available,
     })
+}
+
+fn unavailable_result(
+    fault_modes: Vec<FaultMode>,
+    p_unmonitored: f64,
+    sigma_acc_e: f64,
+    sigma_acc_n: f64,
+    sigma_acc_u: f64,
+    allocation: &IntegrityAllocation,
+) -> AraimResult {
+    let emt_m = fault_modes
+        .iter()
+        .filter(|mode| mode.monitorable)
+        .filter(|mode| mode.prior >= allocation.p_emt)
+        .map(|mode| mode.threshold_enu_m[2])
+        .fold(0.0_f64, f64::max);
+    AraimResult {
+        available: false,
+        hpl_m: f64::INFINITY,
+        vpl_m: f64::INFINITY,
+        sigma_acc_h_m: (sigma_acc_e * sigma_acc_e + sigma_acc_n * sigma_acc_n).sqrt(),
+        sigma_acc_v_m: sigma_acc_u,
+        emt_m,
+        fault_modes,
+        p_unmonitored,
+        availability: false,
+    }
 }
 
 struct MonitorInputs<'a> {
