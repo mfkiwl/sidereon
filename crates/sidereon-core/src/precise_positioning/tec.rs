@@ -609,7 +609,9 @@ pub fn ionospheric_pierce_point(
     let azimuth_sin = azimuth_rad.sin();
     let azimuth_cos = azimuth_rad.cos();
 
-    let latitude_rad = (receiver_sin * psi_cos + receiver_cos * psi_sin * azimuth_cos).asin();
+    let latitude_sine =
+        (receiver_sin * psi_cos + receiver_cos * psi_sin * azimuth_cos).clamp(-1.0, 1.0);
+    let latitude_rad = latitude_sine.asin();
     let longitude_step_rad =
         (azimuth_sin * psi_sin * receiver_cos).atan2(psi_cos - receiver_sin * latitude_rad.sin());
     let longitude_rad = normalize_longitude_rad(receiver_longitude_rad + longitude_step_rad);
@@ -1114,6 +1116,28 @@ mod tests {
         assert_close(pierce_point.latitude_rad, receiver_latitude_rad, 1.0e-12);
         assert_close(pierce_point.longitude_rad, receiver_longitude_rad, 1.0e-12);
         assert_close(pierce_point.earth_central_angle_rad, 0.0, 1.0e-12);
+    }
+
+    #[test]
+    fn pierce_point_near_pole_remains_finite() {
+        // Independent rounding of the spherical-trigonometry terms puts the
+        // latitude sine one ulp above 1.0 for this valid near-polar geometry.
+        let config = TecConfig {
+            shell_height_m: f64::from_bits(0x0800_003f_f000_0000),
+            earth_radius_m: f64::from_bits(0x0000_003f_7000_0000),
+        };
+
+        let pierce_point = ionospheric_pierce_point(
+            f64::from_bits(0x3ff0_0000_0000_0014),
+            f64::from_bits(0x0000_3f00_f000_0000),
+            f64::from_bits(0x3ff0_0000_0001_c600),
+            f64::from_bits(0x0000_0000_0900_0000),
+            config,
+        )
+        .expect("valid near-polar pierce point");
+
+        assert!(pierce_point.latitude_rad.is_finite());
+        assert!(pierce_point.longitude_rad.is_finite());
     }
 
     #[test]
