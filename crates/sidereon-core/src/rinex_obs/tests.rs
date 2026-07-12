@@ -799,6 +799,63 @@ fn parses_crinex_v1_decoded_rinex2_into_observations() {
 }
 
 #[test]
+fn rejects_v2_epoch_count_that_exceeds_its_i3_field() {
+    // Exact input from scheduled fuzz run 29188441671. Before the count bound,
+    // the parser passed 155_444_444_444_444 to Vec::with_capacity and aborted
+    // under AddressSanitizer before it could report the malformed epoch.
+    const CRASH: &[u8] =
+        b"5 10 5 5 0 5 0 155444444444444\xff\xff\xaa\xaa\xaa\xaa\xaa\xaa\xaa\n4444444445\0\0\0\0\
+000000000000000000000000000031770ttttv";
+    assert_eq!(CRASH.len(), 92, "scheduled-fuzz artifact length");
+    let body = String::from_utf8_lossy(CRASH);
+    let text = [
+        header_line(
+            "     2.11           OBSERVATION DATA    G (GPS)",
+            "RINEX VERSION / TYPE",
+        ),
+        header_line(
+            "     6    L1    L2    C1    P1    S1    S2",
+            "# / TYPES OF OBSERV",
+        ),
+        header_line("", "END OF HEADER"),
+        body.into_owned(),
+    ]
+    .join("\n");
+
+    let err = RinexObs::parse(&text).expect_err("an over-width epoch count must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message) if message.contains("I3 field maximum of 999")),
+        "{err}"
+    );
+}
+
+#[test]
+fn epoch_record_count_accepts_i3_maximum_and_rejects_overflow() {
+    assert_eq!(
+        parse_epoch_record_count("999", "epoch"),
+        Ok(MAX_EPOCH_RECORD_COUNT)
+    );
+    for token in ["1000", "155444444444444"] {
+        let err = parse_epoch_record_count(token, "epoch")
+            .expect_err("a count wider than the I3 field must be rejected");
+        assert!(
+            matches!(err, Error::Parse(ref message) if message.contains("I3 field maximum of 999")),
+            "{token}: {err}"
+        );
+    }
+}
+
+#[test]
+fn rejects_v3_epoch_count_that_exceeds_its_i3_field() {
+    let err = RinexObs::parse(&minimal_obs(&[], "> 2020 06 25 00 00 00.0000000  0  1000"))
+        .expect_err("an over-width RINEX-3 epoch count must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message) if message.contains("I3 field maximum of 999")),
+        "{err}"
+    );
+}
+
+#[test]
 fn rejects_malformed_phase_shift_headers() {
     for body in [
         "G L1C bad",

@@ -67,6 +67,8 @@ use crate::{Error, Result};
 const OBS_FIELD_WIDTH: usize = 16;
 /// Width of the numeric part of one observation field (`F14.3`).
 const OBS_VALUE_WIDTH: usize = 14;
+/// Largest record count representable by a RINEX epoch `I3` field.
+const MAX_EPOCH_RECORD_COUNT: usize = 999;
 const HEADER_LABELS: &[&str] = &[
     "RINEX VERSION / TYPE",
     "PGM / RUN BY / DATE",
@@ -1834,7 +1836,7 @@ fn parse_epoch_line(
     };
     let flag = strict_int_token::<u8>(tokens[index], "epoch.flag", line)?;
     index += 1;
-    let numsat = strict_int_token::<usize>(tokens[index], "epoch.satellite_count", line)?;
+    let numsat = parse_epoch_record_count(tokens[index], line)?;
     index += 1;
     let rcv_clock_offset_s = tokens
         .get(index)
@@ -1874,7 +1876,7 @@ fn parse_epoch_line_v2(
     )
     .map_err(|error| map_field_error(error, line))?;
     let flag = strict_int_token::<u8>(tokens[6], "epoch.flag", line)?;
-    let numsat = strict_int_token::<usize>(tokens[7], "epoch.satellite_count", line)?;
+    let numsat = parse_epoch_record_count(tokens[7], line)?;
     let clock = field(line, 68, line.len()).trim();
     let rcv_clock_offset_s = if clock.is_empty() {
         None
@@ -1904,6 +1906,16 @@ fn expand_rinex2_year(year: i32) -> i32 {
     } else {
         2000 + year
     }
+}
+
+fn parse_epoch_record_count(token: &str, line: &str) -> Result<usize> {
+    let count = strict_int_token::<usize>(token, "epoch.satellite_count", line)?;
+    if token.len() > 3 || count > MAX_EPOCH_RECORD_COUNT {
+        return Err(Error::Parse(format!(
+            "RINEX OBS epoch satellite count exceeds the I3 field maximum of {MAX_EPOCH_RECORD_COUNT} in {line:?}"
+        )));
+    }
+    Ok(count)
 }
 
 fn collect_epoch_sv_tokens_v2<'a, I: Iterator<Item = &'a str>>(
