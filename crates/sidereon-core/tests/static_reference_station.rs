@@ -117,7 +117,6 @@ fn carrier_options(
                     process_noise_baseline_sigma_m: 0.0,
                     dynamics_model: DynamicsModel::ConstantPosition,
                     float_only_systems: Vec::new(),
-                    innovation_screen: None,
                     report_residuals: true,
                     receiver_antenna_corrections: None,
                     ar_arming_sigma_m: None,

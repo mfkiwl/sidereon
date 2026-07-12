@@ -5,9 +5,9 @@
 //! `state` submodule. It drives the shared double-difference measurement model
 //! ([`super::rows::dd_epoch_rows_into`]), the Gauss-Newton iterated information filter
 //! ([`iterate_epoch_into`]), the LAMBDA search-and-hold step
-//! ([`search_and_hold`]), the kinematic predict step, the predicted-residual
-//! screen, and the public option/result/error types ([`UpdateOpts`],
-//! [`EpochUpdate`], [`UpdateError`]). The row buffers, normal-equation folds,
+//! ([`search_and_hold`]), the kinematic predict step, and the public option/result
+//! types ([`UpdateOpts`], [`EpochUpdate`], [`UpdateError`]). The row buffers,
+//! normal-equation folds,
 //! integer search, and measurement-model primitives live in the sibling
 //! `rows`/`normal`/`search`/`model`/`antenna` submodules and are reused here.
 //!
@@ -46,9 +46,7 @@ use super::state::{FilterState, FilterStateValidationError, FilterStateValidatio
 use super::BlockFoldScratch;
 use super::{AmbiguityScale, MeasContext, ReceiverAntennaError};
 use crate::ambiguity::AmbiguityId;
-use crate::estimation::recipe::ResidualNormRecipe;
 use crate::estimation::substrate::ambiguity::resolve_integer_lattice;
-use crate::estimation::substrate::qc::normalized_residual;
 use crate::geometry_quality::{classify, GeometryQuality, GeometryQualityThresholds};
 use crate::id::GnssSystem;
 use crate::validate;
@@ -214,9 +212,7 @@ struct GeometryScratch {
 pub struct RtkFilterScratch {
     iterate: IterateScratch,
     report_iterate: IterateScratch,
-    screen_rows: EpochRowsScratch,
     residual_rows: EpochRowsScratch,
-    screen_mask: Vec<bool>,
     held: HoldPool,
     geometry: GeometryScratch,
 }
@@ -257,7 +253,7 @@ pub(super) fn iterate_epoch(
     controls: IterateControls,
 ) -> Option<EpochPosterior> {
     let mut scratch = IterateScratch::default();
-    let posterior = iterate_epoch_into(ctx, state, epoch, held, controls, None, &mut scratch)
+    let posterior = iterate_epoch_into(ctx, state, epoch, held, controls, &mut scratch)
         .ok()
         .flatten()?;
     Some(EpochPosterior {
@@ -274,7 +270,6 @@ fn iterate_epoch_into<'a>(
     epoch: &Epoch,
     held: &[Hold],
     controls: IterateControls,
-    screen_mask: Option<&[bool]>,
     scratch: &'a mut IterateScratch,
 ) -> Result<Option<EpochPosteriorRef<'a>>, UpdateError> {
     let IterateControls {
@@ -344,12 +339,7 @@ fn iterate_epoch_into<'a>(
         // block (`Enum.sort_by(block_rows, & &1.sat)`) before assembling, so the
         // kernel must accumulate Σ_a Σ_b in the same order.
         scratch.block_indices.clear();
-        match screen_mask {
-            Some(mask) => scratch
-                .block_indices
-                .extend((0..rows.len()).filter(|&idx| mask.get(idx).copied().unwrap_or(false))),
-            None => scratch.block_indices.extend(0..rows.len()),
-        }
+        scratch.block_indices.extend(0..rows.len());
         scratch.block_indices.sort_by(|&a, &b| {
             (rows[a].kind, rows[a].ref_sat.as_str()).cmp(&(rows[b].kind, rows[b].ref_sat.as_str()))
         });
@@ -556,28 +546,6 @@ pub enum DynamicsModel {
     VelocityPropagated,
 }
 
-/// Optional predicted-residual screen for one epoch update.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct InnovationScreenOpts {
-    pub threshold_sigma: f64,
-    pub min_rows: usize,
-}
-
-/// Diagnostics from the optional predicted-residual screen.
-#[derive(Debug, Clone, PartialEq)]
-pub struct InnovationScreen {
-    pub threshold_sigma: f64,
-    pub min_rows: usize,
-    pub input_rows: usize,
-    pub accepted_rows: usize,
-    pub rejected_rows: usize,
-    pub rejected_code_rows: usize,
-    pub rejected_phase_rows: usize,
-    pub max_abs_normalized_innovation: Option<f64>,
-    pub max_rejected_abs_normalized_innovation: Option<f64>,
-    pub coasted: bool,
-}
-
 /// Options for one streaming filter epoch update.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateOpts {
@@ -599,8 +567,6 @@ pub struct UpdateOpts {
     /// (GLONASS FDMA is the canonical use). Mirrors the Elixir
     /// `:float_only_systems`.
     pub float_only_systems: Vec<String>,
-    /// Optional predicted-residual screen for the Rust kernel update.
-    pub innovation_screen: Option<InnovationScreenOpts>,
     /// Emit public residual diagnostics in [`EpochUpdate`]. Keep this disabled
     /// for pure state-carry hot-path callers.
     pub report_residuals: bool,
@@ -658,8 +624,6 @@ pub struct EpochUpdate {
     /// validate a zero-redundancy epoch while residual-based RAIM still requires
     /// positive measurement redundancy.
     pub geometry_quality: GeometryQuality,
-    /// Optional predicted-residual screen metrics.
-    pub innovation_screen: Option<InnovationScreen>,
 }
 
 /// Why a carried [`FilterState`] is not structurally valid for an update.
@@ -855,20 +819,6 @@ fn validate_update_opts(opts: &UpdateOpts) -> Result<(), UpdateError> {
         "rtk.update.process_noise_baseline_sigma_m",
     )
     .map_err(invalid_update_input)?;
-
-    if let Some(screen) = opts.innovation_screen {
-        validate::finite_positive(
-            screen.threshold_sigma,
-            "rtk.update.innovation_screen.threshold_sigma",
-        )
-        .map_err(invalid_update_input)?;
-        if screen.min_rows == 0 {
-            return Err(invalid_update_option(
-                "rtk.update.innovation_screen.min_rows",
-                super::RtkInputErrorKind::NotPositive,
-            ));
-        }
-    }
 
     if let Some(ar_arming_sigma_m) = opts.ar_arming_sigma_m {
         validate::finite_positive(ar_arming_sigma_m, "rtk.update.ar_arming_sigma_m")
@@ -1220,91 +1170,6 @@ fn filter_geometry_quality(
     ))
 }
 
-fn prepare_innovation_screen(
-    state: &FilterState,
-    epoch: &Epoch,
-    base: [f64; 3],
-    model: &MeasModel,
-    opts: &UpdateOpts,
-    rows_scratch: &mut EpochRowsScratch,
-    mask: &mut Vec<bool>,
-) -> Result<Option<InnovationScreen>, UpdateError> {
-    let Some(screen) = opts.innovation_screen else {
-        mask.clear();
-        return Ok(None);
-    };
-
-    let ctx = MeasContext {
-        base,
-        model,
-        antenna: opts.receiver_antenna_corrections.as_ref(),
-    };
-    let rows = dd_epoch_rows_into(
-        ctx,
-        epoch,
-        0,
-        state.baseline_m,
-        DdRowRecipe::SequentialFilter {
-            sd_ambiguity_ids: &state.sd_ambiguity_ids,
-            sd_ambiguities_m: &state.sd_ambiguities_m,
-        },
-        rows_scratch,
-    )
-    .map_err(update_row_error)?;
-
-    mask.clear();
-    mask.reserve(rows.len());
-
-    let mut accepted_rows = 0usize;
-    let mut rejected_rows = 0usize;
-    let mut rejected_code_rows = 0usize;
-    let mut rejected_phase_rows = 0usize;
-    let mut max_abs_normalized_innovation = None;
-    let mut max_rejected_abs_normalized_innovation = None;
-
-    for row in rows {
-        let normalized = normalized_residual(
-            ResidualNormRecipe::RtkInverseVarianceInnovation,
-            row.y,
-            row.weight,
-        )
-        .abs();
-        max_abs_normalized_innovation = Some(
-            max_abs_normalized_innovation
-                .map_or(normalized, |current: f64| current.max(normalized)),
-        );
-
-        let rejected = normalized > screen.threshold_sigma;
-        mask.push(!rejected);
-        if rejected {
-            rejected_rows += 1;
-            match row.kind {
-                RowKind::Code => rejected_code_rows += 1,
-                RowKind::Phase => rejected_phase_rows += 1,
-            }
-            max_rejected_abs_normalized_innovation = Some(
-                max_rejected_abs_normalized_innovation
-                    .map_or(normalized, |current: f64| current.max(normalized)),
-            );
-        } else {
-            accepted_rows += 1;
-        }
-    }
-
-    Ok(Some(InnovationScreen {
-        threshold_sigma: screen.threshold_sigma,
-        min_rows: screen.min_rows,
-        input_rows: rows.len(),
-        accepted_rows,
-        rejected_rows,
-        rejected_code_rows,
-        rejected_phase_rows,
-        max_abs_normalized_innovation,
-        max_rejected_abs_normalized_innovation,
-        coasted: accepted_rows < screen.min_rows,
-    }))
-}
-
 fn reported_epoch_residuals(
     ctx: MeasContext,
     state: &FilterState,
@@ -1327,44 +1192,6 @@ fn reported_epoch_residuals(
     .map_err(update_row_error)?;
 
     filter_residuals(rows)
-}
-
-fn coasted_update(
-    mut state: FilterState,
-    epoch: &Epoch,
-    ctx: MeasContext,
-    opts: &UpdateOpts,
-    innovation_screen: Option<InnovationScreen>,
-    geometry_quality: GeometryQuality,
-    residual_scratch: &mut EpochRowsScratch,
-) -> Result<EpochUpdate, UpdateError> {
-    let residuals = if opts.report_residuals {
-        reported_epoch_residuals(
-            ctx,
-            &state,
-            epoch,
-            state.baseline_m,
-            &state.sd_ambiguities_m,
-            residual_scratch,
-        )?
-    } else {
-        empty_filter_residuals()
-    };
-    let fixed_ids: Vec<String> = state.fixed_cycles.keys().cloned().collect();
-    state.epoch_count += 1;
-    Ok(EpochUpdate {
-        reported_baseline_m: state.baseline_m,
-        reported_sd_ambiguities_m: None,
-        integer_ratio: 0.0,
-        search: None,
-        integer_fixed: !fixed_ids.is_empty(),
-        newly_fixed: Vec::new(),
-        fixed_ids,
-        residuals,
-        geometry_quality,
-        innovation_screen,
-        state,
-    })
 }
 
 /// Run the LAMBDA search on the epoch's not-yet-held double differences and hold
@@ -1787,56 +1614,13 @@ pub fn update_epoch_with_scratch(
     let mut geometry_quality =
         filter_geometry_quality(ctx, &state, epoch, has_valid_prior, &mut scratch.geometry)?;
 
-    let mut innovation_screen = prepare_innovation_screen(
-        &state,
-        epoch,
-        base,
-        model,
-        opts,
-        &mut scratch.screen_rows,
-        &mut scratch.screen_mask,
-    )?;
-    if innovation_screen
-        .as_ref()
-        .is_some_and(|screen| screen.coasted)
-    {
-        return coasted_update(
-            state,
-            epoch,
-            ctx,
-            opts,
-            innovation_screen,
-            geometry_quality,
-            &mut scratch.residual_rows,
-        );
-    }
-    let screen_mask = innovation_screen
-        .as_ref()
-        .map(|_| scratch.screen_mask.as_slice());
-
     let mut held = held_from_state_into(&state, &mut scratch.held)?;
-    let mut posterior = iterate_epoch_into(
-        ctx,
-        &state,
-        epoch,
-        held,
-        controls,
-        screen_mask,
-        &mut scratch.iterate,
-    )?;
+    let mut posterior =
+        iterate_epoch_into(ctx, &state, epoch, held, controls, &mut scratch.iterate)?;
 
     if posterior.is_none() {
         if let Some(fallback_state) = uninflated_state {
             state = fallback_state;
-            innovation_screen = prepare_innovation_screen(
-                &state,
-                epoch,
-                base,
-                model,
-                opts,
-                &mut scratch.screen_rows,
-                &mut scratch.screen_mask,
-            )?;
             let has_valid_prior =
                 has_valid_filter_prior(&state, epoch_columns_had_prior, &mut scratch.geometry);
             geometry_quality = filter_geometry_quality(
@@ -1846,33 +1630,9 @@ pub fn update_epoch_with_scratch(
                 has_valid_prior,
                 &mut scratch.geometry,
             )?;
-            if innovation_screen
-                .as_ref()
-                .is_some_and(|screen| screen.coasted)
-            {
-                return coasted_update(
-                    state,
-                    epoch,
-                    ctx,
-                    opts,
-                    innovation_screen,
-                    geometry_quality,
-                    &mut scratch.residual_rows,
-                );
-            }
-            let screen_mask = innovation_screen
-                .as_ref()
-                .map(|_| scratch.screen_mask.as_slice());
             held = held_from_state_into(&state, &mut scratch.held)?;
-            posterior = iterate_epoch_into(
-                ctx,
-                &state,
-                epoch,
-                held,
-                controls,
-                screen_mask,
-                &mut scratch.iterate,
-            )?;
+            posterior =
+                iterate_epoch_into(ctx, &state, epoch, held, controls, &mut scratch.iterate)?;
         }
     }
 
@@ -1918,7 +1678,6 @@ pub fn update_epoch_with_scratch(
             fixed_ids,
             residuals,
             geometry_quality,
-            innovation_screen,
             state,
         });
     }
@@ -1964,9 +1723,6 @@ pub fn update_epoch_with_scratch(
     } else {
         let prior_state = prior_state_for_report.expect("search targets clone prior state");
         let new_held = held_from_state(&state)?;
-        let screen_mask = innovation_screen
-            .as_ref()
-            .map(|_| scratch.screen_mask.as_slice());
         let report_posterior = {
             #[cfg(test)]
             {
@@ -1979,7 +1735,6 @@ pub fn update_epoch_with_scratch(
                         epoch,
                         &new_held,
                         controls,
-                        screen_mask,
                         &mut scratch.report_iterate,
                     )
                 }
@@ -1992,7 +1747,6 @@ pub fn update_epoch_with_scratch(
                     epoch,
                     &new_held,
                     controls,
-                    screen_mask,
                     &mut scratch.report_iterate,
                 )
             }
@@ -2030,6 +1784,5 @@ pub fn update_epoch_with_scratch(
         fixed_ids,
         residuals,
         geometry_quality,
-        innovation_screen,
     })
 }

@@ -504,7 +504,6 @@ fuzz_target!(|data: &[u8]| {
         process_noise_baseline_sigma_m: input.scalars[7],
         dynamics_model: DynamicsModel::VelocityPropagated,
         float_only_systems: Vec::new(),
-        innovation_screen: None,
         report_residuals: input.bits[2] & 1 == 1,
         receiver_antenna_corrections: None,
         ar_arming_sigma_m: Some(input.scalars[8]),

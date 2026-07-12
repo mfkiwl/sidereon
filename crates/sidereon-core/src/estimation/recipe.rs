@@ -535,11 +535,6 @@ impl AmbiguityIdPolicy {
 /// ([`crate::estimation::substrate::qc::normalized_residual`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResidualNormRecipe {
-    /// `value · weight` where `weight` is an inverse double-difference *variance*
-    /// (`1/(sigma_sat^2 + sigma_ref^2)`), so the normalized innovation is
-    /// `value / sigma^2`. The RTK sequential information filter, whose DD rows
-    /// weight by inverse variance, screens its predicted innovations this way.
-    RtkInverseVarianceInnovation,
     /// `value · weight` where `weight` is an inverse *sigma*
     /// (`1/sqrt(sigma_sat^2 + sigma_ref^2)`), so the normalized residual is
     /// `value / sigma`. The RTK static float/fixed least-squares baselines, whose
@@ -552,8 +547,8 @@ pub enum ResidualNormRecipe {
     PppInverseSigmaMagnitude,
 }
 
-/// The residual-screen family a strategy applies after (or, for the filter,
-/// before) a solve. Strategy DATA for the P4 selector; the chi-square variant is
+/// The residual-screen family a strategy applies after a solve. Strategy DATA
+/// for the P4 selector; the chi-square variant is
 /// the SPP RAIM aggregate test, the rest are per-residual sigma screens that
 /// share [`crate::estimation::substrate::qc::normalized_residual`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -565,9 +560,6 @@ pub enum ScreenKind {
     /// excluding the worst satellite within a budget
     /// (`rtk_filter::fixed::solve_fixed_baseline_validated`).
     RtkFixedResidualValidation,
-    /// RTK sequential filter: information-weighted innovation screen on predicted
-    /// DD rows, masking rejected rows and coasting (`rtk_filter::update`).
-    RtkSequentialInnovation,
     /// PPP float: worst studentized residual vs a sigma gate, leave-one-out prune
     /// and re-solve while WRMS improves (`precise_positioning::float`).
     PppFloatLeaveOneOut,
@@ -581,7 +573,6 @@ impl ScreenKind {
         match self {
             Self::RaimChiSquare => None,
             Self::RtkFixedResidualValidation => Some(ResidualNormRecipe::RtkInverseSigmaResidual),
-            Self::RtkSequentialInnovation => Some(ResidualNormRecipe::RtkInverseVarianceInnovation),
             Self::PppFloatLeaveOneOut => Some(ResidualNormRecipe::PppInverseSigmaMagnitude),
         }
     }
@@ -825,10 +816,6 @@ mod tests {
         assert_eq!(
             ScreenKind::RtkFixedResidualValidation.residual_norm(),
             Some(ResidualNormRecipe::RtkInverseSigmaResidual)
-        );
-        assert_eq!(
-            ScreenKind::RtkSequentialInnovation.residual_norm(),
-            Some(ResidualNormRecipe::RtkInverseVarianceInnovation)
         );
         assert_eq!(
             ScreenKind::PppFloatLeaveOneOut.residual_norm(),

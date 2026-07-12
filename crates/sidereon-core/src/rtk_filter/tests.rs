@@ -343,7 +343,6 @@ fn single_dd_update_opts() -> UpdateOpts {
         process_noise_baseline_sigma_m: 0.0,
         dynamics_model: DynamicsModel::ConstantPosition,
         float_only_systems: vec![],
-        innovation_screen: None,
         report_residuals: false,
         force_report_iterate_failure: false,
         receiver_antenna_corrections: None,
@@ -528,28 +527,6 @@ fn update_epoch_rejects_invalid_update_options_before_math() {
         opts,
         "rtk.update.process_noise_baseline_sigma_m",
         RtkInputErrorKind::Negative,
-    );
-
-    let mut opts = valid_opts.clone();
-    opts.innovation_screen = Some(InnovationScreenOpts {
-        threshold_sigma: 0.0,
-        min_rows: 1,
-    });
-    assert_invalid(
-        opts,
-        "rtk.update.innovation_screen.threshold_sigma",
-        RtkInputErrorKind::NotPositive,
-    );
-
-    let mut opts = valid_opts.clone();
-    opts.innovation_screen = Some(InnovationScreenOpts {
-        threshold_sigma: 3.0,
-        min_rows: 0,
-    });
-    assert_invalid(
-        opts,
-        "rtk.update.innovation_screen.min_rows",
-        RtkInputErrorKind::NotPositive,
     );
 
     let mut opts = valid_opts.clone();
@@ -1601,7 +1578,6 @@ fn update_epoch_grows_searches_and_carries_held_ambiguities() {
         process_noise_baseline_sigma_m: 0.0,
         dynamics_model: DynamicsModel::ConstantPosition,
         float_only_systems: vec![],
-        innovation_screen: None,
         report_residuals: true,
         force_report_iterate_failure: false,
         receiver_antenna_corrections: None,
@@ -2969,7 +2945,6 @@ fn velocity_prediction_moves_prior_after_first_epoch_only_when_enabled() {
         process_noise_baseline_sigma_m: 0.0,
         dynamics_model: DynamicsModel::VelocityPropagated,
         float_only_systems: vec![],
-        innovation_screen: None,
         report_residuals: false,
         force_report_iterate_failure: false,
         receiver_antenna_corrections: None,
@@ -3079,7 +3054,6 @@ fn mg_opts() -> UpdateOpts {
         process_noise_baseline_sigma_m: 0.0,
         dynamics_model: DynamicsModel::ConstantPosition,
         float_only_systems: vec![],
-        innovation_screen: None,
         report_residuals: false,
         force_report_iterate_failure: false,
         receiver_antenna_corrections: None,

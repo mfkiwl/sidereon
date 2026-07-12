@@ -1386,7 +1386,6 @@ fn sequential_updates_with_options(
         process_noise_baseline_sigma_m: run_opts.process_noise_baseline_sigma_m,
         dynamics_model: DynamicsModel::ConstantPosition,
         float_only_systems: run_opts.float_only_systems,
-        innovation_screen: None,
         report_residuals: true,
         receiver_antenna_corrections: run_opts.receiver_antenna_corrections,
         ar_arming_sigma_m: run_opts.ar_arming_sigma_m,

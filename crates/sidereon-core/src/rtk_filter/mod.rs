@@ -110,8 +110,8 @@ use update::{
     IterateControls, SearchPolicy,
 };
 pub use update::{
-    update_epoch, update_epoch_with_scratch, DynamicsModel, EpochUpdate, InnovationScreen,
-    InnovationScreenOpts, InvalidStateKind, RtkFilterScratch, SearchOpts, UpdateError, UpdateOpts,
+    update_epoch, update_epoch_with_scratch, DynamicsModel, EpochUpdate, InvalidStateKind,
+    RtkFilterScratch, SearchOpts, UpdateError, UpdateOpts,
 };
 
 /// Canonical RTK solver defaults.

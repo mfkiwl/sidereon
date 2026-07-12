@@ -242,16 +242,11 @@ impl ResolvedStrategy {
     }
 }
 
-/// The residual-screen families a technique applies (P3 `ScreenKind`). RTK lists
-/// both the static fixed-baseline validation and the sequential-filter innovation
-/// screen, the two members of its screen family.
+/// The residual-screen families a technique applies (P3 `ScreenKind`).
 const fn screens_for(technique: Technique) -> &'static [ScreenKind] {
     match technique {
         Technique::Spp => &[ScreenKind::RaimChiSquare],
-        Technique::Rtk => &[
-            ScreenKind::RtkFixedResidualValidation,
-            ScreenKind::RtkSequentialInnovation,
-        ],
+        Technique::Rtk => &[ScreenKind::RtkFixedResidualValidation],
         Technique::Ppp => &[ScreenKind::PppFloatLeaveOneOut],
     }
 }
@@ -363,10 +358,7 @@ mod tests {
         // Compile-time-ish guard that the float/fixed entries share a technique.
         assert_eq!(
             screens_for(Technique::Rtk),
-            &[
-                ScreenKind::RtkFixedResidualValidation,
-                ScreenKind::RtkSequentialInnovation,
-            ]
+            &[ScreenKind::RtkFixedResidualValidation]
         );
         assert_eq!(screens_for(Technique::Spp), &[ScreenKind::RaimChiSquare]);
         assert_eq!(
@@ -400,19 +392,16 @@ mod tests {
     #[test]
     fn each_resolved_strategy_screen_uses_its_own_residual_norm() {
         // Each resolved screen maps to its committed normalization recipe: the
-        // RTK static baseline to the inverse-sigma residual, the RTK sequential
-        // filter to the inverse-variance innovation, PPP to the inverse-sigma
-        // root. SPP's aggregate RAIM screen has no per-residual recipe.
+        // RTK static baseline to the inverse-sigma residual and PPP to the
+        // inverse-sigma root. SPP's aggregate RAIM screen has no per-residual
+        // recipe.
         let rtk = ResolvedStrategy::resolve(StrategyId::rtk_reference()).unwrap();
         assert_eq!(
             rtk.screens
                 .iter()
                 .map(|screen| screen.residual_norm())
                 .collect::<Vec<_>>(),
-            vec![
-                Some(ResidualNormRecipe::RtkInverseSigmaResidual),
-                Some(ResidualNormRecipe::RtkInverseVarianceInnovation),
-            ]
+            vec![Some(ResidualNormRecipe::RtkInverseSigmaResidual)]
         );
         let ppp = ResolvedStrategy::resolve(StrategyId::ppp_reference()).unwrap();
         assert_eq!(

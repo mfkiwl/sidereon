@@ -53,8 +53,8 @@ use super::{
     baseline_ambiguity_index_core, solve_fixed_baseline_validated, solve_float_baseline,
     update_epoch, AmbiguityScale, AmbiguitySet, DynamicsModel, Epoch, FilterState,
     FilterStateValidationError, FloatBaselineSolution, FloatResidual, FloatSolveError,
-    InnovationScreen, IntegerSearchMeta, MeasModel, SatMeas, UpdateError, UpdateOpts,
-    ValidatedFixedBaselineSolution, ValidatedFixedSolveError, ValidatedFixedSolveOpts,
+    IntegerSearchMeta, MeasModel, SatMeas, UpdateError, UpdateOpts, ValidatedFixedBaselineSolution,
+    ValidatedFixedSolveError, ValidatedFixedSolveOpts,
 };
 
 /// Minimum number of arc satellites required to attempt the baseline solve.
@@ -151,7 +151,7 @@ pub struct RtkArcConfig {
     /// Per-ambiguity code-to-phase metre offsets for the integer search.
     pub offsets_m: BTreeMap<String, f64>,
     /// Per-epoch sequential-update controls (hold sigma, tolerances, dynamics,
-    /// float-only systems, innovation screen, AR arming, ratio threshold). The
+    /// float-only systems, AR arming, ratio threshold). The
     /// receiver-antenna PCO/PCV corrections also live here
     /// ([`UpdateOpts::receiver_antenna_corrections`]) and are applied verbatim by
     /// the per-epoch [`update_epoch`] / core antenna-correction path.
@@ -466,11 +466,6 @@ pub struct RtkArcEpochSolution {
     /// zero-redundancy covariance as unvalidated; sequential filters validate it
     /// only after a full-rank propagated prior is carried into the epoch.
     pub geometry_quality: GeometryQuality,
-    /// Per-epoch predicted-residual (innovation) screen result, as produced by the
-    /// per-epoch [`update_epoch`] this driver runs. `None` when the screen is
-    /// disabled in [`UpdateOpts::innovation_screen`]; otherwise it carries the
-    /// rejected-row counts and the `coasted` flag for this epoch.
-    pub innovation_screen: Option<InnovationScreen>,
 }
 
 /// Full sequential RTK arc solution.
@@ -2005,7 +2000,6 @@ fn epoch_solution(
         search: update.search.clone(),
         residuals: update.residuals.clone(),
         geometry_quality: update.geometry_quality,
-        innovation_screen: update.innovation_screen.clone(),
     }
 }
 
@@ -2030,8 +2024,8 @@ mod tests {
     use crate::constants::{C_M_S, F_L1_HZ, F_L2_HZ};
     use crate::observables::{predict, ObservableState, ObservablesError, PredictOptions};
     use crate::rtk_filter::{
-        defaults, FixedBaselineSolution, FixedSolveOpts, FloatSolveOpts, InnovationScreenOpts,
-        ResidualValidationOpts, SearchOpts, StochasticModel,
+        defaults, FixedBaselineSolution, FixedSolveOpts, FloatSolveOpts, ResidualValidationOpts,
+        SearchOpts, StochasticModel,
     };
     use crate::{GnssSatelliteId, GnssSystem};
 
@@ -2119,7 +2113,6 @@ mod tests {
             process_noise_baseline_sigma_m: 0.0,
             dynamics_model: DynamicsModel::ConstantPosition,
             float_only_systems: Vec::new(),
-            innovation_screen: None::<InnovationScreenOpts>,
             report_residuals: false,
             force_report_iterate_failure: false,
             receiver_antenna_corrections: None,
@@ -2222,45 +2215,6 @@ mod tests {
             last.integer_fixed,
             "arc should fix integers by the last epoch"
         );
-    }
-
-    #[test]
-    fn arc_surfaces_innovation_screen() {
-        let (epochs, mut config, _baseline, _tokens) = integer_arc();
-        // Enable the per-epoch innovation screen with a permissive threshold so no
-        // row is rejected and no epoch coasts; the arc numerics are unchanged but
-        // every epoch solution now carries the populated screen result.
-        config.update_opts.innovation_screen = Some(InnovationScreenOpts {
-            threshold_sigma: 1.0e6,
-            min_rows: 1,
-        });
-        let solution = solve_rtk_arc(&epochs, &config).expect("arc solves");
-        assert_eq!(solution.epochs.len(), epochs.len());
-        for epoch in &solution.epochs {
-            let screen = epoch
-                .innovation_screen
-                .as_ref()
-                .expect("innovation screen populated when enabled");
-            assert!(screen.input_rows > 0, "screen saw no rows");
-            assert_eq!(
-                screen.accepted_rows, screen.input_rows,
-                "permissive threshold should accept every row"
-            );
-            assert_eq!(screen.rejected_rows, 0);
-            assert!(!screen.coasted, "no epoch should coast under this screen");
-        }
-    }
-
-    #[test]
-    fn arc_innovation_screen_absent_when_disabled() {
-        // The default config leaves the screen off; the new field mirrors that as
-        // `None` without altering any other reported quantity.
-        let (epochs, config, _baseline, _tokens) = integer_arc();
-        let solution = solve_rtk_arc(&epochs, &config).expect("arc solves");
-        assert!(solution
-            .epochs
-            .iter()
-            .all(|epoch| epoch.innovation_screen.is_none()));
     }
 
     #[test]
