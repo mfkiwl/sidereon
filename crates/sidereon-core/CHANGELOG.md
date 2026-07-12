@@ -2,6 +2,43 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [0.26.0]
+
+### Breaking
+
+- Removed the generic sequential-RTK innovation-screen API and its result
+  fields: `InnovationScreenOpts`, `InnovationScreen`,
+  `UpdateOpts::innovation_screen`, `EpochUpdate::innovation_screen`,
+  `RtkArcEpochSolution::innovation_screen`,
+  `ScreenKind::RtkSequentialInnovation`, and
+  `ResidualNormRecipe::RtkInverseVarianceInnovation`. The removed mechanism
+  divided residuals by measurement variance, omitted predicted-state
+  covariance and shared-reference correlation during classification, and
+  treated carrier-phase events as ordinary row outliers. Sequential RTK now
+  consistently assimilates the complete correlated double-difference block;
+  carrier anomalies remain handled by the causal slip/arc lifecycle.
+- Removing those variants also compacts the enums' compiler-assigned numeric
+  discriminants. Code that casts them to integers will observe
+  `ResidualNormRecipe::RtkInverseSigmaResidual` changing from 1 to 0,
+  `ResidualNormRecipe::PppInverseSigmaMagnitude` from 2 to 1, and
+  `ScreenKind::PppFloatLeaveOneOut` from 3 to 2. These enums do not promise a
+  stable numeric representation; 0.26.0 does not preserve unused discriminant
+  holes.
+
+### Fixed
+
+- Ionospheric pierce-point evaluation now remains finite when floating-point
+  rounding puts a valid near-polar latitude sine just outside `[-1, 1]`.
+- The locked dependency graph now uses `crossbeam-epoch` 0.9.20, which fixes
+  RUSTSEC-2026-0204.
+
+### Evaluation-bit stability
+
+- The near-polar TEC correction intentionally changes affected pierce-point
+  results from non-finite latitude/longitude values to finite values. Existing
+  in-range TEC evaluations require no golden re-pin, and the ordinary
+  sequential-RTK path remains bit-identical to its former no-screen execution.
+
 ## [0.25.0]
 
 ### Added
