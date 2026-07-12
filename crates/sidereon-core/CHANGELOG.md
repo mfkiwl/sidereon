@@ -2,6 +2,23 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [0.26.1]
+
+### Security and availability
+
+- RINEX observation parsing now rejects epoch record counts that exceed the
+  format's three-character `I3` maximum of 999 before reserving record storage.
+  A malformed RINEX 2 epoch could previously pass an effectively unbounded
+  count to `Vec::with_capacity`, allowing memory exhaustion or a process abort
+  instead of a parse error. `sidereon-core` releases 0.11.1 through 0.26.0,
+  inclusive, are affected.
+
+### Evaluation-bit stability
+
+- Valid RINEX inputs retain identical parsed values and evaluation bits. Only
+  malformed epochs with an over-width record count change behavior: they now
+  return a deterministic parse error before allocation.
+
 ## [0.26.0]
 
 ### Breaking
