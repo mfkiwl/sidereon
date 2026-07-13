@@ -1,7 +1,26 @@
 use sidereon::ephemeris::{
-    sample, EphemerisSampleStatus, MmapPreciseEphemerisInterpolant, PreciseEphemerisInterpolant,
-    Sp3,
+    sample, EphemerisSampleStatus, MergeOptions, MergePrecedenceScope,
+    MmapPreciseEphemerisInterpolant, OutlierRejectOptions, PreciseEphemerisInterpolant, Sp3,
 };
+
+#[test]
+fn facade_reexports_sp3_merge_controls_and_prediction_metadata() {
+    let sp3 = Sp3::parse(DEGENERATE_SP3).expect("parse SP3 fixture");
+    let summary = sp3.prediction_summary();
+    assert!(summary.epochs.iter().all(|epoch| epoch.is_observed()));
+    assert_eq!(summary.observed_through, sp3.epochs.last().copied());
+
+    let options = MergeOptions {
+        precedence_scope: MergePrecedenceScope::SatelliteArc,
+        outlier_reject: Some(OutlierRejectOptions {
+            position_tolerance_m: 0.5,
+            clock_tolerance_s: 5.0e-9,
+        }),
+        ..MergeOptions::default()
+    };
+    assert_eq!(options.precedence_scope, MergePrecedenceScope::SatelliteArc);
+    assert!(options.outlier_reject.is_some());
+}
 use sidereon::{
     emission_media_batch_at_j2000_s, EmissionMediaBatchOptions, EmissionMediaStatus,
     GnssSatelliteId, GnssSystem,

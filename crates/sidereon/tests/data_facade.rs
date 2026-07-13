@@ -1,6 +1,7 @@
 use sidereon::data::{
     dted_cache_relpath, hgt_to_dted, mgex_nav, ops_ultra_sp3, parse_skadi_tile_id,
-    skadi_archive_url, station_obs_url, terrain_tile_index, AnalysisCenter, ProductDate,
+    skadi_archive_url, station_obs_url, terrain_tile_index, ultra_sp3_locations, AnalysisCenter,
+    ProductDate,
 };
 
 #[test]
@@ -21,6 +22,19 @@ fn facade_reexports_data_catalog_derivation() {
         product.archive_url().expect("url"),
         "https://igs.bkg.bund.de/root_ftp/IGS/products/2330/IGS0OPSULT_20242470600_02D_15M_ORB.SP3.gz"
     );
+}
+
+#[test]
+fn facade_reexports_ultra_sp3_fallback_locations() {
+    let locations = ultra_sp3_locations(
+        AnalysisCenter::EsaUlt,
+        ProductDate::new(2026, 7, 13).expect("valid date"),
+        "0000",
+    )
+    .expect("ultra locations");
+
+    assert_eq!(locations[0].pattern, "primary_02D_05M");
+    assert_eq!(locations[1].pattern, "alternate_02D_15M");
 }
 
 #[test]

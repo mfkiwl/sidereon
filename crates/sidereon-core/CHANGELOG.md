@@ -2,6 +2,20 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+## [0.28.0] - 2026-07-13
+
+### Added
+
+- Added deterministic contested-cell outlier rejection, per-cell precedence,
+  mixed-cadence SP3 coverage merging, clock-outlier provenance, and an opt-in
+  whole-satellite precedence mode.
+- Added SP3 per-epoch observed/predicted metadata and the contiguous
+  observed-through boundary derived from record flags.
+- Added current and alternate ultra-rapid SP3 catalog locations for IGS, CODE,
+  ESA, and GFZ.
+
 ## [0.27.1] - 2026-07-13
 
 ### Fixed
