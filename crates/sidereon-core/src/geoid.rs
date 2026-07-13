@@ -19,6 +19,10 @@
 //!   documented grid text format so a caller can supply a full EGM grid;
 //! - [`GeoidGrid::from_egm96_dac`], a loader for the authoritative NGA EGM96
 //!   15-arcminute binary grid (`WW15MGH.DAC`) for decimetre-class datum work;
+//! - [`GeoidGrid::from_proj_egm96_gtx`], a loader for PROJ's public EGM96
+//!   15-arcminute GTX grid, paired with [`GeoidGrid::undulation_proj_rad`] and
+//!   an explicit [`ProjVgridshiftArithmetic`] recipe for PROJ 9.3.0
+//!   vertical-grid interpolation;
 //! - [`GeoidGrid::from_egm2008_raster`], a loader for the NGA EGM2008
 //!   row-framed `REAL*4` raster grids at 2.5-arcminute and 1-arcminute spacing;
 //! - [`egm96_undulation`] / [`egm96_grid`], a zero-setup lookup against an
@@ -53,6 +57,13 @@
 //!    grid is impractical (the 15-arcminute grid is ~1 M samples and EGM2008
 //!    1-minute is ~2.3 GB), so the high-resolution path loads the file at
 //!    runtime.
+//!
+//! For bit-level interoperability with a PROJ vertical-grid pipeline, load the
+//! public `egm96_15.gtx` with [`GeoidGrid::from_proj_egm96_gtx`] and call
+//! [`GeoidGrid::undulation_proj_rad`]. This path preserves the GTX float samples
+//! and reproduces PROJ 9.3.0's radian indexing and blend order. Because PROJ's
+//! C++ source does not prescribe floating-point contraction, the caller also
+//! selects whether the multiply-add steps are fused or separately rounded.
 //!
 //! A caller with any other vendor grid can lower it to [`GeoidGrid::from_text`]
 //! or build a [`GeoidGrid`] via [`GeoidGrid::new`] and call
@@ -108,6 +119,60 @@ impl core::fmt::Display for GeoidError {
 }
 
 impl std::error::Error for GeoidError {}
+
+/// Why PROJ vertical-grid interpolation could not evaluate a coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjVgridshiftError {
+    /// A lookup coordinate was not finite.
+    NonFiniteCoordinate {
+        /// The offending coordinate.
+        field: &'static str,
+    },
+    /// A lookup coordinate was outside the grid extent.
+    CoordinateOutsideGrid {
+        /// The offending coordinate.
+        field: &'static str,
+    },
+}
+
+impl core::fmt::Display for ProjVgridshiftError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NonFiniteCoordinate { field } => {
+                write!(f, "PROJ vertical-grid {field} coordinate is not finite")
+            }
+            Self::CoordinateOutsideGrid { field } => {
+                write!(
+                    f,
+                    "PROJ vertical-grid {field} coordinate is outside the grid"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjVgridshiftError {}
+
+/// Floating-point evaluation recipe for PROJ vertical-grid interpolation.
+///
+/// PROJ 9.3.0 expresses its final three accumulation steps as ordinary C++
+/// multiply/add statements and does not set a contraction policy. Consequently,
+/// conforming builds can differ by one ULP depending on compiler, target, and
+/// build flags. Selecting the recipe explicitly makes the requested behavior
+/// reproducible instead of guessing from the Rust compilation target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjVgridshiftArithmetic {
+    /// Round the multiplication and addition separately.
+    ///
+    /// This matches PROJ builds where floating-point contraction is disabled,
+    /// including the reviewed default x86-64 Clang build of PROJ 9.3.0.
+    SeparateMultiplyAdd,
+    /// Evaluate each accumulation as a fused multiply-add with one rounding.
+    ///
+    /// This matches PROJ builds where the compiler contracts the statements,
+    /// including the AArch64 PROJ 9.3.0 build used for the dense fixture.
+    FusedMultiplyAdd,
+}
 
 /// Supported NGA EGM2008 interpolation-raster spacings.
 ///
@@ -442,6 +507,74 @@ impl GeoidGrid {
         )
     }
 
+    /// Parse PROJ's public EGM96 15-arcminute vertical-shift grid
+    /// (`egm96_15.gtx`).
+    ///
+    /// The grid is distributed by the OSGeo PROJ vdatum mirror at
+    /// <https://download.osgeo.org/proj/vdatum/egm96_15/egm96_15.gtx>. Its GTX
+    /// header and samples are big-endian: four `f64` fields (`south`, `west`,
+    /// latitude spacing, longitude spacing), two `i32` dimensions, then
+    /// `721 * 1440` row-major `f32` metre offsets. Rows are already ordered
+    /// south-to-north, as required by PROJ's vertical-grid interpolation.
+    ///
+    /// Use [`GeoidGrid::undulation_proj_rad`] with the returned grid and the
+    /// [`ProjVgridshiftArithmetic`] recipe matching the reference PROJ build.
+    /// The ordinary [`GeoidGrid::undulation_rad`] method intentionally retains
+    /// this crate's general degree-space interpolation behavior.
+    pub fn from_proj_egm96_gtx(bytes: &[u8]) -> Result<Self, GeoidError> {
+        let expected =
+            PROJ_EGM96_GTX_HEADER_BYTES + PROJ_EGM96_GTX_N_LAT * PROJ_EGM96_GTX_N_LON * 4;
+        if bytes.len() != expected {
+            return Err(GeoidError::Parse {
+                reason: format!(
+                    "PROJ egm96_15.gtx must be {expected} bytes, got {}",
+                    bytes.len()
+                ),
+            });
+        }
+
+        let south_deg = read_be_f64(bytes, 0);
+        let west_deg = read_be_f64(bytes, 8);
+        let dlat_deg = read_be_f64(bytes, 16);
+        let dlon_deg = read_be_f64(bytes, 24);
+        let n_lat = read_be_i32(bytes, 32);
+        let n_lon = read_be_i32(bytes, 36);
+        if south_deg.to_bits() != (-90.0f64).to_bits()
+            || west_deg.to_bits() != (-180.0f64).to_bits()
+            || dlat_deg.to_bits() != 0.25f64.to_bits()
+            || dlon_deg.to_bits() != 0.25f64.to_bits()
+            || n_lat != PROJ_EGM96_GTX_N_LAT as i32
+            || n_lon != PROJ_EGM96_GTX_N_LON as i32
+        {
+            return Err(GeoidError::Parse {
+                reason: format!(
+                    "PROJ egm96_15.gtx header mismatch: south={south_deg}, west={west_deg}, dlat={dlat_deg}, dlon={dlon_deg}, rows={n_lat}, columns={n_lon}"
+                ),
+            });
+        }
+
+        let mut values_m = Vec::with_capacity(PROJ_EGM96_GTX_N_LAT * PROJ_EGM96_GTX_N_LON);
+        for chunk in bytes[PROJ_EGM96_GTX_HEADER_BYTES..].chunks_exact(4) {
+            let value = f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if !value.is_finite() {
+                return Err(GeoidError::NonFiniteValue {
+                    index: values_m.len(),
+                });
+            }
+            values_m.push(f64::from(value));
+        }
+
+        Self::new(
+            south_deg,
+            west_deg,
+            dlat_deg,
+            dlon_deg,
+            PROJ_EGM96_GTX_N_LAT,
+            PROJ_EGM96_GTX_N_LON,
+            values_m,
+        )
+    }
+
     /// Parse an official full-global NGA EGM2008 interpolation raster.
     ///
     /// The byte stream must be the `Und_min1x1_...` or `Und_min2.5x2.5_...`
@@ -494,6 +627,128 @@ impl GeoidGrid {
     /// radians (latitude positive north, longitude positive east).
     pub fn undulation_rad(&self, lat_rad: f64, lon_rad: f64) -> f64 {
         self.undulation_deg(lat_rad.to_degrees(), lon_rad.to_degrees())
+    }
+
+    /// Bilinearly interpolated undulation using PROJ 9.3.0's
+    /// `read_vgrid_value` indexing and operation order.
+    ///
+    /// Unlike [`GeoidGrid::undulation_rad`], this method constructs the grid
+    /// extent and reciprocal resolution in radians, indexes latitude from the
+    /// south, and evaluates the four bilinear terms in PROJ's A/B/C/D order.
+    /// Pair it with [`GeoidGrid::from_proj_egm96_gtx`] and select the
+    /// [`ProjVgridshiftArithmetic`] used by the reference PROJ build for
+    /// bit-exact EGM96 vertical-grid results. Inputs are finite geodetic radians.
+    /// Latitude must be within the grid extent; full-world grids wrap every
+    /// finite longitude. Invalid coordinates return [`ProjVgridshiftError`]
+    /// rather than panicking or extrapolating.
+    pub fn undulation_proj_rad(
+        &self,
+        lat_rad: f64,
+        lon_rad: f64,
+        arithmetic: ProjVgridshiftArithmetic,
+    ) -> Result<f64, ProjVgridshiftError> {
+        if !lat_rad.is_finite() {
+            return Err(ProjVgridshiftError::NonFiniteCoordinate { field: "latitude" });
+        }
+        if !lon_rad.is_finite() {
+            return Err(ProjVgridshiftError::NonFiniteCoordinate { field: "longitude" });
+        }
+
+        let west = self.lon_min_deg * PROJ_DEG_TO_RAD;
+        let south = self.lat_min_deg * PROJ_DEG_TO_RAD;
+        let res_x = self.dlon_deg * PROJ_DEG_TO_RAD;
+        let res_y = self.dlat_deg * PROJ_DEG_TO_RAD;
+        let east = (self.lon_min_deg + self.dlon_deg * (self.n_lon as f64 - 1.0)) * PROJ_DEG_TO_RAD;
+        let north =
+            (self.lat_min_deg + self.dlat_deg * (self.n_lat as f64 - 1.0)) * PROJ_DEG_TO_RAD;
+        let inv_res_x = 1.0 / res_x;
+        let inv_res_y = 1.0 / res_y;
+        let full_world_longitude = east - west + res_x >= 2.0 * core::f64::consts::PI - 1.0e-10;
+
+        if lat_rad < south || lat_rad > north {
+            return Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "latitude" });
+        }
+
+        let longitude_delta = lon_rad - west;
+        let mut grid_x = longitude_delta * inv_res_x;
+        if full_world_longitude && !grid_x.is_finite() {
+            grid_x = longitude_delta.rem_euclid(2.0 * core::f64::consts::PI) * inv_res_x;
+        }
+        if lon_rad < west {
+            if full_world_longitude {
+                let width = self.n_lon as f64;
+                grid_x = ((grid_x + width) % width + width) % width;
+            } else {
+                grid_x = (lon_rad + 2.0 * core::f64::consts::PI - west) * inv_res_x;
+            }
+        } else if lon_rad > east {
+            if full_world_longitude {
+                let width = self.n_lon as f64;
+                grid_x = ((grid_x + width) % width + width) % width;
+            } else {
+                grid_x = (lon_rad - 2.0 * core::f64::consts::PI - west) * inv_res_x;
+            }
+        }
+        let mut grid_y = (lat_rad - south) * inv_res_y;
+
+        let max_grid_x = if full_world_longitude {
+            self.n_lon as f64
+        } else {
+            self.n_lon as f64 - 1.0
+        };
+        if !grid_x.is_finite() || grid_x < 0.0 || grid_x > max_grid_x {
+            return Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "longitude" });
+        }
+        if !grid_y.is_finite() || grid_y < 0.0 || grid_y > self.n_lat as f64 - 1.0 {
+            return Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "latitude" });
+        }
+
+        let grid_ix = grid_x.floor() as usize;
+        let grid_iy = grid_y.floor() as usize;
+        if grid_ix >= self.n_lon {
+            return Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "longitude" });
+        }
+        if grid_iy >= self.n_lat {
+            return Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "latitude" });
+        }
+        grid_x -= grid_ix as f64;
+        grid_y -= grid_iy as f64;
+
+        let grid_ix2 = if grid_ix + 1 >= self.n_lon {
+            if full_world_longitude {
+                0
+            } else {
+                self.n_lon - 1
+            }
+        } else {
+            grid_ix + 1
+        };
+        let grid_iy2 = (grid_iy + 1).min(self.n_lat - 1);
+
+        let value_a = self.sample(grid_iy, grid_ix);
+        let value_b = self.sample(grid_iy, grid_ix2);
+        let value_c = self.sample(grid_iy2, grid_ix);
+        let value_d = self.sample(grid_iy2, grid_ix2);
+
+        let grid_x_y = grid_x * grid_y;
+        let weight_a = 1.0 - grid_x - grid_y + grid_x_y;
+        let mut value = value_a * weight_a;
+        let weight_b = grid_x - grid_x_y;
+        let weight_c = grid_y - grid_x_y;
+        let weight_d = grid_x_y;
+        match arithmetic {
+            ProjVgridshiftArithmetic::SeparateMultiplyAdd => {
+                value += value_b * weight_b;
+                value += value_c * weight_c;
+                value += value_d * weight_d;
+            }
+            ProjVgridshiftArithmetic::FusedMultiplyAdd => {
+                value = value_b.mul_add(weight_b, value);
+                value = value_c.mul_add(weight_c, value);
+                value = value_d.mul_add(weight_d, value);
+            }
+        }
+        Ok(value)
     }
 
     /// Batch bilinear undulation lookup for geodetic positions in radians.
@@ -725,6 +980,31 @@ pub fn egm96_ellipsoidal_height_m(orthometric_height_m: f64, lat_rad: f64, lon_r
 const EGM96_DAC_N_LAT: usize = 721;
 /// Longitude sample count per record of the NGA EGM96 `WW15MGH.DAC` grid.
 const EGM96_DAC_N_LON: usize = 1440;
+
+/// Byte length of a GTX header (four big-endian f64 fields and two i32 fields).
+const PROJ_EGM96_GTX_HEADER_BYTES: usize = 40;
+/// Latitude row count of PROJ's EGM96 15-arcminute GTX grid.
+const PROJ_EGM96_GTX_N_LAT: usize = 721;
+/// Longitude column count of PROJ's EGM96 15-arcminute GTX grid.
+const PROJ_EGM96_GTX_N_LON: usize = 1440;
+/// PROJ 9.3.0's `DEG_TO_RAD` binary64 constant from `proj_internal.h`.
+const PROJ_DEG_TO_RAD: f64 = 0.017453292519943296;
+
+fn read_be_f64(bytes: &[u8], offset: usize) -> f64 {
+    f64::from_be_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("validated GTX header length"),
+    )
+}
+
+fn read_be_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_be_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("validated GTX header length"),
+    )
+}
 
 /// Latitude row count of the NGA EGM2008 1-arcminute raster.
 const EGM2008_1_MIN_N_LAT: usize = 10801;
@@ -999,6 +1279,16 @@ mod tests {
     //! EGM96 PROJ fixtures use `us_nga_egm96_15.tif` through PROJ `cct` and
     //! assert 5 mm agreement with sparse real `WW15MGH.DAC` centimetre nodes.
     //!
+    //! The contracted-arithmetic EGM96 fixture is generated from an AArch64
+    //! build of public PROJ tag 9.3.0 `read_vgrid_value` and the public OSGeo
+    //! `egm96_15.gtx` (SHA-256
+    //! `c02a6eb70a7a78efebe5adf3ade626eb75390e170bb8b3f36136a2c28f5326a0`).
+    //! It contains 13,051 radian input/result bit triples and the 52,012 source
+    //! float nodes needed by those points. The generator also requires a second
+    //! PROJ build exposed through pyproj to match every result at 0 ULP. Fixture
+    //! SHA-256:
+    //! `6de70d99b857ea1cf8efa6e820537f0b30742fe65cc0966ff1f4439a13c7e966`.
+    //!
     //! EGM2008 fixtures use the public NGA `EGM2008_Interpolation_Grid.zip`
     //! archive from `https://earth-info.nga.mil/php/download.php?file=egm-08interpolation`.
     //! Archive SHA-256:
@@ -1034,6 +1324,8 @@ mod tests {
 
     const EGM2008_NORCAL_CROP_BYTES: &[u8] =
         include_bytes!("../tests/fixtures/geoid/egm2008_25_norcal_crop.bin");
+    const PROJ_EGM96_930_DENSE_BYTES: &[u8] =
+        include_bytes!("../tests/fixtures/geoid/proj_egm96_930_dense.bin");
 
     // PROJ oracle provenance for the 15-arcminute EGM96 fixture below:
     //
@@ -1231,6 +1523,44 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn sparse_proj_egm96_gtx_from_dense_fixture() -> (Vec<u8>, usize, usize) {
+        assert_eq!(&PROJ_EGM96_930_DENSE_BYTES[..8], b"SIDGEO93");
+        let node_count = u32::from_be_bytes(
+            PROJ_EGM96_930_DENSE_BYTES[8..12]
+                .try_into()
+                .expect("fixture node count"),
+        ) as usize;
+        let point_count = u32::from_be_bytes(
+            PROJ_EGM96_930_DENSE_BYTES[12..16]
+                .try_into()
+                .expect("fixture point count"),
+        ) as usize;
+        let point_offset = 16 + node_count * 8;
+        assert_eq!(
+            PROJ_EGM96_930_DENSE_BYTES.len(),
+            point_offset + point_count * 24
+        );
+
+        let mut gtx = vec![
+            0u8;
+            super::PROJ_EGM96_GTX_HEADER_BYTES
+                + super::PROJ_EGM96_GTX_N_LAT * super::PROJ_EGM96_GTX_N_LON * 4
+        ];
+        gtx[0..8].copy_from_slice(&(-90.0f64).to_be_bytes());
+        gtx[8..16].copy_from_slice(&(-180.0f64).to_be_bytes());
+        gtx[16..24].copy_from_slice(&0.25f64.to_be_bytes());
+        gtx[24..32].copy_from_slice(&0.25f64.to_be_bytes());
+        gtx[32..36].copy_from_slice(&(super::PROJ_EGM96_GTX_N_LAT as i32).to_be_bytes());
+        gtx[36..40].copy_from_slice(&(super::PROJ_EGM96_GTX_N_LON as i32).to_be_bytes());
+
+        for record in PROJ_EGM96_930_DENSE_BYTES[16..point_offset].chunks_exact(8) {
+            let index = u32::from_be_bytes(record[..4].try_into().expect("fixture node index"));
+            let offset = super::PROJ_EGM96_GTX_HEADER_BYTES + index as usize * 4;
+            gtx[offset..offset + 4].copy_from_slice(&record[4..8]);
+        }
+        (gtx, point_offset, point_count)
     }
 
     #[test]
@@ -1618,6 +1948,133 @@ mod tests {
             GeoidGrid::from_egm96_dac(&bytes[..bytes.len() - 2]),
             Err(GeoidError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn from_proj_egm96_gtx_rejects_wrong_layout_and_nonfinite_samples() {
+        let (mut bytes, _, _) = sparse_proj_egm96_gtx_from_dense_fixture();
+        assert!(matches!(
+            GeoidGrid::from_proj_egm96_gtx(&bytes[..bytes.len() - 4]),
+            Err(GeoidError::Parse { .. })
+        ));
+
+        bytes[16..24].copy_from_slice(&0.5f64.to_be_bytes());
+        assert!(matches!(
+            GeoidGrid::from_proj_egm96_gtx(&bytes),
+            Err(GeoidError::Parse { .. })
+        ));
+
+        bytes[16..24].copy_from_slice(&0.25f64.to_be_bytes());
+        bytes[super::PROJ_EGM96_GTX_HEADER_BYTES..super::PROJ_EGM96_GTX_HEADER_BYTES + 4]
+            .copy_from_slice(&f32::NAN.to_be_bytes());
+        assert_eq!(
+            GeoidGrid::from_proj_egm96_gtx(&bytes),
+            Err(GeoidError::NonFiniteValue { index: 0 })
+        );
+    }
+
+    #[test]
+    fn proj_930_egm96_fused_dense_sample_is_zero_ulp() {
+        let (bytes, point_offset, point_count) = sparse_proj_egm96_gtx_from_dense_fixture();
+        let grid = GeoidGrid::from_proj_egm96_gtx(&bytes).expect("parse sparse public PROJ GTX");
+
+        for (index, record) in PROJ_EGM96_930_DENSE_BYTES[point_offset..]
+            .chunks_exact(24)
+            .enumerate()
+        {
+            let lon_rad = f64::from_bits(u64::from_be_bytes(
+                record[..8].try_into().expect("fixture longitude"),
+            ));
+            let lat_rad = f64::from_bits(u64::from_be_bytes(
+                record[8..16].try_into().expect("fixture latitude"),
+            ));
+            let expected_bits =
+                u64::from_be_bytes(record[16..24].try_into().expect("fixture undulation"));
+            let got = grid
+                .undulation_proj_rad(lat_rad, lon_rad, ProjVgridshiftArithmetic::FusedMultiplyAdd)
+                .expect("fixture coordinate is inside the grid");
+            assert_eq!(
+                got.to_bits(),
+                expected_bits,
+                "contracted PROJ 9.3.0 EGM96 point {index}/{point_count}: lat={lat_rad}, lon={lon_rad}, got={got}"
+            );
+        }
+        assert_eq!(point_count, 13_051);
+    }
+
+    #[test]
+    fn proj_930_egm96_separate_multiply_add_bits_are_pinned() {
+        let (bytes, _, _) = sparse_proj_egm96_gtx_from_dense_fixture();
+        let grid = GeoidGrid::from_proj_egm96_gtx(&bytes).expect("parse sparse public PROJ GTX");
+
+        // These cases are spread across the dense fixture and differ by one ULP
+        // from contracted PROJ builds. Expected values come from the reviewed
+        // PROJ 9.3.0 source sequence with contraction disabled.
+        let cases = [
+            (
+                0xbff9_21e9_072f_0bff,
+                0x3fb4_1b28_2494_7d44,
+                0xc03d_88b2_3abe_f2f0,
+            ),
+            (
+                0xbfd9_21e9_072f_0bfc,
+                0x4006_eef9_c9b9_5ed9,
+                0x4049_ff99_e8a7_6f47,
+            ),
+            (
+                0x3fd9_21e9_072f_0c01,
+                0x4004_6b94_c526_cf33,
+                0x403d_018d_8044_d991,
+            ),
+            (
+                0x3fef_6a63_48fa_cf01,
+                0x3ffb_a557_324c_2c33,
+                0xc044_4b8e_0e1f_a00c,
+            ),
+            (
+                0x3ff9_21e9_072f_0bff,
+                0x4009_21f2_2db9_9c8b,
+                0x402b_362a_4459_31d0,
+            ),
+        ];
+        for (lat_bits, lon_bits, expected_bits) in cases {
+            let got = grid
+                .undulation_proj_rad(
+                    f64::from_bits(lat_bits),
+                    f64::from_bits(lon_bits),
+                    ProjVgridshiftArithmetic::SeparateMultiplyAdd,
+                )
+                .expect("fixture coordinate is inside the grid");
+            assert_eq!(got.to_bits(), expected_bits);
+        }
+    }
+
+    #[test]
+    fn proj_lookup_rejects_invalid_coordinates_without_panicking() {
+        let (bytes, _, _) = sparse_proj_egm96_gtx_from_dense_fixture();
+        let grid = GeoidGrid::from_proj_egm96_gtx(&bytes).expect("parse sparse public PROJ GTX");
+        let arithmetic = ProjVgridshiftArithmetic::FusedMultiplyAdd;
+
+        assert_eq!(
+            grid.undulation_proj_rad(f64::NAN, 0.0, arithmetic),
+            Err(ProjVgridshiftError::NonFiniteCoordinate { field: "latitude" })
+        );
+        assert_eq!(
+            grid.undulation_proj_rad(0.0, f64::INFINITY, arithmetic),
+            Err(ProjVgridshiftError::NonFiniteCoordinate { field: "longitude" })
+        );
+        assert_eq!(
+            grid.undulation_proj_rad(-91.0 * super::PROJ_DEG_TO_RAD, 0.0, arithmetic),
+            Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "latitude" })
+        );
+        assert_eq!(
+            grid.undulation_proj_rad(91.0 * super::PROJ_DEG_TO_RAD, 0.0, arithmetic),
+            Err(ProjVgridshiftError::CoordinateOutsideGrid { field: "latitude" })
+        );
+        assert!(grid
+            .undulation_proj_rad(0.0, f64::MAX, arithmetic)
+            .expect("full-world grids wrap every finite longitude")
+            .is_finite());
     }
 
     #[test]

@@ -2,6 +2,17 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- `GeoidGrid::from_proj_egm96_gtx` loads the public PROJ EGM96 15-arcminute
+  GTX grid. `GeoidGrid::undulation_proj_rad` reproduces PROJ 9.3.0's radian
+  indexing and interpolation order with an explicit
+  `ProjVgridshiftArithmetic` selection for contracted or separately rounded
+  multiply-add evaluation. The new path is pinned against 13,051 public-grid
+  reference points; invalid coordinates return typed errors.
+
 ## [0.26.1]
 
 ### Security and availability

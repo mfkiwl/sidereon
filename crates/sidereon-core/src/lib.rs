@@ -230,7 +230,7 @@ pub use geofence::{
 pub use geoid::{
     egm96_undulations_deg, egm96_undulations_rad, ellipsoidal_height_m, geoid_undulation,
     geoid_undulations_deg, geoid_undulations_rad, orthometric_height_m, Egm2008GridSpacing,
-    Egm2008RasterWindow, GeoidError, GeoidGrid,
+    Egm2008RasterWindow, GeoidError, GeoidGrid, ProjVgridshiftArithmetic, ProjVgridshiftError,
 };
 pub use id::{GnssSatelliteId, GnssSystem, SatelliteIdError};
 pub use inertial::{

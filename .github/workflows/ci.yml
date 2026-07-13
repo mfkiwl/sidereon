@@ -20,3 +20,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  geoid-proj-x86_64:
+    name: PROJ geoid arithmetic (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Require x86_64 runner
+        run: test "$(uname -m)" = x86_64
+      - name: Verify fused and separately rounded PROJ arithmetic
+        run: cargo test -p sidereon-core geoid::tests::proj_
