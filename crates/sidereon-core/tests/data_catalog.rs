@@ -5,9 +5,9 @@ use sidereon_core::data::{
     predicted_ionex, product_convention, rapid_ionex, skadi_archive_url, skadi_band,
     skadi_source_entry, skadi_tile_id, space_weather_archive_url, space_weather_cache_relpath,
     space_weather_filename, space_weather_source_entry, station_obs, station_obs_filename,
-    station_obs_protocol, station_obs_url, terrain_tile_index, AnalysisCenter, ArchiveCompression,
-    ArchiveProtocol, DataCatalogError, ProductDate, ProductDateTime, ProductType,
-    SpaceWeatherProduct, UltraIssue,
+    station_obs_protocol, station_obs_url, terrain_tile_index, ultra_sp3_locations, AnalysisCenter,
+    ArchiveCompression, ArchiveProtocol, DataCatalogError, ProductDate, ProductDateTime,
+    ProductType, SpaceWeatherProduct, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
@@ -164,7 +164,7 @@ fn ultra_rapid_sp3_urls_match_binding_catalog_examples() {
         .expect("ESA ultra SP3 product");
     assert_eq!(
         esa.archive_url().expect("url"),
-        "https://navigation-office.esa.int/products/gnss-products/2330/ESA0OPSULT_20242470600_02D_15M_ORB.SP3.gz"
+        "https://navigation-office.esa.int/products/gnss-products/2330/ESA0OPSULT_20242470600_02D_05M_ORB.SP3.gz"
     );
 
     let cod = ops_ultra_sp3(AnalysisCenter::CodUlt, date(2026, 6, 11), None, None)
@@ -177,6 +177,28 @@ fn ultra_rapid_sp3_urls_match_binding_catalog_examples() {
         cod.archive_url().expect("url"),
         "http://ftp.aiub.unibe.ch/CODE/COD0OPSULT_20261620000_01D_05M_ORB.SP3"
     );
+}
+
+#[test]
+fn ultra_rapid_sp3_locations_include_current_patterns_and_fallbacks() {
+    let esa = ultra_sp3_locations(AnalysisCenter::EsaUlt, date(2026, 7, 12), "1800")
+        .expect("ESA candidates");
+    assert_eq!(esa[0].pattern, "primary_02D_05M");
+    assert!(esa[0].filename.ends_with("_02D_05M_ORB.SP3"));
+    assert_eq!(esa[1].pattern, "alternate_02D_15M");
+
+    let code = ultra_sp3_locations(AnalysisCenter::CodUlt, date(2026, 6, 3), "0000")
+        .expect("CODE candidates");
+    let alias = code.last().expect("latest alias");
+    assert_eq!(alias.pattern, "alias_latest");
+    assert_eq!(alias.filename, "COD0OPSULT.SP3");
+    assert_eq!(alias.url, "http://ftp.aiub.unibe.ch/CODE/COD0OPSULT.SP3");
+
+    let gfz_target = ProductDateTime::new(date(2026, 7, 12), 10, 0, 0).expect("target");
+    let gfz_issues =
+        sidereon_core::data::ultra_issue_candidates(AnalysisCenter::GfzUlt, gfz_target)
+            .expect("GFZ issues");
+    assert_eq!(gfz_issues[0].issue, "0900");
 }
 
 #[test]

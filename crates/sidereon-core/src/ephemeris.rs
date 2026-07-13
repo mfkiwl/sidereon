@@ -42,11 +42,12 @@ pub use crate::sp3::{
     align_clock_reference, clock_reference_offset, compare_position_series, merge,
     precise_interpolant_store_checksum64, sp3_ecef_state_to_eci, AgreementMetric,
     ClockReferenceOffset, EpochAgreement, InterpolationComparison, InterpolationDivergence,
-    MergeCombine, MergeFlag, MergeOptions, MergeReport, MmapPreciseEphemerisInterpolant,
-    PreciseEphemerisInterpolant, PreciseEphemerisSample, PreciseEphemerisSamples,
-    PreciseEphemerisStateSample, PreciseInterpolantError, PreciseInterpolantStoreError,
-    PreciseSamplesError, ReferenceState, Sp3, Sp3DataType, Sp3Flags, Sp3FrameLabelSet,
-    Sp3FrameReconciliation, Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions, Sp3Header,
+    MergeCombine, MergeFlag, MergeOptions, MergePrecedenceScope, MergeReport,
+    MmapPreciseEphemerisInterpolant, OutlierRejectOptions, PreciseEphemerisInterpolant,
+    PreciseEphemerisSample, PreciseEphemerisSamples, PreciseEphemerisStateSample,
+    PreciseInterpolantError, PreciseInterpolantStoreError, PreciseSamplesError, ReferenceState,
+    Sp3, Sp3DataType, Sp3EpochPrediction, Sp3Flags, Sp3FrameLabelSet, Sp3FrameReconciliation,
+    Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions, Sp3Header, Sp3PredictionSummary,
     Sp3State, Sp3TimeSystem, Sp3Version,
 };
 pub use crate::spp::EphemerisSource;

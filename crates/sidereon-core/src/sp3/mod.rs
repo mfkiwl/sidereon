@@ -243,6 +243,35 @@ pub struct Sp3State {
     pub flags: Sp3Flags,
 }
 
+/// Prediction status aggregated over every satellite record at one SP3 epoch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sp3EpochPrediction {
+    /// The parsed epoch.
+    pub epoch: Instant,
+    /// Satellites whose orbit record is marked predicted at this epoch.
+    pub orbit_predicted_satellites: Vec<GnssSatelliteId>,
+    /// Satellites whose clock record is marked predicted at this epoch.
+    pub clock_predicted_satellites: Vec<GnssSatelliteId>,
+}
+
+impl Sp3EpochPrediction {
+    /// True when no position or clock record at this epoch is marked predicted.
+    pub fn is_observed(&self) -> bool {
+        self.orbit_predicted_satellites.is_empty() && self.clock_predicted_satellites.is_empty()
+    }
+}
+
+/// Product-wide observed/predicted metadata derived from SP3 record flags.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sp3PredictionSummary {
+    /// Per-epoch prediction status in parsed epoch order.
+    pub epochs: Vec<Sp3EpochPrediction>,
+    /// Last epoch before the first epoch containing any predicted record. This
+    /// is the product's truthful contiguous observed-through boundary. It is
+    /// `None` when the first epoch is already predicted or the product is empty.
+    pub observed_through: Option<Instant>,
+}
+
 /// Parsed SP3 header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sp3Header {
@@ -384,6 +413,47 @@ impl Sp3 {
     /// satellite order.
     pub fn states_at(&self, epoch_index: usize) -> Result<&BTreeMap<GnssSatelliteId, Sp3State>> {
         self.states.get(epoch_index).ok_or(Error::EpochOutOfRange)
+    }
+
+    /// Aggregate the per-record SP3 orbit/clock prediction flags by epoch and
+    /// compute the contiguous observed-through boundary.
+    ///
+    /// This uses the actual `P` flags carried by position records; it never
+    /// assumes a fixed ultra-rapid observed duration. Individual cell flags
+    /// remain available through [`Sp3::state`] and [`Sp3::states_at`].
+    pub fn prediction_summary(&self) -> Sp3PredictionSummary {
+        let epochs: Vec<Sp3EpochPrediction> = self
+            .epochs
+            .iter()
+            .copied()
+            .zip(self.states.iter())
+            .map(|(epoch, states)| Sp3EpochPrediction {
+                epoch,
+                orbit_predicted_satellites: states
+                    .iter()
+                    .filter_map(|(satellite, state)| {
+                        state.flags.orbit_predicted.then_some(*satellite)
+                    })
+                    .collect(),
+                clock_predicted_satellites: states
+                    .iter()
+                    .filter_map(|(satellite, state)| {
+                        state.flags.clock_predicted.then_some(*satellite)
+                    })
+                    .collect(),
+            })
+            .collect();
+        let first_predicted = epochs.iter().position(|epoch| !epoch.is_observed());
+        let observed_through = match first_predicted {
+            Some(0) => None,
+            Some(index) => self.epochs.get(index - 1).copied(),
+            None => self.epochs.last().copied(),
+        };
+
+        Sp3PredictionSummary {
+            epochs,
+            observed_through,
+        }
     }
 }
 
@@ -1090,8 +1160,9 @@ mod write;
 
 pub use combine::{
     align_clock_reference, clock_reference_offset, merge, AgreementMetric, ClockReferenceOffset,
-    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergeReport, Sp3FrameLabelSet,
-    Sp3FrameReconciliation, Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions,
+    EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergePrecedenceScope, MergeReport,
+    OutlierRejectOptions, Sp3FrameLabelSet, Sp3FrameReconciliation, Sp3FrameReconciliationMethod,
+    Sp3FrameReconciliationOptions,
 };
 pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
 pub use interpolant_store::{

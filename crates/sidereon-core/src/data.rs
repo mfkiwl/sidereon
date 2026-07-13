@@ -503,7 +503,7 @@ const ESA_ULT_PRODUCTS: [CenterProductConvention; 1] = [CenterProductConvention 
     token: "ESA0OPSULT",
     layout: ArchiveLayout::GpsWeek,
     span: "02D",
-    default_sample: "15M",
+    default_sample: "05M",
     compression: ArchiveCompression::Gzip,
 }];
 
@@ -518,6 +518,9 @@ const GFZ_ULT_PRODUCTS: [CenterProductConvention; 1] = [CenterProductConvention 
 
 const OPSULT_ISSUES: [&str; 4] = ["0000", "0600", "1200", "1800"];
 const COD_ULT_ISSUES: [&str; 1] = ["0000"];
+const GFZ_ULT_ISSUES: [&str; 8] = [
+    "0000", "0300", "0600", "0900", "1200", "1500", "1800", "2100",
+];
 
 const CENTER_ORDER: [AnalysisCenter; 11] = [
     AnalysisCenter::CodRap,
@@ -631,7 +634,7 @@ const CATALOG: [CenterCatalogEntry; 11] = [
         host: "isdc-data.gfz.de",
         root_url: "https://isdc-data.gfz.de/gnss/products",
         products: &GFZ_ULT_PRODUCTS,
-        issues: &OPSULT_ISSUES,
+        issues: &GFZ_ULT_ISSUES,
     },
 ];
 
@@ -1034,6 +1037,115 @@ impl UltraIssue {
         })
     }
 }
+
+/// One generated ultra-rapid SP3 archive candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UltraSp3Location {
+    /// Stable catalog label identifying the primary, alternate, or alias rule.
+    pub pattern: String,
+    /// Product span token used by the candidate.
+    pub span: String,
+    /// Sampling token used by the candidate.
+    pub sample: String,
+    /// Archive filename without a transport compression suffix.
+    pub filename: String,
+    /// Full archive URL, including its compression suffix when applicable.
+    pub url: String,
+    /// Archive compression for this candidate.
+    pub compression: ArchiveCompression,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UltraSp3Pattern {
+    label: &'static str,
+    span: &'static str,
+    sample: &'static str,
+    alias_filename: Option<&'static str>,
+}
+
+const IGS_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
+    UltraSp3Pattern {
+        label: "primary_02D_15M",
+        span: "02D",
+        sample: "15M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_02D_05M",
+        span: "02D",
+        sample: "05M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_01D_15M",
+        span: "01D",
+        sample: "15M",
+        alias_filename: None,
+    },
+];
+
+const COD_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
+    UltraSp3Pattern {
+        label: "primary_01D_05M",
+        span: "01D",
+        sample: "05M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_02D_05M",
+        span: "02D",
+        sample: "05M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alias_latest",
+        span: "01D",
+        sample: "05M",
+        alias_filename: Some("COD0OPSULT.SP3"),
+    },
+];
+
+const ESA_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
+    UltraSp3Pattern {
+        label: "primary_02D_05M",
+        span: "02D",
+        sample: "05M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_02D_15M",
+        span: "02D",
+        sample: "15M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_01D_05M",
+        span: "01D",
+        sample: "05M",
+        alias_filename: None,
+    },
+];
+
+const GFZ_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
+    UltraSp3Pattern {
+        label: "primary_02D_05M",
+        span: "02D",
+        sample: "05M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_02D_15M",
+        span: "02D",
+        sample: "15M",
+        alias_filename: None,
+    },
+    UltraSp3Pattern {
+        label: "alternate_01D_05M",
+        span: "01D",
+        sample: "05M",
+        alias_filename: None,
+    },
+];
 
 /// A pure product specification that resolves to one archive filename and URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1585,6 +1697,65 @@ pub fn ops_ultra_sp3(
 ) -> Result<ProductSpec, DataCatalogError> {
     let issue = issue.unwrap_or("0000");
     product(center, ProductType::Sp3, date, sample, Some(issue))
+}
+
+/// Generate the current primary ultra-rapid SP3 location followed by known
+/// duration/sampling alternates and documented latest-product aliases.
+///
+/// Candidate order is deterministic and center-specific. Callers should try
+/// the next location only when the prior archive URL is absent; transport and
+/// retry policy remain outside the pure core catalog.
+pub fn ultra_sp3_locations(
+    center: AnalysisCenter,
+    date: ProductDate,
+    issue: &str,
+) -> Result<Vec<UltraSp3Location>, DataCatalogError> {
+    validate_issue_for_center(center, Some(issue))?;
+    let patterns: &[UltraSp3Pattern] = match center {
+        AnalysisCenter::IgsUlt => &IGS_ULT_SP3_PATTERNS,
+        AnalysisCenter::CodUlt => &COD_ULT_SP3_PATTERNS,
+        AnalysisCenter::EsaUlt => &ESA_ULT_SP3_PATTERNS,
+        AnalysisCenter::GfzUlt => &GFZ_ULT_SP3_PATTERNS,
+        other => {
+            return Err(DataCatalogError::UnsupportedProduct {
+                center: other,
+                product_type: ProductType::Sp3,
+            })
+        }
+    };
+    let convention = product_convention(center, ProductType::Sp3)?;
+    let entry = center_catalog(center).expect("catalog entry exists for enum variant");
+    let directory = dir_path(convention.layout, date)?;
+    let date = date_block(date, Some(issue));
+
+    Ok(patterns
+        .iter()
+        .map(|pattern| {
+            let filename = pattern.alias_filename.map_or_else(
+                || {
+                    format!(
+                        "{}_{}_{}_{}_ORB.SP3",
+                        convention.token, date, pattern.span, pattern.sample
+                    )
+                },
+                ToOwned::to_owned,
+            );
+            UltraSp3Location {
+                pattern: pattern.label.to_string(),
+                span: pattern.span.to_string(),
+                sample: pattern.sample.to_string(),
+                url: format!(
+                    "{}/{}/{}{}",
+                    entry.root_url,
+                    directory,
+                    filename,
+                    convention.compression.suffix()
+                ),
+                filename,
+                compression: convention.compression,
+            }
+        })
+        .collect())
 }
 
 /// Build an ultra-rapid OPS clock product for a date and issue time.

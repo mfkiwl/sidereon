@@ -219,6 +219,33 @@ fn predicted_and_maneuver_flags_sp3d() {
 }
 
 #[test]
+fn prediction_summary_uses_record_flags_for_the_observed_boundary() {
+    let flagged = SP3C_FILE.replace(
+        "PG01  15100.000000 -20100.000000   5100.000000   -987.654321              E",
+        "PG01  15100.000000 -20100.000000   5100.000000   -987.654321                   P",
+    );
+    let sp3 = Sp3::parse(flagged.as_bytes()).unwrap();
+    let summary = sp3.prediction_summary();
+
+    assert_eq!(summary.epochs.len(), 2);
+    assert!(summary.epochs[0].is_observed());
+    assert_eq!(
+        summary.epochs[1].orbit_predicted_satellites,
+        vec![id(GnssSystem::Gps, 1)]
+    );
+    assert_eq!(summary.observed_through, Some(sp3.epochs[0]));
+}
+
+#[test]
+fn prediction_summary_marks_a_final_product_fully_observed() {
+    let sp3 = Sp3::parse(SP3C_FILE.as_bytes()).unwrap();
+    let summary = sp3.prediction_summary();
+
+    assert!(summary.epochs.iter().all(Sp3EpochPrediction::is_observed));
+    assert_eq!(summary.observed_through, sp3.epochs.last().copied());
+}
+
+#[test]
 fn epoch_index_out_of_range_errors() {
     let sp3 = Sp3::parse(SP3C_FILE.as_bytes()).unwrap();
     assert_eq!(
