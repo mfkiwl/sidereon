@@ -118,7 +118,7 @@ of epochs across a rayon pool, bit-identical to the serial path.
 ## What's in the box
 
 - **Orbits:** SGP4/TLE and OMM, numerical propagation with atmospheric drag and decay/reentry prediction, Kepler and anomaly conversions, classical and equinoctial elements, passes, look angles, ground tracks
-- **Frames, time & geodesy:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, topocentric coordinates, UTC/TT/TDB/UT1, EGM96 geoid, DTED terrain elevation
+- **Frames, time & geodesy:** TEME ↔ GCRS ↔ ITRS, GMST/GAST, geodetic ↔ ECEF, topocentric coordinates, UTC/TT/TDB/UT1, EGM96/EGM2008 geoid grids, PROJ EGM96 GTX loading with explicit fused or separately rounded interpolation, DTED terrain elevation
 - **Bodies & almanac:** Sun/Moon/planet apparent places (geocentric or topocentric RA/Dec and az/el), Sun and Moon rise/set, Moon illumination, seasons, moon phases, eclipses, planetary transits, plus JPL SPK (DAF/.bsp) kernels
 - **Observation geometry:** angular separation and position angle, phase/beta/parallactic angles, sub-solar and sub-observer points, terminator, satellite visual magnitude
 - **Positioning:** SPP, RINEX observation to SPP assembly and solve helpers, RTK (float/fixed), PPP (float/fixed), DOP, velocity, robust fault detection and exclusion

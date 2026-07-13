@@ -27,6 +27,8 @@ and never compile the SP3/RINEX/IONEX/solver code.
 - Single-point positioning, double-differenced RTK with LAMBDA ambiguity resolution, and
   static precise point positioning.
 - Broadcast Klobuchar ionosphere and Saastamoinen plus Niell troposphere.
+- EGM96/EGM2008 geoid grids, including the public PROJ EGM96 GTX loader with
+  explicit fused or separately rounded PROJ 9.3 interpolation.
 
 ## Parity bar
 

@@ -2,7 +2,7 @@
 
 All notable changes to `sidereon-core` are documented here.
 
-## [Unreleased]
+## [0.27.0] - 2026-07-12
 
 ### Added
 
@@ -12,6 +12,12 @@ All notable changes to `sidereon-core` are documented here.
   `ProjVgridshiftArithmetic` selection for contracted or separately rounded
   multiply-add evaluation. The new path is pinned against 13,051 public-grid
   reference points; invalid coordinates return typed errors.
+
+### Evaluation-bit stability
+
+- Existing geoid loaders and `GeoidGrid::undulation_rad` retain their previous
+  evaluation bits. The new PROJ path has no implicit platform-dependent
+  default: callers select fused or separately rounded arithmetic explicitly.
 
 ## [0.26.1]
 
