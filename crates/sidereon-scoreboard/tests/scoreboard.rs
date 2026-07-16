@@ -152,6 +152,53 @@ fn mocked_fetch_resolves_without_network() {
 }
 
 #[test]
+fn source_network_failure_falls_back_to_an_independent_archive() {
+    struct SourceFallbackFetcher {
+        bkg_attempts: std::cell::Cell<usize>,
+    }
+
+    impl ProductFetcher for SourceFallbackFetcher {
+        fn fetch(
+            &self,
+            candidate: &ProductCandidate,
+        ) -> Result<FetchOutcome, sidereon_scoreboard::ScoreboardError> {
+            if candidate.source == "BKG IGS" {
+                self.bkg_attempts.set(self.bkg_attempts.get() + 1);
+                return Err(sidereon_scoreboard::ScoreboardError::Network {
+                    archive_source: candidate.source.to_string(),
+                    name: candidate.name.clone(),
+                    url: candidate.url.clone(),
+                    message: "simulated connection failure".to_string(),
+                });
+            }
+            if candidate.source == "ESA" {
+                return Ok(FetchOutcome::Available(
+                    include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
+                ));
+            }
+            panic!("resolver should stop after the independent fallback succeeds");
+        }
+    }
+
+    let fetcher = SourceFallbackFetcher {
+        bkg_attempts: std::cell::Cell::new(0),
+    };
+    let report = run_with_fetcher(date(2026, 7, 15), 4, &fetcher)
+        .expect("one source outage does not abort the scoreboard");
+
+    assert_eq!(report.status, ScoreboardStatus::Scored);
+    assert_eq!(fetcher.bkg_attempts.get(), 1);
+    assert_eq!(report.attempted_candidates.len(), 2);
+    assert_eq!(report.attempted_candidates[0].source, "BKG IGS");
+    assert!(report.attempted_candidates[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("simulated connection failure")));
+    assert_eq!(report.attempted_candidates[1].source, "ESA");
+    assert!(report.attempted_candidates[1].error.is_none());
+}
+
+#[test]
 fn missing_candidate_urls_are_no_data_report() {
     struct MissingFetcher;
 

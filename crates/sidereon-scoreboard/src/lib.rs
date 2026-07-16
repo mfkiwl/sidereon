@@ -90,6 +90,9 @@ pub struct AttemptedCandidateReport {
     pub url: String,
     /// HTTP status proving that this candidate URL was absent, when available.
     pub http_status: Option<u16>,
+    /// Source-local fetch failure, when the resolver continued with another source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Per-constellation scoreboard aggregate.
@@ -201,6 +204,8 @@ pub struct ProductResolution {
     pub attempted: Vec<ProductCandidate>,
     /// HTTP absence statuses aligned with `attempted`; `None` means unavailable or successful.
     pub attempted_http_statuses: Vec<Option<u16>>,
+    /// Source-local fetch failures aligned with `attempted`.
+    pub attempted_errors: Vec<Option<String>>,
 }
 
 /// Fetch result for one product candidate.
@@ -333,27 +338,56 @@ pub fn resolve_latest_available_rapid_sp3(
 ) -> Result<ProductResolution, ScoreboardError> {
     let mut attempted = Vec::new();
     let mut attempted_http_statuses = Vec::new();
+    let mut attempted_errors = Vec::new();
+    let mut unavailable_sources = BTreeSet::new();
     for candidate in product_candidates(target_date, lookback_days)? {
+        if unavailable_sources.contains(candidate.source) {
+            continue;
+        }
         attempted.push(candidate.clone());
-        match fetcher.fetch(&candidate)? {
-            FetchOutcome::Available(bytes) => {
+        match fetcher.fetch(&candidate) {
+            Ok(FetchOutcome::Available(bytes)) => {
                 attempted_http_statuses.push(None);
+                attempted_errors.push(None);
                 return Ok(ProductResolution {
                     resolved: Some(ResolvedProduct { candidate, bytes }),
                     attempted,
                     attempted_http_statuses,
+                    attempted_errors,
                 });
             }
-            FetchOutcome::NotPosted { http_status } => {
+            Ok(FetchOutcome::NotPosted { http_status }) => {
                 attempted_http_statuses.push(http_status);
+                attempted_errors.push(None);
             }
+            Err(error) if source_local_fetch_failure(&error) => {
+                attempted_http_statuses.push(fetch_failure_http_status(&error));
+                attempted_errors.push(Some(error.to_string()));
+                unavailable_sources.insert(candidate.source);
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(ProductResolution {
         resolved: None,
         attempted,
         attempted_http_statuses,
+        attempted_errors,
     })
+}
+
+fn source_local_fetch_failure(error: &ScoreboardError) -> bool {
+    matches!(
+        error,
+        ScoreboardError::Network { .. } | ScoreboardError::HttpStatus { .. }
+    )
+}
+
+fn fetch_failure_http_status(error: &ScoreboardError) -> Option<u16> {
+    match error {
+        ScoreboardError::HttpStatus { status, .. } => Some(*status),
+        _ => None,
+    }
 }
 
 /// Build a scoreboard report from SP3 bytes.
@@ -460,30 +494,48 @@ pub fn no_data_report(
     attempted: &[ProductCandidate],
 ) -> ScoreboardReport {
     let attempted_http_statuses = vec![None; attempted.len()];
-    no_data_report_with_statuses(target_date, attempted, &attempted_http_statuses)
+    let attempted_errors = vec![None; attempted.len()];
+    no_data_report_with_statuses(
+        target_date,
+        attempted,
+        &attempted_http_statuses,
+        &attempted_errors,
+    )
 }
 
 fn no_data_report_with_statuses(
     target_date: ProductDate,
     attempted: &[ProductCandidate],
     attempted_http_statuses: &[Option<u16>],
+    attempted_errors: &[Option<String>],
 ) -> ScoreboardReport {
+    let mut notes = vec![
+        format!(
+            "No rapid or ultra-rapid SP3 candidate URL returned data in {} attempts.",
+            attempted.len()
+        ),
+        "HTTP 404/410 establishes absence at an attempted URL, not authoritative publication status at another provider path."
+            .to_string(),
+    ];
+    if attempted_errors.iter().any(Option::is_some) {
+        notes.push(
+            "Source-local fetch failures did not stop fallback to independent archives; diagnostics are retained on attempted candidates."
+                .to_string(),
+        );
+    }
     ScoreboardReport {
         date_utc: target_date.to_string(),
         sidereon_version: env!("CARGO_PKG_VERSION").to_string(),
         status: ScoreboardStatus::NoData,
         product: None,
-        attempted_candidates: attempted_candidate_reports(attempted, attempted_http_statuses),
+        attempted_candidates: attempted_candidate_reports(
+            attempted,
+            attempted_http_statuses,
+            attempted_errors,
+        ),
         per_constellation: BTreeMap::new(),
         per_sat: empty_per_satellite_report(),
-        notes: vec![
-            format!(
-                "No rapid or ultra-rapid SP3 candidate URL returned data in {} attempts.",
-                attempted.len()
-            ),
-            "HTTP 404/410 establishes absence at an attempted URL, not authoritative publication status at another provider path."
-                .to_string(),
-        ],
+        notes,
     }
 }
 
@@ -508,6 +560,7 @@ pub fn write_report_outputs(
 fn attempted_candidate_reports(
     attempted: &[ProductCandidate],
     attempted_http_statuses: &[Option<u16>],
+    attempted_errors: &[Option<String>],
 ) -> Vec<AttemptedCandidateReport> {
     attempted
         .iter()
@@ -519,6 +572,7 @@ fn attempted_candidate_reports(
             name: candidate.name.clone(),
             url: candidate.url.clone(),
             http_status: attempted_http_statuses.get(index).copied().flatten(),
+            error: attempted_errors.get(index).cloned().flatten(),
         })
         .collect()
 }
@@ -1060,6 +1114,7 @@ pub fn run_with_fetcher(
             target_date,
             &resolution.attempted,
             &resolution.attempted_http_statuses,
+            &resolution.attempted_errors,
         ));
     };
     let mut report = score_sp3_bytes(
@@ -1068,8 +1123,11 @@ pub fn run_with_fetcher(
         resolved.candidate.date,
         &ScoreOptions::default(),
     )?;
-    report.attempted_candidates =
-        attempted_candidate_reports(&resolution.attempted, &resolution.attempted_http_statuses);
+    report.attempted_candidates = attempted_candidate_reports(
+        &resolution.attempted,
+        &resolution.attempted_http_statuses,
+        &resolution.attempted_errors,
+    );
     Ok(report)
 }
 
