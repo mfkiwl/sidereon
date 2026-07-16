@@ -57,6 +57,20 @@ https://cddis.nasa.gov/archive/gnss/products/ionex/<year>/<day-of-year>/<officia
 The core rejects CDDIS requests for product families for which this mapping is
 not implemented. It does not relabel another file as the requested product.
 
+## CODE predicted IONEX paths
+
+CODE P1 and P2 predicted maps use separate AIUB tiers. Direct locations resolve
+the exact product identity to:
+
+```text
+https://www.aiub.unibe.ch/download/CODE/IONO/P1/<identity-year>/<official-filename>.gz
+https://www.aiub.unibe.ch/download/CODE/IONO/P2/<identity-year>/<official-filename>.gz
+```
+
+The HTTPS redirect chain is restricted to AIUB's download host and public
+object-store host. A missing exact URL remains a not-published result; direct
+location derivation performs no date lookback or tier substitution.
+
 ## Authentication and transport boundary
 
 Credentials are binding inputs, never core state. Python and Elixir accept a
@@ -103,8 +117,10 @@ remote service, including in offline mode.
 
 ## Compatibility and extension
 
-Legacy direct-fetch APIs and their existing cache locations remain unchanged.
-The exact-source API is additive and uses a separate versioned cache tree.
+Python and Elixir route the legacy IONEX convenience API through exact
+acquisition. Its explicit lookback option still controls candidate dates, but
+each candidate now uses the versioned exact cache and full semantic validation;
+unverified entries in the former flat cache are not accepted implicitly.
 Adding another public distributor requires a location/compression mapping for
 an existing identity plus the same redirect, size, content, parse, provenance,
 and cache gates. It must not modify identity fields.

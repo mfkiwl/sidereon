@@ -324,6 +324,46 @@ fn predicted_ionex_aliases_apply_the_existing_date_offset() {
         prd2.identity().expect("identity").key(),
         "prediction horizon must remain part of the normalized cache identity"
     );
+    assert_ne!(
+        same_file_prd1
+            .identity()
+            .expect("P1 identity")
+            .cache_relpath(DistributionSource::Direct)
+            .expect("P1 cache path"),
+        prd2.identity()
+            .expect("P2 identity")
+            .cache_relpath(DistributionSource::Direct)
+            .expect("P2 cache path"),
+        "P1 and P2 must not collide even when their official filenames match"
+    );
+}
+
+#[test]
+fn predicted_ionex_direct_urls_use_exact_aiub_tier_and_identity_year() {
+    let p1 = predicted_ionex(AnalysisCenter::CodPrd1, date(2026, 7, 15), None)
+        .expect("P1 predicted IONEX");
+    assert_eq!(
+        p1.archive_url().expect("P1 direct URL"),
+        "https://www.aiub.unibe.ch/download/CODE/IONO/P1/2026/\
+COD0OPSPRD_20261960000_01D_01H_GIM.INX.gz"
+    );
+
+    let p2 = predicted_ionex(AnalysisCenter::CodPrd2, date(2026, 7, 15), None)
+        .expect("P2 predicted IONEX");
+    assert_eq!(
+        p2.archive_url().expect("P2 direct URL"),
+        "https://www.aiub.unibe.ch/download/CODE/IONO/P2/2026/\
+COD0OPSPRD_20261970000_01D_01H_GIM.INX.gz"
+    );
+
+    let boundary = predicted_ionex(AnalysisCenter::CodPrd2, date(2026, 12, 31), None)
+        .expect("year-boundary P2 predicted IONEX");
+    assert_eq!(boundary.date, date(2027, 1, 1));
+    assert_eq!(
+        boundary.archive_url().expect("year-boundary P2 URL"),
+        "https://www.aiub.unibe.ch/download/CODE/IONO/P2/2027/\
+COD0OPSPRD_20270010000_01D_01H_GIM.INX.gz"
+    );
 }
 
 #[test]

@@ -4,6 +4,18 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-07-15
+
+### Fixed
+
+- CODE predicted IONEX direct locations now use AIUB's supported HTTPS
+  download endpoint and the exact `CODE/IONO/P1/<year>` or
+  `CODE/IONO/P2/<year>` directory selected by the requested prediction tier.
+- The directory year is derived from the resolved product identity, including
+  a P2 request whose one-day offset crosses into a new year. Exact filenames,
+  prediction horizons, and distributor-independent cache identities are
+  unchanged; no older date, alternate tier, or provider is substituted.
+
 ## [0.29.0] - 2026-07-15
 
 ### Added

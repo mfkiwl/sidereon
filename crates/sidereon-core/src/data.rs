@@ -748,18 +748,18 @@ const CATALOG: [CenterCatalogEntry; 11] = [
     CenterCatalogEntry {
         center: AnalysisCenter::CodPrd1,
         code: "cod_prd1",
-        protocol: ArchiveProtocol::Http,
-        host: "ftp.aiub.unibe.ch",
-        root_url: "http://ftp.aiub.unibe.ch",
+        protocol: ArchiveProtocol::Https,
+        host: "www.aiub.unibe.ch",
+        root_url: "https://www.aiub.unibe.ch/download",
         products: &COD_PRD_PRODUCTS,
         issues: &[],
     },
     CenterCatalogEntry {
         center: AnalysisCenter::CodPrd2,
         code: "cod_prd2",
-        protocol: ArchiveProtocol::Http,
-        host: "ftp.aiub.unibe.ch",
-        root_url: "http://ftp.aiub.unibe.ch",
+        protocol: ArchiveProtocol::Https,
+        host: "www.aiub.unibe.ch",
+        root_url: "https://www.aiub.unibe.ch/download",
         products: &COD_PRD_PRODUCTS,
         issues: &[],
     },
@@ -854,9 +854,11 @@ const CELESTRAK_SPACE_WEATHER_SOURCE: SpaceWeatherSourceEntry = SpaceWeatherSour
     root_url: "https://celestrak.org/SpaceData",
 };
 
-const ALLOWED_HOSTS: [&str; 9] = [
+const ALLOWED_HOSTS: [&str; 11] = [
     "ftp.aiub.unibe.ch",
     "www.aiub.unibe.ch",
+    "download.aiub.unibe.ch",
+    "zhw-b.s3.cloud.switch.ch",
     "navigation-office.esa.int",
     "isdc-data.gfz.de",
     "igs.bkg.bund.de",
@@ -1652,7 +1654,7 @@ impl ProductSpec {
         Ok(format!(
             "{}/{}/{}{}",
             entry.root_url,
-            dir_path(convention.layout, self.date)?,
+            product_dir_path(self.center, convention.layout, self.date)?,
             filename,
             convention.compression.suffix()
         ))
@@ -2642,6 +2644,18 @@ fn dir_path(layout: ArchiveLayout, date: ProductDate) -> Result<String, DataCata
         ArchiveLayout::AiubCodeYear => format!("CODE/{}", date.year),
         ArchiveLayout::AiubCodeRoot => "CODE".to_string(),
     })
+}
+
+fn product_dir_path(
+    center: AnalysisCenter,
+    layout: ArchiveLayout,
+    date: ProductDate,
+) -> Result<String, DataCatalogError> {
+    match center {
+        AnalysisCenter::CodPrd1 => Ok(format!("CODE/IONO/P1/{}", date.year)),
+        AnalysisCenter::CodPrd2 => Ok(format!("CODE/IONO/P2/{}", date.year)),
+        _ => dir_path(layout, date),
+    }
 }
 
 fn product_date_from_jdn(jdn: i64) -> Result<ProductDate, DataCatalogError> {
