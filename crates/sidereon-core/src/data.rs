@@ -78,6 +78,41 @@ impl AnalysisCenter {
             _ => None,
         }
     }
+
+    /// Public publisher represented by this catalog product line.
+    #[must_use]
+    pub const fn publisher(self) -> ProductPublisher {
+        match self {
+            Self::Igs | Self::IgsUlt => ProductPublisher::Igs,
+            Self::CodRap | Self::CodPrd1 | Self::CodPrd2 | Self::Cod | Self::CodUlt => {
+                ProductPublisher::Code
+            }
+            Self::Esa | Self::EsaUlt => ProductPublisher::Esa,
+            Self::Gfz | Self::GfzUlt => ProductPublisher::Gfz,
+        }
+    }
+
+    /// Public solution class represented by this catalog product line.
+    #[must_use]
+    pub const fn solution_class(self) -> SolutionClass {
+        match self {
+            Self::Igs => SolutionClass::Broadcast,
+            Self::CodRap | Self::Gfz => SolutionClass::Rapid,
+            Self::CodPrd1 | Self::CodPrd2 => SolutionClass::Predicted,
+            Self::Esa | Self::Cod => SolutionClass::Final,
+            Self::IgsUlt | Self::CodUlt | Self::EsaUlt | Self::GfzUlt => SolutionClass::UltraRapid,
+        }
+    }
+
+    /// Prediction horizon associated with a predicted product alias.
+    #[must_use]
+    pub const fn prediction_horizon_days(self) -> Option<u8> {
+        match self {
+            Self::CodPrd1 => Some(1),
+            Self::CodPrd2 => Some(2),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for AnalysisCenter {
@@ -143,6 +178,170 @@ impl FromStr for ProductType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::from_code(s).ok_or_else(|| DataCatalogError::UnknownProductType(s.to_string()))
+    }
+}
+
+/// Public organization that produced or combined a GNSS product.
+///
+/// This is intentionally separate from [`AnalysisCenter`]. Catalog center
+/// codes such as `cod`, `cod_rap`, and `cod_ult` select different product
+/// lines, but all three have the same publisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProductPublisher {
+    /// International GNSS Service combination product.
+    Igs,
+    /// Center for Orbit Determination in Europe (CODE).
+    Code,
+    /// European Space Agency.
+    Esa,
+    /// GFZ German Research Centre for Geosciences.
+    Gfz,
+}
+
+impl ProductPublisher {
+    /// IGS long-filename publisher token.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Igs => "IGS",
+            Self::Code => "COD",
+            Self::Esa => "ESA",
+            Self::Gfz => "GFZ",
+        }
+    }
+}
+
+impl fmt::Display for ProductPublisher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+/// Public solution class encoded in a GNSS product name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SolutionClass {
+    /// Final product.
+    Final,
+    /// Rapid product.
+    Rapid,
+    /// Ultra-rapid product, which may contain observed and predicted segments.
+    UltraRapid,
+    /// Predicted product.
+    Predicted,
+    /// Broadcast navigation product.
+    Broadcast,
+}
+
+impl SolutionClass {
+    /// Stable public code used in Sidereon provenance and cache paths.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::Rapid => "rapid",
+            Self::UltraRapid => "ultra_rapid",
+            Self::Predicted => "predicted",
+            Self::Broadcast => "broadcast",
+        }
+    }
+
+    /// IGS long-filename solution token where one exists.
+    #[must_use]
+    pub const fn filename_token(self) -> Option<&'static str> {
+        match self {
+            Self::Final => Some("FIN"),
+            Self::Rapid => Some("RAP"),
+            Self::UltraRapid => Some("ULT"),
+            Self::Predicted => Some("PRD"),
+            Self::Broadcast => None,
+        }
+    }
+}
+
+impl fmt::Display for SolutionClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+/// Public campaign or project encoded in a GNSS product name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProductCampaign {
+    /// Operational IGS product line.
+    Operational,
+    /// Multi-GNSS product line (`MGN`).
+    MultiGnss,
+    /// Multi-GNSS Experiment product line (`MGX`).
+    MultiGnssExperiment,
+    /// Broadcast navigation archive product.
+    Broadcast,
+}
+
+impl ProductCampaign {
+    /// Stable public code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Operational => "OPS",
+            Self::MultiGnss => "MGN",
+            Self::MultiGnssExperiment => "MGX",
+            Self::Broadcast => "BRD",
+        }
+    }
+}
+
+/// Public serialization format carried by a catalog product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProductFormat {
+    /// Standard Product 3 orbit format.
+    Sp3,
+    /// IONosphere map EXchange format.
+    Ionex,
+    /// RINEX clock format.
+    RinexClock,
+    /// RINEX navigation format.
+    RinexNavigation,
+}
+
+impl ProductFormat {
+    /// Stable public format code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Sp3 => "SP3",
+            Self::Ionex => "IONEX",
+            Self::RinexClock => "RINEX_CLK",
+            Self::RinexNavigation => "RINEX_NAV",
+        }
+    }
+}
+
+/// Explicit distributor used to obtain an exact public product.
+///
+/// Distributor selection never changes product publisher, solution class,
+/// issue, cadence, date, or family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DistributionSource {
+    /// The cataloged analysis-center or IGS direct archive.
+    Direct,
+    /// NASA CDDIS over HTTPS, optionally authenticated with Earthdata Login.
+    NasaCddis,
+    /// Bytes read from a caller-provided local file.
+    LocalFile,
+    /// Bytes supplied directly by the caller.
+    InMemory,
+}
+
+impl DistributionSource {
+    /// Stable public code used in provenance and cache paths.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::NasaCddis => "nasa_cddis",
+            Self::LocalFile => "local_file",
+            Self::InMemory => "in_memory",
+        }
     }
 }
 
@@ -655,7 +854,7 @@ const CELESTRAK_SPACE_WEATHER_SOURCE: SpaceWeatherSourceEntry = SpaceWeatherSour
     root_url: "https://celestrak.org/SpaceData",
 };
 
-const ALLOWED_HOSTS: [&str; 7] = [
+const ALLOWED_HOSTS: [&str; 9] = [
     "ftp.aiub.unibe.ch",
     "www.aiub.unibe.ch",
     "navigation-office.esa.int",
@@ -663,6 +862,8 @@ const ALLOWED_HOSTS: [&str; 7] = [
     "igs.bkg.bund.de",
     "s3.amazonaws.com",
     "celestrak.org",
+    "cddis.nasa.gov",
+    "urs.earthdata.nasa.gov",
 ];
 
 const NO_OPEN_MIRRORS: [NoOpenMirrorProduct; 7] = [
@@ -709,6 +910,22 @@ pub enum DataCatalogError {
         center: AnalysisCenter,
         /// Product type.
         product_type: ProductType,
+    },
+    /// A distributor does not carry the requested product family.
+    UnsupportedDistribution {
+        /// Explicit distributor.
+        source: DistributionSource,
+        /// Requested product family.
+        product_type: ProductType,
+    },
+    /// An exact request did not include any acceptable distributor.
+    NoDistributionSources,
+    /// A caller-constructed identity contained an unsafe official filename.
+    InvalidOfficialFilename(String),
+    /// A caller-constructed identity disagrees with its official filename.
+    InconsistentProductIdentity {
+        /// Identity field that did not agree with the filename or catalog convention.
+        field: &'static str,
     },
     /// The product has no verified anonymous HTTP(S) mirror.
     NoOpenMirror {
@@ -797,6 +1014,26 @@ impl fmt::Display for DataCatalogError {
                 center,
                 product_type,
             } => write!(f, "{center} does not serve {product_type}"),
+            Self::UnsupportedDistribution {
+                source,
+                product_type,
+            } => write!(
+                f,
+                "distributor {} does not serve {product_type}",
+                source.code()
+            ),
+            Self::NoDistributionSources => {
+                write!(f, "exact product request has no distributors")
+            }
+            Self::InvalidOfficialFilename(filename) => {
+                write!(f, "invalid official product filename {filename:?}")
+            }
+            Self::InconsistentProductIdentity { field } => {
+                write!(
+                    f,
+                    "product identity field {field:?} disagrees with its official filename"
+                )
+            }
             Self::NoOpenMirror {
                 center,
                 product_type,
@@ -1151,6 +1388,182 @@ const GFZ_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
     },
 ];
 
+/// Exact identity of one public GNSS product, independent of distributor.
+///
+/// The official filename is part of the identity. Transport compression and
+/// URL belong to [`DistributionLocation`] because two distributors may package
+/// the same decompressed product differently.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProductIdentity {
+    /// Product family.
+    pub family: ProductType,
+    /// Producing or combining organization.
+    pub publisher: ProductPublisher,
+    /// Solution class or tier.
+    pub solution: SolutionClass,
+    /// Campaign or project.
+    pub campaign: ProductCampaign,
+    /// Product-line version encoded by the long filename.
+    pub version: u8,
+    /// Nominal product start date.
+    pub date: ProductDate,
+    /// Optional `HHMM` issue/start time.
+    pub issue: Option<String>,
+    /// Intended coverage period token, for example `01D`.
+    pub span: String,
+    /// Sampling interval token, for example `05M`.
+    pub sample: String,
+    /// Official filename without transport compression suffix.
+    pub official_filename: String,
+    /// Public serialization format.
+    pub format: ProductFormat,
+    /// Prediction horizon when the product line encodes one.
+    pub prediction_horizon_days: Option<u8>,
+}
+
+impl ProductIdentity {
+    /// Validate that every identity field agrees with the official filename.
+    ///
+    /// This is required for caller-constructed values before using them in a
+    /// request, URL, or cache path. Catalog-produced identities are validated
+    /// before they are returned.
+    pub fn validate(&self) -> Result<(), DataCatalogError> {
+        validate_official_filename(&self.official_filename)?;
+        ProductDate::new(self.date.year, self.date.month, self.date.day)?;
+        validate_sample(&self.sample)?;
+        if let Some(issue) = self.issue.as_deref() {
+            validate_issue(issue)?;
+        }
+
+        if self.format != product_format(self.family) {
+            return Err(DataCatalogError::InconsistentProductIdentity { field: "format" });
+        }
+
+        let horizon_valid = match (self.publisher, self.solution, self.prediction_horizon_days) {
+            (ProductPublisher::Code, SolutionClass::Predicted, Some(1 | 2)) => true,
+            (_, SolutionClass::Predicted, _) => false,
+            (_, _, None) => true,
+            (_, _, Some(_)) => false,
+        };
+        if !horizon_valid {
+            return Err(DataCatalogError::InconsistentProductIdentity {
+                field: "prediction_horizon_days",
+            });
+        }
+
+        let descriptor = product_type_convention(self.family);
+        let expected = match descriptor.kind {
+            ProductFilenameKind::Sampled => {
+                let solution_token = self
+                    .solution
+                    .filename_token()
+                    .ok_or(DataCatalogError::InconsistentProductIdentity { field: "solution" })?;
+                format!(
+                    "{}{}{}{}_{}_{}_{}_{}.{}",
+                    self.publisher.code(),
+                    self.version,
+                    self.campaign.code(),
+                    solution_token,
+                    date_block(self.date, self.issue.as_deref()),
+                    self.span,
+                    self.sample,
+                    descriptor.content_code,
+                    descriptor.extension
+                )
+            }
+            ProductFilenameKind::Nav => {
+                let nav_fields_valid = self.publisher == ProductPublisher::Igs
+                    && self.solution == SolutionClass::Broadcast
+                    && self.campaign == ProductCampaign::Broadcast
+                    && self.version == 0
+                    && self.issue.is_none()
+                    && self.span == "01D"
+                    && self.sample == "01D";
+                if !nav_fields_valid {
+                    return Err(DataCatalogError::InconsistentProductIdentity {
+                        field: "broadcast_navigation",
+                    });
+                }
+                format!(
+                    "BRDC00WRD_R_{}_{}_{}.{}",
+                    date_block(self.date, None),
+                    self.span,
+                    descriptor.content_code,
+                    descriptor.extension
+                )
+            }
+        };
+        if expected != self.official_filename {
+            return Err(DataCatalogError::InconsistentProductIdentity {
+                field: "official_filename",
+            });
+        }
+        Ok(())
+    }
+
+    /// Deterministic identity key suitable for a portable cache layout.
+    pub fn key(&self) -> Result<String, DataCatalogError> {
+        self.validate()?;
+        let prediction = self.prediction_horizon_days.map_or_else(
+            || "observed".to_string(),
+            |days| format!("prediction_{days}d"),
+        );
+        Ok(format!(
+            "{}/{}/{}/{}/{}/{}",
+            self.family.code(),
+            self.publisher.code().to_ascii_lowercase(),
+            self.solution.code(),
+            self.campaign.code().to_ascii_lowercase(),
+            prediction,
+            self.official_filename
+        ))
+    }
+
+    /// Deterministic cache path for this identity and distributor.
+    pub fn cache_relpath(&self, source: DistributionSource) -> Result<String, DataCatalogError> {
+        Ok(format!("products/v1/{}/{}", source.code(), self.key()?))
+    }
+}
+
+/// Distribution metadata for an exact product identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributionLocation {
+    /// Selected distributor.
+    pub source: DistributionSource,
+    /// Original public URL. Local and in-memory sources have no URL.
+    pub original_url: Option<String>,
+    /// Archive filename as served, including transport compression suffix.
+    pub archive_filename: String,
+    /// Compression applied by this distributor.
+    pub compression: ArchiveCompression,
+}
+
+/// Exact product request with an ordered, caller-controlled distributor list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductRequest {
+    /// Exact requested identity.
+    pub identity: ProductIdentity,
+    /// Ordered acceptable distributors for that identity only.
+    pub distributors: Vec<DistributionSource>,
+}
+
+impl ProductRequest {
+    /// Build an exact request. At least one distributor is required.
+    pub fn new(
+        identity: ProductIdentity,
+        distributors: Vec<DistributionSource>,
+    ) -> Result<Self, DataCatalogError> {
+        if distributors.is_empty() {
+            return Err(DataCatalogError::NoDistributionSources);
+        }
+        identity.validate()?;
+        Ok(Self {
+            identity,
+            distributors,
+        })
+    }
+}
+
 /// A pure product specification that resolves to one archive filename and URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductSpec {
@@ -1243,6 +1656,86 @@ impl ProductSpec {
             filename,
             convention.compression.suffix()
         ))
+    }
+
+    /// Exact product identity, independent of distributor.
+    pub fn identity(&self) -> Result<ProductIdentity, DataCatalogError> {
+        let convention = validate_product(
+            self.center,
+            self.product_type,
+            &self.sample,
+            self.issue.as_deref(),
+        )?;
+        let descriptor = product_type_convention(self.product_type);
+        let campaign = match descriptor.kind {
+            ProductFilenameKind::Nav => ProductCampaign::Broadcast,
+            ProductFilenameKind::Sampled => match convention.token.get(4..7) {
+                Some("OPS") => ProductCampaign::Operational,
+                Some("MGN") => ProductCampaign::MultiGnss,
+                Some("MGX") => ProductCampaign::MultiGnssExperiment,
+                _ => {
+                    return Err(DataCatalogError::InconsistentProductIdentity {
+                        field: "campaign",
+                    });
+                }
+            },
+        };
+        let identity = ProductIdentity {
+            family: self.product_type,
+            publisher: self.center.publisher(),
+            solution: self.center.solution_class(),
+            campaign,
+            version: 0,
+            date: self.date,
+            issue: self.issue.clone(),
+            span: convention.span.to_string(),
+            sample: self.sample.clone(),
+            official_filename: self.canonical_filename()?,
+            format: product_format(self.product_type),
+            prediction_horizon_days: self.center.prediction_horizon_days(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Resolve one explicit distributor without changing product identity.
+    pub fn distribution_location(
+        &self,
+        source: DistributionSource,
+    ) -> Result<DistributionLocation, DataCatalogError> {
+        let identity = self.identity()?;
+        match source {
+            DistributionSource::Direct => {
+                let compression = product_convention(self.center, self.product_type)?.compression;
+                Ok(DistributionLocation {
+                    source,
+                    original_url: Some(self.archive_url()?),
+                    archive_filename: format!(
+                        "{}{}",
+                        identity.official_filename,
+                        compression.suffix()
+                    ),
+                    compression,
+                })
+            }
+            DistributionSource::NasaCddis => {
+                let url = cddis_archive_url(&identity)?;
+                Ok(DistributionLocation {
+                    source,
+                    original_url: Some(url),
+                    archive_filename: format!("{}.gz", identity.official_filename),
+                    compression: ArchiveCompression::Gzip,
+                })
+            }
+            DistributionSource::LocalFile | DistributionSource::InMemory => {
+                Ok(DistributionLocation {
+                    source,
+                    original_url: None,
+                    archive_filename: identity.official_filename,
+                    compression: ArchiveCompression::None,
+                })
+            }
+        }
     }
 }
 
@@ -1615,6 +2108,54 @@ pub fn archive_url(
     product(center, product_type, date, sample, issue)?.archive_url()
 }
 
+/// Build the exact identity for a catalog product.
+pub fn product_identity(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+    sample: Option<&str>,
+    issue: Option<&str>,
+) -> Result<ProductIdentity, DataCatalogError> {
+    product(center, product_type, date, sample, issue)?.identity()
+}
+
+/// Resolve an explicit distributor for a catalog product.
+pub fn distribution_location(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+    sample: Option<&str>,
+    issue: Option<&str>,
+    source: DistributionSource,
+) -> Result<DistributionLocation, DataCatalogError> {
+    product(center, product_type, date, sample, issue)?.distribution_location(source)
+}
+
+/// Build the official NASA CDDIS HTTPS URL for an exact SP3 or IONEX identity.
+///
+/// CDDIS stores current SP3 products by GPS week and current IONEX products by
+/// year/day-of-year. The decompressed official filename is unchanged.
+pub fn cddis_archive_url(identity: &ProductIdentity) -> Result<String, DataCatalogError> {
+    identity.validate()?;
+    match identity.family {
+        ProductType::Sp3 => Ok(format!(
+            "https://cddis.nasa.gov/archive/gnss/products/{}/{}.gz",
+            identity.date.gps_week()?,
+            identity.official_filename
+        )),
+        ProductType::Ionex => Ok(format!(
+            "https://cddis.nasa.gov/archive/gnss/products/ionex/{}/{:03}/{}.gz",
+            identity.date.year,
+            identity.date.day_of_year(),
+            identity.official_filename
+        )),
+        product_type => Err(DataCatalogError::UnsupportedDistribution {
+            source: DistributionSource::NasaCddis,
+            product_type,
+        }),
+    }
+}
+
 /// Build a clock product for a center and date.
 pub fn mgex_clk(
     center: AnalysisCenter,
@@ -1955,6 +2496,32 @@ fn product_type_convention(product_type: ProductType) -> &'static ProductTypeCon
         .iter()
         .find(|descriptor| descriptor.product_type == product_type)
         .expect("product descriptor exists for enum variant")
+}
+
+const fn product_format(product_type: ProductType) -> ProductFormat {
+    match product_type {
+        ProductType::Sp3 => ProductFormat::Sp3,
+        ProductType::Ionex => ProductFormat::Ionex,
+        ProductType::Clk => ProductFormat::RinexClock,
+        ProductType::Nav => ProductFormat::RinexNavigation,
+    }
+}
+
+fn validate_official_filename(filename: &str) -> Result<(), DataCatalogError> {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains('\0')
+        || filename.contains("..")
+    {
+        Err(DataCatalogError::InvalidOfficialFilename(
+            filename.to_string(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_product(

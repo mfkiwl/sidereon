@@ -4,6 +4,26 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-15
+
+### Added
+
+- Added an exact public GNSS product identity model that keeps product family,
+  publisher, solution class, campaign, issue, cadence, coverage date, official
+  filename version, format, and prediction horizon separate from distribution.
+- Added explicit direct-archive, NASA CDDIS/Earthdata, local-file, and in-memory
+  distribution sources, including exact CDDIS SP3 and IONEX locations and
+  deterministic source-specific cache paths.
+- Added validated product requests and distribution locations so selecting a
+  distributor cannot silently change the requested center, tier, issue,
+  cadence, date, family, or official filename.
+
+### Compatibility
+
+- This release is additive. Existing product selection, URL generation, and
+  cache behavior remain unchanged; the new exact-identity and distribution
+  APIs are opt-in.
+
 ## [0.28.1] - 2026-07-15
 
 ### Fixed

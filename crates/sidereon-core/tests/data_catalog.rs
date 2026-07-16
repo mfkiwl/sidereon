@@ -1,15 +1,16 @@
 use std::process::Command;
 
 use sidereon_core::data::{
-    allowed_hosts, archive_url, canonical_filename, catalog, dted_block_dir, dted_cache_relpath,
-    dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk, mgex_ionex, mgex_nav,
-    mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3, parse_skadi_tile_id,
-    predicted_ionex, product_convention, rapid_ionex, skadi_archive_url, skadi_band,
-    skadi_source_entry, skadi_tile_id, space_weather_archive_url, space_weather_cache_relpath,
-    space_weather_filename, space_weather_source_entry, station_obs, station_obs_filename,
-    station_obs_protocol, station_obs_url, terrain_tile_index, ultra_sp3_locations, AnalysisCenter,
-    ArchiveCompression, ArchiveProtocol, DataCatalogError, ProductDate, ProductDateTime,
-    ProductType, SpaceWeatherProduct, UltraIssue,
+    allowed_hosts, archive_url, canonical_filename, catalog, cddis_archive_url, dted_block_dir,
+    dted_cache_relpath, dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk,
+    mgex_ionex, mgex_nav, mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3,
+    parse_skadi_tile_id, predicted_ionex, product_convention, rapid_ionex, skadi_archive_url,
+    skadi_band, skadi_source_entry, skadi_tile_id, space_weather_archive_url,
+    space_weather_cache_relpath, space_weather_filename, space_weather_source_entry, station_obs,
+    station_obs_filename, station_obs_protocol, station_obs_url, terrain_tile_index,
+    ultra_sp3_locations, AnalysisCenter, ArchiveCompression, ArchiveProtocol, DataCatalogError,
+    DistributionSource, ProductCampaign, ProductDate, ProductDateTime, ProductFormat,
+    ProductPublisher, ProductRequest, ProductType, SolutionClass, SpaceWeatherProduct, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
@@ -59,6 +60,170 @@ fn ionex_urls_match_binding_catalog_examples() {
     assert_eq!(
         rapid.archive_url().expect("url"),
         "http://ftp.aiub.unibe.ch/CODE/COD0OPSRAP_20261640000_01D_01H_GIM.INX.gz"
+    );
+}
+
+#[test]
+fn product_identity_is_independent_of_distributor() {
+    let product =
+        mgex_sp3(AnalysisCenter::Esa, date(2020, 6, 24), None).expect("ESA final SP3 product");
+    let identity = product.identity().expect("identity");
+
+    assert_eq!(identity.family, ProductType::Sp3);
+    assert_eq!(identity.publisher, ProductPublisher::Esa);
+    assert_eq!(identity.solution, SolutionClass::Final);
+    assert_eq!(identity.campaign, ProductCampaign::MultiGnss);
+    assert_eq!(identity.format, ProductFormat::Sp3);
+    assert_eq!(identity.version, 0);
+    assert_eq!(identity.span, "01D");
+    assert_eq!(identity.sample, "05M");
+    assert_eq!(
+        identity.official_filename,
+        "ESA0MGNFIN_20201760000_01D_05M_ORB.SP3"
+    );
+
+    let direct = product
+        .distribution_location(DistributionSource::Direct)
+        .expect("direct location");
+    let cddis = product
+        .distribution_location(DistributionSource::NasaCddis)
+        .expect("CDDIS location");
+    assert_eq!(product.identity().expect("identity"), identity);
+    assert_eq!(direct.source, DistributionSource::Direct);
+    assert_eq!(cddis.source, DistributionSource::NasaCddis);
+    assert_eq!(direct.compression, ArchiveCompression::Gzip);
+    assert_eq!(cddis.compression, ArchiveCompression::Gzip);
+    assert_eq!(
+        cddis.original_url.as_deref(),
+        Some(
+            "https://cddis.nasa.gov/archive/gnss/products/2111/\
+ESA0MGNFIN_20201760000_01D_05M_ORB.SP3.gz"
+        )
+    );
+}
+
+#[test]
+fn cddis_ionex_path_uses_current_year_and_day_of_year_layout() {
+    let product = rapid_ionex(date(2026, 6, 13), None).expect("CODE rapid IONEX");
+    let identity = product.identity().expect("identity");
+    assert_eq!(identity.publisher, ProductPublisher::Code);
+    assert_eq!(identity.solution, SolutionClass::Rapid);
+    assert_eq!(identity.campaign, ProductCampaign::Operational);
+    assert_eq!(identity.format, ProductFormat::Ionex);
+    assert_eq!(
+        cddis_archive_url(&identity).expect("CDDIS URL"),
+        "https://cddis.nasa.gov/archive/gnss/products/ionex/2026/164/\
+COD0OPSRAP_20261640000_01D_01H_GIM.INX.gz"
+    );
+}
+
+#[test]
+fn exact_request_and_cache_key_keep_source_selection_explicit() {
+    let product = ops_ultra_sp3(AnalysisCenter::IgsUlt, date(2024, 9, 3), None, Some("0600"))
+        .expect("IGS ultra product");
+    let identity = product.identity().expect("identity");
+    let request = ProductRequest::new(
+        identity.clone(),
+        vec![DistributionSource::NasaCddis, DistributionSource::Direct],
+    )
+    .expect("request");
+    assert_eq!(request.identity, identity);
+    assert_eq!(
+        request.distributors,
+        vec![DistributionSource::NasaCddis, DistributionSource::Direct]
+    );
+    assert_ne!(
+        request
+            .identity
+            .cache_relpath(DistributionSource::NasaCddis)
+            .expect("CDDIS cache path"),
+        request
+            .identity
+            .cache_relpath(DistributionSource::Direct)
+            .expect("direct cache path")
+    );
+    assert_eq!(
+        ProductRequest::new(identity, vec![]),
+        Err(DataCatalogError::NoDistributionSources)
+    );
+}
+
+#[test]
+fn caller_constructed_identity_must_agree_with_its_official_filename() {
+    let product = mgex_sp3(AnalysisCenter::Cod, date(2026, 7, 12), None).expect("CODE SP3");
+    let identity = product.identity().expect("identity");
+    assert_eq!(identity.campaign, ProductCampaign::MultiGnssExperiment);
+    assert_eq!(identity.validate(), Ok(()));
+
+    let mut inconsistent = identity.clone();
+    inconsistent.publisher = ProductPublisher::Esa;
+    assert_eq!(
+        inconsistent.validate(),
+        Err(DataCatalogError::InconsistentProductIdentity {
+            field: "official_filename",
+        })
+    );
+    assert_eq!(
+        cddis_archive_url(&inconsistent),
+        Err(DataCatalogError::InconsistentProductIdentity {
+            field: "official_filename",
+        })
+    );
+    assert_eq!(
+        ProductRequest::new(inconsistent.clone(), vec![DistributionSource::NasaCddis]),
+        Err(DataCatalogError::InconsistentProductIdentity {
+            field: "official_filename",
+        })
+    );
+    assert_eq!(
+        inconsistent.cache_relpath(DistributionSource::NasaCddis),
+        Err(DataCatalogError::InconsistentProductIdentity {
+            field: "official_filename",
+        })
+    );
+
+    let mut unsafe_identity = identity;
+    unsafe_identity.official_filename = "../escape.SP3".to_string();
+    assert_eq!(
+        unsafe_identity.cache_relpath(DistributionSource::NasaCddis),
+        Err(DataCatalogError::InvalidOfficialFilename(
+            "../escape.SP3".to_string()
+        ))
+    );
+}
+
+#[test]
+fn broadcast_navigation_identity_validates_fields_not_encoded_in_filename() {
+    let product = mgex_nav(AnalysisCenter::Igs, date(2026, 7, 12), None).expect("IGS NAV");
+    let identity = product.identity().expect("identity");
+    assert_eq!(identity.validate(), Ok(()));
+
+    let mut inconsistent = identity;
+    inconsistent.sample = "30S".to_string();
+    assert_eq!(
+        inconsistent.validate(),
+        Err(DataCatalogError::InconsistentProductIdentity {
+            field: "broadcast_navigation",
+        })
+    );
+}
+
+#[test]
+fn local_sources_have_no_network_url_and_cddis_does_not_expand_family_scope() {
+    let sp3 = mgex_sp3(AnalysisCenter::Cod, date(2020, 6, 24), None).expect("SP3");
+    let local = sp3
+        .distribution_location(DistributionSource::LocalFile)
+        .expect("local location");
+    assert_eq!(local.original_url, None);
+    assert_eq!(local.compression, ArchiveCompression::None);
+
+    let nav = mgex_nav(AnalysisCenter::Igs, date(2020, 6, 25), None).expect("NAV");
+    assert_eq!(
+        nav.distribution_location(DistributionSource::NasaCddis),
+        Err(DataCatalogError::UnsupportedDistribution {
+            source: DistributionSource::NasaCddis,
+            product_type: ProductType::Nav,
+        })
     );
 }
 
@@ -146,6 +311,18 @@ fn predicted_ionex_aliases_apply_the_existing_date_offset() {
     assert_eq!(
         prd2.canonical_filename().expect("filename"),
         "COD0OPSPRD_20261660000_01D_01H_GIM.INX"
+    );
+
+    let same_file_prd1 =
+        predicted_ionex(AnalysisCenter::CodPrd1, date(2026, 6, 15), None).expect("prd1");
+    assert_eq!(
+        same_file_prd1.canonical_filename().expect("filename"),
+        prd2.canonical_filename().expect("filename")
+    );
+    assert_ne!(
+        same_file_prd1.identity().expect("identity").key(),
+        prd2.identity().expect("identity").key(),
+        "prediction horizon must remain part of the normalized cache identity"
     );
 }
 

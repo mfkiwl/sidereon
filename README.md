@@ -27,6 +27,12 @@ sidereon is one engine: a Rust core for satellite orbit propagation, GNSS positi
 - **Atmosphere and terrain:** Klobuchar and full Galileo NeQuick-G ionosphere, IONEX grids (vertical TEC and slant delay), tropospheric delay, NRLMSISE-00 density, DTED terrain elevation lookup with batch probes, a memory-mappable terrain store, EGM96/EGM2008 geoid grids, and a PROJ 9.3-compatible EGM96 GTX loader with explicit fused or separately rounded radian interpolation.
 - **RF link and signal analysis:** free-space path loss, EIRP, carrier-to-noise (C/N0), link margin, and closed-form navigation-signal figures of merit (BPSK/BOC spectra, spectral separation coefficients, DLL thermal-noise jitter, multipath error envelopes) validated against published constants.
 - **Formats:** TLE/OMM (Alpha-5 catalog numbers and CelesTrak GP CSV/JSON), CCSDS OEM/OPM/CDM/TDM, RINEX observation/navigation/clock, CRINEX (Hatanaka encode/decode), SP3, IONEX, ANTEX, Bias-SINEX, CODE DCB, RTCM 3.x, NMEA 0183, with forgiving parsers and round-trippable serializers for the formats that support it.
+- **Public product distribution:** exact GNSS product identity is independent of
+  its direct archive, NASA CDDIS/Earthdata, local-file, or in-memory source. The
+  network-free core derives official SP3/IONEX names, source locations, and
+  collision-resistant cache paths; the Python and Elixir interfaces add
+  authenticated acquisition, validation, typed failures, and secret-free
+  provenance. See the [design note](docs/public-gnss-distribution-sources.md).
 
 ## Install
 
