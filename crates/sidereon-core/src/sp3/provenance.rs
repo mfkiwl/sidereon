@@ -197,6 +197,15 @@ fn canonical_contributor_bytes(
     {
         return Err(invalid_contributor(index, "resolved format version"));
     }
+    if contributor.requested_identity.format_version.is_some()
+        && contributor.requested_identity.format_version
+            != contributor.resolved_identity.format_version
+    {
+        return Err(invalid_contributor(
+            index,
+            "resolved format version does not match requested version",
+        ));
+    }
 
     let mut requested_without_revision = contributor.requested_identity.clone();
     requested_without_revision.format_version = None;

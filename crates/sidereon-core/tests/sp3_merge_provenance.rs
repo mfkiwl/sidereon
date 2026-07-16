@@ -170,6 +170,14 @@ fn incomplete_or_mismatched_provenance_fails_closed() {
         Sp3MergeInputIdentity::new(&[contributor], &MergeOptions::default()),
         Err(Sp3MergeInputIdentityError::InvalidContributor { .. })
     ));
+
+    let mut contributor = artifact(AnalysisCenter::Esa, 0x11);
+    contributor.requested_identity.format_version = Some("SP3-c".to_string());
+    contributor.resolved_identity.format_version = Some("SP3-d".to_string());
+    assert!(matches!(
+        Sp3MergeInputIdentity::new(&[contributor], &MergeOptions::default()),
+        Err(Sp3MergeInputIdentityError::InvalidContributor { .. })
+    ));
 }
 
 #[test]
