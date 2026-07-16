@@ -2,6 +2,22 @@
 
 All notable changes to `sidereon-core` are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Added `Sp3ArtifactIdentity` and `Sp3MergeInputIdentity`, a versioned,
+  order-independent stable identity for the complete set of exact SP3
+  artifacts and merge controls. The canonical identity binds requested and
+  resolved product identities, distributor, product and archive digests and
+  lengths, compression, and every merge option while excluding acquisition
+  observations, URLs, credentials, and local paths. Mean/median contributor
+  enumeration is canonicalized; precedence contributor order is bound as an
+  effective policy control.
+- Added exact-identity distribution-location derivation so alternate cataloged
+  SP3 duration and sampling candidates retain their declared identity instead
+  of being reconstructed as the catalog default.
+
 ## [0.30.0] - 2026-07-16
 
 ### Added

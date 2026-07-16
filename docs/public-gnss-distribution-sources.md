@@ -127,6 +127,33 @@ decompressed product, original downloaded archive, and JSON provenance sidecar
 are retained. A cache hit rechecks identities, byte counts, both hashes, caller
 checksum, and a fresh product parse with semantic checks.
 
+## Merged-SP3 input identity
+
+Every contributor accepted by a merged-SP3 acquisition has two separate public
+records. `Sp3ArtifactIdentity` is reproducible: it binds requested and resolved
+`ProductIdentity`, the selected distributor, official decompressed filename,
+SHA-256 digest and byte length of both product and distributor archive, and
+archive compression. Retrieval time, cache-hit status, sanitized URLs, HTTP
+metadata, and failed attempts are acquisition observations and do not enter the
+artifact identity.
+
+`Sp3MergeInputIdentity::new` validates complete artifact records and binds the
+canonical contributor set plus every `MergeOptions` control to a versioned
+`sidereon-sp3-merge-input-v1:<sha256>` identifier. Contributor enumeration and
+set/map iteration order do not affect that identifier for mean or median
+combination. With precedence combination, contributor order is an effective
+merge-policy control and is therefore bound in order; reversing it can change
+the merged bytes and changes the identifier. A different verified artifact,
+resolved identity, contributor set, or merge option also changes it. Empty,
+duplicate, malformed, non-SP3, or internally mismatched contributor records are
+rejected rather than inferred from filenames or cache contents.
+
+The stable identifier deliberately contains no retrieval observations,
+credentials, cookies, headers, URLs, or filesystem paths. Persist the public
+artifact records and merge policy alongside it; `verify` recomputes the
+canonical identifier from those records. Single-contributor and
+multi-contributor merges use the same schema.
+
 The acquisition-capable Python and Elixir interfaces publish the product,
 original archive, and JSON provenance as one immutable transaction. A single
 SHA-256-bound commit record names that transaction and is atomically replaced

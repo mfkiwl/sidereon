@@ -45,6 +45,13 @@ publication and parse the authenticated bytes again on a cache hit. The full
 audit and filesystem assumptions are documented in
 [`docs/exact-product-cache-atomicity.md`](../../docs/exact-product-cache-atomicity.md).
 
+For merged precise ephemerides, `Sp3ArtifactIdentity` separates exact,
+reproducible artifact fields from retrieval observations.
+`Sp3MergeInputIdentity` validates and canonically binds the complete artifact
+set and `MergeOptions` into a versioned stable identifier that is unchanged by
+cache hits or non-semantic contributor enumeration order. Precedence order is
+bound when precedence combination is selected because it can change results.
+
 ## Parity bar
 
 Every independently reproducible, libm-bound component (propagation, frames, time, SGP4,

@@ -1154,6 +1154,7 @@ mod combine;
 mod interp;
 mod interpolant;
 mod interpolant_store;
+mod provenance;
 mod samples;
 mod verify;
 mod write;
@@ -1168,6 +1169,10 @@ pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
 pub use interpolant_store::{
     precise_interpolant_store_checksum64, MmapPreciseEphemerisInterpolant,
     PreciseInterpolantStoreError,
+};
+pub use provenance::{
+    Sp3ArtifactIdentity, Sp3MergeInputIdentity, Sp3MergeInputIdentityError,
+    SP3_MERGE_INPUT_ID_PREFIX, SP3_MERGE_INPUT_SCHEMA_VERSION,
 };
 pub use samples::{
     sp3_ecef_state_to_eci, PreciseEphemerisSample, PreciseEphemerisSamples,

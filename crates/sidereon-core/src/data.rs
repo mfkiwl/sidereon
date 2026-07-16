@@ -1932,38 +1932,7 @@ impl ProductSpec {
         source: DistributionSource,
     ) -> Result<DistributionLocation, DataCatalogError> {
         let identity = self.identity()?;
-        match source {
-            DistributionSource::Direct => {
-                let compression = product_convention(self.center, self.product_type)?.compression;
-                Ok(DistributionLocation {
-                    source,
-                    original_url: Some(self.archive_url()?),
-                    archive_filename: format!(
-                        "{}{}",
-                        identity.official_filename,
-                        compression.suffix()
-                    ),
-                    compression,
-                })
-            }
-            DistributionSource::NasaCddis => {
-                let url = cddis_archive_url(&identity)?;
-                Ok(DistributionLocation {
-                    source,
-                    original_url: Some(url),
-                    archive_filename: format!("{}.gz", identity.official_filename),
-                    compression: ArchiveCompression::Gzip,
-                })
-            }
-            DistributionSource::LocalFile | DistributionSource::InMemory => {
-                Ok(DistributionLocation {
-                    source,
-                    original_url: None,
-                    archive_filename: identity.official_filename,
-                    compression: ArchiveCompression::None,
-                })
-            }
-        }
+        distribution_location_for_identity(&identity, source)
     }
 }
 
@@ -2357,6 +2326,54 @@ pub fn distribution_location(
     source: DistributionSource,
 ) -> Result<DistributionLocation, DataCatalogError> {
     product(center, product_type, date, sample, issue)?.distribution_location(source)
+}
+
+/// Resolve one explicit distributor from a complete exact product identity.
+///
+/// Unlike [`distribution_location`], this retains alternate catalog cadence and
+/// duration fields already carried by `identity` instead of reconstructing a
+/// default product specification. The function performs no network or file IO.
+pub fn distribution_location_for_identity(
+    identity: &ProductIdentity,
+    source: DistributionSource,
+) -> Result<DistributionLocation, DataCatalogError> {
+    identity.validate()?;
+    match source {
+        DistributionSource::Direct => {
+            let convention = product_convention(identity.analysis_center, identity.family)?;
+            let entry = center_catalog(identity.analysis_center)
+                .expect("validated analysis center has a catalog entry");
+            let url = format!(
+                "{}/{}/{}{}",
+                entry.root_url,
+                product_dir_path(identity.analysis_center, convention.layout, identity.date)?,
+                identity.official_filename,
+                convention.compression.suffix()
+            );
+            Ok(DistributionLocation {
+                source,
+                original_url: Some(url),
+                archive_filename: format!(
+                    "{}{}",
+                    identity.official_filename,
+                    convention.compression.suffix()
+                ),
+                compression: convention.compression,
+            })
+        }
+        DistributionSource::NasaCddis => Ok(DistributionLocation {
+            source,
+            original_url: Some(cddis_archive_url(identity)?),
+            archive_filename: format!("{}.gz", identity.official_filename),
+            compression: ArchiveCompression::Gzip,
+        }),
+        DistributionSource::LocalFile | DistributionSource::InMemory => Ok(DistributionLocation {
+            source,
+            original_url: None,
+            archive_filename: identity.official_filename.clone(),
+            compression: ArchiveCompression::None,
+        }),
+    }
 }
 
 /// Build the official NASA CDDIS HTTPS URL for an exact SP3 or IONEX identity.
