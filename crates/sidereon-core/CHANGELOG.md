@@ -4,6 +4,8 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-16
+
 ### Added
 
 - Added `Sp3ArtifactIdentity` and `Sp3MergeInputIdentity`, a versioned,
@@ -17,6 +19,11 @@ All notable changes to `sidereon-core` are documented here.
 - Added exact-identity distribution-location derivation so alternate cataloged
   SP3 duration and sampling candidates retain their declared identity instead
   of being reconstructed as the catalog default.
+
+### Compatibility
+
+- This release is additive. Existing SP3 merge and product-location APIs retain
+  their prior signatures; exact provenance identity construction is opt-in.
 
 ## [0.30.0] - 2026-07-16
 
