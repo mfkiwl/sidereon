@@ -74,10 +74,8 @@ fn complete_policy(combine: MergeCombine) -> MergeOptions {
 
 #[test]
 fn public_v1_golden_vectors_are_literal_and_cross_surface_stable() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/fixtures/sp3-merge-input-v1.json"
-    ))
-    .unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../golden/sp3-merge-input-v1.json")).unwrap();
     assert_eq!(fixture["schema_version"], 1);
     let expected = &fixture["expected"];
     let first = artifact(AnalysisCenter::Esa, 0x11);

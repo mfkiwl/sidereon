@@ -156,7 +156,7 @@ multi-contributor merges use the same schema.
 
 Accepted negative-zero tolerances canonicalize to positive zero because both
 values execute identically. The literal public contract vectors in
-[`docs/fixtures/sp3-merge-input-v1.json`](fixtures/sp3-merge-input-v1.json) bind
+[`sp3-merge-input-v1.json`](../crates/sidereon-core/golden/sp3-merge-input-v1.json) bind
 the complete policy and exact artifacts for Rust, Python, Elixir, C, and WASM.
 
 The acquisition-capable Python and Elixir interfaces publish the product,

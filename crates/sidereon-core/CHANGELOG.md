@@ -4,6 +4,14 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.31.2] - 2026-07-16
+
+### Fixed
+
+- Included the public merged-SP3 v1 golden fixture inside the published
+  `sidereon-core` crate so its integration tests compile from an isolated
+  crates.io source archive.
+
 ## [0.31.1] - 2026-07-16
 
 ### Fixed
