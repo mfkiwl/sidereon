@@ -4,8 +4,19 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-07-15
+
 ### Fixed
 
+- CODE ultra-rapid SP3 candidates now use AIUB's official HTTPS download
+  endpoint while retaining the daily `0000` issue and the dated, alternate,
+  and latest-alias filenames. The remaining AIUB-backed catalog entries were
+  audited separately and remain unchanged because current and historical trees
+  use mixed naming and availability conventions.
+- The SP3 validation harness no longer treats access denial or transport
+  failure as product absence. Candidate-URL 404/410 statuses are retained in
+  reports, while transport failures preserve source, filename, URL, and the
+  available HTTP status or network diagnostic.
 - Sequential RTK solves with baseline process noise now enforce the exact
   symmetry of the information-form time update. The rank-3 correction is
   symmetric mathematically, but independently evaluated matrix triangles could

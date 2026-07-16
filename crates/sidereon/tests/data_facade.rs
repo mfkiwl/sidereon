@@ -35,6 +35,28 @@ fn facade_reexports_ultra_sp3_fallback_locations() {
 
     assert_eq!(locations[0].pattern, "primary_02D_05M");
     assert_eq!(locations[1].pattern, "alternate_02D_15M");
+
+    let code_locations = ultra_sp3_locations(
+        AnalysisCenter::CodUlt,
+        ProductDate::new(2026, 7, 14).expect("valid date"),
+        "0000",
+    )
+    .expect("CODE ultra locations");
+    assert_eq!(code_locations[0].pattern, "primary_01D_05M");
+    assert_eq!(
+        code_locations[0].url,
+        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_01D_05M_ORB.SP3"
+    );
+    assert_eq!(code_locations[1].pattern, "alternate_02D_05M");
+    assert_eq!(
+        code_locations[1].url,
+        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_02D_05M_ORB.SP3"
+    );
+    assert_eq!(code_locations[2].pattern, "alias_latest");
+    assert_eq!(
+        code_locations[2].url,
+        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT.SP3"
+    );
 }
 
 #[test]

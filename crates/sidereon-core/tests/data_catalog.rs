@@ -1,5 +1,7 @@
+use std::process::Command;
+
 use sidereon_core::data::{
-    allowed_hosts, archive_url, canonical_filename, dted_block_dir, dted_cache_relpath,
+    allowed_hosts, archive_url, canonical_filename, catalog, dted_block_dir, dted_cache_relpath,
     dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk, mgex_ionex, mgex_nav,
     mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3, parse_skadi_tile_id,
     predicted_ionex, product_convention, rapid_ionex, skadi_archive_url, skadi_band,
@@ -167,15 +169,15 @@ fn ultra_rapid_sp3_urls_match_binding_catalog_examples() {
         "https://navigation-office.esa.int/products/gnss-products/2330/ESA0OPSULT_20242470600_02D_05M_ORB.SP3.gz"
     );
 
-    let cod = ops_ultra_sp3(AnalysisCenter::CodUlt, date(2026, 6, 11), None, None)
+    let cod = ops_ultra_sp3(AnalysisCenter::CodUlt, date(2026, 7, 14), None, None)
         .expect("CODE ultra SP3 product");
     assert_eq!(
         cod.canonical_filename().expect("filename"),
-        "COD0OPSULT_20261620000_01D_05M_ORB.SP3"
+        "COD0OPSULT_20261950000_01D_05M_ORB.SP3"
     );
     assert_eq!(
         cod.archive_url().expect("url"),
-        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261620000_01D_05M_ORB.SP3"
+        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_01D_05M_ORB.SP3"
     );
 }
 
@@ -187,24 +189,82 @@ fn ultra_rapid_sp3_locations_include_current_patterns_and_fallbacks() {
     assert!(esa[0].filename.ends_with("_02D_05M_ORB.SP3"));
     assert_eq!(esa[1].pattern, "alternate_02D_15M");
 
-    let code = ultra_sp3_locations(AnalysisCenter::CodUlt, date(2026, 6, 3), "0000")
+    let code = ultra_sp3_locations(AnalysisCenter::CodUlt, date(2026, 7, 14), "0000")
         .expect("CODE candidates");
-    assert!(code.iter().all(|location| location
-        .url
-        .starts_with("https://www.aiub.unibe.ch/download/CODE/")));
-    let alias = code.last().expect("latest alias");
+    assert_eq!(code.len(), 3);
+    assert_eq!(code[0].pattern, "primary_01D_05M");
+    assert_eq!(code[0].filename, "COD0OPSULT_20261950000_01D_05M_ORB.SP3");
+    assert_eq!(
+        code[0].url,
+        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_01D_05M_ORB.SP3"
+    );
+    assert_eq!(code[1].pattern, "alternate_02D_05M");
+    assert_eq!(code[1].filename, "COD0OPSULT_20261950000_02D_05M_ORB.SP3");
+    assert_eq!(
+        code[1].url,
+        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_02D_05M_ORB.SP3"
+    );
+    let alias = &code[2];
     assert_eq!(alias.pattern, "alias_latest");
     assert_eq!(alias.filename, "COD0OPSULT.SP3");
     assert_eq!(
         alias.url,
         "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT.SP3"
     );
+    assert!(code.iter().all(|candidate| candidate
+        .url
+        .starts_with("https://www.aiub.unibe.ch/download/CODE/")));
+    assert!(allowed_hosts().contains(&"www.aiub.unibe.ch"));
+
+    let catalog_entry = catalog()
+        .iter()
+        .find(|entry| entry.center == AnalysisCenter::CodUlt)
+        .expect("CODE ultra catalog entry");
+    assert_eq!(catalog_entry.protocol, ArchiveProtocol::Https);
+    assert_eq!(catalog_entry.host, "www.aiub.unibe.ch");
+    assert_eq!(catalog_entry.root_url, "https://www.aiub.unibe.ch/download");
 
     let gfz_target = ProductDateTime::new(date(2026, 7, 12), 10, 0, 0).expect("target");
     let gfz_issues =
         sidereon_core::data::ultra_issue_candidates(AnalysisCenter::GfzUlt, gfz_target)
             .expect("GFZ issues");
     assert_eq!(gfz_issues[0].issue, "0900");
+}
+
+#[test]
+#[ignore = "network test for AIUB's current CODE ultra-rapid object store"]
+fn live_aiub_code_ultra_day_195_downloads_and_parses_as_sp3() {
+    let candidate = ultra_sp3_locations(AnalysisCenter::CodUlt, date(2026, 7, 14), "0000")
+        .expect("CODE candidates")
+        .remove(0);
+    assert_eq!(candidate.pattern, "primary_01D_05M");
+
+    let response = Command::new("curl")
+        .args([
+            "--http1.1",
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--retry",
+            "2",
+            &candidate.url,
+        ])
+        .output()
+        .expect("run curl");
+    assert!(
+        response.status.success(),
+        "curl failed for {}: {}",
+        candidate.url,
+        String::from_utf8_lossy(&response.stderr)
+    );
+    assert!(response.stdout.starts_with(b"#dP"));
+    assert_eq!(response.stdout.len(), 1_473_962);
+
+    let sp3 = sidereon_core::ephemeris::Sp3::parse(&response.stdout)
+        .expect("downloaded CODE object parses as SP3");
+    assert_eq!(sp3.epoch_count(), 289);
+    assert_eq!(sp3.header.epoch_interval_s, 300.0);
 }
 
 #[test]

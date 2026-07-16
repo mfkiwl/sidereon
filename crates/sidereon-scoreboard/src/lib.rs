@@ -88,6 +88,8 @@ pub struct AttemptedCandidateReport {
     pub name: String,
     /// HTTPS archive URL.
     pub url: String,
+    /// HTTP status proving that this candidate URL was absent, when available.
+    pub http_status: Option<u16>,
 }
 
 /// Per-constellation scoreboard aggregate.
@@ -197,6 +199,8 @@ pub struct ProductResolution {
     pub resolved: Option<ResolvedProduct>,
     /// Candidates attempted in request order.
     pub attempted: Vec<ProductCandidate>,
+    /// HTTP absence statuses aligned with `attempted`; `None` means unavailable or successful.
+    pub attempted_http_statuses: Vec<Option<u16>>,
 }
 
 /// Fetch result for one product candidate.
@@ -204,8 +208,11 @@ pub struct ProductResolution {
 pub enum FetchOutcome {
     /// Candidate was present and returned decompressed SP3 bytes.
     Available(Vec<u8>),
-    /// Candidate was not posted at the archive.
-    NotPosted,
+    /// The candidate URL returned an HTTP absence status.
+    NotPosted {
+        /// HTTP 404 or 410 when supplied by a network fetcher.
+        http_status: Option<u16>,
+    },
 }
 
 enum SatelliteScoreRow {
@@ -259,22 +266,34 @@ pub enum ScoreboardError {
     #[error("data catalog error: {0}")]
     DataCatalog(#[from] DataCatalogError),
     /// The resolved archive URL was not HTTPS.
-    #[error("non-HTTPS product URL: {url}")]
+    #[error("non-HTTPS product URL for {archive_source} candidate {name}: {url}")]
     NonHttpsUrl {
+        /// Archive or analysis-center source.
+        archive_source: String,
+        /// Canonical candidate filename.
+        name: String,
         /// URL rejected by the fetcher.
         url: String,
     },
     /// An HTTP status other than a not-posted status was returned.
-    #[error("HTTP status {status} while fetching {url}")]
+    #[error("HTTP status {status} while fetching {archive_source} candidate {name} at {url}")]
     HttpStatus {
+        /// Archive or analysis-center source.
+        archive_source: String,
+        /// Canonical candidate filename.
+        name: String,
         /// URL requested.
         url: String,
         /// HTTP status code.
         status: u16,
     },
     /// Network transport failed.
-    #[error("network error while fetching {url}: {message}")]
+    #[error("network error while fetching {archive_source} candidate {name} at {url}: {message}")]
     Network {
+        /// Archive or analysis-center source.
+        archive_source: String,
+        /// Canonical candidate filename.
+        name: String,
         /// URL requested.
         url: String,
         /// Transport error message.
@@ -313,21 +332,27 @@ pub fn resolve_latest_available_rapid_sp3(
     fetcher: &impl ProductFetcher,
 ) -> Result<ProductResolution, ScoreboardError> {
     let mut attempted = Vec::new();
+    let mut attempted_http_statuses = Vec::new();
     for candidate in product_candidates(target_date, lookback_days)? {
         attempted.push(candidate.clone());
         match fetcher.fetch(&candidate)? {
             FetchOutcome::Available(bytes) => {
+                attempted_http_statuses.push(None);
                 return Ok(ProductResolution {
                     resolved: Some(ResolvedProduct { candidate, bytes }),
                     attempted,
+                    attempted_http_statuses,
                 });
             }
-            FetchOutcome::NotPosted => {}
+            FetchOutcome::NotPosted { http_status } => {
+                attempted_http_statuses.push(http_status);
+            }
         }
     }
     Ok(ProductResolution {
         resolved: None,
         attempted,
+        attempted_http_statuses,
     })
 }
 
@@ -434,20 +459,30 @@ pub fn no_data_report(
     target_date: ProductDate,
     attempted: &[ProductCandidate],
 ) -> ScoreboardReport {
+    let attempted_http_statuses = vec![None; attempted.len()];
+    no_data_report_with_statuses(target_date, attempted, &attempted_http_statuses)
+}
+
+fn no_data_report_with_statuses(
+    target_date: ProductDate,
+    attempted: &[ProductCandidate],
+    attempted_http_statuses: &[Option<u16>],
+) -> ScoreboardReport {
     ScoreboardReport {
         date_utc: target_date.to_string(),
         sidereon_version: env!("CARGO_PKG_VERSION").to_string(),
         status: ScoreboardStatus::NoData,
         product: None,
-        attempted_candidates: attempted_candidate_reports(attempted),
+        attempted_candidates: attempted_candidate_reports(attempted, attempted_http_statuses),
         per_constellation: BTreeMap::new(),
         per_sat: empty_per_satellite_report(),
         notes: vec![
             format!(
-                "No rapid or ultra-rapid SP3 product was posted in {} attempted candidates.",
+                "No rapid or ultra-rapid SP3 candidate URL returned data in {} attempts.",
                 attempted.len()
             ),
-            "This is recorded as no data, not a harness failure.".to_string(),
+            "HTTP 404/410 establishes absence at an attempted URL, not authoritative publication status at another provider path."
+                .to_string(),
         ],
     }
 }
@@ -470,15 +505,20 @@ pub fn write_report_outputs(
     Ok(())
 }
 
-fn attempted_candidate_reports(attempted: &[ProductCandidate]) -> Vec<AttemptedCandidateReport> {
+fn attempted_candidate_reports(
+    attempted: &[ProductCandidate],
+    attempted_http_statuses: &[Option<u16>],
+) -> Vec<AttemptedCandidateReport> {
     attempted
         .iter()
-        .map(|candidate| AttemptedCandidateReport {
+        .enumerate()
+        .map(|(index, candidate)| AttemptedCandidateReport {
             date_utc: candidate.date.to_string(),
             cadence: candidate.cadence.as_str().to_string(),
             source: candidate.source.to_string(),
             name: candidate.name.clone(),
             url: candidate.url.clone(),
+            http_status: attempted_http_statuses.get(index).copied().flatten(),
         })
         .collect()
 }
@@ -692,6 +732,8 @@ fn product_date_from_j2000_seconds(seconds: i64) -> Result<ProductDate, Scoreboa
 fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
     if !candidate.url.starts_with("https://") {
         return Err(ScoreboardError::NonHttpsUrl {
+            archive_source: candidate.source.to_string(),
+            name: candidate.name.clone(),
             url: candidate.url.clone(),
         });
     }
@@ -710,29 +752,20 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
             "%{http_code}",
             &candidate.url,
         ])
-        .output()?;
-    let status_text = String::from_utf8_lossy(&status_output.stdout);
-    let status = status_text
-        .trim()
-        .parse::<u16>()
-        .map_err(|_| ScoreboardError::Network {
-            url: candidate.url.clone(),
-            message: curl_message(&status_output.stderr, &status_output.stdout),
-        })?;
-    if status == 0 || status == 403 || status == 404 {
-        return Ok(FetchOutcome::NotPosted);
-    }
-    if !status_output.status.success() {
-        return Err(ScoreboardError::Network {
-            url: candidate.url.clone(),
-            message: curl_message(&status_output.stderr, &status_output.stdout),
-        });
-    }
-    if !(200..300).contains(&status) {
-        return Err(ScoreboardError::HttpStatus {
-            url: candidate.url.clone(),
-            status,
-        });
+        .output()
+        .map_err(|error| network_error(candidate, error.to_string()))?;
+    match classify_http_probe(
+        candidate,
+        status_output.status.success(),
+        &status_output.stdout,
+        &status_output.stderr,
+    )? {
+        HttpProbeOutcome::Available => {}
+        HttpProbeOutcome::NotPosted(status) => {
+            return Ok(FetchOutcome::NotPosted {
+                http_status: Some(status),
+            });
+        }
     }
 
     let response = Command::new("curl")
@@ -746,12 +779,13 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
             "2",
             &candidate.url,
         ])
-        .output()?;
+        .output()
+        .map_err(|error| network_error(candidate, error.to_string()))?;
     if !response.status.success() {
-        return Err(ScoreboardError::Network {
-            url: candidate.url.clone(),
-            message: String::from_utf8_lossy(&response.stderr).to_string(),
-        });
+        return Err(network_error(
+            candidate,
+            String::from_utf8_lossy(&response.stderr).to_string(),
+        ));
     }
     let bytes = response.stdout;
     if candidate.url.ends_with(".gz") {
@@ -761,6 +795,49 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
         Ok(FetchOutcome::Available(decoded))
     } else {
         Ok(FetchOutcome::Available(bytes))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpProbeOutcome {
+    Available,
+    NotPosted(u16),
+}
+
+fn classify_http_probe(
+    candidate: &ProductCandidate,
+    process_succeeded: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<HttpProbeOutcome, ScoreboardError> {
+    let status_text = String::from_utf8_lossy(stdout);
+    let status = status_text
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| network_error(candidate, curl_message(stderr, stdout)))?;
+    if !process_succeeded || status == 0 {
+        return Err(network_error(candidate, curl_message(stderr, stdout)));
+    }
+    if status == 404 || status == 410 {
+        return Ok(HttpProbeOutcome::NotPosted(status));
+    }
+    if (200..300).contains(&status) {
+        return Ok(HttpProbeOutcome::Available);
+    }
+    Err(ScoreboardError::HttpStatus {
+        archive_source: candidate.source.to_string(),
+        name: candidate.name.clone(),
+        url: candidate.url.clone(),
+        status,
+    })
+}
+
+fn network_error(candidate: &ProductCandidate, message: String) -> ScoreboardError {
+    ScoreboardError::Network {
+        archive_source: candidate.source.to_string(),
+        name: candidate.name.clone(),
+        url: candidate.url.clone(),
+        message,
     }
 }
 
@@ -979,7 +1056,11 @@ pub fn run_with_fetcher(
 ) -> Result<ScoreboardReport, ScoreboardError> {
     let resolution = resolve_latest_available_rapid_sp3(target_date, lookback_days, fetcher)?;
     let Some(resolved) = resolution.resolved else {
-        return Ok(no_data_report(target_date, &resolution.attempted));
+        return Ok(no_data_report_with_statuses(
+            target_date,
+            &resolution.attempted,
+            &resolution.attempted_http_statuses,
+        ));
     };
     let mut report = score_sp3_bytes(
         &resolved.bytes,
@@ -987,6 +1068,74 @@ pub fn run_with_fetcher(
         resolved.candidate.date,
         &ScoreOptions::default(),
     )?;
-    report.attempted_candidates = attempted_candidate_reports(&resolution.attempted);
+    report.attempted_candidates =
+        attempted_candidate_reports(&resolution.attempted, &resolution.attempted_http_statuses);
     Ok(report)
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    fn candidate() -> ProductCandidate {
+        ProductCandidate {
+            date: ProductDate::new(2026, 7, 14).expect("date"),
+            cadence: ProductCadence::UltraRapid,
+            source: "AIUB CODE",
+            name: "COD0OPSULT_20261950000_01D_05M_ORB.SP3".to_string(),
+            url: "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_01D_05M_ORB.SP3"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn only_candidate_absence_statuses_are_not_posted() {
+        let candidate = candidate();
+        assert_eq!(
+            classify_http_probe(&candidate, true, b"404", b"").expect("404 classification"),
+            HttpProbeOutcome::NotPosted(404)
+        );
+        assert_eq!(
+            classify_http_probe(&candidate, true, b"410", b"").expect("410 classification"),
+            HttpProbeOutcome::NotPosted(410)
+        );
+    }
+
+    #[test]
+    fn access_denial_preserves_status_url_and_candidate_details() {
+        let candidate = candidate();
+        match classify_http_probe(&candidate, true, b"403", b"") {
+            Err(ScoreboardError::HttpStatus {
+                archive_source,
+                name,
+                url,
+                status,
+            }) => {
+                assert_eq!(archive_source, candidate.source);
+                assert_eq!(name, candidate.name);
+                assert_eq!(url, candidate.url);
+                assert_eq!(status, 403);
+            }
+            other => panic!("expected HTTP status diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_failure_is_not_classified_as_publication_absence() {
+        let candidate = candidate();
+        match classify_http_probe(&candidate, false, b"000", b"connection refused") {
+            Err(ScoreboardError::Network {
+                archive_source,
+                name,
+                url,
+                message,
+            }) => {
+                assert_eq!(archive_source, candidate.source);
+                assert_eq!(name, candidate.name);
+                assert_eq!(url, candidate.url);
+                assert!(message.contains("connection refused"));
+            }
+            other => panic!("expected network diagnostic, got {other:?}"),
+        }
+    }
 }

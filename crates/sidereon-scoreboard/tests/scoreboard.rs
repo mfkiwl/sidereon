@@ -132,7 +132,7 @@ fn mocked_fetch_resolves_without_network() {
                     include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
                 ))
             } else {
-                Ok(FetchOutcome::NotPosted)
+                Ok(FetchOutcome::NotPosted { http_status: None })
             }
         }
     }
@@ -152,7 +152,7 @@ fn mocked_fetch_resolves_without_network() {
 }
 
 #[test]
-fn no_posted_product_is_no_data_report() {
+fn missing_candidate_urls_are_no_data_report() {
     struct MissingFetcher;
 
     impl ProductFetcher for MissingFetcher {
@@ -160,7 +160,9 @@ fn no_posted_product_is_no_data_report() {
             &self,
             _candidate: &ProductCandidate,
         ) -> Result<FetchOutcome, sidereon_scoreboard::ScoreboardError> {
-            Ok(FetchOutcome::NotPosted)
+            Ok(FetchOutcome::NotPosted {
+                http_status: Some(404),
+            })
         }
     }
 
@@ -174,6 +176,27 @@ fn no_posted_product_is_no_data_report() {
         .attempted_candidates
         .iter()
         .any(|candidate| candidate.url.contains("/products/2426/")));
+    assert!(report
+        .attempted_candidates
+        .iter()
+        .all(|candidate| candidate.http_status == Some(404)));
+    assert!(report
+        .notes
+        .iter()
+        .any(|note| note.contains("attempted URL")));
+    let attempted =
+        serde_json::to_value(&report.attempted_candidates[0]).expect("attempted candidate JSON");
+    assert_keys(
+        &attempted,
+        &[
+            "cadence",
+            "date_utc",
+            "http_status",
+            "name",
+            "source",
+            "url",
+        ],
+    );
 }
 
 #[test]
@@ -190,7 +213,7 @@ fn candidate_urls_use_product_dates_gps_week() {
                     include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
                 ))
             } else {
-                Ok(FetchOutcome::NotPosted)
+                Ok(FetchOutcome::NotPosted { http_status: None })
             }
         }
     }
