@@ -172,7 +172,10 @@ fn exact_product_set_requires_every_declared_identity_before_processing() {
         Err(ExactProductSetError::EmptyExpected)
     );
     assert_eq!(
-        validate_exact_product_set(&[first.clone(), second.clone()], &[first.clone()]),
+        validate_exact_product_set(
+            &[first.clone(), second.clone()],
+            std::slice::from_ref(&first),
+        ),
         Err(ExactProductSetError::Mismatch {
             missing: vec![second],
             unexpected: vec![],
@@ -223,7 +226,10 @@ fn exact_product_set_compares_prediction_metadata_not_only_filenames() {
     );
 
     assert_eq!(
-        validate_exact_product_set(&[predicted_one_day.clone()], &[predicted_two_day.clone()]),
+        validate_exact_product_set(
+            std::slice::from_ref(&predicted_one_day),
+            std::slice::from_ref(&predicted_two_day),
+        ),
         Err(ExactProductSetError::Mismatch {
             missing: vec![predicted_one_day],
             unexpected: vec![predicted_two_day],
