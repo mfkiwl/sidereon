@@ -4,6 +4,8 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-07-16
+
 ### Fixed
 
 - Canonical merged-SP3 identities now normalize accepted negative-zero
