@@ -7,6 +7,7 @@
 
 use core::fmt;
 use core::str::FromStr;
+use std::collections::{HashMap, HashSet};
 
 use crate::astro::time::civil::{civil_from_julian_day_number, day_of_year_int, days_in_month};
 use crate::astro::time::gnss::{week_epoch_julian_day_number, week_from_calendar};
@@ -1547,6 +1548,160 @@ pub struct ProductRequest {
     pub identity: ProductIdentity,
     /// Ordered acceptable distributors for that identity only.
     pub distributors: Vec<DistributionSource>,
+}
+
+/// Complete-set validation failure for exact product identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactProductSetError {
+    /// A complete set must declare at least one expected product.
+    EmptyExpected,
+    /// One expected identity was not internally consistent.
+    InvalidExpected {
+        /// Zero-based position in the expected identity list.
+        index: usize,
+        /// Identity validation failure.
+        source: DataCatalogError,
+    },
+    /// One available identity was not internally consistent.
+    InvalidAvailable {
+        /// Zero-based position in the available identity list.
+        index: usize,
+        /// Identity validation failure.
+        source: DataCatalogError,
+    },
+    /// The available identities were not exactly the expected set.
+    Mismatch {
+        /// Expected identities that were not available.
+        missing: Vec<ProductIdentity>,
+        /// Available identities that were not expected.
+        unexpected: Vec<ProductIdentity>,
+        /// Identities declared more than once in the expected list.
+        duplicate_expected: Vec<ProductIdentity>,
+        /// Identities declared more than once in the available list.
+        duplicate_available: Vec<ProductIdentity>,
+    },
+}
+
+impl fmt::Display for ExactProductSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyExpected => write!(f, "exact product set has no expected products"),
+            Self::InvalidExpected { index, source } => {
+                write!(f, "expected product {index} is invalid: {source}")
+            }
+            Self::InvalidAvailable { index, source } => {
+                write!(f, "available product {index} is invalid: {source}")
+            }
+            Self::Mismatch {
+                missing,
+                unexpected,
+                duplicate_expected,
+                duplicate_available,
+            } => write!(
+                f,
+                "exact product set mismatch (missing: {}; unexpected: {}; duplicate expected: {}; duplicate available: {})",
+                identity_list(missing),
+                identity_list(unexpected),
+                identity_list(duplicate_expected),
+                identity_list(duplicate_available),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExactProductSetError {}
+
+/// Require an available product inventory to match an expected exact set.
+///
+/// Every identity is validated before comparison. The expected list must be
+/// non-empty, neither list may contain duplicates, every expected identity must
+/// be available, and no undeclared identity may be present. Comparison uses the
+/// complete [`ProductIdentity`], not only its filename, so metadata that
+/// distinguishes otherwise identical archive names remains authoritative.
+///
+/// This function is a sans-IO completion gate: pass only identities from
+/// successfully validated acquisitions, and do not start dependent processing
+/// unless it returns `Ok(())`. For SP3 observed/predicted timing, use
+/// [`crate::sp3::Sp3::prediction_summary`]; issue times and catalog fields are
+/// not substitutes for the record flags in the product itself.
+pub fn validate_exact_product_set(
+    expected: &[ProductIdentity],
+    available: &[ProductIdentity],
+) -> Result<(), ExactProductSetError> {
+    if expected.is_empty() {
+        return Err(ExactProductSetError::EmptyExpected);
+    }
+    for (index, identity) in expected.iter().enumerate() {
+        identity
+            .validate()
+            .map_err(|source| ExactProductSetError::InvalidExpected { index, source })?;
+    }
+    for (index, identity) in available.iter().enumerate() {
+        identity
+            .validate()
+            .map_err(|source| ExactProductSetError::InvalidAvailable { index, source })?;
+    }
+
+    let expected_counts = identity_counts(expected);
+    let available_counts = identity_counts(available);
+    let missing = unique_matching(expected, |identity| {
+        !available_counts.contains_key(identity)
+    });
+    let unexpected = unique_matching(available, |identity| {
+        !expected_counts.contains_key(identity)
+    });
+    let duplicate_expected = unique_matching(expected, |identity| expected_counts[identity] > 1);
+    let duplicate_available = unique_matching(available, |identity| available_counts[identity] > 1);
+
+    if missing.is_empty()
+        && unexpected.is_empty()
+        && duplicate_expected.is_empty()
+        && duplicate_available.is_empty()
+    {
+        Ok(())
+    } else {
+        Err(ExactProductSetError::Mismatch {
+            missing,
+            unexpected,
+            duplicate_expected,
+            duplicate_available,
+        })
+    }
+}
+
+fn identity_counts(identities: &[ProductIdentity]) -> HashMap<&ProductIdentity, usize> {
+    let mut counts = HashMap::with_capacity(identities.len());
+    for identity in identities {
+        *counts.entry(identity).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn unique_matching(
+    identities: &[ProductIdentity],
+    mut predicate: impl FnMut(&ProductIdentity) -> bool,
+) -> Vec<ProductIdentity> {
+    let mut seen = HashSet::with_capacity(identities.len());
+    identities
+        .iter()
+        .filter(|identity| predicate(identity) && seen.insert((*identity).clone()))
+        .cloned()
+        .collect()
+}
+
+fn identity_list(identities: &[ProductIdentity]) -> String {
+    if identities.is_empty() {
+        return "none".to_string();
+    }
+    identities
+        .iter()
+        .map(|identity| {
+            identity
+                .key()
+                .unwrap_or_else(|_| identity.official_filename.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl ProductRequest {

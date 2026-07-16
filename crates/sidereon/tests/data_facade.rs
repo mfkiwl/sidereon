@@ -1,7 +1,7 @@
 use sidereon::data::{
-    dted_cache_relpath, hgt_to_dted, mgex_nav, ops_ultra_sp3, parse_skadi_tile_id,
-    skadi_archive_url, station_obs_url, terrain_tile_index, ultra_sp3_locations, AnalysisCenter,
-    ProductDate,
+    dted_cache_relpath, hgt_to_dted, mgex_nav, mgex_sp3, ops_ultra_sp3, parse_skadi_tile_id,
+    skadi_archive_url, station_obs_url, terrain_tile_index, ultra_sp3_locations,
+    validate_exact_product_set, AnalysisCenter, ProductDate,
 };
 
 #[test]
@@ -22,6 +22,32 @@ fn facade_reexports_data_catalog_derivation() {
         product.archive_url().expect("url"),
         "https://igs.bkg.bund.de/root_ftp/IGS/products/2330/IGS0OPSULT_20242470600_02D_15M_ORB.SP3.gz"
     );
+}
+
+#[test]
+fn facade_reexports_exact_product_set_gate() {
+    let first = mgex_sp3(
+        AnalysisCenter::Cod,
+        ProductDate::new(2026, 7, 12).expect("valid date"),
+        None,
+    )
+    .expect("first product")
+    .identity()
+    .expect("first identity");
+    let second = mgex_sp3(
+        AnalysisCenter::Cod,
+        ProductDate::new(2026, 7, 13).expect("valid date"),
+        None,
+    )
+    .expect("second product")
+    .identity()
+    .expect("second identity");
+
+    assert_eq!(
+        validate_exact_product_set(&[first.clone(), second.clone()], &[second.clone(), first]),
+        Ok(())
+    );
+    assert!(validate_exact_product_set(&[second], &[]).is_err());
 }
 
 #[test]

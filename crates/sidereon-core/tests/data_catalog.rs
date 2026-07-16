@@ -8,9 +8,10 @@ use sidereon_core::data::{
     skadi_band, skadi_source_entry, skadi_tile_id, space_weather_archive_url,
     space_weather_cache_relpath, space_weather_filename, space_weather_source_entry, station_obs,
     station_obs_filename, station_obs_protocol, station_obs_url, terrain_tile_index,
-    ultra_sp3_locations, AnalysisCenter, ArchiveCompression, ArchiveProtocol, DataCatalogError,
-    DistributionSource, ProductCampaign, ProductDate, ProductDateTime, ProductFormat,
-    ProductPublisher, ProductRequest, ProductType, SolutionClass, SpaceWeatherProduct, UltraIssue,
+    ultra_sp3_locations, validate_exact_product_set, AnalysisCenter, ArchiveCompression,
+    ArchiveProtocol, DataCatalogError, DistributionSource, ExactProductSetError, ProductCampaign,
+    ProductDate, ProductDateTime, ProductFormat, ProductPublisher, ProductRequest, ProductType,
+    SolutionClass, SpaceWeatherProduct, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
@@ -145,6 +146,90 @@ fn exact_request_and_cache_key_keep_source_selection_explicit() {
     assert_eq!(
         ProductRequest::new(identity, vec![]),
         Err(DataCatalogError::NoDistributionSources)
+    );
+}
+
+#[test]
+fn exact_product_set_requires_every_declared_identity_before_processing() {
+    let first = mgex_sp3(AnalysisCenter::Cod, date(2026, 7, 12), None)
+        .expect("first product")
+        .identity()
+        .expect("first identity");
+    let second = mgex_sp3(AnalysisCenter::Cod, date(2026, 7, 13), None)
+        .expect("second product")
+        .identity()
+        .expect("second identity");
+
+    assert_eq!(
+        validate_exact_product_set(
+            &[first.clone(), second.clone()],
+            &[second.clone(), first.clone()]
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        validate_exact_product_set(&[], &[]),
+        Err(ExactProductSetError::EmptyExpected)
+    );
+    assert_eq!(
+        validate_exact_product_set(&[first.clone(), second.clone()], &[first.clone()]),
+        Err(ExactProductSetError::Mismatch {
+            missing: vec![second],
+            unexpected: vec![],
+            duplicate_expected: vec![],
+            duplicate_available: vec![],
+        })
+    );
+}
+
+#[test]
+fn exact_product_set_rejects_duplicates_and_undeclared_products() {
+    let first = mgex_sp3(AnalysisCenter::Cod, date(2026, 7, 12), None)
+        .expect("first product")
+        .identity()
+        .expect("first identity");
+    let second = mgex_sp3(AnalysisCenter::Cod, date(2026, 7, 13), None)
+        .expect("second product")
+        .identity()
+        .expect("second identity");
+
+    assert_eq!(
+        validate_exact_product_set(
+            &[first.clone(), first.clone()],
+            &[first.clone(), second.clone(), second.clone()]
+        ),
+        Err(ExactProductSetError::Mismatch {
+            missing: vec![],
+            unexpected: vec![second.clone()],
+            duplicate_expected: vec![first],
+            duplicate_available: vec![second],
+        })
+    );
+}
+
+#[test]
+fn exact_product_set_compares_prediction_metadata_not_only_filenames() {
+    let predicted_one_day = predicted_ionex(AnalysisCenter::CodPrd1, date(2026, 7, 15), None)
+        .expect("one-day prediction")
+        .identity()
+        .expect("one-day identity");
+    let predicted_two_day = predicted_ionex(AnalysisCenter::CodPrd2, date(2026, 7, 14), None)
+        .expect("two-day prediction")
+        .identity()
+        .expect("two-day identity");
+    assert_eq!(
+        predicted_one_day.official_filename,
+        predicted_two_day.official_filename
+    );
+
+    assert_eq!(
+        validate_exact_product_set(&[predicted_one_day.clone()], &[predicted_two_day.clone()]),
+        Err(ExactProductSetError::Mismatch {
+            missing: vec![predicted_one_day],
+            unexpected: vec![predicted_two_day],
+            duplicate_expected: vec![],
+            duplicate_available: vec![],
+        })
     );
 }
 

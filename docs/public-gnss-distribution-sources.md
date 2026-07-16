@@ -40,6 +40,24 @@ compression as a different scientific product.
 acceptable distributors. It grants no permission to try another analysis
 center, tier, issue, date, cadence, or family.
 
+## Complete exact product sets
+
+Workflows that require several products can declare the full identity inventory
+and call `validate_exact_product_set(expected, available)` after every product
+has passed acquisition validation. The gate rejects an empty declaration,
+duplicates on either side, missing identities, and undeclared identities. It
+compares complete identities rather than filenames, so two prediction tiers
+that publish the same filename remain distinct.
+
+The gate is sans-IO and does not make cache writes transactional. Its contract
+is that dependent processing starts only after it returns `Ok(())`. Pass only
+resolved identities from successful acquisitions as `available`.
+
+SP3 observed/predicted timing is a separate content property. Read it from
+`Sp3::prediction_summary()`, which aggregates the product's record flags. Do
+not derive that boundary from issue times, nominal durations, or catalog
+prediction fields.
+
 ## CDDIS paths
 
 Current long-name SP3 products resolve to:

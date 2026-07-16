@@ -4,6 +4,19 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-07-16
+
+### Added
+
+- Added `validate_exact_product_set`, a sans-IO completion gate for workflows
+  that require several exact products. It rejects empty declarations,
+  duplicate expected or available identities, missing identities, and
+  undeclared identities before dependent processing begins.
+- Exact-set comparison uses the complete distributor-independent identity, so
+  same-filename products with different prediction tiers remain distinct.
+  SP3 observed/predicted timing remains authoritative only through
+  `Sp3::prediction_summary()` and its record-level flags.
+
 ## [0.29.1] - 2026-07-15
 
 ### Fixed
