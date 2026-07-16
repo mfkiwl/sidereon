@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use sha2::{Digest, Sha256};
 
 use crate::data::{ArchiveCompression, DistributionSource, ProductIdentity, ProductType};
-use crate::id::GnssSystem;
+use crate::tolerances::WHOLE_SECOND_EPS_S;
 
 use super::{MergeCombine, MergeOptions, MergePrecedenceScope};
 
@@ -291,13 +291,22 @@ fn validate_policy(policy: &MergeOptions) -> Result<(), Sp3MergeInputIdentityErr
             ));
         }
     }
+    if let Some(value) = policy.target_epoch_interval_s {
+        if !value.is_finite()
+            || (value - value.round()).abs() > WHOLE_SECOND_EPS_S
+            || value.round() < 1.0
+        {
+            return Err(Sp3MergeInputIdentityError::InvalidPolicy(
+                "target epoch interval",
+            ));
+        }
+    }
     if policy
-        .target_epoch_interval_s
-        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        .systems
+        .as_ref()
+        .is_some_and(|systems| systems.is_empty())
     {
-        return Err(Sp3MergeInputIdentityError::InvalidPolicy(
-            "target epoch interval",
-        ));
+        return Err(Sp3MergeInputIdentityError::InvalidPolicy("systems filter"));
     }
     for labels in &policy.frame_reconciliation.asserted_equivalent_label_sets {
         if labels.labels.len() < 2 || labels.labels.iter().any(|label| label.trim().is_empty()) {
@@ -340,14 +349,15 @@ fn canonical_policy_bytes(policy: &MergeOptions, precedence: &[Vec<u8>]) -> Vec<
         None => bytes.push(0),
     }
 
-    let systems: Vec<GnssSystem> = policy
-        .systems
-        .as_ref()
-        .map(|values| values.iter().copied().collect())
-        .unwrap_or_default();
-    put_u64(&mut bytes, systems.len() as u64);
-    for system in systems {
-        bytes.push(system.letter() as u8);
+    match &policy.systems {
+        Some(systems) => {
+            bytes.push(1);
+            put_u64(&mut bytes, systems.len() as u64);
+            for system in systems {
+                bytes.push(system.letter() as u8);
+            }
+        }
+        None => bytes.push(0),
     }
 
     let mut label_sets: Vec<Vec<u8>> = policy

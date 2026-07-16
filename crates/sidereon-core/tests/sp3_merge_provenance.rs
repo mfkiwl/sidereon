@@ -149,6 +149,41 @@ fn policy_set_order_does_not_change_the_stable_identity() {
 }
 
 #[test]
+fn non_executable_merge_policies_fail_closed() {
+    let contributor = artifact(AnalysisCenter::Esa, 0x11);
+    let empty_systems = MergeOptions {
+        systems: Some(BTreeSet::new()),
+        ..MergeOptions::default()
+    };
+    assert!(matches!(
+        Sp3MergeInputIdentity::new(std::slice::from_ref(&contributor), &empty_systems),
+        Err(Sp3MergeInputIdentityError::InvalidPolicy("systems filter"))
+    ));
+
+    let fractional_interval = MergeOptions {
+        target_epoch_interval_s: Some(1.5),
+        ..MergeOptions::default()
+    };
+    assert!(matches!(
+        Sp3MergeInputIdentity::new(&[contributor], &fractional_interval),
+        Err(Sp3MergeInputIdentityError::InvalidPolicy(
+            "target epoch interval"
+        ))
+    ));
+
+    let near_zero_interval = MergeOptions {
+        target_epoch_interval_s: Some(1.0e-12),
+        ..MergeOptions::default()
+    };
+    assert!(matches!(
+        Sp3MergeInputIdentity::new(&[artifact(AnalysisCenter::Esa, 0x22)], &near_zero_interval),
+        Err(Sp3MergeInputIdentityError::InvalidPolicy(
+            "target epoch interval"
+        ))
+    ));
+}
+
+#[test]
 fn incomplete_or_mismatched_provenance_fails_closed() {
     let mut contributor = artifact(AnalysisCenter::Esa, 0x11);
     contributor.archive_sha256 = "not-a-digest".to_string();
