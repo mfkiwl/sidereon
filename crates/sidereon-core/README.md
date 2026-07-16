@@ -51,6 +51,9 @@ reproducible artifact fields from retrieval observations.
 set and `MergeOptions` into a versioned stable identifier that is unchanged by
 cache hits or non-semantic contributor enumeration order. Precedence order is
 bound when precedence combination is selected because it can change results.
+Accepted `-0.0` tolerances canonicalize to `+0.0`, matching execution. Literal
+cross-interface vectors for the public v1 encoding are committed at
+[`docs/fixtures/sp3-merge-input-v1.json`](../../docs/fixtures/sp3-merge-input-v1.json).
 
 ## Parity bar
 

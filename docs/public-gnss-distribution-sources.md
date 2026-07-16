@@ -154,6 +154,11 @@ artifact records and merge policy alongside it; `verify` recomputes the
 canonical identifier from those records. Single-contributor and
 multi-contributor merges use the same schema.
 
+Accepted negative-zero tolerances canonicalize to positive zero because both
+values execute identically. The literal public contract vectors in
+[`docs/fixtures/sp3-merge-input-v1.json`](fixtures/sp3-merge-input-v1.json) bind
+the complete policy and exact artifacts for Rust, Python, Elixir, C, and WASM.
+
 The acquisition-capable Python and Elixir interfaces publish the product,
 original archive, and JSON provenance as one immutable transaction. A single
 SHA-256-bound commit record names that transaction and is atomically replaced

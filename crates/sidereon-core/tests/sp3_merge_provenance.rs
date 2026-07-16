@@ -5,8 +5,9 @@ use sidereon_core::data::{
     DistributionSource, ProductDate, ProductType,
 };
 use sidereon_core::ephemeris::{
-    MergeCombine, MergeOptions, Sp3ArtifactIdentity, Sp3FrameLabelSet,
-    Sp3FrameReconciliationOptions, Sp3MergeInputIdentity, Sp3MergeInputIdentityError,
+    MergeCombine, MergeOptions, MergePrecedenceScope, OutlierRejectOptions, Sp3ArtifactIdentity,
+    Sp3FrameLabelSet, Sp3FrameReconciliationOptions, Sp3MergeInputIdentity,
+    Sp3MergeInputIdentityError,
 };
 use sidereon_core::GnssSystem;
 
@@ -33,7 +34,7 @@ fn identity(center: AnalysisCenter) -> sidereon_core::data::ProductIdentity {
 fn artifact(center: AnalysisCenter, byte: u8) -> Sp3ArtifactIdentity {
     let requested_identity = identity(center);
     let mut resolved_identity = requested_identity.clone();
-    resolved_identity.format_version = Some("d".to_string());
+    resolved_identity.format_version = Some("SP3-d".to_string());
     Sp3ArtifactIdentity {
         official_filename: requested_identity.official_filename.clone(),
         requested_identity,
@@ -45,6 +46,188 @@ fn artifact(center: AnalysisCenter, byte: u8) -> Sp3ArtifactIdentity {
         archive_byte_length: 6_789,
         compression: ArchiveCompression::Gzip,
     }
+}
+
+fn complete_policy(combine: MergeCombine) -> MergeOptions {
+    MergeOptions {
+        position_tolerance_m: 0.0,
+        clock_tolerance_s: 2.5e-9,
+        min_agree: 2,
+        clock_min_common: 3,
+        combine,
+        precedence_scope: MergePrecedenceScope::SatelliteArc,
+        outlier_reject: Some(OutlierRejectOptions {
+            position_tolerance_m: 1.25,
+            clock_tolerance_s: 7.5e-9,
+        }),
+        target_epoch_interval_s: Some(900.0),
+        systems: Some(BTreeSet::from([GnssSystem::Gps, GnssSystem::Galileo])),
+        frame_reconciliation: Sp3FrameReconciliationOptions {
+            asserted_equivalent_label_sets: vec![
+                Sp3FrameLabelSet::new(["IGS20", "ITRF2020"]),
+                Sp3FrameLabelSet::new(["IGS14", "ITRF2014"]),
+            ],
+            helmert: true,
+        },
+    }
+}
+
+#[test]
+fn public_v1_golden_vectors_are_literal_and_cross_surface_stable() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/fixtures/sp3-merge-input-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture["schema_version"], 1);
+    let expected = &fixture["expected"];
+    let first = artifact(AnalysisCenter::Esa, 0x11);
+    let second = artifact(AnalysisCenter::Cod, 0x22);
+    assert_eq!(
+        fixture["artifacts"]["esa"]["official_filename"],
+        first.official_filename
+    );
+    assert_eq!(
+        fixture["artifacts"]["esa"]["product_sha256"],
+        first.product_sha256
+    );
+    assert_eq!(
+        fixture["artifacts"]["cod"]["official_filename"],
+        second.official_filename
+    );
+    assert_eq!(
+        fixture["artifacts"]["cod"]["product_sha256"],
+        second.product_sha256
+    );
+    let mean = Sp3MergeInputIdentity::new(
+        &[first.clone(), second.clone()],
+        &complete_policy(MergeCombine::Mean),
+    )
+    .unwrap();
+    let mean_reverse = Sp3MergeInputIdentity::new(
+        &[second.clone(), first.clone()],
+        &complete_policy(MergeCombine::Mean),
+    )
+    .unwrap();
+    assert_eq!(mean.stable_id, expected["mean_esa_cod"].as_str().unwrap());
+    assert_eq!(mean, mean_reverse);
+    assert_eq!(
+        mean.contributors[0].official_filename,
+        second.official_filename
+    );
+    assert_eq!(
+        mean.contributors[1].official_filename,
+        first.official_filename
+    );
+    assert_eq!(mean.precedence_contributors, None);
+
+    let median = Sp3MergeInputIdentity::new(
+        &[first.clone(), second.clone()],
+        &complete_policy(MergeCombine::Median),
+    )
+    .unwrap();
+    let median_reverse = Sp3MergeInputIdentity::new(
+        &[second.clone(), first.clone()],
+        &complete_policy(MergeCombine::Median),
+    )
+    .unwrap();
+    assert_eq!(
+        median.stable_id,
+        expected["median_esa_cod"].as_str().unwrap()
+    );
+    assert_eq!(median, median_reverse);
+
+    let precedence = Sp3MergeInputIdentity::new(
+        &[first.clone(), second.clone()],
+        &complete_policy(MergeCombine::Precedence),
+    )
+    .unwrap();
+    let precedence_reverse = Sp3MergeInputIdentity::new(
+        &[second.clone(), first.clone()],
+        &complete_policy(MergeCombine::Precedence),
+    )
+    .unwrap();
+    assert_eq!(
+        precedence.stable_id,
+        expected["precedence_esa_cod"].as_str().unwrap()
+    );
+    assert_eq!(
+        precedence_reverse.stable_id,
+        expected["precedence_cod_esa"].as_str().unwrap()
+    );
+    assert_eq!(
+        precedence
+            .precedence_contributors
+            .as_ref()
+            .unwrap()
+            .first()
+            .unwrap()
+            .official_filename,
+        first.official_filename
+    );
+
+    let single = Sp3MergeInputIdentity::new(
+        std::slice::from_ref(&first),
+        &complete_policy(MergeCombine::Mean),
+    )
+    .unwrap();
+    assert_eq!(
+        single.stable_id,
+        expected["single_mean_esa"].as_str().unwrap()
+    );
+    assert_ne!(single.stable_id, mean.stable_id);
+
+    let mutations = &fixture["required_mutations"];
+    let mut changed_bytes = first.clone();
+    changed_bytes.product_sha256 = mutations["changed_product_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let changed_bytes = Sp3MergeInputIdentity::new(
+        &[changed_bytes, second.clone()],
+        &complete_policy(MergeCombine::Mean),
+    )
+    .unwrap();
+    assert_ne!(changed_bytes.stable_id, mean.stable_id);
+
+    let mut changed_resolved = first.clone();
+    changed_resolved.resolved_identity.format_version = Some(
+        mutations["changed_resolved_format_version"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    );
+    let changed_resolved = Sp3MergeInputIdentity::new(
+        &[changed_resolved, second.clone()],
+        &complete_policy(MergeCombine::Mean),
+    )
+    .unwrap();
+    assert_ne!(changed_resolved.stable_id, mean.stable_id);
+
+    let mut changed_policy = complete_policy(MergeCombine::Mean);
+    changed_policy.clock_tolerance_s = mutations["changed_clock_tolerance_s"].as_f64().unwrap();
+    let changed_policy =
+        Sp3MergeInputIdentity::new(&[first.clone(), second.clone()], &changed_policy).unwrap();
+    assert_ne!(changed_policy.stable_id, mean.stable_id);
+
+    let mut reordered_policy = complete_policy(MergeCombine::Mean);
+    reordered_policy
+        .frame_reconciliation
+        .asserted_equivalent_label_sets
+        .reverse();
+    reordered_policy.systems = Some([GnssSystem::Galileo, GnssSystem::Gps].into_iter().collect());
+    let reordered =
+        Sp3MergeInputIdentity::new(&[second.clone(), first.clone()], &reordered_policy).unwrap();
+    assert_eq!(reordered.stable_id, mean.stable_id);
+
+    let mut malformed = first;
+    malformed.product_sha256 = mutations["malformed_product_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(matches!(
+        Sp3MergeInputIdentity::new(&[malformed, second], &complete_policy(MergeCombine::Mean)),
+        Err(Sp3MergeInputIdentityError::InvalidContributor { .. })
+    ));
 }
 
 #[test]
@@ -181,6 +364,51 @@ fn non_executable_merge_policies_fail_closed() {
             "target epoch interval"
         ))
     ));
+
+    let incomplete_frame_set = MergeOptions {
+        frame_reconciliation: Sp3FrameReconciliationOptions {
+            asserted_equivalent_label_sets: vec![Sp3FrameLabelSet::new(["IGS20"])],
+            helmert: false,
+        },
+        ..MergeOptions::default()
+    };
+    assert!(matches!(
+        Sp3MergeInputIdentity::new(
+            &[artifact(AnalysisCenter::Esa, 0x33)],
+            &incomplete_frame_set
+        ),
+        Err(Sp3MergeInputIdentityError::InvalidPolicy(
+            "asserted frame label set"
+        ))
+    ));
+}
+
+#[test]
+fn negative_zero_tolerances_have_the_same_identity_as_positive_zero() {
+    let contributor = artifact(AnalysisCenter::Esa, 0x11);
+    let positive = MergeOptions {
+        position_tolerance_m: 0.0,
+        clock_tolerance_s: 0.0,
+        outlier_reject: Some(OutlierRejectOptions {
+            position_tolerance_m: 0.0,
+            clock_tolerance_s: 0.0,
+        }),
+        ..MergeOptions::default()
+    };
+    let negative = MergeOptions {
+        position_tolerance_m: -0.0,
+        clock_tolerance_s: -0.0,
+        outlier_reject: Some(OutlierRejectOptions {
+            position_tolerance_m: -0.0,
+            clock_tolerance_s: -0.0,
+        }),
+        ..MergeOptions::default()
+    };
+
+    let positive =
+        Sp3MergeInputIdentity::new(std::slice::from_ref(&contributor), &positive).unwrap();
+    let negative = Sp3MergeInputIdentity::new(&[contributor], &negative).unwrap();
+    assert_eq!(positive.stable_id, negative.stable_id);
 }
 
 #[test]

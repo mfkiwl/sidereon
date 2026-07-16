@@ -754,14 +754,6 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
             .is_none_or(|systems| systems.contains(&sat.system))
     };
 
-    if let Some(systems) = &opts.systems {
-        if systems.is_empty() {
-            return Err(Error::InvalidInput(
-                "merge systems filter must not be empty".into(),
-            ));
-        }
-    }
-
     let mut out_epochs: Vec<Instant> = Vec::with_capacity(epoch_keys.len());
     let mut out_epoch_j2000_s: Vec<f64> = Vec::with_capacity(epoch_keys.len());
     let mut out_states: Vec<BTreeMap<GnssSatelliteId, Sp3State>> =
@@ -1530,6 +1522,22 @@ fn validate_merge_options(opts: &MergeOptions) -> Result<()> {
         )
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     }
+    if opts
+        .systems
+        .as_ref()
+        .is_some_and(|systems| systems.is_empty())
+    {
+        return Err(Error::InvalidInput(
+            "merge systems filter must not be empty".into(),
+        ));
+    }
+    for labels in &opts.frame_reconciliation.asserted_equivalent_label_sets {
+        if labels.labels.len() < 2 || labels.labels.iter().any(|label| label.trim().is_empty()) {
+            return Err(Error::InvalidInput(
+                "merge asserted frame label sets require at least two non-empty labels".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1819,7 +1827,7 @@ mod tests {
     use super::{
         align_clock_reference, clock_reference_offset, merge, MergeCombine, MergeOptions,
         MergePrecedenceScope, MergeReport, OutlierRejectOptions, Sp3FrameLabelSet,
-        Sp3FrameReconciliationMethod,
+        Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions,
     };
     use crate::constants::SECONDS_PER_DAY;
     use crate::id::{GnssSatelliteId, GnssSystem};
@@ -2045,6 +2053,30 @@ mod tests {
             "single-source fraction {frac}"
         );
         assert_eq!(MergeReport::default().single_source_fraction(), None);
+    }
+
+    #[test]
+    fn merge_rejects_non_executable_system_and_frame_policies() {
+        let source = sp3_records(&[("G01", [15000.0, -20000.0, 5000.0], Some(100.0))]);
+
+        let empty_systems = MergeOptions {
+            systems: Some(BTreeSet::new()),
+            ..MergeOptions::default()
+        };
+        let error = merge(std::slice::from_ref(&source), &empty_systems).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("systems filter must not be empty"));
+
+        let incomplete_frame_set = MergeOptions {
+            frame_reconciliation: Sp3FrameReconciliationOptions {
+                asserted_equivalent_label_sets: vec![Sp3FrameLabelSet::new(["IGS20"])],
+                helmert: false,
+            },
+            ..MergeOptions::default()
+        };
+        let error = merge(&[source], &incomplete_frame_set).unwrap_err();
+        assert!(error.to_string().contains("at least two non-empty labels"));
     }
 
     #[test]

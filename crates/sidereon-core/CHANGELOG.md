@@ -4,6 +4,16 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Canonical merged-SP3 identities now normalize accepted negative-zero
+  tolerances to positive zero, matching merge execution semantics.
+- Merge execution and provenance identity validation now reject the same empty
+  system filters and incomplete asserted frame-label sets.
+- Added literal cross-interface v1 golden vectors covering the complete merge
+  policy, canonical contributor ordering, precedence ordering, and malformed
+  inputs.
+
 ## [0.31.0] - 2026-07-16
 
 ### Added

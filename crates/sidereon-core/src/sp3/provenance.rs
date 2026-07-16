@@ -320,8 +320,14 @@ fn validate_policy(policy: &MergeOptions) -> Result<(), Sp3MergeInputIdentityErr
 
 fn canonical_policy_bytes(policy: &MergeOptions, precedence: &[Vec<u8>]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    put_u64(&mut bytes, policy.position_tolerance_m.to_bits());
-    put_u64(&mut bytes, policy.clock_tolerance_s.to_bits());
+    put_u64(
+        &mut bytes,
+        canonical_nonnegative_f64_bits(policy.position_tolerance_m),
+    );
+    put_u64(
+        &mut bytes,
+        canonical_nonnegative_f64_bits(policy.clock_tolerance_s),
+    );
     put_u64(&mut bytes, policy.min_agree as u64);
     put_u64(&mut bytes, policy.clock_min_common as u64);
     bytes.push(match policy.combine {
@@ -336,8 +342,14 @@ fn canonical_policy_bytes(policy: &MergeOptions, precedence: &[Vec<u8>]) -> Vec<
     match policy.outlier_reject {
         Some(value) => {
             bytes.push(1);
-            put_u64(&mut bytes, value.position_tolerance_m.to_bits());
-            put_u64(&mut bytes, value.clock_tolerance_s.to_bits());
+            put_u64(
+                &mut bytes,
+                canonical_nonnegative_f64_bits(value.position_tolerance_m),
+            );
+            put_u64(
+                &mut bytes,
+                canonical_nonnegative_f64_bits(value.clock_tolerance_s),
+            );
         }
         None => bytes.push(0),
     }
@@ -388,6 +400,14 @@ fn canonical_policy_bytes(policy: &MergeOptions, precedence: &[Vec<u8>]) -> Vec<
 
 fn finite_nonnegative(value: f64) -> bool {
     value.is_finite() && value >= 0.0
+}
+
+fn canonical_nonnegative_f64_bits(value: f64) -> u64 {
+    if value == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        value.to_bits()
+    }
 }
 
 fn valid_sha256(value: &str) -> bool {
