@@ -4,6 +4,8 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-18
+
 ### Added
 
 - Added deterministic `parse_navcen_at` and `merge_navcen_at` APIs for
