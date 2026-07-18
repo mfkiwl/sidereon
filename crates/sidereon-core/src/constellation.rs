@@ -59,6 +59,7 @@
 //! ```
 
 use crate::astro::omm::Omm;
+use crate::astro::passes::UtcInstant;
 use crate::ephemeris::Sp3;
 use crate::id::GnssSystem;
 use core::fmt::{self, Write as _};
@@ -132,8 +133,9 @@ impl std::error::Error for ConstellationError {}
 ///
 /// `active` in a record means the satellite is present in the base identity
 /// source. `usable` is an advisory health flag; for the current GPS path it is
-/// `true` unless a compatible merged NAVCEN row carries an active NANU that
-/// marks the PRN unusable or decommissioned.
+/// the result carried by a compatible merged NAVCEN row. The clock-free merge
+/// uses NAVCEN's historical immediate classification, while
+/// [`merge_navcen_at`] can carry an explicitly timed forecast assessment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordSource {
     /// CelesTrak `gps-ops` identity provenance.
@@ -232,6 +234,49 @@ pub struct NavcenStatus {
     pub block_type: Option<String>,
     /// Clock type.
     pub clock: Option<String>,
+}
+
+/// A bounded UTC interval carried by a NAVCEN forecast notice.
+///
+/// The interval is half-open: the satellite is affected at `start_utc` and is
+/// no longer affected at `end_utc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavcenEffectiveInterval {
+    /// First affected UTC instant (inclusive).
+    pub start_utc: UtcInstant,
+    /// First unaffected UTC instant (exclusive).
+    pub end_utc: UtcInstant,
+}
+
+/// Result of interpreting timing fields from a NAVCEN row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavcenTiming {
+    /// The NANU type does not describe a forecast outage interval.
+    NotApplicable,
+    /// A complete, validated UTC interval was parsed.
+    Parsed(NavcenEffectiveInterval),
+    /// The NANU type describes a forecast outage, but no complete trustworthy
+    /// interval could be resolved from the row.
+    Unparseable,
+}
+
+/// A NAVCEN row evaluated for operational usability at an explicit UTC instant.
+///
+/// [`parse_navcen_at`] returns this type instead of silently changing the
+/// clock-free legacy behavior of [`parse_navcen`]. `status.usable` is the result
+/// at `evaluated_at_utc`; the raw NANU type and subject remain in `status`, and
+/// `outage_start` plus `timing` preserve how a forecast interval was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavcenAssessment {
+    /// Parsed NAVCEN row, with `usable` evaluated at `evaluated_at_utc`.
+    pub status: NavcenStatus,
+    /// Explicit UTC instant used for the usability decision.
+    pub evaluated_at_utc: UtcInstant,
+    /// Cleaned NAVCEN "Outage Start" text. Duplicate cells are joined with
+    /// `" | "` and make bounded forecast timing unparseable.
+    pub outage_start: Option<String>,
+    /// Parsed forecast timing or an explicit non-applicable/ambiguous state.
+    pub timing: NavcenTiming,
 }
 
 /// Validation report for a constellation catalog.
@@ -783,10 +828,7 @@ pub fn parse_navcen(bytes: &[u8]) -> Result<Vec<NavcenStatus>, ConstellationErro
     let html = core::str::from_utf8(bytes).map_err(|_| ConstellationError::NavcenNotUtf8)?;
 
     let mut statuses = Vec::new();
-    for row in tr_blocks(html) {
-        if find_ci(row, "views-field-field-gps-prn").is_none() || find_ci(row, "<td").is_none() {
-            continue;
-        }
+    for row in navcen_rows(html) {
         statuses.push(navcen_status_from_row(row)?);
     }
 
@@ -795,6 +837,37 @@ pub fn parse_navcen(bytes: &[u8]) -> Result<Vec<NavcenStatus>, ConstellationErro
     }
     statuses.sort_by_key(|s| s.prn);
     Ok(statuses)
+}
+
+/// Parse NAVCEN GPS status HTML and evaluate usability at an explicit UTC time.
+///
+/// This is the deterministic, time-aware companion to [`parse_navcen`]. Active
+/// bounded forecast notices affect usability only on their parsed half-open
+/// interval `[start_utc, end_utc)`. A forecast whose interval cannot be parsed
+/// is retained as [`NavcenTiming::Unparseable`] and conservatively leaves the
+/// satellite usable. Active `UNUSABLE` and `DECOM` notices retain their legacy
+/// immediate-unusable semantics. The time-aware path also recognizes active
+/// `UNUSUFN` as immediately unusable; the legacy clock-free parser did not.
+///
+/// The parser reads the interval's year from the row's raw "Outage Start"
+/// date and requires its day-of-year to agree with the first `JDAY` in the NANU
+/// subject. It never reads the host clock and performs no network access.
+pub fn parse_navcen_at(
+    bytes: &[u8],
+    evaluated_at_utc: UtcInstant,
+) -> Result<Vec<NavcenAssessment>, ConstellationError> {
+    let html = core::str::from_utf8(bytes).map_err(|_| ConstellationError::NavcenNotUtf8)?;
+
+    let mut assessments = Vec::new();
+    for row in navcen_rows(html) {
+        assessments.push(navcen_assessment_from_row(row, evaluated_at_utc)?);
+    }
+
+    if assessments.is_empty() {
+        return Err(ConstellationError::NavcenNoRows);
+    }
+    assessments.sort_by_key(|assessment| assessment.status.prn);
+    Ok(assessments)
 }
 
 fn navcen_status_from_row(row: &str) -> Result<NavcenStatus, ConstellationError> {
@@ -817,6 +890,247 @@ fn navcen_status_from_row(row: &str) -> Result<NavcenStatus, ConstellationError>
         block_type: blank_to_none(navcen_text(row, "gps-con-block-type")),
         clock: blank_to_none(navcen_text(row, "gps-con-clock")),
     })
+}
+
+fn navcen_assessment_from_row(
+    row: &str,
+    evaluated_at_utc: UtcInstant,
+) -> Result<NavcenAssessment, ConstellationError> {
+    let mut status = navcen_status_from_row(row)?;
+    let outage_start_cells = navcen_texts(row, "nanu-outage-start-date");
+    let outage_start = blank_to_none(Some(outage_start_cells.join(" | ")));
+    let timing = if outage_start_cells.len() > 1
+        && status
+            .nanu_type
+            .as_deref()
+            .is_some_and(|text| forecast_outage_type(&text.trim().to_ascii_uppercase()))
+    {
+        NavcenTiming::Unparseable
+    } else {
+        navcen_timing(
+            status.nanu_type.as_deref(),
+            status.nanu_subject.as_deref(),
+            outage_start.as_deref(),
+        )
+    };
+    status.usable = navcen_usable_at(
+        status.active_nanu,
+        status.nanu_type.as_deref(),
+        timing,
+        evaluated_at_utc,
+    );
+
+    Ok(NavcenAssessment {
+        status,
+        evaluated_at_utc,
+        outage_start,
+        timing,
+    })
+}
+
+fn navcen_usable_at(
+    active_nanu: bool,
+    nanu_type: Option<&str>,
+    timing: NavcenTiming,
+    evaluated_at_utc: UtcInstant,
+) -> bool {
+    if !active_nanu {
+        return true;
+    }
+    let Some(nanu_type) = nanu_type else {
+        return true;
+    };
+    let upper = nanu_type.trim().to_ascii_uppercase();
+    if matches!(upper.as_str(), "UNUSABLE" | "UNUSUFN" | "DECOM") {
+        return false;
+    }
+    if !forecast_outage_type(&upper) {
+        return true;
+    }
+    match timing {
+        NavcenTiming::Parsed(interval) => {
+            !(interval.start_utc <= evaluated_at_utc && evaluated_at_utc < interval.end_utc)
+        }
+        NavcenTiming::NotApplicable | NavcenTiming::Unparseable => true,
+    }
+}
+
+fn navcen_timing(
+    nanu_type: Option<&str>,
+    subject: Option<&str>,
+    outage_start: Option<&str>,
+) -> NavcenTiming {
+    let Some(nanu_type) = nanu_type else {
+        return NavcenTiming::NotApplicable;
+    };
+    let upper = nanu_type.trim().to_ascii_uppercase();
+    if !forecast_outage_type(&upper) {
+        return NavcenTiming::NotApplicable;
+    }
+
+    parse_navcen_interval(subject, outage_start)
+        .map_or(NavcenTiming::Unparseable, NavcenTiming::Parsed)
+}
+
+fn forecast_outage_type(upper_nanu_type: &str) -> bool {
+    matches!(upper_nanu_type, "FCSTDV" | "FCSTMX" | "FCSTEXTD")
+}
+
+fn parse_navcen_interval(
+    subject: Option<&str>,
+    outage_start: Option<&str>,
+) -> Option<NavcenEffectiveInterval> {
+    let (year, outage_day_of_year) = parse_navcen_outage_date(outage_start?)?;
+    let ((start_day, start_hour, start_minute), (end_day, end_hour, end_minute)) =
+        parse_jday_interval(subject?)?;
+    if start_day != outage_day_of_year || !valid_day_of_year(year, start_day) {
+        return None;
+    }
+
+    let end_year = if end_day >= start_day {
+        year
+    } else if start_day >= 335 && end_day <= 31 {
+        year.checked_add(1)?
+    } else {
+        return None;
+    };
+    if !valid_day_of_year(end_year, end_day) {
+        return None;
+    }
+
+    let start_utc = utc_from_ordinal(year, start_day, start_hour, start_minute)?;
+    let end_utc = utc_from_ordinal(end_year, end_day, end_hour, end_minute)?;
+    (end_utc > start_utc).then_some(NavcenEffectiveInterval { start_utc, end_utc })
+}
+
+fn parse_navcen_outage_date(text: &str) -> Option<(i32, u16)> {
+    let words: Vec<&str> = text.split_ascii_whitespace().collect();
+    let mut parsed = None;
+    for window in words.windows(3) {
+        let Ok(day) = window[0].parse::<u8>() else {
+            continue;
+        };
+        let Some(month) = month_number(window[1]) else {
+            continue;
+        };
+        if window[2].len() != 4 || !window[2].bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(year @ 1980..=9999) = window[2].parse::<i32>() else {
+            continue;
+        };
+        if UtcInstant::from_utc(year, i32::from(month), i32::from(day), 0, 0, 0, 0).is_none() {
+            continue;
+        }
+        let Some(day_of_year) = ordinal_day(year, month, day) else {
+            continue;
+        };
+        if parsed.replace((year, day_of_year)).is_some() {
+            return None;
+        }
+    }
+    parsed
+}
+
+fn month_number(text: &str) -> Option<u8> {
+    match text.to_ascii_uppercase().as_str() {
+        "JAN" => Some(1),
+        "FEB" => Some(2),
+        "MAR" => Some(3),
+        "APR" => Some(4),
+        "MAY" => Some(5),
+        "JUN" => Some(6),
+        "JUL" => Some(7),
+        "AUG" => Some(8),
+        "SEP" => Some(9),
+        "OCT" => Some(10),
+        "NOV" => Some(11),
+        "DEC" => Some(12),
+        _ => None,
+    }
+}
+
+fn ordinal_day(year: i32, month: u8, day: u8) -> Option<u16> {
+    const MONTH_DAYS: [u16; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 0 || month > 12 {
+        return None;
+    }
+    let mut ordinal: u16 = MONTH_DAYS[..usize::from(month - 1)].iter().sum();
+    if month > 2 && leap_year(year) {
+        ordinal += 1;
+    }
+    ordinal.checked_add(u16::from(day))
+}
+
+fn leap_year(year: i32) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
+fn valid_day_of_year(year: i32, day: u16) -> bool {
+    day >= 1 && day <= if leap_year(year) { 366 } else { 365 }
+}
+
+fn utc_from_ordinal(year: i32, day: u16, hour: u8, minute: u8) -> Option<UtcInstant> {
+    if !valid_day_of_year(year, day) || hour >= 24 || minute >= 60 {
+        return None;
+    }
+    let jan_1 = UtcInstant::from_utc(year, 1, 1, 0, 0, 0, 0)?;
+    let day_us = i64::from(day - 1).checked_mul(86_400_000_000)?;
+    let clock_us = (i64::from(hour) * 3_600 + i64::from(minute) * 60).checked_mul(1_000_000)?;
+    Some(UtcInstant::from_unix_microseconds(
+        jan_1
+            .unix_microseconds()
+            .checked_add(day_us)?
+            .checked_add(clock_us)?,
+    ))
+}
+
+type JdayClock = (u16, u8, u8);
+
+fn parse_jday_interval(text: &str) -> Option<(JdayClock, JdayClock)> {
+    let upper = text.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut cursor = 0;
+    let mut clocks = [(0, 0, 0); 2];
+
+    for clock in &mut clocks {
+        let relative = upper.get(cursor..)?.find("JDAY")?;
+        cursor = cursor.checked_add(relative + 4)?;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let day = parse_ascii_digits(bytes, &mut cursor, 3)?;
+        if bytes.get(cursor) != Some(&b'/') {
+            return None;
+        }
+        cursor += 1;
+        let hhmm = parse_ascii_digits(bytes, &mut cursor, 4)?;
+        if bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        let hour = u8::try_from(hhmm / 100).ok()?;
+        let minute = u8::try_from(hhmm % 100).ok()?;
+        if hour >= 24 || minute >= 60 {
+            return None;
+        }
+        *clock = (u16::try_from(day).ok()?, hour, minute);
+    }
+
+    if upper.get(cursor..)?.contains("JDAY") {
+        return None;
+    }
+
+    Some((clocks[0], clocks[1]))
+}
+
+fn parse_ascii_digits(bytes: &[u8], cursor: &mut usize, count: usize) -> Option<u32> {
+    let end = cursor.checked_add(count)?;
+    let digits = bytes.get(*cursor..end)?;
+    if !digits.iter().all(u8::is_ascii_digit) || bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    *cursor = end;
+    core::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 fn navcen_required_int(row: &str, field: &'static str) -> Result<u16, ConstellationError> {
@@ -843,8 +1157,15 @@ fn parse_positive_int(text: &str, field: &'static str) -> Result<u16, Constellat
 }
 
 fn navcen_text(row: &str, field: &str) -> Option<String> {
+    navcen_texts(row, field).into_iter().next()
+}
+
+fn navcen_texts(row: &str, field: &str) -> Vec<String> {
     let needle = format!("views-field-field-{field}");
-    td_inner(row, &needle).map(clean_html)
+    td_inners(row, &needle)
+        .into_iter()
+        .map(clean_html)
+        .collect()
 }
 
 fn navcen_active(row: &str) -> bool {
@@ -898,6 +1219,21 @@ pub fn merge_navcen(records: &[Record], statuses: &[NavcenStatus]) -> Vec<Record
         .collect();
     merged.sort_by_key(|r| (r.system, r.prn));
     merged
+}
+
+/// Merge time-aware NAVCEN assessments into normalized records.
+///
+/// Each assessment already carries both its explicit evaluation time and the
+/// resulting `status.usable` value. The returned record provenance retains the
+/// raw NANU type and subject; callers retain the assessment to inspect its raw
+/// outage-start cell and parsed/ambiguous timing state.
+#[must_use]
+pub fn merge_navcen_at(records: &[Record], assessments: &[NavcenAssessment]) -> Vec<Record> {
+    let statuses: Vec<NavcenStatus> = assessments
+        .iter()
+        .map(|assessment| assessment.status.clone())
+        .collect();
+    merge_navcen(records, &statuses)
 }
 
 fn merge_status(record: &Record, status: &NavcenStatus) -> Record {
@@ -1299,21 +1635,37 @@ fn tr_blocks(html: &str) -> Vec<&str> {
     out
 }
 
+fn navcen_rows(html: &str) -> impl Iterator<Item = &str> {
+    tr_blocks(html).into_iter().filter(|row| {
+        find_ci(row, "views-field-field-gps-prn").is_some() && find_ci(row, "<td").is_some()
+    })
+}
+
 /// Inner text of the first `<td>` whose attributes contain `class_needle`.
 fn td_inner<'a>(row: &'a str, class_needle: &str) -> Option<&'a str> {
+    td_inners(row, class_needle).into_iter().next()
+}
+
+/// Inner text of every `<td>` whose attributes contain `class_needle`.
+fn td_inners<'a>(row: &'a str, class_needle: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
     let mut rest = row;
-    loop {
-        let start = find_ci(rest, "<td")?;
-        let gt = rest[start..].find('>')?;
+    while let Some(start) = find_ci(rest, "<td") {
+        let Some(gt) = rest[start..].find('>') else {
+            break;
+        };
         let attrs = &rest[start..start + gt];
         let content_start = start + gt + 1;
-        let close = find_ci(&rest[content_start..], "</td>")?;
+        let Some(close) = find_ci(&rest[content_start..], "</td>") else {
+            break;
+        };
         let inner = &rest[content_start..content_start + close];
         if find_ci(attrs, class_needle).is_some() {
-            return Some(inner);
+            out.push(inner);
         }
         rest = &rest[content_start + close + "</td>".len()..];
     }
+    out
 }
 
 /// Strip tags, unescape entities, and collapse whitespace, matching the
@@ -1718,6 +2070,177 @@ mod tests {
                 (GnssSystem::Glonass, 2),
             ]
         );
+    }
+
+    #[test]
+    fn navcen_interval_parser_accepts_valid_same_year_rollover_and_leap_intervals() {
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 205/0115 - JDAY 205/1315"),
+                Some("24 JUL 2026")
+            ),
+            Some(NavcenEffectiveInterval {
+                start_utc: UtcInstant::from_utc(2026, 7, 24, 1, 15, 0, 0).unwrap(),
+                end_utc: UtcInstant::from_utc(2026, 7, 24, 13, 15, 0, 0).unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 365/2300 - JDAY 001/0100"),
+                Some("31 DEC 2026")
+            ),
+            Some(NavcenEffectiveInterval {
+                start_utc: UtcInstant::from_utc(2026, 12, 31, 23, 0, 0, 0).unwrap(),
+                end_utc: UtcInstant::from_utc(2027, 1, 1, 1, 0, 0, 0).unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 060/0000 - JDAY 060/0100"),
+                Some("29 FEB 2028")
+            ),
+            Some(NavcenEffectiveInterval {
+                start_utc: UtcInstant::from_utc(2028, 2, 29, 0, 0, 0, 0).unwrap(),
+                end_utc: UtcInstant::from_utc(2028, 2, 29, 1, 0, 0, 0).unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 365/2300 - JDAY 366/0100"),
+                Some("30 DEC 2028")
+            ),
+            Some(NavcenEffectiveInterval {
+                start_utc: UtcInstant::from_utc(2028, 12, 30, 23, 0, 0, 0).unwrap(),
+                end_utc: UtcInstant::from_utc(2028, 12, 31, 1, 0, 0, 0).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn navcen_interval_parser_rejects_ambiguous_or_invalid_inputs() {
+        assert_eq!(
+            parse_navcen_outage_date("Outage Start 24 JUL 2026 UTC"),
+            Some((2026, 205))
+        );
+        assert_eq!(
+            parse_navcen_outage_date("24 JUL 2026 revised 25 JUL 2026"),
+            None
+        );
+        assert_eq!(parse_navcen_outage_date("24 JUL 26"), None);
+        assert_eq!(parse_navcen_outage_date("24 JUL 1979"), None);
+        assert_eq!(
+            parse_jday_interval("JDAY 205/0115 - JDAY 205/1315 - JDAY 205/1415"),
+            None
+        );
+        assert_eq!(parse_jday_interval("JDAY 205/01150 - JDAY 205/1315"), None);
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 204/0115 - JDAY 205/1315"),
+                Some("24 JUL 2026")
+            ),
+            None,
+            "first JDAY must agree with Outage Start"
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 205/1315 - JDAY 205/0115"),
+                Some("24 JUL 2026")
+            ),
+            None,
+            "reversed same-day interval"
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 205/0115 - JDAY 205/0115"),
+                Some("24 JUL 2026")
+            ),
+            None,
+            "zero-length interval"
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 205/2400 - JDAY 205/2500"),
+                Some("24 JUL 2026")
+            ),
+            None,
+            "invalid clock"
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 205/0100 - JDAY 001/0200"),
+                Some("24 JUL 2026")
+            ),
+            None,
+            "only a December-to-January rollover is accepted"
+        );
+        assert_eq!(
+            parse_navcen_interval(
+                Some("OUTAGE JDAY 365/0100 - JDAY 366/0200"),
+                Some("31 DEC 2026")
+            ),
+            None,
+            "JDAY 366 is invalid in a non-leap year"
+        );
+    }
+
+    #[test]
+    fn navcen_assessment_rejects_duplicate_outage_start_cells() {
+        let row = r#"
+            <td class="views-field-field-gps-prn">7</td>
+            <td class="views-field-field-nanu-outage-start-date">24 JUL 2026</td>
+            <td class="views-field-field-nanu-outage-start-date">25 JUL 2026</td>
+            <td class="views-field-field-nanu-type">FCSTDV</td>
+            <td class="views-field-field-nanu-subject">
+              JDAY 205/0115 - JDAY 205/1315
+            </td>
+            <td class="nanu-active-check">1</td>
+        "#;
+        let assessment =
+            navcen_assessment_from_row(row, UtcInstant::from_utc(2026, 7, 24, 2, 0, 0, 0).unwrap())
+                .unwrap();
+
+        assert_eq!(assessment.timing, NavcenTiming::Unparseable);
+        assert_eq!(
+            assessment.outage_start.as_deref(),
+            Some("24 JUL 2026 | 25 JUL 2026")
+        );
+        assert!(assessment.status.usable);
+    }
+
+    #[test]
+    fn navcen_assessment_applies_bounded_fcstextd_timing() {
+        let row = r#"
+            <td class="views-field-field-gps-prn">9</td>
+            <td class="views-field-field-nanu-outage-start-date">24 JUL 2026</td>
+            <td class="views-field-field-nanu-type">FCSTEXTD</td>
+            <td class="views-field-field-nanu-subject">
+              JDAY 205/0115 - JDAY 205/1315
+            </td>
+            <td class="nanu-active-check">1</td>
+        "#;
+        let assessment =
+            navcen_assessment_from_row(row, UtcInstant::from_utc(2026, 7, 24, 2, 0, 0, 0).unwrap())
+                .unwrap();
+
+        assert!(matches!(assessment.timing, NavcenTiming::Parsed(_)));
+        assert!(!assessment.status.usable);
+    }
+
+    #[test]
+    fn only_legacy_outage_forecast_types_require_bounded_timing() {
+        for nanu_type in ["FCSTDV", "FCSTMX", "FCSTEXTD"] {
+            assert!(forecast_outage_type(nanu_type), "{nanu_type}");
+        }
+        for nanu_type in [
+            "FCSTSUMM",
+            "FCSTCANC",
+            "FCSTUUFN",
+            "FCSTRESCD",
+            "UNUSABLE",
+            "DECOM",
+        ] {
+            assert!(!forecast_outage_type(nanu_type), "{nanu_type}");
+        }
     }
 
     #[test]

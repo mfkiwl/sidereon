@@ -9,14 +9,17 @@
 //! unchanged, so every record and CSV assertion matches the reference exactly.
 
 use sidereon_core::astro::omm::{self, Omm};
+use sidereon_core::astro::passes::UtcInstant;
 use sidereon_core::constellation::{
-    self, BoolStyle, ConstellationError, NavcenStatus, Record, RecordSource,
+    self, BoolStyle, ConstellationError, NavcenStatus, NavcenTiming, Record, RecordSource,
 };
 use sidereon_core::ephemeris::Sp3;
 use sidereon_core::GnssSystem;
 
 const GPS_OPS_JSON: &str = include_str!("fixtures/constellation/gps_ops_sample.json");
 const NAVCEN_HTML: &[u8] = include_bytes!("fixtures/constellation/navcen_gps_sample.html");
+const NAVCEN_FORECAST_HTML: &[u8] =
+    include_bytes!("fixtures/constellation/navcen_forecast_cases.html");
 
 const SP3: &str = "\
 #cP2020  6 24  0  0  0.00000000       1 ORBIT IGS14 FIT  TST
@@ -119,6 +122,161 @@ fn parse_navcen_extracts_svn_and_active_nanu_status() {
     assert!(prn19.active_nanu);
     assert!(!prn19.usable);
     assert_eq!(prn19.nanu_type.as_deref(), Some("UNUSABLE"));
+}
+
+fn utc(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> UtcInstant {
+    UtcInstant::from_utc(year, month, day, hour, minute, 0, 0).expect("valid UTC fixture time")
+}
+
+fn assessment(
+    rows: &[constellation::NavcenAssessment],
+    prn: u16,
+) -> &constellation::NavcenAssessment {
+    rows.iter()
+        .find(|row| row.status.prn == prn)
+        .expect("fixture PRN")
+}
+
+#[test]
+fn parse_navcen_at_applies_forecast_only_during_its_utc_interval() {
+    let before = constellation::parse_navcen_at(NAVCEN_FORECAST_HTML, utc(2026, 7, 24, 1, 14))
+        .expect("before assessments");
+    let during = constellation::parse_navcen_at(NAVCEN_FORECAST_HTML, utc(2026, 7, 24, 1, 15))
+        .expect("during assessments");
+    let after = constellation::parse_navcen_at(NAVCEN_FORECAST_HTML, utc(2026, 7, 24, 13, 15))
+        .expect("after assessments");
+
+    assert!(assessment(&before, 7).status.usable);
+    assert!(!assessment(&during, 7).status.usable);
+    assert!(assessment(&after, 7).status.usable);
+
+    assert_eq!(
+        assessment(&during, 7).evaluated_at_utc,
+        utc(2026, 7, 24, 1, 15)
+    );
+    assert_eq!(
+        assessment(&during, 7).outage_start.as_deref(),
+        Some("24 JUL 2026")
+    );
+    assert_eq!(
+        assessment(&during, 7).status.nanu_type.as_deref(),
+        Some("FCSTDV")
+    );
+    assert_eq!(
+        assessment(&during, 7).status.nanu_subject.as_deref(),
+        Some("SVN48 (PRN07) FORECAST OUTAGE JDAY 205/0115 - JDAY 205/1315")
+    );
+    match assessment(&during, 7).timing {
+        NavcenTiming::Parsed(interval) => {
+            assert_eq!(interval.start_utc, utc(2026, 7, 24, 1, 15));
+            assert_eq!(interval.end_utc, utc(2026, 7, 24, 13, 15));
+        }
+        other => panic!("expected parsed forecast interval, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_navcen_at_preserves_unusable_decom_and_ambiguous_forecast_semantics() {
+    let assessments = constellation::parse_navcen_at(NAVCEN_FORECAST_HTML, utc(2026, 7, 24, 2, 0))
+        .expect("assessments");
+
+    assert!(
+        !assessment(&assessments, 19).status.usable,
+        "active UNUSABLE remains unusable"
+    );
+    assert_eq!(
+        assessment(&assessments, 19).timing,
+        NavcenTiming::NotApplicable
+    );
+    assert!(
+        !assessment(&assessments, 13).status.usable,
+        "active DECOM remains unusable"
+    );
+    assert_eq!(
+        assessment(&assessments, 13).timing,
+        NavcenTiming::NotApplicable
+    );
+
+    assert!(
+        assessment(&assessments, 4).status.usable,
+        "ambiguous forecast is conservative"
+    );
+    assert_eq!(
+        assessment(&assessments, 4).timing,
+        NavcenTiming::Unparseable
+    );
+    assert_eq!(
+        assessment(&assessments, 4).status.nanu_type.as_deref(),
+        Some("FCSTMX")
+    );
+    assert_eq!(
+        assessment(&assessments, 4).outage_start.as_deref(),
+        Some("24 JUL 2026")
+    );
+    assert_eq!(
+        assessment(&assessments, 4).status.nanu_subject.as_deref(),
+        Some("SVN74 (PRN04) FORECAST OUTAGE JDAY 205/0115 - UNTIL FURTHER NOTICE")
+    );
+
+    assert!(
+        assessment(&assessments, 8).status.usable,
+        "inactive forecast cannot change usability"
+    );
+    assert_eq!(
+        assessment(&assessments, 8).timing,
+        NavcenTiming::Parsed(constellation::NavcenEffectiveInterval {
+            start_utc: utc(2026, 7, 24, 1, 15),
+            end_utc: utc(2026, 7, 24, 13, 15),
+        })
+    );
+
+    assert!(
+        !assessment(&assessments, 20).status.usable,
+        "time-aware path recognizes active UNUSUFN"
+    );
+    assert_eq!(
+        assessment(&assessments, 20).timing,
+        NavcenTiming::NotApplicable
+    );
+}
+
+#[test]
+fn legacy_parse_navcen_keeps_its_documented_clock_free_behavior() {
+    let statuses = constellation::parse_navcen(NAVCEN_FORECAST_HTML).expect("legacy statuses");
+    let forecast = statuses
+        .iter()
+        .find(|status| status.prn == 7)
+        .expect("PRN 7 forecast");
+    assert!(
+        !forecast.usable,
+        "legacy active FCSTDV remains immediately unusable"
+    );
+    let unusufn = statuses
+        .iter()
+        .find(|status| status.prn == 20)
+        .expect("PRN 20 UNUSUFN");
+    assert!(
+        unusufn.usable,
+        "legacy parser's pre-existing UNUSUFN omission remains unchanged"
+    );
+}
+
+#[test]
+fn merge_navcen_at_applies_the_evaluated_status() {
+    let records = [record(7), record(13), record(19)];
+    let during = constellation::parse_navcen_at(NAVCEN_FORECAST_HTML, utc(2026, 7, 24, 2, 0))
+        .expect("during assessments");
+    let after = constellation::parse_navcen_at(NAVCEN_FORECAST_HTML, utc(2026, 7, 24, 13, 15))
+        .expect("after assessments");
+
+    let during_records = constellation::merge_navcen_at(&records, &during);
+    let after_records = constellation::merge_navcen_at(&records, &after);
+    let usable = |rows: &[Record], prn| rows.iter().find(|row| row.prn == prn).unwrap().usable;
+
+    assert!(!usable(&during_records, 7));
+    assert!(usable(&after_records, 7));
+    assert!(!usable(&during_records, 13));
+    assert!(!usable(&during_records, 19));
 }
 
 #[test]

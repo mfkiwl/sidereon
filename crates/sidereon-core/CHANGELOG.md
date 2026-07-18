@@ -4,6 +4,28 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Added deterministic `parse_navcen_at` and `merge_navcen_at` APIs for
+  evaluating NAVCEN operational usability at an explicit UTC instant. Returned
+  assessments preserve NANU type, subject, raw Outage Start text, the evaluation
+  instant, and parsed/unparseable/not-applicable timing provenance.
+
+### Fixed
+
+- Active bounded forecast NANUs now affect the time-aware path only during
+  their validated half-open UTC interval. Future forecasts no longer disable a
+  satellite early, completed temporary outages no longer remain active, and an
+  incomplete interval remains usable with explicit ambiguity provenance.
+
+### Compatibility
+
+- Existing `parse_navcen` and `merge_navcen` signatures and clock-free behavior
+  are unchanged. Callers making operational decisions should migrate to the
+  explicit-time APIs; see `NAVCEN_TIME_SEMANTICS.md`. The time-aware path also
+  recognizes active `UNUSUFN` notices as immediately unusable; the legacy path's
+  pre-existing omission of that code is intentionally preserved.
+
 ## [0.31.2] - 2026-07-16
 
 ### Fixed
