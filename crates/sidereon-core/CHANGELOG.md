@@ -4,6 +4,8 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-07-20
+
 ### Added
 
 - Added IGS combined final-SP3 catalog support with date-aware official names:
