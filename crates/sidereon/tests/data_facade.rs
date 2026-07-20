@@ -1,7 +1,7 @@
 use sidereon::data::{
-    dted_cache_relpath, hgt_to_dted, mgex_nav, mgex_sp3, ops_ultra_sp3, parse_skadi_tile_id,
-    skadi_archive_url, station_obs_url, terrain_tile_index, ultra_sp3_locations,
-    validate_exact_product_set, AnalysisCenter, ProductDate,
+    default_sample_for_date, dted_cache_relpath, hgt_to_dted, mgex_nav, mgex_sp3, ops_ultra_sp3,
+    parse_skadi_tile_id, skadi_archive_url, station_obs_url, terrain_tile_index,
+    ultra_sp3_locations, validate_exact_product_set, AnalysisCenter, ProductDate, ProductType,
 };
 
 #[test]
@@ -21,6 +21,21 @@ fn facade_reexports_data_catalog_derivation() {
     assert_eq!(
         product.archive_url().expect("url"),
         "https://igs.bkg.bund.de/root_ftp/IGS/products/2330/IGS0OPSULT_20242470600_02D_15M_ORB.SP3.gz"
+    );
+}
+
+#[test]
+fn facade_reexports_date_aware_product_defaults() {
+    let legacy = ProductDate::new(2021, 5, 17).expect("valid legacy date");
+    let current = ProductDate::new(2026, 7, 19).expect("valid current date");
+
+    assert_eq!(
+        default_sample_for_date(AnalysisCenter::Gfz, ProductType::Sp3, legacy),
+        Ok("15M")
+    );
+    assert_eq!(
+        default_sample_for_date(AnalysisCenter::Gfz, ProductType::Sp3, current),
+        Ok("05M")
     );
 }
 

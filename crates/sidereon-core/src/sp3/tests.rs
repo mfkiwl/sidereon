@@ -885,7 +885,7 @@ fn assert_exact_parse_write_parse_round_trip(file: &str) {
 }
 
 #[test]
-fn writer_does_not_inject_comment_into_no_comment_product() {
+fn writer_pads_required_comment_records_without_injecting_semantic_comments() {
     let no_comment = "\
 #cP2020  6 24  0  0  0.00000000       1 ORBIT IGS14 FIT  TST
 ## 2111 432000.00000000   900.00000000 59024 0.0000000000000
@@ -905,10 +905,13 @@ EOF
     assert!(original.comments.is_empty());
 
     let text = original.to_sp3_string();
-    assert!(
-        !text.lines().any(|line| line.starts_with("/*")),
-        "writer must not synthesize a provenance comment:\n{text}"
-    );
+    let comments = text
+        .lines()
+        .filter(|line| line.starts_with("/*"))
+        .collect::<Vec<_>>();
+    assert_eq!(comments, vec!["/*"; 4]);
+    let reparsed = Sp3::parse(text.as_bytes()).expect("reparse padded SP3");
+    assert!(reparsed.comments.is_empty());
     assert_exact_parse_write_parse_round_trip(no_comment);
 }
 

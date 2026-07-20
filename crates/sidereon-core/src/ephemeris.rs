@@ -39,17 +39,18 @@ pub use crate::rinex_nav::{
     NavMessagePreference,
 };
 pub use crate::sp3::{
-    align_clock_reference, clock_reference_offset, compare_position_series, merge,
-    precise_interpolant_store_checksum64, sp3_ecef_state_to_eci, AgreementMetric,
-    ClockReferenceOffset, EpochAgreement, InterpolationComparison, InterpolationDivergence,
-    MergeCombine, MergeFlag, MergeOptions, MergePrecedenceScope, MergeReport,
-    MmapPreciseEphemerisInterpolant, OutlierRejectOptions, PreciseEphemerisInterpolant,
-    PreciseEphemerisSample, PreciseEphemerisSamples, PreciseEphemerisStateSample,
-    PreciseInterpolantError, PreciseInterpolantStoreError, PreciseSamplesError, ReferenceState,
-    Sp3, Sp3ArtifactIdentity, Sp3DataType, Sp3EpochPrediction, Sp3Flags, Sp3FrameLabelSet,
-    Sp3FrameReconciliation, Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions, Sp3Header,
-    Sp3MergeInputIdentity, Sp3MergeInputIdentityError, Sp3PredictionSummary, Sp3State,
-    Sp3TimeSystem, Sp3Version, SP3_MERGE_INPUT_ID_PREFIX, SP3_MERGE_INPUT_SCHEMA_VERSION,
+    align_clock_reference, clock_reference_offset, compare_position_series, merge, parse_exact_sp3,
+    precise_interpolant_store_checksum64, sp3_ecef_state_to_eci, validate_exact_sp3,
+    AgreementMetric, ClockReferenceOffset, EpochAgreement, ExactSp3Coverage, ExactSp3Request,
+    ExactSp3ValidationError, InterpolationComparison, InterpolationDivergence, MergeCombine,
+    MergeFlag, MergeOptions, MergePrecedenceScope, MergeReport, MmapPreciseEphemerisInterpolant,
+    OutlierRejectOptions, PreciseEphemerisInterpolant, PreciseEphemerisSample,
+    PreciseEphemerisSamples, PreciseEphemerisStateSample, PreciseInterpolantError,
+    PreciseInterpolantStoreError, PreciseSamplesError, ReferenceState, Sp3, Sp3ArtifactIdentity,
+    Sp3DataType, Sp3EpochPrediction, Sp3Flags, Sp3FrameLabelSet, Sp3FrameReconciliation,
+    Sp3FrameReconciliationMethod, Sp3FrameReconciliationOptions, Sp3Header, Sp3MergeInputIdentity,
+    Sp3MergeInputIdentityError, Sp3PredictionSummary, Sp3State, Sp3TimeSystem, Sp3Version,
+    SP3_MERGE_INPUT_ID_PREFIX, SP3_MERGE_INPUT_SCHEMA_VERSION,
 };
 pub use crate::spp::EphemerisSource;
 use crate::{validate, GnssSatelliteId, GnssSystem};

@@ -4,6 +4,69 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Added IGS combined final-SP3 catalog support with date-aware official names:
+  legacy `igs<week><day>.sp3` identities from GPS week 0730 through 2237 and
+  `IGS0OPSFIN_<epoch>_01D_15M_ORB.SP3` identities from week 2238 onward.
+  Historical CDDIS locations use `.Z`; current CDDIS and direct-BKG locations
+  use `.gz`.
+- Added `product_solution_class` so callers can distinguish IGS final SP3 from
+  IGS broadcast navigation without changing the legacy center-only query.
+- Added `default_sample_for_date` for product lines whose published sampling
+  interval changed over time. GFZ rapid SP3 resolves to `15M` through 2021 day
+  137 and `05M` from day 138.
+- Added `ExactSp3Request`, `parse_exact_sp3`, and `validate_exact_sp3`. Exact
+  validation binds the line-1 start/count, line-2 GPS-week/seconds-of-week/MJD
+  start metadata, mandatory header/EOF records, producing agency, complete
+  per-epoch satellite record sequences, finite positive cadence, parsed regular
+  epoch grid, requested cadence, requested span, and optional format revision.
+  It accepts both the half-open and inclusive regular-grid representations of
+  an exact span.
+
+### Fixed
+
+- CODE rapid and final catalog entries now use AIUB's current HTTPS download
+  service with product-specific routes for MGEX final SP3/clock, operational
+  final IONEX, and rapid IONEX; the already-correct ultra-rapid SP3 route is
+  preserved. Historical `cod` requests are rejected until their distinct
+  short-name identities are modeled instead of being assigned current long
+  filenames.
+- Caller-built identities for unsupported center/product combinations now fail
+  before URL derivation or acquisition.
+- IGS combined final-SP3 requests now reject dates before the official start at
+  GPS week 0730 (1994-01-02), and legacy CDDIS product paths zero-pad the GPS
+  week directory to four digits.
+- Corrected the current GFZ rapid-SP3 catalog default to `05M`. Date-derived
+  requests preserve the historical `15M` default through 2021 day 137 and use
+  the published `05M` convention from day 138, including current products.
+- Exact-SP3 candidate selection now advances only after ordinary publication
+  absence. Parse, digest, identity, cadence, grid, and span failures remain
+  terminal and preserve the first integrity error rather than accepting a
+  later candidate. Candidate product codes and SP3 producing-agency fields are
+  bound to the selected public product family.
+- SP3 serialization now pads the mandatory header comment section to four
+  records without adding semantic comments. Exact validation also enforces the
+  line-3 satellite count, per-epoch record order, and P/V pairing required for
+  velocity products.
+
+### Compatibility
+
+- Existing IGS broadcast-navigation derivation and
+  `AnalysisCenter::solution_class()` are unchanged. The product-aware query and
+  exact-SP3 validator and date-aware default-sample query are additive;
+  `ArchiveCompression::UnixCompress` adds a public enum variant, and the
+  catalog and scoreboard errors add typed public variants. The legacy
+  date-free `default_sample` now reports GFZ's current `05M` rapid-SP3 cadence;
+  dated default derivation remains `15M` for historical products through 2021
+  day 137. Invalid identities, unsupported combinations, unmodeled historical
+  CODE products, and integrity-invalid exact SP3 content now fail earlier.
+  Serialized SP3 text with fewer than four semantic comments gains blank
+  mandatory comment records; blank structural padding is no longer surfaced as
+  semantic text in `Sp3::comments`.
+  These public additions and stricter semantics require a minor `0.33.0`
+  release rather than a patch.
+
 ## [0.32.0] - 2026-07-18
 
 ### Added

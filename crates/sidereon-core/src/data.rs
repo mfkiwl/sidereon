@@ -93,7 +93,11 @@ impl AnalysisCenter {
         }
     }
 
-    /// Public solution class represented by this catalog product line.
+    /// Legacy center-wide solution class represented by this catalog code.
+    ///
+    /// Some centers publish more than one class. In particular, [`Self::Igs`]
+    /// serves both broadcast navigation and final orbit products. New code
+    /// should use [`product_solution_class`] when the product family is known.
     #[must_use]
     pub const fn solution_class(self) -> SolutionClass {
         match self {
@@ -415,6 +419,8 @@ impl ArchiveProtocol {
 pub enum ArchiveCompression {
     /// Archive URL has a `.gz` suffix.
     Gzip,
+    /// Archive URL uses the historical Unix-compress `.Z` suffix.
+    UnixCompress,
     /// Archive URL is the plain product filename.
     None,
 }
@@ -425,6 +431,7 @@ impl ArchiveCompression {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
+            Self::UnixCompress => "unix_compress",
             Self::None => "none",
         }
     }
@@ -432,6 +439,7 @@ impl ArchiveCompression {
     const fn suffix(self) -> &'static str {
         match self {
             Self::Gzip => ".gz",
+            Self::UnixCompress => ".Z",
             Self::None => "",
         }
     }
@@ -658,7 +666,7 @@ const GFZ_PRODUCTS: [CenterProductConvention; 2] = [
         token: "GFZ0OPSRAP",
         layout: ArchiveLayout::GfzRapidWeek,
         span: "01D",
-        default_sample: "15M",
+        default_sample: "05M",
         compression: ArchiveCompression::Gzip,
     },
     CenterProductConvention {
@@ -671,14 +679,24 @@ const GFZ_PRODUCTS: [CenterProductConvention; 2] = [
     },
 ];
 
-const IGS_PRODUCTS: [CenterProductConvention; 1] = [CenterProductConvention {
-    product_type: ProductType::Nav,
-    token: "BRDC00WRD",
-    layout: ArchiveLayout::BkgBrdcYearDoy,
-    span: "01D",
-    default_sample: "01D",
-    compression: ArchiveCompression::Gzip,
-}];
+const IGS_PRODUCTS: [CenterProductConvention; 2] = [
+    CenterProductConvention {
+        product_type: ProductType::Sp3,
+        token: "IGS0OPSFIN",
+        layout: ArchiveLayout::BkgProductsWeek,
+        span: "01D",
+        default_sample: "15M",
+        compression: ArchiveCompression::Gzip,
+    },
+    CenterProductConvention {
+        product_type: ProductType::Nav,
+        token: "BRDC00WRD",
+        layout: ArchiveLayout::BkgBrdcYearDoy,
+        span: "01D",
+        default_sample: "01D",
+        compression: ArchiveCompression::Gzip,
+    },
+];
 
 const IGS_ULT_PRODUCTS: [CenterProductConvention; 1] = [CenterProductConvention {
     product_type: ProductType::Sp3,
@@ -722,6 +740,32 @@ const GFZ_ULT_ISSUES: [&str; 8] = [
     "0000", "0300", "0600", "0900", "1200", "1500", "1800", "2100",
 ];
 
+/// First GPS week covered by the official IGS rapid/final orbit combination.
+///
+/// The IGS rapid/final combination began on 1994-01-02, GPS week 0730.
+const IGS_COMBINED_FINAL_START_GPS_WEEK: u32 = 730;
+
+/// First GPS week in which IGS operational products use only long filenames.
+///
+/// IGS transitioned at the start of GPS week 2238 (2022-11-27). Long-name
+/// trial products from earlier weeks are distinct products and are therefore
+/// not aliases for the legacy final combination.
+const IGS_LONG_FILENAME_START_GPS_WEEK: u32 = 2238;
+
+/// First GPS week in which AIUB's supported CODE product families use the
+/// cataloged long filenames.
+const CODE_LONG_FILENAME_START_GPS_WEEK: u32 = 2238;
+
+/// First GFZ rapid-orbit date published with the five-minute sampling token.
+///
+/// GFZ's official week-2158 listing ends the 15-minute series at 2021 day 137
+/// and begins the five-minute series at 2021 day 138.
+const GFZ_RAPID_5M_START_DATE: ProductDate = ProductDate {
+    year: 2021,
+    month: 5,
+    day: 18,
+};
+
 const CENTER_ORDER: [AnalysisCenter; 11] = [
     AnalysisCenter::CodRap,
     AnalysisCenter::CodPrd1,
@@ -740,9 +784,9 @@ const CATALOG: [CenterCatalogEntry; 11] = [
     CenterCatalogEntry {
         center: AnalysisCenter::CodRap,
         code: "cod_rap",
-        protocol: ArchiveProtocol::Http,
-        host: "ftp.aiub.unibe.ch",
-        root_url: "http://ftp.aiub.unibe.ch",
+        protocol: ArchiveProtocol::Https,
+        host: "www.aiub.unibe.ch",
+        root_url: "https://www.aiub.unibe.ch/download",
         products: &COD_RAP_PRODUCTS,
         issues: &[],
     },
@@ -785,9 +829,9 @@ const CATALOG: [CenterCatalogEntry; 11] = [
     CenterCatalogEntry {
         center: AnalysisCenter::Cod,
         code: "cod",
-        protocol: ArchiveProtocol::Http,
-        host: "ftp.aiub.unibe.ch",
-        root_url: "http://ftp.aiub.unibe.ch",
+        protocol: ArchiveProtocol::Https,
+        host: "www.aiub.unibe.ch",
+        root_url: "https://www.aiub.unibe.ch/download",
         products: &COD_PRODUCTS,
         issues: &[],
     },
@@ -855,8 +899,7 @@ const CELESTRAK_SPACE_WEATHER_SOURCE: SpaceWeatherSourceEntry = SpaceWeatherSour
     root_url: "https://celestrak.org/SpaceData",
 };
 
-const ALLOWED_HOSTS: [&str; 11] = [
-    "ftp.aiub.unibe.ch",
+const ALLOWED_HOSTS: [&str; 10] = [
     "www.aiub.unibe.ch",
     "download.aiub.unibe.ch",
     "zhw-b.s3.cloud.switch.ch",
@@ -921,6 +964,26 @@ pub enum DataCatalogError {
         /// Requested product family.
         product_type: ProductType,
     },
+    /// The catalog does not claim this product family's historical naming era.
+    UnsupportedProductEra {
+        /// Analysis center.
+        center: AnalysisCenter,
+        /// Product type.
+        product_type: ProductType,
+        /// Requested product date.
+        date: ProductDate,
+    },
+    /// A distributor has no verified uniform layout for this product era.
+    UnsupportedDistributionEra {
+        /// Explicit distributor.
+        source: DistributionSource,
+        /// Analysis center.
+        center: AnalysisCenter,
+        /// Product type.
+        product_type: ProductType,
+        /// Requested product date.
+        date: ProductDate,
+    },
     /// An exact request did not include any acceptable distributor.
     NoDistributionSources,
     /// A caller-constructed identity contained an unsafe official filename.
@@ -952,8 +1015,19 @@ pub enum DataCatalogError {
     DateBeforeGpsEpoch(ProductDate),
     /// GPS day-of-week must be `0..=6`.
     InvalidGpsDayOfWeek(u8),
-    /// Sampling token is not `NNX` with an upper-case unit.
+    /// Sampling token is not a supported IGS period token.
     InvalidSample(String),
+    /// A syntactically valid cadence is not published for this catalog line.
+    UnsupportedSample {
+        /// Analysis center.
+        center: AnalysisCenter,
+        /// Product type.
+        product_type: ProductType,
+        /// Requested sample token.
+        sample: String,
+    },
+    /// Coverage-span token is not a supported IGS period token.
+    InvalidSpan(String),
     /// Issue time is malformed.
     InvalidIssue(String),
     /// The center requires an issue time.
@@ -1025,6 +1099,24 @@ impl fmt::Display for DataCatalogError {
                 "distributor {} does not serve {product_type}",
                 source.code()
             ),
+            Self::UnsupportedProductEra {
+                center,
+                product_type,
+                date,
+            } => write!(
+                f,
+                "{center}/{product_type} has no cataloged naming convention for {date}"
+            ),
+            Self::UnsupportedDistributionEra {
+                source,
+                center,
+                product_type,
+                date,
+            } => write!(
+                f,
+                "distributor {} has no cataloged {center}/{product_type} layout for {date}",
+                source.code()
+            ),
             Self::NoDistributionSources => {
                 write!(f, "exact product request has no distributors")
             }
@@ -1052,6 +1144,15 @@ impl fmt::Display for DataCatalogError {
                 write!(f, "invalid GPS day-of-week {day}")
             }
             Self::InvalidSample(sample) => write!(f, "invalid sample code {sample:?}"),
+            Self::UnsupportedSample {
+                center,
+                product_type,
+                sample,
+            } => write!(
+                f,
+                "{center}/{product_type} does not publish sample interval {sample:?}"
+            ),
+            Self::InvalidSpan(span) => write!(f, "invalid coverage span {span:?}"),
             Self::InvalidIssue(issue) => write!(f, "invalid issue time {issue:?}"),
             Self::MissingIssue { center } => write!(f, "{center} requires an issue time"),
             Self::UnexpectedIssue { center } => write!(f, "{center} does not take an issue time"),
@@ -1194,6 +1295,20 @@ impl ProductDate {
             i64::from(self.day),
         )
         .ok_or(DataCatalogError::DateBeforeGpsEpoch(self))
+    }
+
+    /// GPS day of week (`0` = Sunday, `6` = Saturday) for this date.
+    pub fn gps_day_of_week(self) -> Result<u8, DataCatalogError> {
+        let epoch_jdn =
+            week_epoch_julian_day_number(TimeScale::Gpst).expect("GPST has a week-numbering epoch");
+        let days = self
+            .julian_day_number()
+            .checked_sub(epoch_jdn)
+            .ok_or(DataCatalogError::DateOutOfRange)?;
+        if days < 0 {
+            return Err(DataCatalogError::DateBeforeGpsEpoch(self));
+        }
+        u8::try_from(days.rem_euclid(7)).map_err(|_| DataCatalogError::DateOutOfRange)
     }
 
     /// Day-of-year in `1..=366`.
@@ -1442,9 +1557,23 @@ impl ProductIdentity {
         validate_official_filename(&self.official_filename)?;
         ProductDate::new(self.date.year, self.date.month, self.date.day)?;
         validate_sample(&self.sample)?;
+        validate_span(&self.span)?;
         if let Some(issue) = self.issue.as_deref() {
             validate_issue(issue)?;
         }
+
+        // Establish catalog support before deriving any URL. A syntactically
+        // plausible caller-built identity is not evidence that the selected
+        // center publishes that product family.
+        let convention = product_convention(self.analysis_center, self.family)?;
+        validate_product_date(self.analysis_center, self.family, self.date)?;
+        if self.analysis_center == AnalysisCenter::Igs
+            && self.family == ProductType::Sp3
+            && self.span != convention.span
+        {
+            return Err(DataCatalogError::InconsistentProductIdentity { field: "span" });
+        }
+        validate_catalog_sample(self.analysis_center, self.family, &self.sample, convention)?;
 
         if self.format != product_format(self.family) {
             return Err(DataCatalogError::InconsistentProductIdentity { field: "format" });
@@ -1472,45 +1601,80 @@ impl ProductIdentity {
             });
         }
         let descriptor = product_type_convention(self.family);
-        let expected = match descriptor.kind {
-            ProductFilenameKind::Sampled => {
-                let solution_token = self
-                    .solution
-                    .filename_token()
-                    .ok_or(DataCatalogError::InconsistentProductIdentity { field: "solution" })?;
-                format!(
-                    "{}{}{}{}_{}_{}_{}_{}.{}",
-                    self.publisher.code(),
-                    self.version,
-                    self.campaign.code(),
-                    solution_token,
-                    date_block(self.date, self.issue.as_deref()),
-                    self.span,
-                    self.sample,
-                    descriptor.content_code,
-                    descriptor.extension
-                )
+        let legacy_igs_final =
+            uses_legacy_igs_final_name(self.analysis_center, self.family, self.date)?;
+        if !legacy_igs_final && descriptor.kind == ProductFilenameKind::Sampled {
+            let entry = center_catalog(self.analysis_center)
+                .expect("validated analysis center has a catalog entry");
+            let issue_valid = if entry.issues.is_empty() {
+                self.issue.as_deref() == Some("0000")
+            } else {
+                self.issue
+                    .as_deref()
+                    .is_some_and(|issue| entry.issues.contains(&issue))
+            };
+            if !issue_valid {
+                return Err(DataCatalogError::InconsistentProductIdentity { field: "issue" });
             }
-            ProductFilenameKind::Nav => {
-                let nav_fields_valid = self.publisher == ProductPublisher::Igs
-                    && self.solution == SolutionClass::Broadcast
-                    && self.campaign == ProductCampaign::Broadcast
-                    && self.version == 0
-                    && self.issue.is_none()
-                    && self.span == "01D"
-                    && self.sample == "01D";
-                if !nav_fields_valid {
-                    return Err(DataCatalogError::InconsistentProductIdentity {
-                        field: "broadcast_navigation",
-                    });
+        }
+        let expected = if legacy_igs_final {
+            let fields_valid = self.publisher == ProductPublisher::Igs
+                && self.solution == SolutionClass::Final
+                && self.campaign == ProductCampaign::Operational
+                && self.version == 0
+                && self.issue.as_deref() == Some("0000")
+                && self.span == convention.span
+                && self.sample == convention.default_sample;
+            if !fields_valid {
+                return Err(DataCatalogError::InconsistentProductIdentity {
+                    field: "legacy_igs_final",
+                });
+            }
+            format!(
+                "igs{:04}{}.sp3",
+                self.date.gps_week()?,
+                self.date.gps_day_of_week()?
+            )
+        } else {
+            match descriptor.kind {
+                ProductFilenameKind::Sampled => {
+                    let solution_token = self.solution.filename_token().ok_or(
+                        DataCatalogError::InconsistentProductIdentity { field: "solution" },
+                    )?;
+                    format!(
+                        "{}{}{}{}_{}_{}_{}_{}.{}",
+                        self.publisher.code(),
+                        self.version,
+                        self.campaign.code(),
+                        solution_token,
+                        date_block(self.date, self.issue.as_deref()),
+                        self.span,
+                        self.sample,
+                        descriptor.content_code,
+                        descriptor.extension
+                    )
                 }
-                format!(
-                    "BRDC00WRD_R_{}_{}_{}.{}",
-                    date_block(self.date, None),
-                    self.span,
-                    descriptor.content_code,
-                    descriptor.extension
-                )
+                ProductFilenameKind::Nav => {
+                    let nav_fields_valid = self.publisher == ProductPublisher::Igs
+                        && self.solution == SolutionClass::Broadcast
+                        && self.campaign == ProductCampaign::Broadcast
+                        && self.version == 0
+                        && self.issue.is_none()
+                        && self.span == "01D"
+                        && self.sample == "01D";
+                    if !nav_fields_valid {
+                        return Err(DataCatalogError::InconsistentProductIdentity {
+                            field: "broadcast_navigation",
+                        });
+                    }
+                    format!(
+                        "BRDC00WRD_R_{}_{}_{}.{}",
+                        date_block(self.date, None),
+                        self.span,
+                        descriptor.content_code,
+                        descriptor.extension
+                    )
+                }
             }
         };
         if expected != self.official_filename {
@@ -1519,12 +1683,29 @@ impl ProductIdentity {
             });
         }
         if self.publisher != self.analysis_center.publisher()
-            || self.solution != self.analysis_center.solution_class()
+            || self.solution != product_solution_class(self.analysis_center, self.family)?
             || self.prediction_horizon_days != self.analysis_center.prediction_horizon_days()
         {
             return Err(DataCatalogError::InconsistentProductIdentity {
                 field: "analysis_center",
             });
+        }
+
+        if !legacy_igs_final && descriptor.kind == ProductFilenameKind::Sampled {
+            let expected_catalog_filename = format!(
+                "{}_{}_{}_{}_{}.{}",
+                convention.token,
+                date_block(self.date, self.issue.as_deref()),
+                self.span,
+                self.sample,
+                descriptor.content_code,
+                descriptor.extension
+            );
+            if expected_catalog_filename != self.official_filename {
+                return Err(DataCatalogError::InconsistentProductIdentity {
+                    field: "analysis_center",
+                });
+            }
         }
         Ok(())
     }
@@ -1809,7 +1990,9 @@ impl ProductSpec {
         sample: &str,
         issue: Option<&str>,
     ) -> Result<Self, DataCatalogError> {
+        ProductDate::new(date.year, date.month, date.day)?;
         validate_product(center, product_type, sample, issue)?;
+        validate_product_date(center, product_type, date)?;
         Ok(Self {
             center,
             product_type,
@@ -1830,14 +2013,27 @@ impl ProductSpec {
         self.date.day_of_year()
     }
 
-    /// Canonical IGS long-name filename without archive compression suffix.
+    /// Canonical official filename without archive compression suffix.
+    ///
+    /// IGS combined final SP3 products use the historical
+    /// `igs<week><day>.sp3` convention before GPS week 2238 and the IGS long
+    /// filename convention from week 2238 onward.
     pub fn canonical_filename(&self) -> Result<String, DataCatalogError> {
+        ProductDate::new(self.date.year, self.date.month, self.date.day)?;
         let convention = validate_product(
             self.center,
             self.product_type,
             &self.sample,
             self.issue.as_deref(),
         )?;
+        validate_product_date(self.center, self.product_type, self.date)?;
+        if uses_legacy_igs_final_name(self.center, self.product_type, self.date)? {
+            return Ok(format!(
+                "igs{:04}{}.sp3",
+                self.date.gps_week()?,
+                self.date.gps_day_of_week()?
+            ));
+        }
         let descriptor = product_type_convention(self.product_type);
         Ok(match descriptor.kind {
             ProductFilenameKind::Sampled => format!(
@@ -1860,22 +2056,37 @@ impl ProductSpec {
         })
     }
 
-    /// Full archive URL, including `.gz` when the cataloged archive is gzipped.
+    /// Full archive URL, including its cataloged transport-compression suffix.
     pub fn archive_url(&self) -> Result<String, DataCatalogError> {
+        ProductDate::new(self.date.year, self.date.month, self.date.day)?;
         let convention = validate_product(
             self.center,
             self.product_type,
             &self.sample,
             self.issue.as_deref(),
         )?;
+        if uses_legacy_igs_final_name(self.center, self.product_type, self.date)? {
+            return Err(DataCatalogError::UnsupportedDistributionEra {
+                source: DistributionSource::Direct,
+                center: self.center,
+                product_type: self.product_type,
+                date: self.date,
+            });
+        }
         let entry = center_catalog(self.center).expect("catalog entry exists for enum variant");
         let filename = self.canonical_filename()?;
+        let compression = product_archive_compression(
+            self.center,
+            self.product_type,
+            self.date,
+            convention.compression,
+        )?;
         Ok(format!(
             "{}/{}/{}{}",
             entry.root_url,
             product_dir_path(self.center, convention.layout, self.date)?,
             filename,
-            convention.compression.suffix()
+            compression.suffix()
         ))
     }
 
@@ -1905,7 +2116,7 @@ impl ProductSpec {
             family: self.product_type,
             analysis_center: self.center,
             publisher: self.center.publisher(),
-            solution: self.center.solution_class(),
+            solution: product_solution_class(self.center, self.product_type)?,
             campaign,
             version: 0,
             date: self.date,
@@ -2249,12 +2460,57 @@ pub fn product_convention(
         })
 }
 
-/// Default sampling token for a center/product pair.
+/// Return the solution class for a supported center/product family.
+///
+/// This product-aware API resolves the ambiguity in the legacy
+/// [`AnalysisCenter::solution_class`] method. For example, IGS merged
+/// broadcast navigation is [`SolutionClass::Broadcast`], while IGS combined
+/// final SP3 is [`SolutionClass::Final`]. Unsupported combinations are
+/// rejected before callers derive a filename or attempt acquisition.
+pub fn product_solution_class(
+    center: AnalysisCenter,
+    product_type: ProductType,
+) -> Result<SolutionClass, DataCatalogError> {
+    product_convention(center, product_type)?;
+    Ok(match (center, product_type) {
+        (AnalysisCenter::Igs, ProductType::Sp3) => SolutionClass::Final,
+        _ => center.solution_class(),
+    })
+}
+
+/// Current default sampling token for a center/product pair.
+///
+/// This preserves the original date-free query and reports the current catalog
+/// convention. Use [`default_sample_for_date`] when deriving a historical
+/// product whose published cadence may have changed.
 pub fn default_sample(
     center: AnalysisCenter,
     product_type: ProductType,
 ) -> Result<&'static str, DataCatalogError> {
     Ok(product_convention(center, product_type)?.default_sample)
+}
+
+/// Published default sampling token for a center/product pair on a date.
+///
+/// Most catalog families use one sampling token across their modeled history.
+/// GFZ rapid SP3 changed within GPS week 2158: dates through 2021 day 137 use
+/// `15M`, and dates from day 138 use `05M`.
+pub fn default_sample_for_date(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+) -> Result<&'static str, DataCatalogError> {
+    ProductDate::new(date.year, date.month, date.day)?;
+    let current = default_sample(center, product_type)?;
+    validate_product_date(center, product_type, date)?;
+    if center == AnalysisCenter::Gfz
+        && product_type == ProductType::Sp3
+        && date < GFZ_RAPID_5M_START_DATE
+    {
+        Ok("15M")
+    } else {
+        Ok(current)
+    }
 }
 
 /// GPS week number for a product date.
@@ -2278,7 +2534,7 @@ pub fn product(
 ) -> Result<ProductSpec, DataCatalogError> {
     let sample = match sample {
         Some(sample) => sample,
-        None => default_sample(center, product_type)?,
+        None => default_sample_for_date(center, product_type, date)?,
     };
     ProductSpec::new(center, product_type, date, sample, issue)
 }
@@ -2341,32 +2597,51 @@ pub fn distribution_location_for_identity(
     match source {
         DistributionSource::Direct => {
             let convention = product_convention(identity.analysis_center, identity.family)?;
+            if uses_legacy_igs_final_name(identity.analysis_center, identity.family, identity.date)?
+            {
+                return Err(DataCatalogError::UnsupportedDistributionEra {
+                    source,
+                    center: identity.analysis_center,
+                    product_type: identity.family,
+                    date: identity.date,
+                });
+            }
             let entry = center_catalog(identity.analysis_center)
                 .expect("validated analysis center has a catalog entry");
+            let compression = product_archive_compression(
+                identity.analysis_center,
+                identity.family,
+                identity.date,
+                convention.compression,
+            )?;
             let url = format!(
                 "{}/{}/{}{}",
                 entry.root_url,
                 product_dir_path(identity.analysis_center, convention.layout, identity.date)?,
                 identity.official_filename,
-                convention.compression.suffix()
+                compression.suffix()
             );
             Ok(DistributionLocation {
                 source,
                 original_url: Some(url),
-                archive_filename: format!(
-                    "{}{}",
-                    identity.official_filename,
-                    convention.compression.suffix()
-                ),
-                compression: convention.compression,
+                archive_filename: format!("{}{}", identity.official_filename, compression.suffix()),
+                compression,
             })
         }
-        DistributionSource::NasaCddis => Ok(DistributionLocation {
-            source,
-            original_url: Some(cddis_archive_url(identity)?),
-            archive_filename: format!("{}.gz", identity.official_filename),
-            compression: ArchiveCompression::Gzip,
-        }),
+        DistributionSource::NasaCddis => {
+            let compression = product_archive_compression(
+                identity.analysis_center,
+                identity.family,
+                identity.date,
+                ArchiveCompression::Gzip,
+            )?;
+            Ok(DistributionLocation {
+                source,
+                original_url: Some(cddis_archive_url(identity)?),
+                archive_filename: format!("{}{}", identity.official_filename, compression.suffix()),
+                compression,
+            })
+        }
         DistributionSource::LocalFile | DistributionSource::InMemory => Ok(DistributionLocation {
             source,
             original_url: None,
@@ -2383,11 +2658,20 @@ pub fn distribution_location_for_identity(
 pub fn cddis_archive_url(identity: &ProductIdentity) -> Result<String, DataCatalogError> {
     identity.validate()?;
     match identity.family {
-        ProductType::Sp3 => Ok(format!(
-            "https://cddis.nasa.gov/archive/gnss/products/{}/{}.gz",
-            identity.date.gps_week()?,
-            identity.official_filename
-        )),
+        ProductType::Sp3 => {
+            let compression = product_archive_compression(
+                identity.analysis_center,
+                identity.family,
+                identity.date,
+                ArchiveCompression::Gzip,
+            )?;
+            Ok(format!(
+                "https://cddis.nasa.gov/archive/gnss/products/{:04}/{}{}",
+                identity.date.gps_week()?,
+                identity.official_filename,
+                compression.suffix()
+            ))
+        }
         ProductType::Ionex => Ok(format!(
             "https://cddis.nasa.gov/archive/gnss/products/ionex/{}/{:03}/{}.gz",
             identity.date.year,
@@ -2777,8 +3061,71 @@ fn validate_product(
 ) -> Result<&'static CenterProductConvention, DataCatalogError> {
     let convention = product_convention(center, product_type)?;
     validate_sample(sample)?;
+    validate_catalog_sample(center, product_type, sample, convention)?;
     validate_issue_for_center(center, issue)?;
     Ok(convention)
+}
+
+fn validate_catalog_sample(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    sample: &str,
+    convention: &CenterProductConvention,
+) -> Result<(), DataCatalogError> {
+    // The combined IGS final-orbit series is cataloged only at the official
+    // 15-minute cadence. Other catalog lines retain their existing caller-
+    // selectable cadence behavior until their complete published variants are
+    // modeled explicitly.
+    if center == AnalysisCenter::Igs
+        && product_type == ProductType::Sp3
+        && sample != convention.default_sample
+    {
+        return Err(DataCatalogError::UnsupportedSample {
+            center,
+            product_type,
+            sample: sample.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_product_date(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+) -> Result<(), DataCatalogError> {
+    // The official IGS rapid/final orbit combination began at GPS week 0730.
+    // Earlier dates must not be assigned a syntactically plausible legacy
+    // filename for a combined final product that did not yet exist.
+    if center == AnalysisCenter::Igs
+        && product_type == ProductType::Sp3
+        && date.gps_week()? < IGS_COMBINED_FINAL_START_GPS_WEEK
+    {
+        return Err(DataCatalogError::UnsupportedProductEra {
+            center,
+            product_type,
+            date,
+        });
+    }
+
+    // AIUB documents different short-name CODE products through week 2237.
+    // This catalog intentionally refuses those dates until their distinct
+    // identities and distributor rules are modeled; it must not emit a
+    // post-transition long filename that never existed.
+    if center == AnalysisCenter::Cod
+        && matches!(
+            product_type,
+            ProductType::Sp3 | ProductType::Clk | ProductType::Ionex
+        )
+        && date.gps_week()? < CODE_LONG_FILENAME_START_GPS_WEEK
+    {
+        return Err(DataCatalogError::UnsupportedProductEra {
+            center,
+            product_type,
+            date,
+        });
+    }
+    Ok(())
 }
 
 fn validate_issue_for_center(
@@ -2805,15 +3152,39 @@ fn validate_issue_for_center(
 }
 
 fn validate_sample(sample: &str) -> Result<(), DataCatalogError> {
-    let bytes = sample.as_bytes();
-    let valid = bytes.len() == 3
-        && bytes[0].is_ascii_digit()
-        && bytes[1].is_ascii_digit()
-        && bytes[2].is_ascii_uppercase();
-    if valid {
+    if validate_period_token(sample) {
         Ok(())
     } else {
         Err(DataCatalogError::InvalidSample(sample.to_string()))
+    }
+}
+
+fn validate_span(span: &str) -> Result<(), DataCatalogError> {
+    if validate_period_token(span) {
+        Ok(())
+    } else {
+        Err(DataCatalogError::InvalidSpan(span.to_string()))
+    }
+}
+
+fn validate_period_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() != 3 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
+        return false;
+    }
+    let amount = u16::from(bytes[0] - b'0') * 10 + u16::from(bytes[1] - b'0');
+    match bytes[2] {
+        // Reject exact smaller-unit spellings where the public guideline
+        // unambiguously provides the next sub-day unit. Do not normalize D to
+        // W or L to Y: official IGS filenames use values such as 07D, and the
+        // public convention treats those calendar-oriented units as valid.
+        b'S' | b'M' => amount > 0 && amount % 60 != 0,
+        b'H' => amount > 0 && amount % 24 != 0,
+        b'D' | b'W' | b'L' | b'Y' => amount > 0,
+        // IGS reserves 00U for an unspecified interval. Exact-SP3 validation
+        // rejects it because it cannot represent a positive cadence.
+        b'U' => amount == 0,
+        _ => false,
     }
 }
 
@@ -2898,6 +3269,29 @@ fn product_dir_path(
         AnalysisCenter::CodPrd1 => Ok(format!("CODE/IONO/P1/{}", date.year)),
         AnalysisCenter::CodPrd2 => Ok(format!("CODE/IONO/P2/{}", date.year)),
         _ => dir_path(layout, date),
+    }
+}
+
+fn uses_legacy_igs_final_name(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+) -> Result<bool, DataCatalogError> {
+    Ok(center == AnalysisCenter::Igs
+        && product_type == ProductType::Sp3
+        && date.gps_week()? < IGS_LONG_FILENAME_START_GPS_WEEK)
+}
+
+fn product_archive_compression(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+    default: ArchiveCompression,
+) -> Result<ArchiveCompression, DataCatalogError> {
+    if uses_legacy_igs_final_name(center, product_type, date)? {
+        Ok(ArchiveCompression::UnixCompress)
+    } else {
+        Ok(default)
     }
 }
 

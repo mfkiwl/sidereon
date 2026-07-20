@@ -27,6 +27,9 @@ use super::{
 const SATS_PER_LINE: usize = 17;
 /// SP3-c fixes five `+`/`++` lines (85 slots); SP3-d may use more.
 const MIN_PLUS_LINES: usize = 5;
+/// SP3-d retains at least four header comment records for backward
+/// compatibility, even when fewer carry semantic text.
+const MIN_COMMENT_LINES: usize = 4;
 const SP3_TIME_TICKS_PER_SECOND: i64 = 100_000_000;
 const SP3_TIME_TICKS_PER_MINUTE: i64 = 60 * SP3_TIME_TICKS_PER_SECOND;
 const SP3_TIME_TICKS_PER_HOUR: i64 = 60 * SP3_TIME_TICKS_PER_MINUTE;
@@ -141,6 +144,9 @@ impl Sp3 {
         // Provenance comments (e.g. merge derivation) are preserved when present.
         for comment in &self.comments {
             let _ = writeln!(out, "/* {comment}");
+        }
+        for _ in self.comments.len()..MIN_COMMENT_LINES {
+            out.push_str("/*\n");
         }
     }
 

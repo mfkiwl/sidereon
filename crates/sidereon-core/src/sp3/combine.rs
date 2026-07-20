@@ -1127,9 +1127,41 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
         ..sources[base_idx].header.clone()
     };
 
+    let mandatory_header_lines = 5.max(header.satellites.len().div_ceil(17));
+    let declared_satellite_tokens = header
+        .satellites
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let epoch_position_tokens = vec![declared_satellite_tokens.clone(); out_epochs.len()];
+    let epoch_state_record_sequence = epoch_position_tokens
+        .iter()
+        .map(|tokens| {
+            tokens
+                .iter()
+                .cloned()
+                .map(|token| ('P', token))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let merged = Sp3 {
         header,
         epochs: out_epochs,
+        declared_num_epochs: out_epoch_j2000_s.len() as u64,
+        declared_start_j2000_s: out_epoch_j2000_s.first().copied(),
+        had_eof: true,
+        trailing_content_after_eof: false,
+        satellite_header_lines: mandatory_header_lines,
+        accuracy_header_lines: mandatory_header_lines,
+        time_system_header_lines: 2,
+        float_header_lines: 2,
+        integer_header_lines: 2,
+        header_comment_lines: 4,
+        declared_satellite_count: Some(declared_satellite_tokens.len()),
+        declared_satellite_tokens,
+        epoch_velocity_tokens: vec![Vec::new(); epoch_position_tokens.len()],
+        epoch_position_tokens,
+        epoch_state_record_sequence,
         epoch_j2000_s: out_epoch_j2000_s,
         states: out_states,
         interp_raw: out_raw,

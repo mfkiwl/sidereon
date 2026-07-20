@@ -314,16 +314,45 @@ pub struct Sp3Header {
 
 /// A parsed SP3 precise-ephemeris product.
 ///
-/// Construct with [`Sp3::parse`]. Epochs are stored in ascending order; each
-/// epoch maps satellite -> [`Sp3State`]. Per-satellite/per-epoch access is via
-/// [`Sp3::state`]; arbitrary-epoch interpolation is built separately to match
-/// the parity reference and is not part of this parser.
-#[derive(Debug, Clone, PartialEq)]
+/// Construct with [`Sp3::parse`]. Epochs are stored in file order; exact-product
+/// consumers can use [`validate_exact_sp3`] to require a strictly increasing,
+/// regular requested-cadence grid. Each epoch maps satellite -> [`Sp3State`].
+/// Per-satellite/per-epoch access is via [`Sp3::state`]; arbitrary-epoch
+/// interpolation is built separately to match the parity reference and is not
+/// part of this parser.
+#[derive(Debug, Clone)]
 pub struct Sp3 {
     /// The parsed header.
     pub header: Sp3Header,
-    /// Epochs in ascending time order, tagged with the header time scale.
+    /// Epochs in file order, tagged with the header time scale.
     pub epochs: Vec<Instant>,
+    /// Epoch count declared on SP3 header line 1. Kept separately from
+    /// [`Sp3Header::num_epochs`], which intentionally remains the number of
+    /// epoch records actually parsed for backward compatibility.
+    declared_num_epochs: u64,
+    /// Start epoch declared on SP3 header line 1, expressed as seconds since
+    /// J2000 in the product time scale. `None` means the legacy permissive
+    /// parser could not interpret those otherwise-unused line-1 fields; exact
+    /// product validation rejects that condition.
+    declared_start_j2000_s: Option<f64>,
+    /// Whether the parser encountered the mandatory terminal record.
+    had_eof: bool,
+    trailing_content_after_eof: bool,
+    /// Raw mandatory header-record counts retained for exact validation.
+    satellite_header_lines: usize,
+    accuracy_header_lines: usize,
+    time_system_header_lines: usize,
+    float_header_lines: usize,
+    integer_header_lines: usize,
+    header_comment_lines: usize,
+    /// Raw line-3 satellite count and record sequences retained only for exact
+    /// acquisition validation. Tokens include declarations the typed parser
+    /// cannot represent, so exact validation can still prove count and order.
+    declared_satellite_count: Option<usize>,
+    declared_satellite_tokens: Vec<String>,
+    epoch_position_tokens: Vec<Vec<String>>,
+    epoch_velocity_tokens: Vec<Vec<String>>,
+    epoch_state_record_sequence: Vec<Vec<(char, String)>>,
     /// Exact seconds since J2000 for each parsed epoch, in the product time
     /// scale, formed from the epoch record's civil fields with integer
     /// whole-second arithmetic.
@@ -347,6 +376,22 @@ pub struct Sp3 {
     /// without aborting the whole parse on one such entry. Mirrors
     /// [`crate::astro::sgp4::TleFile::skipped`].
     pub skipped_records: usize,
+}
+
+// Preserve the parser's existing canonical-product equality contract. Raw
+// line-1 declarations are retained only as acquisition-integrity evidence and
+// are intentionally excluded: serialization canonicalizes them to the actual
+// body count and first epoch.
+impl PartialEq for Sp3 {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header
+            && self.epochs == other.epochs
+            && self.epoch_j2000_s == other.epoch_j2000_s
+            && self.states == other.states
+            && self.interp_raw == other.interp_raw
+            && self.comments == other.comments
+            && self.skipped_records == other.skipped_records
+    }
 }
 
 /// Native-unit interpolation node: the file's own km / microseconds, kept
@@ -395,6 +440,26 @@ impl Sp3 {
     /// Number of parsed epochs.
     pub fn epoch_count(&self) -> usize {
         self.epochs.len()
+    }
+
+    /// Epoch count written in SP3 header line 1.
+    ///
+    /// This can differ from [`Sp3::epoch_count`] when a truncated or otherwise
+    /// inconsistent file is parsed through the deliberately permissive base
+    /// parser. Use [`validate_exact_sp3`] when those fields must agree.
+    pub fn declared_epoch_count(&self) -> u64 {
+        self.declared_num_epochs
+    }
+
+    /// Start epoch written in SP3 header line 1, as seconds since J2000 in the
+    /// product time scale.
+    ///
+    /// The base parser historically ignored these civil fields, so malformed
+    /// values are represented as `None` rather than changing `Sp3::parse`
+    /// compatibility. Exact product validation requires `Some` and checks it
+    /// against both the request and the first parsed epoch.
+    pub fn declared_start_j2000_s(&self) -> Option<f64> {
+        self.declared_start_j2000_s
     }
 
     /// The state of `sat` at the parsed epoch with index `epoch_index`.
@@ -527,6 +592,7 @@ struct Parser {
     version: Option<Sp3Version>,
     data_type: Option<Sp3DataType>,
     num_epochs: u64,
+    declared_start_j2000_s: Option<f64>,
     coordinate_system: String,
     orbit_type: String,
     agency: String,
@@ -538,6 +604,8 @@ struct Parser {
     time_system: Option<Sp3TimeSystem>,
     /// `+`-line declared satellites, in file order.
     sat_list: Vec<GnssSatelliteId>,
+    declared_satellite_count: Option<usize>,
+    declared_satellite_tokens: Vec<String>,
     /// `++`-line per-satellite accuracy codes, in satellite-list order.
     sat_accuracy_codes: Vec<u16>,
     /// Number of real (non-padding) `+`-line satellite slots seen, including any
@@ -556,6 +624,11 @@ struct Parser {
     accuracy_slot_cursor: usize,
     /// `%c` descriptor lines seen so far (the first carries the time system).
     pc_count: u32,
+    satellite_header_lines: usize,
+    accuracy_header_lines: usize,
+    float_header_lines: usize,
+    integer_header_lines: usize,
+    header_comment_lines: usize,
     /// Header line 1 parsed?
     have_line1: bool,
     /// Header line 2 parsed?
@@ -566,9 +639,14 @@ struct Parser {
     epoch_j2000_s: Vec<f64>,
     states: Vec<BTreeMap<GnssSatelliteId, Sp3State>>,
     interp_raw: Vec<BTreeMap<GnssSatelliteId, RawNode>>,
+    epoch_position_tokens: Vec<Vec<String>>,
+    epoch_velocity_tokens: Vec<Vec<String>>,
+    epoch_state_record_sequence: Vec<Vec<(char, String)>>,
     comments: Vec<String>,
     diagnostics: Diagnostics,
     done: bool,
+    had_eof: bool,
+    trailing_content_after_eof: bool,
 }
 
 impl Parser {
@@ -577,6 +655,7 @@ impl Parser {
             version: None,
             data_type: None,
             num_epochs: 0,
+            declared_start_j2000_s: None,
             coordinate_system: String::new(),
             orbit_type: String::new(),
             agency: String::new(),
@@ -587,11 +666,18 @@ impl Parser {
             mjd_fraction: 0.0,
             time_system: None,
             sat_list: Vec::new(),
+            declared_satellite_count: None,
+            declared_satellite_tokens: Vec::new(),
             sat_accuracy_codes: Vec::new(),
             declared_sat_slots: 0,
             dropped_sat_slots: Vec::new(),
             accuracy_slot_cursor: 0,
             pc_count: 0,
+            satellite_header_lines: 0,
+            accuracy_header_lines: 0,
+            float_header_lines: 0,
+            integer_header_lines: 0,
+            header_comment_lines: 0,
             have_line1: false,
             have_line2: false,
             current_epoch: None,
@@ -599,14 +685,22 @@ impl Parser {
             epoch_j2000_s: Vec::new(),
             states: Vec::new(),
             interp_raw: Vec::new(),
+            epoch_position_tokens: Vec::new(),
+            epoch_velocity_tokens: Vec::new(),
+            epoch_state_record_sequence: Vec::new(),
             comments: Vec::new(),
             diagnostics: Diagnostics::new(),
             done: false,
+            had_eof: false,
+            trailing_content_after_eof: false,
         }
     }
 
     fn feed(&mut self, raw: &str, line_number: usize) -> Result<()> {
         if self.done {
+            if !raw.trim().is_empty() {
+                self.trailing_content_after_eof = true;
+            }
             return Ok(());
         }
         // SP3 is fixed-column ASCII; trim only the trailing CR / newline noise,
@@ -615,14 +709,22 @@ impl Parser {
 
         if line == "EOF" {
             self.done = true;
+            self.had_eof = true;
             return Ok(());
         }
         if line.starts_with("/*") {
+            if self.integer_header_lines >= 2 && self.epochs.is_empty() {
+                self.header_comment_lines += 1;
+            }
             // Comment line; columns 4.. are the text.
+            // Blank records are mandatory structural padding, not semantic
+            // comments. Count them above but do not add empty strings to the
+            // public `comments` collection.
             if line.len() > 3 {
-                self.comments.push(line[3..].trim_end().to_string());
-            } else {
-                self.comments.push(String::new());
+                let comment = line[3..].trim_end();
+                if !comment.is_empty() {
+                    self.comments.push(comment.to_string());
+                }
             }
             return Ok(());
         }
@@ -636,6 +738,11 @@ impl Parser {
             return Ok(());
         }
         if line.starts_with('+') {
+            if line.starts_with("++") {
+                self.accuracy_header_lines += 1;
+            } else {
+                self.satellite_header_lines += 1;
+            }
             self.parse_plus_line(line, line_number)?;
             return Ok(());
         }
@@ -643,7 +750,14 @@ impl Parser {
             self.parse_pc_line(line)?;
             return Ok(());
         }
-        if line.starts_with("%f") || line.starts_with("%i") {
+        if line.starts_with("%f") {
+            self.float_header_lines += 1;
+            // Float accuracy descriptors are retained only as structural
+            // evidence for exact validation.
+            return Ok(());
+        }
+        if line.starts_with("%i") {
+            self.integer_header_lines += 1;
             // Float/int accuracy descriptor lines - not needed for the typed
             // state; skipped deterministically.
             return Ok(());
@@ -692,6 +806,11 @@ impl Parser {
             .trim()
             .parse::<u64>()
             .map_err(|_| Error::Parse(format!("SP3 num_epochs unparsable in {line:?}")))?;
+        // Keep line-1 start metadata for exact-product validation. These fields
+        // were historically cosmetic to the base parser, so use a best-effort
+        // parse here: malformed values remain parse-compatible but are rejected
+        // by the exact validator as unavailable declared metadata.
+        self.declared_start_j2000_s = parse_declared_start_j2000_s(line);
         self.coordinate_system = field(line, 45, 51).trim().to_string();
         self.orbit_type = field(line, 51, 55).trim().to_string();
         self.agency = field_from(line, 55).trim().to_string();
@@ -729,6 +848,9 @@ impl Parser {
         if line.starts_with("++") {
             return self.parse_accuracy_line(line);
         }
+        if self.satellite_header_lines == 1 {
+            self.declared_satellite_count = field(line, 3, 6).trim().parse::<usize>().ok();
+        }
         // SV tokens start at column 9 (0-based), each 3 chars, up to 17 per line.
         let mut col = 9;
         while col + 3 <= line.len() {
@@ -749,6 +871,7 @@ impl Parser {
             // to this axis, so track its index whether or not the token resolves.
             let slot_index = self.declared_sat_slots;
             self.declared_sat_slots += 1;
+            self.declared_satellite_tokens.push(trimmed.to_owned());
             if let Some(id) = parse_sv_token(token, self.version) {
                 if !self.sat_list.contains(&id) {
                     self.sat_list.push(id);
@@ -871,6 +994,9 @@ impl Parser {
         self.epoch_j2000_s.push(epoch_j2000_s);
         self.states.push(BTreeMap::new());
         self.interp_raw.push(BTreeMap::new());
+        self.epoch_position_tokens.push(Vec::new());
+        self.epoch_velocity_tokens.push(Vec::new());
+        self.epoch_state_record_sequence.push(Vec::new());
         self.current_epoch = Some(epoch);
         Ok(())
     }
@@ -888,6 +1014,14 @@ impl Parser {
             )));
         }
         let token = field(line, 1, 4);
+        self.epoch_position_tokens
+            .last_mut()
+            .expect("current epoch has a raw position-token list")
+            .push(token.trim().to_owned());
+        self.epoch_state_record_sequence
+            .last_mut()
+            .expect("current epoch has a raw state-record sequence")
+            .push(('P', token.trim().to_owned()));
         let Some(sat) = parse_sv_token(token, self.version) else {
             // A token that does not parse to a representable `GnssSatelliteId`
             // (e.g. an extended GLONASS slot like R28 beyond the engine's PRN
@@ -961,6 +1095,14 @@ impl Parser {
             )));
         }
         let token = field(line, 1, 4);
+        self.epoch_velocity_tokens
+            .last_mut()
+            .expect("current epoch has a raw velocity-token list")
+            .push(token.trim().to_owned());
+        self.epoch_state_record_sequence
+            .last_mut()
+            .expect("current epoch has a raw state-record sequence")
+            .push(('V', token.trim().to_owned()));
         let Some(sat) = parse_sv_token(token, self.version) else {
             // Unparsable / out-of-range satellite token: skip and count, same
             // as the position-record path above.
@@ -1065,6 +1207,21 @@ impl Parser {
         Ok(Sp3 {
             header,
             epochs: self.epochs,
+            declared_num_epochs: self.num_epochs,
+            declared_start_j2000_s: self.declared_start_j2000_s,
+            had_eof: self.had_eof,
+            trailing_content_after_eof: self.trailing_content_after_eof,
+            satellite_header_lines: self.satellite_header_lines,
+            accuracy_header_lines: self.accuracy_header_lines,
+            time_system_header_lines: self.pc_count as usize,
+            float_header_lines: self.float_header_lines,
+            integer_header_lines: self.integer_header_lines,
+            header_comment_lines: self.header_comment_lines,
+            declared_satellite_count: self.declared_satellite_count,
+            declared_satellite_tokens: self.declared_satellite_tokens,
+            epoch_position_tokens: self.epoch_position_tokens,
+            epoch_velocity_tokens: self.epoch_velocity_tokens,
+            epoch_state_record_sequence: self.epoch_state_record_sequence,
             epoch_j2000_s: self.epoch_j2000_s,
             states: self.states,
             interp_raw: self.interp_raw,
@@ -1072,6 +1229,38 @@ impl Parser {
             skipped_records,
         })
     }
+}
+
+/// Best-effort parse of the civil start epoch carried on SP3 header line 1.
+///
+/// Exact validation treats `None` as an integrity failure. Keeping this helper
+/// non-fallible preserves the long-standing permissive behavior of `Sp3::parse`
+/// for callers that only consume epoch records.
+fn parse_declared_start_j2000_s(line: &str) -> Option<f64> {
+    let year = field(line, 3, 7).trim().parse::<i64>().ok()?;
+    let month = field(line, 8, 10).trim().parse::<i64>().ok()?;
+    let day = field(line, 11, 13).trim().parse::<i64>().ok()?;
+    let hour = field(line, 14, 16).trim().parse::<i64>().ok()?;
+    let minute = field(line, 17, 19).trim().parse::<i64>().ok()?;
+    let second = field(line, 20, 31).trim().parse::<f64>().ok()?;
+    let civil = validate::civil_datetime_with_second_policy(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        validate::CivilSecondPolicy::UtcLike,
+    )
+    .ok()?;
+    Some(j2000_seconds(
+        civil.year as i32,
+        civil.month as i32,
+        civil.day as i32,
+        civil.hour as i32,
+        civil.minute as i32,
+        civil.second,
+    ))
 }
 
 /// Parse a fixed-column float coordinate, mapping failures to a parse error
@@ -1151,6 +1340,7 @@ fn next_field<T: std::str::FromStr>(
 }
 
 mod combine;
+mod exact;
 mod interp;
 mod interpolant;
 mod interpolant_store;
@@ -1164,6 +1354,9 @@ pub use combine::{
     EpochAgreement, MergeCombine, MergeFlag, MergeOptions, MergePrecedenceScope, MergeReport,
     OutlierRejectOptions, Sp3FrameLabelSet, Sp3FrameReconciliation, Sp3FrameReconciliationMethod,
     Sp3FrameReconciliationOptions,
+};
+pub use exact::{
+    parse_exact_sp3, validate_exact_sp3, ExactSp3Coverage, ExactSp3Request, ExactSp3ValidationError,
 };
 pub use interpolant::{PreciseEphemerisInterpolant, PreciseInterpolantError};
 pub use interpolant_store::{

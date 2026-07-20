@@ -13,18 +13,21 @@ use sidereon_core::astro::propagator::{
 };
 use sidereon_core::astro::state::CartesianState;
 use sidereon_core::astro::time::civil::{
-    civil_from_j2000_seconds, j2000_seconds, split_julian_date_from_j2000_seconds,
+    civil_from_j2000_seconds, j2000_seconds, split_julian_date,
+    split_julian_date_from_j2000_seconds, MJD_JD_OFFSET,
 };
+use sidereon_core::astro::time::gnss::{seconds_of_week_from_calendar, week_from_calendar};
 use sidereon_core::astro::time::model::{Instant, JulianDateSplit, TimeScale};
 use sidereon_core::constants::{J2000_JD, SECONDS_PER_DAY};
 use sidereon_core::data::ProductDate;
-use sidereon_core::ephemeris::Sp3;
+use sidereon_core::ephemeris::{ExactSp3ValidationError, Sp3};
 use sidereon_core::{
     EarthOrientationProvider, GnssSatelliteId, GnssSystem, TdbEarthOrientationProvider,
 };
 use sidereon_scoreboard::{
     parse_product_date, resolve_latest_available_rapid_sp3, run_with_fetcher, score_sp3_bytes,
-    FetchOutcome, HttpsFetcher, ProductCandidate, ProductFetcher, ScoreOptions, ScoreboardStatus,
+    FetchOutcome, HttpsFetcher, ProductCandidate, ProductFetcher, ScoreOptions, ScoreboardError,
+    ScoreboardStatus,
 };
 
 const SP3_POSITION_3D_QUANTIZATION_BOUND_M: f64 = 8.660_254_037_844_386e-4;
@@ -127,28 +130,69 @@ fn mocked_fetch_resolves_without_network() {
             &self,
             candidate: &ProductCandidate,
         ) -> Result<FetchOutcome, sidereon_scoreboard::ScoreboardError> {
-            if candidate.name.contains("20201760000") {
-                Ok(FetchOutcome::Available(
-                    include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
-                ))
+            if candidate.name.contains("20261950000") {
+                Ok(FetchOutcome::Available(exact_candidate_sp3(candidate)))
             } else {
                 Ok(FetchOutcome::NotPosted { http_status: None })
             }
         }
     }
 
-    let resolution = resolve_latest_available_rapid_sp3(date(2020, 6, 25), 1, &MockFetcher)
+    let resolution = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 1, &MockFetcher)
         .expect("previous day resolves");
     let resolved = resolution.resolved.expect("resolved product");
-    assert!(resolved.candidate.name.contains("20201760000"));
-    assert_eq!(
-        resolved.bytes,
-        include_bytes!("fixtures/minimal_sp3.sp3").to_vec()
-    );
+    assert!(resolved.candidate.name.contains("20261950000"));
+    assert_eq!(resolved.bytes, exact_candidate_sp3(&resolved.candidate));
     assert!(resolution
         .attempted
         .iter()
-        .any(|candidate| candidate.name == "IGS0OPSRAP_20201760000_01D_15M_ORB.SP3"));
+        .any(|candidate| candidate.name == "IGS0OPSRAP_20261950000_01D_15M_ORB.SP3"));
+}
+
+#[test]
+fn pretransition_candidate_dates_are_rejected_before_fetch() {
+    struct MustNotFetch;
+
+    impl ProductFetcher for MustNotFetch {
+        fn fetch(&self, _candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            panic!("unsupported historical candidate must not be emitted")
+        }
+    }
+
+    let error = resolve_latest_available_rapid_sp3(date(2020, 6, 25), 1, &MustNotFetch)
+        .expect_err("historical rapid/ultra naming was not modeled");
+    assert!(matches!(
+        error,
+        ScoreboardError::UnsupportedCandidateEra {
+            gps_week: 2111,
+            minimum_gps_week: 2238,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn transition_week_target_skips_unsupported_lookback_dates() {
+    struct Missing;
+
+    impl ProductFetcher for Missing {
+        fn fetch(&self, _candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            Ok(FetchOutcome::NotPosted {
+                http_status: Some(404),
+            })
+        }
+    }
+
+    let transition_date = date(2022, 11, 27);
+    let resolution = resolve_latest_available_rapid_sp3(transition_date, 4, &Missing)
+        .expect("the first supported long-name date remains usable");
+
+    assert!(resolution.resolved.is_none());
+    assert_eq!(resolution.attempted.len(), 19);
+    assert!(resolution
+        .attempted
+        .iter()
+        .all(|candidate| candidate.date == transition_date));
 }
 
 #[test]
@@ -172,9 +216,7 @@ fn source_network_failure_falls_back_to_an_independent_archive() {
                 });
             }
             if candidate.source == "ESA" {
-                return Ok(FetchOutcome::Available(
-                    include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
-                ));
+                return Ok(FetchOutcome::Available(exact_candidate_sp3(candidate)));
             }
             panic!("resolver should stop after the independent fallback succeeds");
         }
@@ -183,19 +225,18 @@ fn source_network_failure_falls_back_to_an_independent_archive() {
     let fetcher = SourceFallbackFetcher {
         bkg_attempts: std::cell::Cell::new(0),
     };
-    let report = run_with_fetcher(date(2026, 7, 15), 4, &fetcher)
+    let resolution = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 4, &fetcher)
         .expect("one source outage does not abort the scoreboard");
 
-    assert_eq!(report.status, ScoreboardStatus::Scored);
+    assert!(resolution.resolved.is_some());
     assert_eq!(fetcher.bkg_attempts.get(), 1);
-    assert_eq!(report.attempted_candidates.len(), 2);
-    assert_eq!(report.attempted_candidates[0].source, "BKG IGS");
-    assert!(report.attempted_candidates[0]
-        .error
+    assert_eq!(resolution.attempted.len(), 2);
+    assert_eq!(resolution.attempted[0].source, "BKG IGS");
+    assert!(resolution.attempted_errors[0]
         .as_deref()
         .is_some_and(|error| error.contains("simulated connection failure")));
-    assert_eq!(report.attempted_candidates[1].source, "ESA");
-    assert!(report.attempted_candidates[1].error.is_none());
+    assert_eq!(resolution.attempted[1].source, "ESA");
+    assert!(resolution.attempted_errors[1].is_none());
 }
 
 #[test]
@@ -256,9 +297,7 @@ fn candidate_urls_use_product_dates_gps_week() {
             candidate: &ProductCandidate,
         ) -> Result<FetchOutcome, sidereon_scoreboard::ScoreboardError> {
             if candidate.name == "IGS0OPSRAP_20261850000_01D_15M_ORB.SP3" {
-                Ok(FetchOutcome::Available(
-                    include_bytes!("fixtures/minimal_sp3.sp3").to_vec(),
-                ))
+                Ok(FetchOutcome::Available(exact_candidate_sp3(candidate)))
             } else {
                 Ok(FetchOutcome::NotPosted { http_status: None })
             }
@@ -272,6 +311,271 @@ fn candidate_urls_use_product_dates_gps_week() {
         resolved.candidate.url,
         "https://igs.bkg.bund.de/root_ftp/IGS/products/2425/IGS0OPSRAP_20261850000_01D_15M_ORB.SP3.gz"
     );
+}
+
+#[test]
+fn ordinary_not_posted_candidate_falls_back_to_next_candidate() {
+    struct AbsentThenValid {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ProductFetcher for AbsentThenValid {
+        fn fetch(&self, candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            match call {
+                0 => Ok(FetchOutcome::NotPosted {
+                    http_status: Some(404),
+                }),
+                1 => Ok(FetchOutcome::Available(exact_candidate_sp3(candidate))),
+                _ => panic!("resolver continued after a valid candidate"),
+            }
+        }
+    }
+
+    let fetcher = AbsentThenValid {
+        calls: std::cell::Cell::new(0),
+    };
+    let resolution = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &fetcher)
+        .expect("ordinary absence permits the documented next candidate");
+
+    assert_eq!(fetcher.calls.get(), 2);
+    assert_eq!(resolution.attempted_http_statuses, vec![Some(404), None]);
+    assert_eq!(
+        resolution
+            .resolved
+            .expect("second candidate resolves")
+            .candidate
+            .name,
+        "IGS0OPSULT_20261961800_02D_15M_ORB.SP3"
+    );
+}
+
+#[test]
+fn exact_product_integrity_failures_are_terminal() {
+    for invalid in [
+        InvalidCandidateBytes::Malformed,
+        InvalidCandidateBytes::ParseInvalid,
+        InvalidCandidateBytes::Cadence,
+        InvalidCandidateBytes::Span,
+        InvalidCandidateBytes::Start,
+        InvalidCandidateBytes::AgencySubstitution,
+    ] {
+        let fetcher = InvalidThenPanicFetcher {
+            invalid,
+            calls: std::cell::Cell::new(0),
+        };
+        let error = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &fetcher)
+            .expect_err("integrity failure must not try a later valid candidate");
+        assert_eq!(fetcher.calls.get(), 1, "case {invalid:?}");
+        match (invalid, error) {
+            (
+                InvalidCandidateBytes::Malformed | InvalidCandidateBytes::ParseInvalid,
+                ScoreboardError::ExactSp3Integrity {
+                    error: ExactSp3ValidationError::Parse(_),
+                    ..
+                },
+            ) => {}
+            (
+                InvalidCandidateBytes::Cadence,
+                ScoreboardError::ExactSp3Integrity {
+                    error: ExactSp3ValidationError::CadenceMismatch { .. },
+                    ..
+                },
+            ) => {}
+            (
+                InvalidCandidateBytes::Span,
+                ScoreboardError::ExactSp3Integrity {
+                    error: ExactSp3ValidationError::SpanMismatch { .. },
+                    ..
+                },
+            ) => {}
+            (
+                InvalidCandidateBytes::Start,
+                ScoreboardError::ExactSp3Integrity {
+                    error: ExactSp3ValidationError::DeclaredStartMismatch { .. },
+                    ..
+                },
+            ) => {}
+            (
+                InvalidCandidateBytes::AgencySubstitution,
+                ScoreboardError::ExactSp3Integrity {
+                    error: ExactSp3ValidationError::AgencyMismatch { expected, actual },
+                    ..
+                },
+            ) => {
+                assert_eq!(expected, "IGS");
+                assert_eq!(actual, "ESOC");
+            }
+            (_, other) => panic!("unexpected error for {invalid:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn absence_followed_by_integrity_failure_returns_the_integrity_failure() {
+    struct AbsentThenInvalid {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ProductFetcher for AbsentThenInvalid {
+        fn fetch(&self, candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            match call {
+                0 => Ok(FetchOutcome::NotPosted {
+                    http_status: Some(410),
+                }),
+                1 => Ok(FetchOutcome::Available(exact_candidate_sp3_custom(
+                    candidate, 0, -1, None,
+                ))),
+                _ => panic!("resolver continued after an integrity failure"),
+            }
+        }
+    }
+
+    let fetcher = AbsentThenInvalid {
+        calls: std::cell::Cell::new(0),
+    };
+    let error = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &fetcher)
+        .expect_err("integrity failure after absence remains terminal");
+
+    assert_eq!(fetcher.calls.get(), 2);
+    assert!(matches!(
+        error,
+        ScoreboardError::ExactSp3Integrity {
+            error: ExactSp3ValidationError::SpanMismatch { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn digest_failure_is_typed_and_terminal() {
+    struct DigestFailure {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ProductFetcher for DigestFailure {
+        fn fetch(&self, candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call != 0 {
+                panic!("resolver continued after a digest failure");
+            }
+            Err(ScoreboardError::DigestMismatch {
+                archive_source: candidate.source.to_string(),
+                name: candidate.name.clone(),
+                expected: "expected-digest".to_string(),
+                actual: "actual-digest".to_string(),
+            })
+        }
+    }
+
+    let fetcher = DigestFailure {
+        calls: std::cell::Cell::new(0),
+    };
+    let error = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &fetcher)
+        .expect_err("digest mismatch must remain terminal");
+
+    assert_eq!(fetcher.calls.get(), 1);
+    assert!(matches!(error, ScoreboardError::DigestMismatch { .. }));
+}
+
+#[test]
+fn first_nonabsence_fetch_error_is_not_reported_as_no_data() {
+    struct OneNetworkFailureThenAbsent;
+
+    impl ProductFetcher for OneNetworkFailureThenAbsent {
+        fn fetch(&self, candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            if candidate.source == "BKG IGS" {
+                Err(ScoreboardError::Network {
+                    archive_source: candidate.source.to_string(),
+                    name: candidate.name.clone(),
+                    url: candidate.url.clone(),
+                    message: "first transport failure".to_string(),
+                })
+            } else {
+                Ok(FetchOutcome::NotPosted {
+                    http_status: Some(404),
+                })
+            }
+        }
+    }
+
+    let error =
+        resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &OneNetworkFailureThenAbsent)
+            .expect_err("a transport failure cannot collapse into publication absence");
+
+    match error {
+        ScoreboardError::Network { message, .. } => {
+            assert_eq!(message, "first transport failure");
+        }
+        other => panic!("expected the first transport failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn nonabsence_status_cannot_be_injected_as_not_posted() {
+    struct InvalidAbsenceStatus {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ProductFetcher for InvalidAbsenceStatus {
+        fn fetch(&self, _candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(FetchOutcome::NotPosted {
+                http_status: Some(403),
+            })
+        }
+    }
+
+    let fetcher = InvalidAbsenceStatus {
+        calls: std::cell::Cell::new(0),
+    };
+    let error = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &fetcher)
+        .expect_err("authorization failure is not publication absence");
+
+    assert_eq!(fetcher.calls.get(), 1);
+    assert!(matches!(
+        error,
+        ScoreboardError::HttpStatus { status: 403, .. }
+    ));
+}
+
+#[test]
+fn fetcher_authorization_error_is_terminal_without_later_fetch() {
+    struct AuthorizationFailure {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ProductFetcher for AuthorizationFailure {
+        fn fetch(&self, candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if call != 0 {
+                panic!("resolver continued after an authorization failure");
+            }
+            Err(ScoreboardError::HttpStatus {
+                archive_source: candidate.source.to_string(),
+                name: candidate.name.clone(),
+                url: candidate.url.clone(),
+                status: 403,
+            })
+        }
+    }
+
+    let fetcher = AuthorizationFailure {
+        calls: std::cell::Cell::new(0),
+    };
+    let error = resolve_latest_available_rapid_sp3(date(2026, 7, 15), 0, &fetcher)
+        .expect_err("authorization failure is terminal");
+
+    assert_eq!(fetcher.calls.get(), 1);
+    assert!(matches!(
+        error,
+        ScoreboardError::HttpStatus { status: 403, .. }
+    ));
 }
 
 #[test]
@@ -388,6 +692,189 @@ const FIT_ROW_KEYS: &[&str] = &[
     "rms_3d_m",
     "satellite",
 ];
+
+#[derive(Debug, Clone, Copy)]
+enum InvalidCandidateBytes {
+    Malformed,
+    ParseInvalid,
+    Cadence,
+    Span,
+    Start,
+    AgencySubstitution,
+}
+
+struct InvalidThenPanicFetcher {
+    invalid: InvalidCandidateBytes,
+    calls: std::cell::Cell<usize>,
+}
+
+impl ProductFetcher for InvalidThenPanicFetcher {
+    fn fetch(&self, candidate: &ProductCandidate) -> Result<FetchOutcome, ScoreboardError> {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call != 0 {
+            panic!("resolver continued after an integrity failure");
+        }
+        let bytes = match self.invalid {
+            InvalidCandidateBytes::Malformed => b"<html>not an SP3 product</html>".to_vec(),
+            InvalidCandidateBytes::ParseInvalid => b"#dP truncated header\nEOF\n".to_vec(),
+            InvalidCandidateBytes::Cadence => {
+                exact_candidate_sp3_custom(candidate, 0, 0, Some(60.0))
+            }
+            InvalidCandidateBytes::Span => exact_candidate_sp3_custom(candidate, 0, -1, None),
+            InvalidCandidateBytes::Start => exact_candidate_sp3_custom(candidate, 300, 0, None),
+            InvalidCandidateBytes::AgencySubstitution => {
+                exact_candidate_sp3_custom_agency(candidate, 0, 0, None, Some("ESOC"))
+            }
+        };
+        Ok(FetchOutcome::Available(bytes))
+    }
+}
+
+fn exact_candidate_sp3(candidate: &ProductCandidate) -> Vec<u8> {
+    exact_candidate_sp3_custom(candidate, 0, 0, None)
+}
+
+fn exact_candidate_sp3_custom(
+    candidate: &ProductCandidate,
+    start_offset_s: i64,
+    count_adjustment: isize,
+    header_cadence_override_s: Option<f64>,
+) -> Vec<u8> {
+    exact_candidate_sp3_custom_agency(
+        candidate,
+        start_offset_s,
+        count_adjustment,
+        header_cadence_override_s,
+        None,
+    )
+}
+
+fn exact_candidate_sp3_custom_agency(
+    candidate: &ProductCandidate,
+    start_offset_s: i64,
+    count_adjustment: isize,
+    header_cadence_override_s: Option<f64>,
+    agency_override: Option<&str>,
+) -> Vec<u8> {
+    let fields = candidate.name.split('_').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 5, "candidate must use a long product name");
+    let date_issue = fields[1];
+    assert_eq!(date_issue.len(), 11);
+    let hour = date_issue[7..9].parse::<i32>().expect("issue hour");
+    let minute = date_issue[9..11].parse::<i32>().expect("issue minute");
+    let span_s = duration_token_seconds(fields[2]);
+    let cadence_s = duration_token_seconds(fields[3]);
+    let epoch_count = isize::try_from(span_s / cadence_s)
+        .expect("fixture epoch count")
+        .checked_add(count_adjustment)
+        .and_then(|count| usize::try_from(count).ok())
+        .expect("positive fixture epoch count");
+    let start = j2000_seconds(
+        candidate.date.year,
+        i32::from(candidate.date.month),
+        i32::from(candidate.date.day),
+        hour,
+        minute,
+        0.0,
+    ) as i64
+        + start_offset_s;
+    let (year, month, day, start_hour, start_minute, start_second) =
+        civil_from_j2000_seconds(start);
+    let gps_week = week_from_calendar(TimeScale::Gpst, year, month, day)
+        .expect("post-transition fixture GPS week");
+    let seconds_of_week =
+        seconds_of_week_from_calendar(year, month, day, start_hour, start_minute, start_second);
+    let (jd_whole, mjd_fraction) = split_julian_date(
+        i32::try_from(year).expect("fixture year"),
+        i32::try_from(month).expect("fixture month"),
+        i32::try_from(day).expect("fixture day"),
+        i32::try_from(start_hour).expect("fixture hour"),
+        i32::try_from(start_minute).expect("fixture minute"),
+        start_second as f64,
+    );
+    let mjd = u32::try_from((jd_whole - MJD_JD_OFFSET) as i64).expect("fixture MJD");
+    let expected_agency = match &candidate.name[..3] {
+        "IGS" => "IGS",
+        "ESA" => "ESOC",
+        "GFZ" => "GFZ",
+        other => panic!("unsupported fixture producer {other}"),
+    };
+    let agency = agency_override.unwrap_or(expected_agency);
+    let mut text = format!(
+        "#dP{} {epoch_count:>7} {:<5}{:>6}{:>4} {}\n",
+        format_calendar(
+            year,
+            month,
+            day,
+            start_hour,
+            start_minute,
+            start_second as f64
+        ),
+        "ORBIT",
+        "IGS20",
+        "FIT",
+        agency
+    );
+    text.push_str(&format!(
+        "## {:>4} {:15.8} {:14.8} {:>5} {:.13}\n",
+        gps_week,
+        seconds_of_week,
+        header_cadence_override_s.unwrap_or(cadence_s as f64),
+        mjd,
+        mjd_fraction
+    ));
+    text.push_str("+    1   G01");
+    for _ in 1..17 {
+        text.push_str("  0");
+    }
+    text.push('\n');
+    for _ in 1..5 {
+        text.push_str("+        ");
+        for _ in 0..17 {
+            text.push_str("  0");
+        }
+        text.push('\n');
+    }
+    for _ in 0..5 {
+        text.push_str("++       ");
+        for _ in 0..17 {
+            text.push_str("  0");
+        }
+        text.push('\n');
+    }
+    text.push_str("%c M  cc GPS ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc\n");
+    text.push_str("%c cc cc ccc ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc\n");
+    text.push_str("%f  1.2500000  1.025000000  0.00000000000  0.000000000000000\n");
+    text.push_str("%f  0.0000000  0.000000000  0.00000000000  0.000000000000000\n");
+    text.push_str("%i    0    0    0    0      0      0      0      0         0\n");
+    text.push_str("%i    0    0    0    0      0      0      0      0         0\n");
+    for _ in 0..4 {
+        text.push_str("/* SCOREBOARD EXACT PRODUCT TEST FIXTURE\n");
+    }
+    for index in 0..epoch_count {
+        let epoch = start + i64::try_from(index).expect("epoch index") * cadence_s;
+        let (year, month, day, hour, minute, second) = civil_from_j2000_seconds(epoch);
+        text.push_str(&format!(
+            "*  {}\n",
+            format_calendar(year, month, day, hour, minute, second as f64)
+        ));
+        text.push_str("PG01  15000.000000 -20000.000000   5000.000000    123.456789\n");
+    }
+    text.push_str("EOF\n");
+    text.into_bytes()
+}
+
+fn duration_token_seconds(token: &str) -> i64 {
+    let amount = token[..2].parse::<i64>().expect("duration amount");
+    let unit = match token.as_bytes()[2] {
+        b'M' => 60,
+        b'H' => 3_600,
+        b'D' => 86_400,
+        other => panic!("unsupported fixture duration unit {other}"),
+    };
+    amount * unit
+}
 
 fn synthetic_sp3(initial: CartesianState, epochs_j2000_s: &[i64]) -> String {
     let sat = GnssSatelliteId::new(GnssSystem::Gps, 1).expect("valid satellite");

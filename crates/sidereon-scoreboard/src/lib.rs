@@ -21,9 +21,9 @@ use sidereon_core::astro::time::civil::civil_from_j2000_seconds;
 use sidereon_core::constants::{J2000_JD, SECONDS_PER_DAY};
 use sidereon_core::data::{DataCatalogError, ProductDate};
 use sidereon_core::ephemeris::{
-    fit_precise_ephemeris_sample_orbit, fit_precise_ephemeris_state_sample_orbit, OrbitFitOptions,
-    OrbitResidualStats, OrientedPreciseEphemerisStateSample, PreciseEphemerisSample,
-    PreciseEphemerisStateSample, Sp3,
+    fit_precise_ephemeris_sample_orbit, fit_precise_ephemeris_state_sample_orbit, parse_exact_sp3,
+    ExactSp3Request, ExactSp3ValidationError, OrbitFitOptions, OrbitResidualStats,
+    OrientedPreciseEphemerisStateSample, PreciseEphemerisSample, PreciseEphemerisStateSample, Sp3,
 };
 use sidereon_core::{
     EarthOrientation, EarthOrientationProvider, Error as CoreError, GnssSatelliteId,
@@ -32,6 +32,7 @@ use sidereon_core::{
 
 const UNIX_TO_J2000_S: i64 = 946_728_000;
 const DEFAULT_LOOKBACK_DAYS: u32 = 4;
+const IGS_LONG_FILENAME_START_GPS_WEEK: u32 = 2238;
 
 /// Scoreboard result emitted as JSON.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -211,7 +212,8 @@ pub struct ProductResolution {
 /// Fetch result for one product candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchOutcome {
-    /// Candidate was present and returned decompressed SP3 bytes.
+    /// Candidate was present and returned decompressed SP3 bytes. The resolver
+    /// still performs exact date, issue, span, cadence, and grid validation.
     Available(Vec<u8>),
     /// The candidate URL returned an HTTP absence status.
     NotPosted {
@@ -304,6 +306,53 @@ pub enum ScoreboardError {
         /// Transport error message.
         message: String,
     },
+    /// Candidate metadata cannot describe one exact SP3 request.
+    #[error("invalid SP3 candidate {name} from {archive_source}: {reason}")]
+    InvalidProductCandidate {
+        /// Archive or analysis-center source.
+        archive_source: String,
+        /// Canonical candidate filename.
+        name: String,
+        /// Candidate-identity validation diagnostic.
+        reason: String,
+    },
+    /// Fetched bytes failed exact-product integrity validation.
+    #[error("integrity failure for SP3 candidate {name} from {archive_source}: {error}")]
+    ExactSp3Integrity {
+        /// Archive or analysis-center source.
+        archive_source: String,
+        /// Canonical candidate filename.
+        name: String,
+        /// Exact-content validation diagnostic.
+        #[source]
+        error: ExactSp3ValidationError,
+    },
+    /// Fetched bytes did not match a separately declared product digest.
+    #[error(
+        "digest mismatch for SP3 candidate {name} from {archive_source}: expected {expected}, got {actual}"
+    )]
+    DigestMismatch {
+        /// Archive or analysis-center source.
+        archive_source: String,
+        /// Canonical candidate filename.
+        name: String,
+        /// Expected digest text.
+        expected: String,
+        /// Digest computed from the fetched bytes.
+        actual: String,
+    },
+    /// The scoreboard has no verified archive convention for this product era.
+    #[error(
+        "unsupported scoreboard SP3 candidate era for {date} (GPS week {gps_week}); verified long-name candidates start at GPS week {minimum_gps_week}"
+    )]
+    UnsupportedCandidateEra {
+        /// Requested candidate date.
+        date: ProductDate,
+        /// GPS week containing the requested date.
+        gps_week: u32,
+        /// First GPS week supported by the modeled long-name candidates.
+        minimum_gps_week: u32,
+    },
     /// File or stream I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -331,6 +380,12 @@ pub const fn default_lookback_days() -> u32 {
 }
 
 /// Resolve and fetch the latest available rapid multi-GNSS SP3 product.
+///
+/// Ordinary publication absence (`404`, `410`, or an equivalent fetcher result
+/// without an HTTP status) permits trying the next candidate. Present but
+/// malformed or identity-inconsistent bytes are terminal. Independent-source
+/// transport failures may be bypassed, but the first such failure is returned
+/// if no source yields a valid product.
 pub fn resolve_latest_available_rapid_sp3(
     target_date: ProductDate,
     lookback_days: u32,
@@ -340,13 +395,22 @@ pub fn resolve_latest_available_rapid_sp3(
     let mut attempted_http_statuses = Vec::new();
     let mut attempted_errors = Vec::new();
     let mut unavailable_sources = BTreeSet::new();
+    let mut first_nonabsence_error = None;
     for candidate in product_candidates(target_date, lookback_days)? {
         if unavailable_sources.contains(candidate.source) {
             continue;
         }
         attempted.push(candidate.clone());
+        let exact_request = candidate_exact_sp3_request(&candidate)?;
         match fetcher.fetch(&candidate) {
             Ok(FetchOutcome::Available(bytes)) => {
+                parse_exact_sp3(&bytes, &exact_request).map_err(|error| {
+                    ScoreboardError::ExactSp3Integrity {
+                        archive_source: candidate.source.to_string(),
+                        name: candidate.name.clone(),
+                        error,
+                    }
+                })?;
                 attempted_http_statuses.push(None);
                 attempted_errors.push(None);
                 return Ok(ProductResolution {
@@ -357,6 +421,16 @@ pub fn resolve_latest_available_rapid_sp3(
                 });
             }
             Ok(FetchOutcome::NotPosted { http_status }) => {
+                if let Some(status) = http_status {
+                    if status != 404 && status != 410 {
+                        return Err(ScoreboardError::HttpStatus {
+                            archive_source: candidate.source.to_string(),
+                            name: candidate.name.clone(),
+                            url: candidate.url.clone(),
+                            status,
+                        });
+                    }
+                }
                 attempted_http_statuses.push(http_status);
                 attempted_errors.push(None);
             }
@@ -364,9 +438,15 @@ pub fn resolve_latest_available_rapid_sp3(
                 attempted_http_statuses.push(fetch_failure_http_status(&error));
                 attempted_errors.push(Some(error.to_string()));
                 unavailable_sources.insert(candidate.source);
+                if first_nonabsence_error.is_none() {
+                    first_nonabsence_error = Some(error);
+                }
             }
             Err(error) => return Err(error),
         }
+    }
+    if let Some(error) = first_nonabsence_error {
+        return Err(error);
     }
     Ok(ProductResolution {
         resolved: None,
@@ -376,11 +456,78 @@ pub fn resolve_latest_available_rapid_sp3(
     })
 }
 
+fn candidate_exact_sp3_request(
+    candidate: &ProductCandidate,
+) -> Result<ExactSp3Request, ScoreboardError> {
+    let invalid = |reason: String| ScoreboardError::InvalidProductCandidate {
+        archive_source: candidate.source.to_string(),
+        name: candidate.name.clone(),
+        reason,
+    };
+    let mut fields = candidate.name.split('_');
+    let product_code = fields
+        .next()
+        .ok_or_else(|| invalid("missing producer field".to_string()))?;
+    let date_issue = fields
+        .next()
+        .ok_or_else(|| invalid("missing date/issue field".to_string()))?;
+    let span = fields
+        .next()
+        .ok_or_else(|| invalid("missing span field".to_string()))?;
+    let sample = fields
+        .next()
+        .ok_or_else(|| invalid("missing sample field".to_string()))?;
+    let content = fields
+        .next()
+        .ok_or_else(|| invalid("missing content field".to_string()))?;
+    if content != "ORB.SP3" || fields.next().is_some() {
+        return Err(invalid(
+            "expected a long-form ORB.SP3 product name".to_string(),
+        ));
+    }
+    let (expected_product_code, expected_agency) = match (candidate.source, candidate.cadence) {
+        ("BKG IGS", ProductCadence::Rapid) => ("IGS0OPSRAP", "IGS"),
+        ("BKG IGS", ProductCadence::UltraRapid) => ("IGS0OPSULT", "IGS"),
+        ("ESA", ProductCadence::Rapid) => ("ESA0OPSRAP", "ESOC"),
+        ("ESA", ProductCadence::UltraRapid) => ("ESA0OPSULT", "ESOC"),
+        ("GFZ ISDC", ProductCadence::Rapid) => ("GFZ0OPSRAP", "GFZ"),
+        ("GFZ ISDC", ProductCadence::UltraRapid) => ("GFZ0OPSULT", "GFZ"),
+        _ => {
+            return Err(invalid(format!(
+                "unsupported source/cadence pair {:?}/{:?}",
+                candidate.source, candidate.cadence
+            )))
+        }
+    };
+    if product_code != expected_product_code {
+        return Err(invalid(format!(
+            "filename product code {product_code:?} does not match expected {expected_product_code:?}"
+        )));
+    }
+    if date_issue.len() != 11 || !date_issue.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid(
+            "date/issue field must contain YYYYDDDHHMM".to_string(),
+        ));
+    }
+    let expected_date = format!("{}{:03}", candidate.date.year, candidate.date.day_of_year());
+    if date_issue[..7] != expected_date {
+        return Err(invalid(format!(
+            "filename date {} does not match candidate date {}",
+            &date_issue[..7],
+            candidate.date
+        )));
+    }
+    ExactSp3Request::new(candidate.date, Some(&date_issue[7..]), span, sample)
+        .and_then(|request| request.with_expected_agency(expected_agency))
+        .map_err(|error| invalid(error.to_string()))
+}
+
 fn source_local_fetch_failure(error: &ScoreboardError) -> bool {
-    matches!(
-        error,
-        ScoreboardError::Network { .. } | ScoreboardError::HttpStatus { .. }
-    )
+    match error {
+        ScoreboardError::Network { .. } => true,
+        ScoreboardError::HttpStatus { status, .. } => (500..600).contains(status),
+        _ => false,
+    }
 }
 
 fn fetch_failure_http_status(error: &ScoreboardError) -> Option<u16> {
@@ -653,7 +800,20 @@ fn product_candidates(
     target: ProductDate,
     lookback_days: u32,
 ) -> Result<Vec<ProductCandidate>, ScoreboardError> {
-    let dates = product_date_candidates(target, lookback_days)?;
+    let target_gps_week = target.gps_week()?;
+    if target_gps_week < IGS_LONG_FILENAME_START_GPS_WEEK {
+        return Err(ScoreboardError::UnsupportedCandidateEra {
+            date: target,
+            gps_week: target_gps_week,
+            minimum_gps_week: IGS_LONG_FILENAME_START_GPS_WEEK,
+        });
+    }
+    let mut dates = Vec::new();
+    for date in product_date_candidates(target, lookback_days)? {
+        if date.gps_week()? >= IGS_LONG_FILENAME_START_GPS_WEEK {
+            dates.push(date);
+        }
+    }
     let mut out = Vec::new();
     for &date in &dates {
         out.extend(bkg_product_candidates(date)?);
@@ -1195,5 +1355,16 @@ mod fetch_tests {
             }
             other => panic!("expected network diagnostic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn filename_date_mismatch_is_a_candidate_configuration_error() {
+        let mut candidate = candidate();
+        candidate.name = "COD0OPSULT_20261940000_01D_05M_ORB.SP3".to_string();
+
+        assert!(matches!(
+            candidate_exact_sp3_request(&candidate),
+            Err(ScoreboardError::InvalidProductCandidate { .. })
+        ));
     }
 }
