@@ -2,4 +2,9 @@
 /artifacts
 # libfuzzer writes generated coverage corpus here on every run; only the small
 # curated seed corpus is tracked (already committed). Ignore generated growth.
-/corpus
+/corpus/*
+# Keep the exact scheduled-fuzz reproducer for the repair round-trip gate while
+# continuing to ignore libFuzzer's generated corpus growth.
+!/corpus/rinex_qc_repair_roundtrip/
+/corpus/rinex_qc_repair_roundtrip/*
+!/corpus/rinex_qc_repair_roundtrip/regression-non-ascii-header-fixed-columns

@@ -26,6 +26,9 @@ All notable changes to `sidereon-core` are documented here.
 
 ### Fixed
 
+- RINEX observation repair now canonicalizes malformed non-ASCII and control
+  characters before fixed-column header parsing while preserving byte offsets,
+  so repaired output remains printable, parseable, and byte-idempotent.
 - CODE rapid and final catalog entries now use AIUB's current HTTPS download
   service with product-specific routes for MGEX final SP3/clock, operational
   final IONEX, and rapid IONEX; the already-correct ultra-rapid SP3 route is

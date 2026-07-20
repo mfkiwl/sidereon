@@ -805,7 +805,13 @@ impl Parser {
         let mut saw_end = false;
         for raw in lines.by_ref() {
             let raw_line = raw.trim_end_matches(['\r', '\n']);
-            let line = normalize_header_line(raw_line);
+            // RINEX header fields are fixed-width printable ASCII. Keep the
+            // parser forgiving, but normalize invalid Unicode and control
+            // characters before interpreting byte columns. Otherwise a lossy
+            // UTF-8 replacement character can straddle a 20-column boundary,
+            // making parse -> write -> parse repartition retained fields.
+            let ascii_line = printable_ascii_header_columns(raw_line);
+            let line = normalize_header_line(&ascii_line);
             let line = line.as_ref();
             let label = raw_field_from(line, 60).trim();
             match label {
@@ -1778,6 +1784,32 @@ fn normalize_header_line(line: &str) -> Cow<'_, str> {
     }
 
     Cow::Borrowed(line)
+}
+
+/// Replace characters outside RINEX's printable-ASCII domain without changing
+/// byte-column offsets in the forgiving UTF-8 input.
+fn printable_ascii_header_columns(line: &str) -> Cow<'_, str> {
+    if line
+        .bytes()
+        .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+    {
+        return Cow::Borrowed(line);
+    }
+
+    let mut normalized = String::with_capacity(line.len());
+    for ch in line.chars() {
+        if ch == ' ' || ch.is_ascii_graphic() {
+            normalized.push(ch);
+        } else {
+            // Fixed columns are byte columns. Preserve the byte width of a
+            // lossy UTF-8 replacement so later fields stay at the offsets the
+            // forgiving parser originally observed.
+            for _ in 0..ch.len_utf8() {
+                normalized.push(' ');
+            }
+        }
+    }
+    Cow::Owned(normalized)
 }
 
 fn truncate_header_content(content: &str) -> Cow<'_, str> {

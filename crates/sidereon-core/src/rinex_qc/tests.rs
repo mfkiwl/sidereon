@@ -599,6 +599,29 @@ fn repair_is_idempotent_and_byte_stable_on_committed_obs_fixtures() {
 }
 
 #[test]
+fn repair_is_idempotent_for_scheduled_fuzz_non_ascii_header_regression() {
+    let input = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/qc/",
+        "rinex_qc_repair_roundtrip-crash-37835df362fe94c02f1151f1d3126fb19723a76c"
+    ));
+    let text = String::from_utf8_lossy(input);
+    let obs = RinexObs::parse(&text).expect("parse scheduled-fuzz regression");
+    let options = repair_oracle_options();
+
+    let first = repair_obs(&obs, &options).repaired.to_rinex_string();
+    assert!(
+        first
+            .bytes()
+            .all(|byte| byte == b'\n' || byte == b' ' || byte.is_ascii_graphic()),
+        "repaired RINEX must contain printable ASCII records"
+    );
+    let reparsed = RinexObs::parse(&first).expect("reparse repaired scheduled-fuzz regression");
+    let second = repair_obs(&reparsed, &options).repaired.to_rinex_string();
+    assert_eq!(second.as_bytes(), first.as_bytes());
+}
+
+#[test]
 fn repair_is_idempotent_and_byte_stable_on_committed_nav_fixtures() {
     let fixtures = [
         "BRDC00GOP_R_20210010000_01D_MN.rnx",
