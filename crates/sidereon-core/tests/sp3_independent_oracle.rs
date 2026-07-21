@@ -134,7 +134,10 @@ fn decimated_product_text(text: &str) -> String {
     let mut epoch_index = 0usize;
     let mut keep_current_epoch = true;
     for line in text.lines() {
-        if line == "EOF" {
+        if line
+            .strip_prefix("EOF")
+            .is_some_and(|padding| padding.bytes().all(|byte| byte == b' '))
+        {
             continue;
         }
         if line.starts_with('*') {

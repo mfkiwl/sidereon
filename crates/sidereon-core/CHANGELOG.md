@@ -4,6 +4,80 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-07-21
+
+### Added
+
+- Added `supported_samples`, a date- and issue-aware catalog query for the
+  officially evidenced cadences of one product. The same gate now rejects a
+  syntactically plausible but unpublished cadence before filename, URL,
+  identity, or cache-key derivation.
+- Added the product- and issue-aware `sp3_content_start_convention` catalog
+  query and `Sp3ContentStartConvention`. The result states whether an exact
+  SP3 product starts at its filename epoch or one day earlier and exposes the
+  corresponding whole-second offset. Invalid issues and issues on product
+  lines that do not publish them are rejected.
+
+### Fixed
+
+- Exact SP3 validation now recognizes the terminal record as a complete logical
+  record: `EOF` in columns 1-3 followed only by ASCII-space padding, bounded by
+  Sidereon's 80-column interoperability policy. This accepts both bare records
+  and the padded records published by the audited ESA and GFZ product lines,
+  with LF, CRLF, or no final line separator. The previous whole-line equality
+  check falsely reported `MissingEof` for those valid public products.
+- Malformed EOF-like records now report `MalformedEofRecord` rather than being
+  misdiagnosed as absent. Missing markers, `EOFX`, tab padding, padding beyond
+  the policy width, leading whitespace, lone-CR framing, premature markers, and
+  nonblank data after a valid marker still fail closed. Empty and ASCII-space-
+  only records after the marker remain an explicitly documented Sidereon
+  tolerance.
+- Exact requests derived from historical GFZ ultra-rapid identities now
+  distinguish the epoch encoded by the official filename from the product's
+  first content epoch. Products through 2022-09-06 require the archive-observed
+  one-day offset; the non-monotonic 2022-09-07/08 transition is cataloged per
+  issue, and products from 2022-09-09 remain aligned. Declared-start, line-2,
+  first-epoch, cadence, grid, and span checks remain strict, and callers cannot
+  override the cataloged offset.
+- Ultra-rapid location candidates now contain only dated span/cadence variants
+  evidenced for the exact center, date, and issue. This removes speculative
+  cross-cadence and alternate-span URLs; the documented GFZ `0000` overlap on
+  2021-05-15 remains. CODE's moving latest-product snapshot is excluded because
+  it is not the dated one-day exact product. All caller-built product
+  identities now require the cataloged span, not merely a
+  syntactically valid span embedded in a matching filename.
+- Hardened auxiliary gzip ingestion for the Rust Bias-SINEX/CODE DCB path
+  loaders and the validation scoreboard. They now decode every RFC 1952 member,
+  accept optional header fields up to the archive limit, validate FHCRC plus
+  every member CRC32/ISIZE and trailer, and reject truncation or trailing data.
+  Local loaders enforce explicit 64 MiB archive and 500 MiB product limits.
+  Scoreboard downloads use one authoritative bounded GET: final 404/410 remains
+  ordinary publication absence, while transport and 5xx retries start with a
+  fresh process and buffer so partial attempts cannot contaminate a success.
+  Its curl status is carried in a dedicated terminal frame, and publication
+  absence is authorized only by curl's HTTP-failure exit plus 404/410; a
+  truncated transfer whose partial body ends in those digits remains a
+  transport failure.
+
+### Compatibility
+
+- Parser, catalog, and transport compatibility only. No orbit, propagation,
+  merge, positioning, solver, frame, timing, or other numerical calculation
+  changed.
+  All language interfaces inherit the same core behavior; each interface
+  carries its own exact-parser regression, and the acquisition-owning
+  interfaces also test the complete acquisition path. The GFZ correction
+  changes only which cataloged start instant exact validation requires.
+- This is a minor release because the new catalog query and enum are public and
+  because exact validation now applies newly cataloged historical GFZ
+  semantics. `ultra_sp3_locations` can return fewer candidates because
+  unsupported alternate spans/cadences and CODE's non-exact moving snapshot
+  are no longer represented as dated products. Caller-built identities with a
+  noncatalog span now fail validation. Existing SP3 parsing and all numerical
+  APIs remain compatible.
+- Gzip changes affect transport integrity and resource limits only; no product
+  parser, orbit, positioning, merge, or other numerical calculation changed.
+
 ## [0.33.1] - 2026-07-20
 
 ### Fixed

@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use serde::Serialize;
 use sidereon_core::astro::frames::transforms::FrameTransformError;
@@ -30,9 +30,23 @@ use sidereon_core::{
     TdbEarthOrientationProvider,
 };
 
+// The scoreboard is an unpublished workspace tool.  Compile the facade's
+// private transport decoder from its single source file so both call sites use
+// identical logic without exposing a Rust-only Sidereon API.
+#[path = "../../sidereon/src/compression.rs"]
+mod compression;
+
 const UNIX_TO_J2000_S: i64 = 946_728_000;
 const DEFAULT_LOOKBACK_DAYS: u32 = 4;
 const IGS_LONG_FILENAME_START_GPS_WEEK: u32 = 2238;
+const MAX_SCOREBOARD_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SCOREBOARD_PRODUCT_BYTES: usize = 500 * 1024 * 1024;
+const MAX_COMMAND_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+const CURL_CONNECT_TIMEOUT_SECONDS: &str = "30";
+const CURL_TRANSFER_TIMEOUT_SECONDS: &str = "300";
+const CURL_BODY_ATTEMPTS: usize = 3;
+const CURL_STATUS_FRAME_PREFIX: &[u8] = b"\nSIDEREON_HTTP_STATUS:";
+const CURL_STATUS_FRAME_BYTES: usize = CURL_STATUS_FRAME_PREFIX.len() + 3;
 
 /// Scoreboard result emitted as JSON.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -952,98 +966,239 @@ fn fetch_https_product(candidate: &ProductCandidate) -> Result<FetchOutcome, Sco
         });
     }
 
-    let status_output = Command::new("curl")
-        .args([
-            "--http1.1",
-            "--location",
-            "--head",
-            "--silent",
-            "--retry",
-            "2",
-            "--output",
-            "/dev/null",
-            "--write-out",
-            "%{http_code}",
-            &candidate.url,
-        ])
-        .output()
-        .map_err(|error| network_error(candidate, error.to_string()))?;
-    match classify_http_probe(
-        candidate,
-        status_output.status.success(),
-        &status_output.stdout,
-        &status_output.stderr,
-    )? {
-        HttpProbeOutcome::Available => {}
-        HttpProbeOutcome::NotPosted(status) => {
+    let transport_limit = if candidate.url.ends_with(".gz") {
+        MAX_SCOREBOARD_ARCHIVE_BYTES
+    } else {
+        MAX_SCOREBOARD_PRODUCT_BYTES
+    };
+    // One GET is authoritative for both publication state and body bytes, so
+    // there is no HEAD/GET time-of-check race.  Each transport/server retry gets
+    // a fresh process and buffer; failed partial bodies are discarded.
+    let body_outcome =
+        fetch_bounded_http_body(candidate, transport_limit, CURL_BODY_ATTEMPTS, || {
+            let mut command = Command::new("curl");
+            command.args([
+                "--http1.1",
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                CURL_CONNECT_TIMEOUT_SECONDS,
+                "--max-time",
+                CURL_TRANSFER_TIMEOUT_SECONDS,
+                "--write-out",
+                "\\nSIDEREON_HTTP_STATUS:%{http_code}",
+                &candidate.url,
+            ]);
+            command
+        })?;
+    let bytes = match body_outcome {
+        HttpBodyOutcome::Available(bytes) => bytes,
+        HttpBodyOutcome::NotPosted(status) => {
             return Ok(FetchOutcome::NotPosted {
                 http_status: Some(status),
             });
         }
-    }
-
-    let response = Command::new("curl")
-        .args([
-            "--http1.1",
-            "--fail",
-            "--location",
-            "--silent",
-            "--show-error",
-            "--retry",
-            "2",
-            &candidate.url,
-        ])
-        .output()
-        .map_err(|error| network_error(candidate, error.to_string()))?;
-    if !response.status.success() {
-        return Err(network_error(
-            candidate,
-            String::from_utf8_lossy(&response.stderr).to_string(),
-        ));
-    }
-    let bytes = response.stdout;
+    };
     if candidate.url.ends_with(".gz") {
-        let mut decoder = GzDecoder::new(bytes.as_slice());
-        let mut decoded = Vec::new();
-        decoder.read_to_end(&mut decoded)?;
-        Ok(FetchOutcome::Available(decoded))
+        Ok(FetchOutcome::Available(decode_gzip_members(&bytes)?))
     } else {
         Ok(FetchOutcome::Available(bytes))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HttpProbeOutcome {
-    Available,
+fn decode_gzip_members(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    compression::decode_gzip_members(
+        bytes,
+        compression::GzipLimits::new(MAX_SCOREBOARD_ARCHIVE_BYTES, MAX_SCOREBOARD_PRODUCT_BYTES),
+    )
+    .map_err(Into::into)
+}
+
+fn output_bounded(command: &mut Command, limit: usize) -> std::io::Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stdout was not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stderr was not piped"))?;
+
+    // Drain stderr concurrently so a verbose failing process cannot fill its
+    // pipe and block while stdout is being bounded.
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut overflow = false;
+        let mut chunk = [0u8; 8 * 1024];
+        loop {
+            let read = stderr.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_COMMAND_DIAGNOSTIC_BYTES.saturating_sub(bytes.len());
+            let retained = read.min(remaining);
+            bytes.extend_from_slice(&chunk[..retained]);
+            overflow |= retained != read;
+        }
+        Ok::<_, std::io::Error>((bytes, overflow))
+    });
+
+    let probe_limit = limit.saturating_add(1);
+    let mut stdout_bytes = Vec::with_capacity(probe_limit.min(64 * 1024));
+    let stdout_result = stdout
+        .by_ref()
+        .take(u64::try_from(probe_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut stdout_bytes);
+    if stdout_result.is_err() || stdout_bytes.len() > limit {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let (stderr_bytes, stderr_overflow) = stderr_reader
+        .join()
+        .map_err(|_| std::io::Error::other("stderr reader thread panicked"))??;
+    stdout_result?;
+    if stdout_bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "response body exceeds the {limit}-byte transport limit (read {} bytes)",
+                stdout_bytes.len()
+            ),
+        ));
+    }
+    if stderr_overflow {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("command diagnostics exceed the {MAX_COMMAND_DIAGNOSTIC_BYTES}-byte limit"),
+        ));
+    }
+    Ok(Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HttpBodyOutcome {
+    Available(Vec<u8>),
     NotPosted(u16),
 }
 
-fn classify_http_probe(
+fn fetch_bounded_http_body(
     candidate: &ProductCandidate,
-    process_succeeded: bool,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> Result<HttpProbeOutcome, ScoreboardError> {
-    let status_text = String::from_utf8_lossy(stdout);
-    let status = status_text
-        .trim()
-        .parse::<u16>()
-        .map_err(|_| network_error(candidate, curl_message(stderr, stdout)))?;
-    if !process_succeeded || status == 0 {
-        return Err(network_error(candidate, curl_message(stderr, stdout)));
+    limit: usize,
+    attempts: usize,
+    mut command: impl FnMut() -> Command,
+) -> Result<HttpBodyOutcome, ScoreboardError> {
+    if attempts == 0 {
+        return Err(ScoreboardError::InvalidArgument(
+            "at least one HTTP body attempt is required".to_string(),
+        ));
     }
-    if status == 404 || status == 410 {
-        return Ok(HttpProbeOutcome::NotPosted(status));
+
+    let mut last_error: Option<ScoreboardError> = None;
+    for _ in 0..attempts {
+        let framed_limit = limit.checked_add(CURL_STATUS_FRAME_BYTES).ok_or_else(|| {
+            ScoreboardError::InvalidArgument("HTTP body limit is too large".to_string())
+        })?;
+        let output = match output_bounded(&mut command(), framed_limit) {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(ScoreboardError::Io(error));
+            }
+            Err(error) => {
+                last_error = Some(network_error(candidate, error.to_string()));
+                continue;
+            }
+        };
+        let process_exit = output.status.code();
+        let stderr = output.stderr;
+        let (body, status_bytes, status) = match split_curl_body_status(output.stdout) {
+            Ok(parts) => parts,
+            Err(message) => {
+                last_error = Some(network_error(candidate, message));
+                continue;
+            }
+        };
+
+        match process_exit {
+            Some(0) if (200..300).contains(&status) => {
+                return Ok(HttpBodyOutcome::Available(body));
+            }
+            Some(0) => {
+                return Err(network_error(
+                    candidate,
+                    format!("curl succeeded with unexpected HTTP status {status}"),
+                ));
+            }
+            // curl documents exit 22 as an HTTP response rejected by --fail.
+            // Only that exit makes a framed 404/410 authoritative evidence of
+            // ordinary publication absence.  Transport failures can retain a
+            // partial body ending in arbitrary digits and must never authorize
+            // candidate fallback.
+            Some(22) if status == 404 || status == 410 => {
+                return Ok(HttpBodyOutcome::NotPosted(status));
+            }
+            Some(22) if (500..600).contains(&status) => {
+                last_error = Some(ScoreboardError::HttpStatus {
+                    archive_source: candidate.source.to_string(),
+                    name: candidate.name.clone(),
+                    url: candidate.url.clone(),
+                    status,
+                });
+                continue;
+            }
+            Some(22) if (400..500).contains(&status) => {
+                return Err(ScoreboardError::HttpStatus {
+                    archive_source: candidate.source.to_string(),
+                    name: candidate.name.clone(),
+                    url: candidate.url.clone(),
+                    status,
+                });
+            }
+            _ => {
+                last_error = Some(network_error(
+                    candidate,
+                    curl_message(&stderr, &status_bytes),
+                ));
+                continue;
+            }
+        }
     }
-    if (200..300).contains(&status) {
-        return Ok(HttpProbeOutcome::Available);
+    Err(last_error.unwrap_or_else(|| {
+        network_error(candidate, "HTTP body fetch produced no result".to_string())
+    }))
+}
+
+fn split_curl_body_status(mut stdout: Vec<u8>) -> Result<(Vec<u8>, [u8; 3], u16), String> {
+    if stdout.len() < CURL_STATUS_FRAME_BYTES {
+        return Err("curl output omitted its final HTTP status".to_string());
     }
-    Err(ScoreboardError::HttpStatus {
-        archive_source: candidate.source.to_string(),
-        name: candidate.name.clone(),
-        url: candidate.url.clone(),
-        status,
-    })
+    let frame_offset = stdout.len() - CURL_STATUS_FRAME_BYTES;
+    if &stdout[frame_offset..frame_offset + CURL_STATUS_FRAME_PREFIX.len()]
+        != CURL_STATUS_FRAME_PREFIX
+    {
+        return Err("curl output omitted its final HTTP status frame".to_string());
+    }
+    let status_offset = stdout.len() - 3;
+    let status_bytes: [u8; 3] = stdout[status_offset..]
+        .try_into()
+        .map_err(|_| "curl emitted a malformed HTTP status".to_string())?;
+    if !status_bytes.iter().all(u8::is_ascii_digit) {
+        return Err("curl emitted a non-numeric HTTP status".to_string());
+    }
+    stdout.truncate(frame_offset);
+    let status = u16::from(status_bytes[0] - b'0') * 100
+        + u16::from(status_bytes[1] - b'0') * 10
+        + u16::from(status_bytes[2] - b'0');
+    Ok((stdout, status_bytes, status))
 }
 
 fn network_error(candidate: &ProductCandidate, message: String) -> ScoreboardError {
@@ -1295,6 +1450,15 @@ pub fn run_with_fetcher(
 mod fetch_tests {
     use super::*;
 
+    fn gzip_member(content: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(content).expect("write gzip member");
+        encoder.finish().expect("finish gzip member")
+    }
+
     fn candidate() -> ProductCandidate {
         ProductCandidate {
             date: ProductDate::new(2026, 7, 14).expect("date"),
@@ -1307,22 +1471,110 @@ mod fetch_tests {
     }
 
     #[test]
+    fn gzip_decoder_consumes_every_complete_member() {
+        let mut archive = gzip_member(b"first");
+        archive.extend_from_slice(&gzip_member(b"second"));
+        assert_eq!(decode_gzip_members(&archive).unwrap(), b"firstsecond");
+
+        let mut long_comment = gzip_member(b"long comment");
+        long_comment[3] |= 0x10;
+        long_comment.splice(10..10, vec![b'c'; 70_000].into_iter().chain([0]));
+        assert_eq!(decode_gzip_members(&long_comment).unwrap(), b"long comment");
+
+        let mut junk_tailed = archive.clone();
+        junk_tailed.extend_from_slice(b"not another gzip member");
+        assert!(decode_gzip_members(&junk_tailed).is_err());
+
+        archive.pop();
+        assert!(decode_gzip_members(&archive).is_err());
+    }
+
+    #[test]
+    fn command_stdout_is_bounded_during_the_read() {
+        let mut exact = Command::new("sh");
+        exact.args(["-c", "printf 1234"]);
+        assert_eq!(output_bounded(&mut exact, 4).unwrap().stdout, b"1234");
+
+        let mut over = Command::new("sh");
+        over.args(["-c", "printf 1234"]);
+        let error = output_bounded(&mut over, 3).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("3-byte transport limit"));
+
+        let mut diagnostics = Command::new("sh");
+        diagnostics.args(["-c", "head -c 1048577 /dev/zero >&2"]);
+        let error = output_bounded(&mut diagnostics, 0).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("diagnostics exceed"));
+    }
+
+    #[test]
+    fn body_retry_discards_partial_bytes_and_starts_with_a_fresh_buffer() {
+        let candidate = candidate();
+        let mut built = 0usize;
+        let output = fetch_bounded_http_body(&candidate, 64, 2, || {
+            built += 1;
+            let mut command = Command::new("sh");
+            if built == 1 {
+                command.args(["-c", "printf 'partial\\nSIDEREON_HTTP_STATUS:200'; exit 1"]);
+            } else {
+                command.args(["-c", "printf 'complete\\nSIDEREON_HTTP_STATUS:200'"]);
+            }
+            command
+        })
+        .unwrap();
+        assert_eq!(built, 2);
+        assert_eq!(output, HttpBodyOutcome::Available(b"complete".to_vec()));
+
+        let mut oversized_attempts = 0usize;
+        let error = fetch_bounded_http_body(&candidate, 3, 3, || {
+            oversized_attempts += 1;
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf '1234\\nSIDEREON_HTTP_STATUS:200'"]);
+            command
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ScoreboardError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(oversized_attempts, 1);
+    }
+
+    #[test]
     fn only_candidate_absence_statuses_are_not_posted() {
         let candidate = candidate();
+        let mut attempts = 0usize;
         assert_eq!(
-            classify_http_probe(&candidate, true, b"404", b"").expect("404 classification"),
-            HttpProbeOutcome::NotPosted(404)
+            fetch_bounded_http_body(&candidate, 16, 3, || {
+                attempts += 1;
+                let mut command = Command::new("sh");
+                command.args(["-c", "printf '\\nSIDEREON_HTTP_STATUS:404'; exit 22"]);
+                command
+            })
+            .expect("404 classification"),
+            HttpBodyOutcome::NotPosted(404)
         );
+        assert_eq!(attempts, 1, "ordinary absence must not be retried");
         assert_eq!(
-            classify_http_probe(&candidate, true, b"410", b"").expect("410 classification"),
-            HttpProbeOutcome::NotPosted(410)
+            fetch_bounded_http_body(&candidate, 16, 1, || {
+                let mut command = Command::new("sh");
+                command.args(["-c", "printf '\\nSIDEREON_HTTP_STATUS:410'; exit 22"]);
+                command
+            })
+            .expect("410 classification"),
+            HttpBodyOutcome::NotPosted(410)
         );
     }
 
     #[test]
     fn access_denial_preserves_status_url_and_candidate_details() {
         let candidate = candidate();
-        match classify_http_probe(&candidate, true, b"403", b"") {
+        match fetch_bounded_http_body(&candidate, 16, 1, || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf '\\nSIDEREON_HTTP_STATUS:403'; exit 22"]);
+            command
+        }) {
             Err(ScoreboardError::HttpStatus {
                 archive_source,
                 name,
@@ -1339,9 +1591,32 @@ mod fetch_tests {
     }
 
     #[test]
+    fn server_error_retries_fresh_and_preserves_the_final_http_status() {
+        let candidate = candidate();
+        let mut attempts = 0usize;
+        match fetch_bounded_http_body(&candidate, 16, 3, || {
+            attempts += 1;
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf '\\nSIDEREON_HTTP_STATUS:503'; exit 22"]);
+            command
+        }) {
+            Err(ScoreboardError::HttpStatus { status, .. }) => assert_eq!(status, 503),
+            other => panic!("expected HTTP 503 diagnostic, got {other:?}"),
+        }
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
     fn transport_failure_is_not_classified_as_publication_absence() {
         let candidate = candidate();
-        match classify_http_probe(&candidate, false, b"000", b"connection refused") {
+        match fetch_bounded_http_body(&candidate, 16, 1, || {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "printf '\\nSIDEREON_HTTP_STATUS:000'; printf 'connection refused' >&2; exit 1",
+            ]);
+            command
+        }) {
             Err(ScoreboardError::Network {
                 archive_source,
                 name,
@@ -1355,6 +1630,28 @@ mod fetch_tests {
             }
             other => panic!("expected network diagnostic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn truncated_transfer_ending_in_absence_status_never_authorizes_fallback() {
+        let candidate = candidate();
+        let mut attempts = 0usize;
+        match fetch_bounded_http_body(&candidate, 64, 2, || {
+            attempts += 1;
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                "printf 'partial404\\nSIDEREON_HTTP_STATUS:404'; exit 18",
+            ]);
+            command
+        }) {
+            Err(ScoreboardError::Network { .. }) => {}
+            other => panic!("expected terminal transport diagnostic, got {other:?}"),
+        }
+        assert_eq!(
+            attempts, 2,
+            "transport failures should exhaust fresh retries"
+        );
     }
 
     #[test]

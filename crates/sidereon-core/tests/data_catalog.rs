@@ -5,18 +5,28 @@ use sidereon_core::data::{
     default_sample_for_date, distribution_location_for_identity, dted_block_dir,
     dted_cache_relpath, dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk,
     mgex_ionex, mgex_nav, mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3,
-    parse_skadi_tile_id, predicted_ionex, product_convention, product_solution_class, rapid_ionex,
-    skadi_archive_url, skadi_band, skadi_source_entry, skadi_tile_id, space_weather_archive_url,
-    space_weather_cache_relpath, space_weather_filename, space_weather_source_entry, station_obs,
-    station_obs_filename, station_obs_protocol, station_obs_url, terrain_tile_index,
+    parse_skadi_tile_id, predicted_ionex, product, product_convention, product_solution_class,
+    rapid_ionex, skadi_archive_url, skadi_band, skadi_source_entry, skadi_tile_id,
+    sp3_content_start_convention, space_weather_archive_url, space_weather_cache_relpath,
+    space_weather_filename, space_weather_source_entry, station_obs, station_obs_filename,
+    station_obs_protocol, station_obs_url, supported_samples, terrain_tile_index,
     ultra_issue_candidates, ultra_sp3_locations, validate_exact_product_set, AnalysisCenter,
     ArchiveCompression, ArchiveProtocol, DataCatalogError, DistributionSource,
     ExactProductSetError, ProductCampaign, ProductDate, ProductDateTime, ProductFormat,
-    ProductPublisher, ProductRequest, ProductType, SolutionClass, SpaceWeatherProduct, UltraIssue,
+    ProductPublisher, ProductRequest, ProductType, SolutionClass, Sp3ContentStartConvention,
+    SpaceWeatherProduct, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
     ProductDate::new(year, month, day).expect("valid test date")
+}
+
+struct UnsupportedCadenceCase<'a> {
+    center: AnalysisCenter,
+    product_date: ProductDate,
+    issue: Option<&'a str>,
+    expected_samples: &'a [&'a str],
+    rejected_sample: &'a str,
 }
 
 #[test]
@@ -502,7 +512,7 @@ fn igs_final_catalog_rejects_unpublished_span_and_cadence_variants() {
 }
 
 #[test]
-fn period_tokens_reject_noncanonical_subday_units_but_accept_documented_calendar_units() {
+fn period_token_syntax_is_distinct_from_cataloged_publication_support() {
     let product_date = date(2026, 4, 30);
     for sample in ["60S", "60M", "24H"] {
         assert_eq!(
@@ -511,9 +521,15 @@ fn period_tokens_reject_noncanonical_subday_units_but_accept_documented_calendar
         );
     }
     for sample in ["07D", "12L"] {
-        let product = mgex_sp3(AnalysisCenter::Esa, product_date, Some(sample))
-            .expect("documented calendar unit");
-        assert_eq!(product.sample, sample);
+        assert_eq!(
+            mgex_sp3(AnalysisCenter::Esa, product_date, Some(sample)),
+            Err(DataCatalogError::UnsupportedSample {
+                center: AnalysisCenter::Esa,
+                product_type: ProductType::Sp3,
+                sample: sample.to_string(),
+            }),
+            "a valid period spelling is not evidence ESA publishes that cadence",
+        );
     }
 
     assert!(mgex_clk(AnalysisCenter::Cod, product_date, Some("30S")).is_ok());
@@ -921,8 +937,10 @@ fn broadcast_navigation_identity_validates_fields_not_encoded_in_filename() {
     inconsistent.sample = "30S".to_string();
     assert_eq!(
         inconsistent.validate(),
-        Err(DataCatalogError::InconsistentProductIdentity {
-            field: "broadcast_navigation",
+        Err(DataCatalogError::UnsupportedSample {
+            center: AnalysisCenter::Igs,
+            product_type: ProductType::Nav,
+            sample: "30S".to_string(),
         })
     );
 }
@@ -1118,34 +1136,26 @@ fn ultra_rapid_sp3_urls_match_binding_catalog_examples() {
 }
 
 #[test]
-fn ultra_rapid_sp3_locations_include_current_patterns_and_fallbacks() {
+fn ultra_rapid_sp3_locations_include_only_evidenced_dated_products() {
     let esa = ultra_sp3_locations(AnalysisCenter::EsaUlt, date(2026, 7, 12), "1800")
         .expect("ESA candidates");
+    assert_eq!(esa.len(), 1);
     assert_eq!(esa[0].pattern, "primary_02D_05M");
     assert!(esa[0].filename.ends_with("_02D_05M_ORB.SP3"));
-    assert_eq!(esa[1].pattern, "alternate_02D_15M");
+
+    let igs = ultra_sp3_locations(AnalysisCenter::IgsUlt, date(2026, 7, 12), "1800")
+        .expect("IGS candidates");
+    assert_eq!(igs.len(), 1);
+    assert_eq!(igs[0].pattern, "primary_02D_15M");
 
     let code = ultra_sp3_locations(AnalysisCenter::CodUlt, date(2026, 7, 14), "0000")
         .expect("CODE candidates");
-    assert_eq!(code.len(), 3);
+    assert_eq!(code.len(), 1);
     assert_eq!(code[0].pattern, "primary_01D_05M");
     assert_eq!(code[0].filename, "COD0OPSULT_20261950000_01D_05M_ORB.SP3");
     assert_eq!(
         code[0].url,
         "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_01D_05M_ORB.SP3"
-    );
-    assert_eq!(code[1].pattern, "alternate_02D_05M");
-    assert_eq!(code[1].filename, "COD0OPSULT_20261950000_02D_05M_ORB.SP3");
-    assert_eq!(
-        code[1].url,
-        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20261950000_02D_05M_ORB.SP3"
-    );
-    let alias = &code[2];
-    assert_eq!(alias.pattern, "alias_latest");
-    assert_eq!(alias.filename, "COD0OPSULT.SP3");
-    assert_eq!(
-        alias.url,
-        "https://www.aiub.unibe.ch/download/CODE/COD0OPSULT.SP3"
     );
     assert!(code.iter().all(|candidate| candidate
         .url
@@ -1191,12 +1201,12 @@ fn ultra_sp3_defaults_and_candidate_order_follow_issue_cadence_eras() {
 
     let esa_0600_locations = ultra_sp3_locations(AnalysisCenter::EsaUlt, esa_transition, "0600")
         .expect("ESA 0600 candidates");
+    assert_eq!(esa_0600_locations.len(), 1);
     assert_eq!(esa_0600_locations[0].pattern, "primary_02D_15M");
-    assert_eq!(esa_0600_locations[1].pattern, "alternate_02D_05M");
     let esa_1200_locations = ultra_sp3_locations(AnalysisCenter::EsaUlt, esa_transition, "1200")
         .expect("ESA 1200 candidates");
+    assert_eq!(esa_1200_locations.len(), 1);
     assert_eq!(esa_1200_locations[0].pattern, "primary_02D_05M");
-    assert_eq!(esa_1200_locations[1].pattern, "alternate_02D_15M");
 
     let gfz_last_15m = date(2021, 5, 15);
     let gfz_first_5m = date(2021, 5, 16);
@@ -1222,12 +1232,368 @@ fn ultra_sp3_defaults_and_candidate_order_follow_issue_cadence_eras() {
     );
     let gfz_legacy_locations = ultra_sp3_locations(AnalysisCenter::GfzUlt, gfz_last_15m, "2100")
         .expect("GFZ legacy candidates");
+    assert_eq!(gfz_legacy_locations.len(), 1);
     assert_eq!(gfz_legacy_locations[0].pattern, "primary_02D_15M");
-    assert_eq!(gfz_legacy_locations[1].pattern, "alternate_02D_05M");
     let gfz_current_locations = ultra_sp3_locations(AnalysisCenter::GfzUlt, gfz_first_5m, "0000")
         .expect("GFZ current candidates");
+    assert_eq!(gfz_current_locations.len(), 1);
     assert_eq!(gfz_current_locations[0].pattern, "primary_02D_05M");
-    assert_eq!(gfz_current_locations[1].pattern, "alternate_02D_15M");
+
+    let gfz_overlap = ultra_sp3_locations(AnalysisCenter::GfzUlt, gfz_last_15m, "0000")
+        .expect("GFZ cataloged overlap");
+    assert_eq!(gfz_overlap.len(), 2);
+    assert_eq!(gfz_overlap[0].pattern, "primary_02D_15M");
+    assert_eq!(gfz_overlap[1].pattern, "alternate_02D_05M");
+    assert!(gfz_overlap.iter().all(|location| location.span == "02D"));
+
+    // Candidate enumeration must round-trip through the same single-product
+    // catalog constructor at every evidenced cadence boundary.
+    for (center, product_date, issue) in [
+        (AnalysisCenter::IgsUlt, date(2026, 7, 12), "1800"),
+        (AnalysisCenter::CodUlt, date(2026, 7, 14), "0000"),
+        (AnalysisCenter::EsaUlt, esa_transition, "0600"),
+        (AnalysisCenter::EsaUlt, esa_transition, "1200"),
+        (AnalysisCenter::GfzUlt, gfz_last_15m, "0000"),
+        (AnalysisCenter::GfzUlt, gfz_last_15m, "2100"),
+        (AnalysisCenter::GfzUlt, gfz_first_5m, "0000"),
+    ] {
+        for candidate in
+            ultra_sp3_locations(center, product_date, issue).expect("cataloged candidates")
+        {
+            let spec = ops_ultra_sp3(center, product_date, Some(&candidate.sample), Some(issue))
+                .expect("single-product constructor");
+            let identity = spec.identity().expect("identity");
+            assert_eq!(candidate.filename, spec.canonical_filename().expect("name"));
+            assert_eq!(candidate.url, spec.archive_url().expect("URL"));
+            assert_eq!(candidate.span, identity.span);
+            assert_eq!(candidate.sample, identity.sample);
+        }
+    }
+}
+
+#[test]
+fn sp3_content_start_convention_is_product_and_issue_aware() {
+    assert_eq!(
+        sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 6), Some("2100")),
+        Ok(Sp3ContentStartConvention::FilenameEpochMinusOneDay)
+    );
+    assert_eq!(
+        sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 8), Some("0600")),
+        Ok(Sp3ContentStartConvention::FilenameEpochMinusOneDay)
+    );
+    assert_eq!(
+        sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 8), Some("0900")),
+        Ok(Sp3ContentStartConvention::FilenameEpoch)
+    );
+    assert_eq!(
+        sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 9), Some("0000")),
+        Ok(Sp3ContentStartConvention::FilenameEpoch)
+    );
+    assert_eq!(
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay.content_start_offset_s(),
+        -86_400
+    );
+    assert_eq!(
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay.code(),
+        "filename_epoch_minus_one_day"
+    );
+
+    assert!(matches!(
+        sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 8), Some("0130")),
+        Err(DataCatalogError::UnsupportedIssue { .. })
+    ));
+    assert_eq!(
+        sp3_content_start_convention(AnalysisCenter::Gfz, date(2022, 9, 8), Some("0000")),
+        Err(DataCatalogError::UnexpectedIssue {
+            center: AnalysisCenter::Gfz,
+        })
+    );
+}
+
+#[test]
+fn unsupported_cadence_is_rejected_before_filename_or_url_derivation() {
+    let cases = [
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::Igs,
+            product_date: date(2026, 6, 15),
+            issue: None,
+            expected_samples: &["15M"],
+            rejected_sample: "05M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::Esa,
+            product_date: date(2026, 6, 15),
+            issue: None,
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::Cod,
+            product_date: date(2026, 6, 15),
+            issue: None,
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::Gfz,
+            product_date: date(2026, 6, 15),
+            issue: None,
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::IgsUlt,
+            product_date: date(2026, 7, 19),
+            issue: Some("1200"),
+            expected_samples: &["15M"],
+            rejected_sample: "05M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::CodUlt,
+            product_date: date(2026, 7, 19),
+            issue: Some("0000"),
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::EsaUlt,
+            product_date: date(2026, 7, 19),
+            issue: Some("1200"),
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::GfzUlt,
+            product_date: date(2026, 7, 19),
+            issue: Some("0300"),
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+        // Boundary controls from the live matrix: the GFZ rapid cadence
+        // transition and the one overlapping GFZ-ultra issue must be exact.
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::Gfz,
+            product_date: date(2021, 5, 17),
+            issue: None,
+            expected_samples: &["15M"],
+            rejected_sample: "05M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::GfzUlt,
+            product_date: date(2021, 5, 15),
+            issue: Some("0300"),
+            expected_samples: &["15M"],
+            rejected_sample: "05M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::EsaUlt,
+            product_date: date(2025, 2, 2),
+            issue: Some("0600"),
+            expected_samples: &["15M"],
+            rejected_sample: "05M",
+        },
+        UnsupportedCadenceCase {
+            center: AnalysisCenter::EsaUlt,
+            product_date: date(2025, 2, 2),
+            issue: Some("1200"),
+            expected_samples: &["05M"],
+            rejected_sample: "15M",
+        },
+    ];
+
+    for case in cases {
+        assert_eq!(
+            supported_samples(case.center, ProductType::Sp3, case.product_date, case.issue,),
+            Ok(case.expected_samples),
+        );
+        let expected = DataCatalogError::UnsupportedSample {
+            center: case.center,
+            product_type: ProductType::Sp3,
+            sample: case.rejected_sample.to_string(),
+        };
+        let construction = if let Some(issue) = case.issue {
+            ops_ultra_sp3(
+                case.center,
+                case.product_date,
+                Some(case.rejected_sample),
+                Some(issue),
+            )
+        } else {
+            mgex_sp3(case.center, case.product_date, Some(case.rejected_sample))
+        };
+        assert_eq!(construction.unwrap_err(), expected);
+        assert_eq!(
+            canonical_filename(
+                case.center,
+                ProductType::Sp3,
+                case.product_date,
+                Some(case.rejected_sample),
+                case.issue,
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            archive_url(
+                case.center,
+                ProductType::Sp3,
+                case.product_date,
+                Some(case.rejected_sample),
+                case.issue,
+            )
+            .unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn supported_samples_are_date_and_issue_aware_for_every_sp3_line() {
+    let cases: &[(AnalysisCenter, ProductDate, Option<&str>, &[&str])] = &[
+        (AnalysisCenter::Igs, date(2026, 6, 15), None, &["15M"]),
+        (AnalysisCenter::Esa, date(2026, 6, 15), None, &["05M"]),
+        (AnalysisCenter::Cod, date(2026, 6, 15), None, &["05M"]),
+        (
+            AnalysisCenter::IgsUlt,
+            date(2026, 7, 19),
+            Some("1200"),
+            &["15M"],
+        ),
+        (
+            AnalysisCenter::CodUlt,
+            date(2026, 7, 19),
+            Some("0000"),
+            &["05M"],
+        ),
+        (AnalysisCenter::Gfz, date(2021, 5, 17), None, &["15M"]),
+        (AnalysisCenter::Gfz, date(2021, 5, 18), None, &["05M"]),
+        (
+            AnalysisCenter::EsaUlt,
+            date(2025, 2, 2),
+            Some("0600"),
+            &["15M"],
+        ),
+        (
+            AnalysisCenter::EsaUlt,
+            date(2025, 2, 2),
+            Some("1200"),
+            &["05M"],
+        ),
+        (
+            AnalysisCenter::GfzUlt,
+            date(2021, 5, 14),
+            Some("0000"),
+            &["15M"],
+        ),
+        (
+            AnalysisCenter::GfzUlt,
+            date(2021, 5, 15),
+            Some("0000"),
+            &["15M", "05M"],
+        ),
+        (
+            AnalysisCenter::GfzUlt,
+            date(2021, 5, 15),
+            Some("2100"),
+            &["15M"],
+        ),
+        (
+            AnalysisCenter::GfzUlt,
+            date(2021, 5, 16),
+            Some("0000"),
+            &["05M"],
+        ),
+    ];
+    for (center, product_date, issue, expected) in cases {
+        assert_eq!(
+            supported_samples(*center, ProductType::Sp3, *product_date, *issue),
+            Ok(*expected),
+            "{center:?} {product_date:?} issue {issue:?}",
+        );
+    }
+
+    assert_eq!(
+        ops_ultra_sp3(
+            AnalysisCenter::GfzUlt,
+            date(2021, 5, 15),
+            Some("05M"),
+            Some("2100"),
+        ),
+        Err(DataCatalogError::UnsupportedSample {
+            center: AnalysisCenter::GfzUlt,
+            product_type: ProductType::Sp3,
+            sample: "05M".to_string(),
+        })
+    );
+}
+
+#[test]
+fn supported_samples_cover_every_current_catalog_product_family() {
+    let product_date = date(2026, 7, 19);
+    for entry in catalog() {
+        let issue = entry.issues.first().copied();
+        for convention in entry.products {
+            assert_eq!(
+                supported_samples(entry.center, convention.product_type, product_date, issue,),
+                Ok(&[convention.default_sample][..]),
+                "{:?} {:?}",
+                entry.center,
+                convention.product_type,
+            );
+
+            let unsupported = if convention.default_sample == "05M" {
+                "15M"
+            } else {
+                "05M"
+            };
+            assert_eq!(
+                canonical_filename(
+                    entry.center,
+                    convention.product_type,
+                    product_date,
+                    Some(unsupported),
+                    issue,
+                ),
+                Err(DataCatalogError::UnsupportedSample {
+                    center: entry.center,
+                    product_type: convention.product_type,
+                    sample: unsupported.to_string(),
+                }),
+                "{:?} {:?}",
+                entry.center,
+                convention.product_type,
+            );
+
+            let mut identity = product(
+                entry.center,
+                convention.product_type,
+                product_date,
+                None,
+                issue,
+            )
+            .expect("catalog product")
+            .identity()
+            .expect("catalog identity");
+            let unsupported_span = if convention.span == "01D" {
+                "02D"
+            } else {
+                "01D"
+            };
+            identity.span = unsupported_span.to_string();
+            identity.official_filename = identity.official_filename.replacen(
+                &format!("_{}_", convention.span),
+                &format!("_{unsupported_span}_"),
+                1,
+            );
+            assert_eq!(
+                identity.validate(),
+                Err(DataCatalogError::InconsistentProductIdentity { field: "span" }),
+                "{:?} {:?}",
+                entry.center,
+                convention.product_type,
+            );
+        }
+    }
 }
 
 #[test]

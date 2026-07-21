@@ -176,9 +176,13 @@
 //! ```
 
 use core::fmt;
-use flate2::read::GzDecoder;
 use std::io::Read;
 use std::path::Path;
+
+mod compression;
+
+const DEFAULT_PRODUCT_FILE_LIMITS: compression::GzipLimits =
+    compression::GzipLimits::new(64 * 1024 * 1024, 500 * 1024 * 1024);
 
 // Re-export core domain modules whose public helpers are intentionally part of
 // the ergonomic crate surface.
@@ -437,8 +441,9 @@ pub use sidereon_core::astro::relative;
 /// [`covariance_from_jacobian`](sidereon_core::astro::math::least_squares::covariance_from_jacobian)
 /// is the binding-facing entry point: it forms the fitted covariance straight
 /// from a design (Jacobian) matrix and the post-fit cost, with no report and no
-/// fabricated residual / parameter vectors. [`covariance_from_report`] keeps the
-/// converged-report path and [`normal_covariance`] the explicit-scale path.
+/// fabricated residual / parameter vectors.
+/// [`least_squares::covariance_from_report`] keeps the converged-report path and
+/// [`least_squares::normal_covariance`] the explicit-scale path.
 pub mod least_squares {
     pub use sidereon_core::astro::math::least_squares::{
         covariance_from_jacobian, covariance_from_report, normal_covariance,
@@ -976,6 +981,10 @@ pub fn parse_bias_sinex_lossy(bytes: &[u8]) -> Result<BiasParsed<BiasSet>> {
 }
 
 /// Read and parse a Bias-SINEX product. Files ending in `.gz` are decompressed.
+///
+/// Local input is bounded at 64 MiB compressed and 500 MiB decompressed.  For
+/// different I/O policies, decode the bytes externally and call
+/// [`parse_bias_sinex`].
 pub fn load_bias_sinex(path: impl AsRef<Path>) -> Result<BiasSet> {
     let bytes = read_maybe_gzip(path)?;
     parse_bias_sinex(&bytes)
@@ -983,6 +992,10 @@ pub fn load_bias_sinex(path: impl AsRef<Path>) -> Result<BiasSet> {
 
 /// Read and parse a Bias-SINEX product, retaining non-fatal diagnostics.
 /// Files ending in `.gz` are decompressed.
+///
+/// Local input is bounded at 64 MiB compressed and 500 MiB decompressed.  For
+/// different I/O policies, decode the bytes externally and call
+/// [`parse_bias_sinex_lossy`].
 pub fn load_bias_sinex_lossy(path: impl AsRef<Path>) -> Result<BiasParsed<BiasSet>> {
     let bytes = read_maybe_gzip(path)?;
     parse_bias_sinex_lossy(&bytes)
@@ -1002,6 +1015,10 @@ pub fn parse_code_dcb_lossy(
 }
 
 /// Read and parse a CODE DCB product. Files ending in `.gz` are decompressed.
+///
+/// Local input is bounded at 64 MiB compressed and 500 MiB decompressed.  For
+/// different I/O policies, decode the bytes externally and call
+/// [`parse_code_dcb`].
 pub fn load_code_dcb(path: impl AsRef<Path>, options: Option<CodeDcbOptions>) -> Result<BiasSet> {
     let bytes = read_maybe_gzip(path)?;
     parse_code_dcb(&bytes, options)
@@ -1009,6 +1026,10 @@ pub fn load_code_dcb(path: impl AsRef<Path>, options: Option<CodeDcbOptions>) ->
 
 /// Read and parse a CODE DCB product, retaining non-fatal diagnostics.
 /// Files ending in `.gz` are decompressed.
+///
+/// Local input is bounded at 64 MiB compressed and 500 MiB decompressed.  For
+/// different I/O policies, decode the bytes externally and call
+/// [`parse_code_dcb_lossy`].
 pub fn load_code_dcb_lossy(
     path: impl AsRef<Path>,
     options: Option<CodeDcbOptions>,
@@ -1039,14 +1060,38 @@ pub fn load_crinex(path: impl AsRef<Path>) -> Result<String> {
 
 fn read_maybe_gzip(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path)?;
-    if path.extension().and_then(|ext| ext.to_str()) != Some("gz") {
+    let limits = DEFAULT_PRODUCT_FILE_LIMITS;
+    let gzip = path.extension().and_then(|ext| ext.to_str()) == Some("gz");
+    let input_limit = if gzip {
+        limits.max_compressed_bytes
+    } else {
+        limits.max_decompressed_bytes
+    };
+    let bytes = read_file_bounded(path, input_limit)?;
+    if !gzip {
         return Ok(bytes);
     }
-    let mut decoder = GzDecoder::new(&bytes[..]);
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded)?;
-    Ok(decoded)
+    compression::decode_gzip_members(&bytes, limits)
+        .map_err(|error| Error::Io(std::io::Error::from(error)))
+}
+
+fn read_file_bounded(path: impl AsRef<Path>, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path.as_ref())?;
+    let probe_limit = limit.saturating_add(1);
+    let mut bytes = Vec::with_capacity(probe_limit.min(64 * 1024));
+    file.by_ref()
+        .take(u64::try_from(probe_limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "product file exceeds the {limit}-byte input limit (read {} bytes)",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Run single-point positioning under the public validation/orchestration
@@ -1571,6 +1616,60 @@ mod tests {
         assert!(err.to_string().contains("SP3 parse failed"));
         // The core parse message is preserved as the error source.
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn gzip_file_reader_decodes_all_members_and_rejects_an_incomplete_later_member() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        fn member(content: &[u8]) -> Vec<u8> {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(content).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        fn with_comment(mut archive: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+            archive[3] |= 0x10;
+            archive.splice(10..10, comment.iter().copied().chain([0]));
+            archive
+        }
+
+        let first = member(b"first member\n");
+        let second = member(b"second member\n");
+        let path = std::env::temp_dir().join(format!(
+            "sidereon-concatenated-gzip-{}.gz",
+            std::process::id()
+        ));
+
+        let mut complete = first.clone();
+        complete.extend_from_slice(&second);
+        std::fs::write(&path, &complete).unwrap();
+        assert_eq!(
+            read_maybe_gzip(&path).unwrap(),
+            b"first member\nsecond member\n"
+        );
+
+        let long_comment = with_comment(member(b"long comment\n"), &vec![b'c'; 70_000]);
+        std::fs::write(&path, &long_comment).unwrap();
+        assert_eq!(read_maybe_gzip(&path).unwrap(), b"long comment\n");
+
+        let mut junk_tailed = complete.clone();
+        junk_tailed.extend_from_slice(b"not another gzip member");
+        std::fs::write(&path, &junk_tailed).unwrap();
+        assert!(matches!(read_maybe_gzip(&path), Err(Error::Io(_))));
+
+        complete.pop();
+        std::fs::write(&path, &complete).unwrap();
+        assert!(matches!(read_maybe_gzip(&path), Err(Error::Io(_))));
+
+        std::fs::write(&path, b"1234").unwrap();
+        assert_eq!(read_file_bounded(&path, 4).unwrap(), b"1234");
+        let error = read_file_bounded(&path, 3).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("3-byte input limit"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

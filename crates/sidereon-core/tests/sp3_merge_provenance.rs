@@ -442,11 +442,19 @@ fn incomplete_or_mismatched_provenance_fails_closed() {
 }
 
 #[test]
-fn direct_location_retains_alternate_exact_filename() {
-    let mut alternate = identity(AnalysisCenter::CodUlt);
-    alternate.span = "02D".to_string();
-    alternate.official_filename = alternate.official_filename.replace("_01D_", "_02D_");
-    alternate.validate().unwrap();
+fn direct_location_retains_cataloged_overlap_cadence() {
+    let alternate = product(
+        AnalysisCenter::GfzUlt,
+        ProductType::Sp3,
+        ProductDate::new(2021, 5, 15).unwrap(),
+        Some("05M"),
+        Some("0000"),
+    )
+    .unwrap()
+    .identity()
+    .unwrap();
+    assert_eq!(alternate.span, "02D");
+    assert_eq!(alternate.sample, "05M");
 
     let location =
         distribution_location_for_identity(&alternate, DistributionSource::Direct).unwrap();

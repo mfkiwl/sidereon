@@ -156,6 +156,8 @@ product should use `default_sample_for_date`, which returns `15M` through 2021
 day 137 and `05M` from day 138. All catalog helpers that receive `sample=None`,
 including `product` and `mgex_sp3`, use the date-aware query. An explicit
 sampling token remains explicit and is not silently rewritten.
+`supported_samples` reports the complete evidenced set for a date and issue;
+constructors reject any other cadence before deriving a filename or URL.
 
 ```text
 through 2021-05-17: https://isdc-data.gfz.de/gnss/products/rapid/w2158/GFZ0OPSRAP_20211370000_01D_15M_ORB.SP3.gz
@@ -193,8 +195,18 @@ and `05M` remains an explicit alternate candidate.
 product it reports the `0000`/start-of-day convention; consequently ESA ultra
 returns `15M` for 2025-02-02. Product construction uses the actual issue, so an
 omitted sample resolves to `15M` at 0600 and `05M` at 1200. Ultra-SP3 location
-candidates put that issue's default cadence first and retain the other cadence
-as an alternate.
+candidates contain only the cadence and span published for that exact issue.
+The only cataloged two-cadence issue is GFZ `2021-05-15 0000`, where the
+official listing contains both `02D_15M` and `02D_05M` objects. CODE additionally
+publishes the moving `COD0OPSULT.SP3` snapshot documented by AIUB. It is not an
+exact alias for the dated one-day product and is outside the exact-candidate
+API.
+
+Current official listings confirm one dated orbit variant per issue for IGS,
+ESA, and GFZ: IGS `02D_15M`, ESA `02D_05M`, and GFZ `02D_05M`. AIUB documents
+CODE's dated ultra-rapid orbit as `01D_05M` and separately documents the moving
+snapshot. Corresponding speculative alternate-span and cross-cadence paths
+returned 404 during the 2026-07-21 audit and are not catalog candidates.
 
 ```text
 ESA last 15M issue:  https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250330600_02D_15M_ORB.SP3.gz
@@ -202,6 +214,80 @@ ESA first 05M issue: https://navigation-office.esa.int/products/gnss-products/23
 GFZ last 15M date:   https://isdc-data.gfz.de/gnss/products/ultra/w2157/GFZ0OPSULT_20211352100_02D_15M_ORB.SP3.gz
 GFZ first 05M date:  https://isdc-data.gfz.de/gnss/products/ultra/w2158/GFZ0OPSULT_20211360000_02D_05M_ORB.SP3.gz
 ```
+
+## SP3 filename epoch and content start
+
+An SP3 long filename identifies an epoch, but official archive content shows
+that the epoch was not always the first epoch inside the product. Current
+cataloged lines use the filename epoch as their content start. Historical GFZ
+ultra-rapid products instead began 24 hours before the filename epoch through
+2022-09-06. GFZ changed conventions issue by issue over the next two days:
+
+| Filename date | 0000 | 0300 | 0600 | 0900 | 1200 | 1500 | 1800 | 2100 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| through 2022-09-06 | -1 day | -1 day | -1 day | -1 day | -1 day | -1 day | -1 day | -1 day |
+| 2022-09-07 | aligned | -1 day | -1 day | -1 day | -1 day | -1 day | -1 day | -1 day |
+| 2022-09-08 | aligned | -1 day | -1 day | aligned | aligned | aligned | aligned | aligned |
+| from 2022-09-09 | aligned | aligned | aligned | aligned | aligned | aligned | aligned | aligned |
+
+The convention before and during the transition is based on a complete header
+sweep of the official GFZ ultra-rapid series from 2020-10-06 through
+2022-09-08, performed on 2026-07-21. The audit requested all eight documented
+issues per day: 5,586 official objects were present, 38 requests were ordinary
+HTTP 404 publication absences, 5,579 present objects used the one-day offset,
+and exactly seven present transition issues were aligned. No present object had
+an unexpected content start and no transport or header decode failed. The
+3.9-MiB audit manifest is retained as release evidence with SHA-256
+`f592591880c6325e32e48ed48a291d93f079bf8cabad18f83c80f0e1fd5c5131`.
+The table is intentionally explicit because the 2022-09-08 0300 and 0600
+issues return to the older convention after the aligned 0000 issue; a single
+issue-time threshold would be incorrect.
+
+`sp3_content_start_convention` exposes this product- and issue-aware catalog
+fact and rejects issues that the selected center does not publish.
+`ExactSp3Request::from_identity` derives the required first epoch from it before
+reading product bytes. There is no caller override. Exact validation still
+requires the line-1 declared start, line-2 GPS week and seconds-of-week and MJD
+fields, and first parsed epoch all to equal that one required instant.
+`ExactSp3Request::new`, which has no product-line identity, continues to require
+the supplied date and issue themselves as the first epoch.
+
+## SP3 terminal-record interoperability
+
+SP3-d identifies the last logical record by the `A3` field `EOF` in columns
+1-3. It does not prescribe a transport line ending and does not explicitly
+assign columns after column 3 on that record. Official products nevertheless
+establish three interoperable encodings:
+
+| Official product inspected | Logical terminal record |
+| --- | --- |
+| ESA `ESA0MGNFIN_20251960000_01D_05M_ORB.SP3.gz` | `EOF` plus 77 ASCII spaces (80 bytes), then LF |
+| GFZ `GFZ0OPSRAP_20262000000_01D_05M_ORB.SP3.gz` | `EOF` plus 37 ASCII spaces (40 bytes), then LF |
+| BKG-hosted `IGS0OPSFIN_20251960000_01D_15M_ORB.SP3.gz` | bare `EOF`, then LF |
+
+Sidereon therefore recognizes a complete logical record beginning with `EOF`
+in columns 1-3 and followed only by ASCII spaces, up to a conservative
+80-column bound. The bound is Sidereon interoperability and input-robustness
+policy, not a claim that SP3-d explicitly mandates an 80-column EOF record. LF
+and CRLF are accepted as text-record separators, and a final record without a
+separator is accepted. Empty or ASCII-space-only records after `EOF` are also
+tolerated; that is a Sidereon compatibility policy rather than a requirement of
+SP3-d.
+
+Recognition is anchored to the complete logical record, not an unrestricted
+substring search. Missing markers, leading whitespace, `EOFX`, `EOF X`, tab
+padding, padding past column 80, a lone CR, nonblank records after the marker,
+and a marker before the declared final epoch are rejected by exact validation.
+A malformed EOF-like record is reported separately from a genuinely absent
+record, while both remain terminal product-integrity failures.
+
+The ESA gzip transport was independently checked end to end: the HTTP body is
+966,204 bytes, `gzip -t` validates the member and its CRC32/ISIZE trailer, and
+the 2,740,975-byte decompressed payload ends in the 80-byte padded record plus
+one LF with no later data. Its compressed SHA-256 is
+`c4f42d3c49c1d692b6c7584360c1621db75ad465ea44825fa9ce0581834050b9`; the
+decompressed SHA-256 is
+`8a5dfa77d3bad74fcd22a9f19140b608c67e9c4f3c273c655bb97b037fdab9aa`.
 
 ## Exact SP3 acceptance
 
@@ -214,8 +300,8 @@ accepts bytes for a declared identity. That gate:
   non-finite, zero, negative, or out-of-range header cadence;
 - requires the header cadence to equal the requested sample interval;
 - requires the line-1 start, line-2 GPS-week/seconds-of-week/MJD start fields,
-  and first parsed epoch to represent the requested start, and requires the
-  header epoch count to equal the parsed count;
+  and first parsed epoch to represent the requested cataloged content start,
+  and requires the header epoch count to equal the parsed count;
 - requires the mandatory SP3 header/EOF structure, exact agreement between the
   line-3 satellite declaration and per-epoch P/V record count and order,
   P-then-V pairing for velocity products, at least four header comment records,
@@ -243,6 +329,14 @@ digest failure, start/identity mismatch, cadence mismatch, irregularity, and
 span mismatch are terminal by default, and the first such error is preserved.
 Caller configuration errors and unsupported center/product pairs are also not
 reported as publication absence.
+
+`ultra_sp3_locations` applies the same date/issue-aware cadence gate and the
+cataloged span before emitting any URL. It does not generate a different span
+or a cadence merely because that token would form a syntactically plausible
+long filename. Moving latest-product snapshots are excluded from this exact
+dated-product API. CODE's current moving snapshot covers a different time
+window and duration from the dated one-day product, so ordinary absence of the
+dated object does not authorize trying it as the same identity.
 
 No official material reviewed for this audit documented a moving-alias rule
 that permits broad fallback after failed content validation, so Sidereon adds
@@ -374,15 +468,22 @@ semantic `Sp3::comments` text. The new
 scoreboard error variants are source-visible API additions for exhaustive Rust
 matches.
 
-Because this adds public API and makes previously accepted ambiguous or
-integrity-invalid inputs fail, it should ship as the next minor release
-(`0.33.0`), not as a patch.
+Those catalog, validation, and cache changes shipped in `0.33.0` as a minor
+release because they added public API and made previously accepted ambiguous or
+integrity-invalid inputs fail.
+
+The terminal-record correction, historical GFZ content-start catalog, and
+public content-start query are prepared for `0.34.0`. The EOF change is parser
+compatibility, but the inspectable catalog enum/query and the newly enforced
+historical GFZ identity semantics warrant a minor release. No numerical
+calculation changes.
 
 ## Public evidence for this audit
 
-All sources were accessed on 2026-07-20. Object and directory links record the
-archive evidence observed on that date; availability of an individual file is
-not a promise that it will remain mirrored by every distributor.
+Unless a row states otherwise, sources were accessed on 2026-07-20. Object and
+directory links record the archive evidence observed on the listed date;
+availability of an individual file is not a promise that it will remain
+mirrored by every distributor.
 
 | Catalog or validation decision | Primary public evidence | Accessed |
 | --- | --- | --- |
@@ -395,6 +496,8 @@ not a promise that it will remain mirrored by every distributor.
 | Long-name LEN/SMP syntax documents `D`, `W`, `L`, and `Y` units, while the official archive publishes `07D` despite the guideline's longest-unit prose. Sidereon therefore does not invent `D`-to-`W` or `L`-to-`Y` rewriting. Exact sub-day equivalents such as `60M` and `24H` remain noncanonical, and `00U` is unspecified rather than an exact positive cadence. | [IGS long product filename guidelines v2.2](https://files.igs.org/pub/resource/guidelines/Guidelines_for_Long_Product_Filenames_in_the_IGS_v2.2_EN.pdf), [official week-2420 `07D` product](https://igs.bkg.bund.de/root_ftp/IGS/products/2420/IGS0OPSFIN_20261440000_07D_01D_ERP.ERP.gz) | 2026-07-20 |
 | SP3 line 1 declares start and epoch count; line 2 repeats the start as GPS week/seconds-of-week and MJD/fraction and declares an epoch interval strictly between 0 and 100,000 seconds. | [SP3-d specification](https://files.igs.org/pub/data/format/sp3d.pdf) | 2026-07-20 |
 | SP3-d requires at least five `+` and five `++` records, at least four header comment records, line-3 satellite-count agreement, a complete ordered satellite record set at every epoch, each V record after its matching P record, and `EOF` as the last record. | [SP3-d specification](https://files.igs.org/pub/data/format/sp3d.pdf) | 2026-07-20 |
+| SP3-d defines the final field as `EOF` in columns 1-3 (`A3`). Official ESA output demonstrates an 80-byte record padded with 77 ASCII spaces; a BKG-hosted IGS final product demonstrates the bare three-byte record. | [SP3-d specification](https://files.igs.org/pub/data/format/sp3d.pdf), [official ESA product](https://navigation-office.esa.int/products/gnss-products/2375/ESA0MGNFIN_20251960000_01D_05M_ORB.SP3.gz), [official BKG-hosted IGS product](https://igs.bkg.bund.de/root_ftp/IGS/products/2375/IGS0OPSFIN_20251960000_01D_15M_ORB.SP3.gz) | 2026-07-21 |
+| GFZ rapid output demonstrates another valid producer convention: `EOF` followed by 37 ASCII spaces, for a 40-byte logical record. | [official GFZ rapid product](https://isdc-data.gfz.de/gnss/products/rapid/w2428/GFZ0OPSRAP_20262000000_01D_05M_ORB.SP3.gz) | 2026-07-21 |
 | Official SP3 bodies identify their producing agency as `IGS`, `ESOC`, `GFZ`, and `AIUB`; these content fields bind IGS, ESA, GFZ, and CODE catalog identities without assuming the filename producer token is identical. | [IGS rapid SP3](https://igs.bkg.bund.de/root_ftp/IGS/products/2428/IGS0OPSRAP_20262000000_01D_15M_ORB.SP3.gz), [ESA rapid SP3](https://navigation-office.esa.int/products/gnss-products/2428/ESA0OPSRAP_20262000000_01D_05M_ORB.SP3.gz), [GFZ rapid SP3](https://isdc-data.gfz.de/gnss/products/rapid/w2428/GFZ0OPSRAP_20262000000_01D_05M_ORB.SP3.gz), [CODE final SP3](https://www.aiub.unibe.ch/download/CODE_MGEX/CODE/2026/COD0MGXFIN_20261920000_01D_05M_ORB.SP3.gz) | 2026-07-20 |
 | AIUB identifies its current product service and CODE product series. | [AIUB services](https://www.aiub.unibe.ch/services/index_eng.html), [CODE Analysis Center](https://www.aiub.unibe.ch/research/code___analysis_center/index_eng.html) | 2026-07-20 |
 | AIUB documents operational, rapid, ultra-rapid, predicted, final, MGEX, clock, SP3, and IONEX names and directories. | [AIUB_AFTP.TXT](https://www.aiub.unibe.ch/download/AIUB_AFTP.TXT) | 2026-07-20 |
@@ -409,6 +512,8 @@ not a promise that it will remain mirrored by every distributor.
 | GFZ's operational ultra-rapid SP3 listing begins on 2020-10-06 (day 280). | [GFZ week-2126 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2126/), [first ultra SP3 object](https://isdc-data.gfz.de/gnss/products/ultra/w2126/GFZ0OPSULT_20202800000_02D_15M_ORB.SP3.gz) | 2026-07-20 |
 | ESA ultra-rapid SP3 changes from `15M` at the 2025-02-02 0600 issue to `05M` at 1200. | [ESA week-2352 listing](https://navigation-office.esa.int/products/gnss-products/2352/), [0600 15M object](https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250330600_02D_15M_ORB.SP3.gz), [1200 05M object](https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250331200_02D_05M_ORB.SP3.gz) | 2026-07-20 |
 | GFZ ultra-rapid SP3 defaults to `15M` through 2021-05-15 and `05M` from 2021-05-16. One 0000 `05M` object overlaps the otherwise-`15M` final day. | [GFZ week-2157 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2157/), [last 15M issue](https://isdc-data.gfz.de/gnss/products/ultra/w2157/GFZ0OPSULT_20211352100_02D_15M_ORB.SP3.gz), [overlapping 05M object](https://isdc-data.gfz.de/gnss/products/ultra/w2157/GFZ0OPSULT_20211350000_02D_05M_ORB.SP3.gz), [GFZ week-2158 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2158/), [first next-day 05M object](https://isdc-data.gfz.de/gnss/products/ultra/w2158/GFZ0OPSULT_20211360000_02D_05M_ORB.SP3.gz) | 2026-07-20 |
+| Current ultra-rapid dated orbit variants are IGS `02D_15M`, ESA `02D_05M`, GFZ `02D_05M`, and CODE `01D_05M`. The official ESA/GFZ/IGS directory listings contain no second current cadence or span, AIUB documents no dated CODE `02D_05M` orbit, and the corresponding synthesized paths returned 404. AIUB separately documents `COD0OPSULT.SP3`, but a live comparison proves it is a different moving snapshot: the 3,337,569-byte alias (SHA-256 `6a51fcc8eb22c232680b04c06b57124616ff51a76e984e8e39dcbb6477d55bb4`) starts 2026-07-20 12:00 and declares 577 epochs at 300 seconds, while the 1,473,962-byte dated product (SHA-256 `36d10bc035aebb1fbfbe8ac9fa00608c1951bf17d6f51b9380508e729da80584`) starts 00:00 and declares 289 epochs. It is therefore excluded from exact dated candidates. | [IGS transition guideline](https://files.igs.org/pub/resource/guidelines/Guideline_for_the_transition_of_the_IGS_products_to_IGS20_and_long_filenames_v2.0.pdf), [BKG week-2428 listing](https://igs.bkg.bund.de/root_ftp/IGS/products/2428/), [ESA week-2370 listing](https://navigation-office.esa.int/products/gnss-products/2370/), [GFZ week-2370 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2370/), [AIUB product inventory](https://www.aiub.unibe.ch/download/AIUB_AFTP.TXT), [AIUB current CODE listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE), [moving snapshot](https://www.aiub.unibe.ch/download/CODE/COD0OPSULT.SP3), [dated product](https://www.aiub.unibe.ch/download/CODE/COD0OPSULT_20262010000_01D_05M_ORB.SP3) | 2026-07-21 |
+| GFZ ultra-rapid SP3 content began one day before its filename epoch through 2022-09-06. The transition was issue-specific on September 7 and 8, including old-convention reversions after aligned issues; products are aligned from September 9. A complete official-archive header sweep requested 5,624 date/issue combinations from series start through the transition: 5,586 objects were present, 38 were ordinary 404 publication absences, 5,579 used the one-day offset, seven transition objects were aligned, and no present object had an unexpected offset. The retained sweep manifest has SHA-256 `f592591880c6325e32e48ed48a291d93f079bf8cabad18f83c80f0e1fd5c5131`. | [GFZ ultra-rapid archive root](https://isdc-data.gfz.de/gnss/products/ultra/), [GFZ week-2226 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2226/), [GPS-week-crossing pre-transition issue](https://isdc-data.gfz.de/gnss/products/ultra/w2226/GFZ0OPSULT_20222470000_02D_05M_ORB.SP3.gz), [September 7 aligned 0000](https://isdc-data.gfz.de/gnss/products/ultra/w2226/GFZ0OPSULT_20222500000_02D_05M_ORB.SP3.gz), [September 8 old-convention 0600](https://isdc-data.gfz.de/gnss/products/ultra/w2226/GFZ0OPSULT_20222510600_02D_05M_ORB.SP3.gz), [September 8 aligned 0900](https://isdc-data.gfz.de/gnss/products/ultra/w2226/GFZ0OPSULT_20222510900_02D_05M_ORB.SP3.gz), [post-transition issue](https://isdc-data.gfz.de/gnss/products/ultra/w2226/GFZ0OPSULT_20222520000_02D_05M_ORB.SP3.gz) | 2026-07-21 |
 | CDDIS IONEX filenames transitioned from historical short names toward long names beginning at week 2238, with center-specific timing. Sidereon therefore does not derive a pre-transition CDDIS URL for a caller's long-name IONEX identity. | [IGS ionospheric products](https://igs.org/products/#ionosphere), [NASA Earthdata support clarification](https://forum.earthdata.nasa.gov/viewtopic.php?t=4779) | 2026-07-20 |
 
 The archive and format sources above do not document a general permission to

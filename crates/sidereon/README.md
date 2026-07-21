@@ -136,6 +136,12 @@ the crate root (`load_sp3`, `encode_crinex`, `solve_spp`, `passes`, `sgp4`,
 behind the explicit `sidereon::raw` escape hatch so the ergonomic surface stays
 small.
 
+The Bias-SINEX and CODE DCB convenience path loaders treat `.gz` files as
+complete RFC 1952 member series and validate every member header and trailer.
+They cap local archives at 64 MiB and cumulative output at 500 MiB. Consumers
+with a different I/O policy can decode bytes externally and pass them to the
+existing `parse_bias_sinex*` or `parse_code_dcb*` functions.
+
 ## Other languages
 
 sidereon is one validated engine with first-class interfaces in **Rust**,

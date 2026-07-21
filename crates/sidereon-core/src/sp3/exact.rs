@@ -48,6 +48,9 @@ pub struct ExactSp3Request {
     sample: String,
     format_version: Option<String>,
     expected_agency: Option<String>,
+    /// Whole seconds from the filename epoch to the cataloged first content
+    /// epoch. Only [`Self::from_identity`] can set a nonzero value.
+    content_start_offset_s: i64,
 }
 
 impl ExactSp3Request {
@@ -77,6 +80,7 @@ impl ExactSp3Request {
             sample: sample.to_owned(),
             format_version: None,
             expected_agency: None,
+            content_start_offset_s: 0,
         })
     }
 
@@ -97,6 +101,8 @@ impl ExactSp3Request {
             &identity.sample,
         )?;
         request.format_version = identity.format_version.clone();
+        request.content_start_offset_s = crate::data::exact_sp3_content_start_offset_s(identity)
+            .map_err(ExactSp3ValidationError::Catalog)?;
         request.expected_agency = Some(
             match identity.analysis_center {
                 AnalysisCenter::Igs => "IGS",
@@ -133,12 +139,19 @@ impl ExactSp3Request {
         Ok(self)
     }
 
-    /// Requested nominal start date.
+    /// Requested filename date.
+    ///
+    /// For requests built with [`Self::new`], this is also the required first
+    /// content date. [`Self::from_identity`] may apply a cataloged historical
+    /// content-start convention while retaining this filename date.
     pub fn date(&self) -> ProductDate {
         self.date
     }
 
-    /// Optional requested `HHMM` start/issue token. No issue means midnight.
+    /// Optional requested `HHMM` filename issue/epoch token.
+    ///
+    /// No issue means midnight. As with [`Self::date`], a catalog-derived
+    /// request may require a historical content start before this epoch.
     pub fn issue(&self) -> Option<&str> {
         self.issue.as_deref()
     }
@@ -221,6 +234,14 @@ pub enum ExactSp3ValidationError {
     },
     /// The product omitted its terminal `EOF` record.
     MissingEof,
+    /// The product contained an EOF-like record that violated the accepted
+    /// logical-record grammar.
+    MalformedEofRecord {
+        /// One-based logical-record line number.
+        line_number: usize,
+        /// Length of the offending logical record in bytes.
+        record_length: usize,
+    },
     /// Nonblank records appeared after the terminal `EOF` marker.
     TrailingContentAfterEof,
     /// A mandatory SP3 header record count is incomplete or inconsistent.
@@ -413,6 +434,13 @@ impl fmt::Display for ExactSp3ValidationError {
                 "SP3 agency mismatch: requested {expected:?}, header declares {actual:?}"
             ),
             Self::MissingEof => write!(f, "SP3 product is missing its EOF record"),
+            Self::MalformedEofRecord {
+                line_number,
+                record_length,
+            } => write!(
+                f,
+                "SP3 product contains a malformed EOF record at line {line_number} ({record_length} bytes)"
+            ),
             Self::TrailingContentAfterEof => {
                 write!(f, "SP3 product contains nonblank records after EOF")
             }
@@ -676,10 +704,16 @@ pub fn validate_exact_sp3(
 }
 
 fn validate_mandatory_structure(product: &Sp3) -> Result<(), ExactSp3ValidationError> {
-    if !product.had_eof {
+    if let Some(malformed) = product.terminal_record.first_malformed_record {
+        return Err(ExactSp3ValidationError::MalformedEofRecord {
+            line_number: malformed.line_number,
+            record_length: malformed.record_length,
+        });
+    }
+    if !product.terminal_record.had_valid_record {
         return Err(ExactSp3ValidationError::MissingEof);
     }
-    if product.trailing_content_after_eof {
+    if product.terminal_record.had_trailing_content {
         return Err(ExactSp3ValidationError::TrailingContentAfterEof);
     }
     if product.satellite_header_lines < 5 {
@@ -879,14 +913,18 @@ fn parse_issue(issue: Option<&str>) -> Result<(u8, u8), ExactSp3ValidationError>
 fn requested_start_j2000_s(request: &ExactSp3Request) -> f64 {
     let (hour, minute) = parse_issue(request.issue.as_deref())
         .expect("ExactSp3Request construction validates its issue token");
-    j2000_seconds(
+    let filename_epoch_j2000_s = j2000_seconds(
         request.date.year,
         i32::from(request.date.month),
         i32::from(request.date.day),
         i32::from(hour),
         i32::from(minute),
         0.0,
-    )
+    );
+    // The exact equality is unchanged. Catalog evidence determines the
+    // required instant before the product bytes are parsed; no caller-facing
+    // override can move it.
+    filename_epoch_j2000_s + request.content_start_offset_s as f64
 }
 
 /// Cross-check SP3 line 2 against the trusted civil start.

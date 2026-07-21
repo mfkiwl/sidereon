@@ -24,7 +24,7 @@ use crate::astro::time::gnss;
 use crate::astro::time::model::Instant;
 
 use super::interp::{instant_to_j2000_seconds, sp3_epoch_j2000_seconds};
-use super::{RawNode, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State};
+use super::{RawNode, Sp3, Sp3DataType, Sp3Flags, Sp3Header, Sp3State, TerminalRecordState};
 use crate::constants::{DAYS_PER_JULIAN_YEAR, GPS_EPOCH_TO_J2000_S, KM_TO_M, SECONDS_PER_DAY};
 use crate::frame::{ItrfPositionM, ItrfVelocityMS};
 use crate::frame_catalog::{
@@ -1149,8 +1149,7 @@ pub fn merge(sources: &[Sp3], opts: &MergeOptions) -> Result<(Sp3, MergeReport)>
         epochs: out_epochs,
         declared_num_epochs: out_epoch_j2000_s.len() as u64,
         declared_start_j2000_s: out_epoch_j2000_s.first().copied(),
-        had_eof: true,
-        trailing_content_after_eof: false,
+        terminal_record: TerminalRecordState::valid(),
         satellite_header_lines: mandatory_header_lines,
         accuracy_header_lines: mandatory_header_lines,
         time_system_header_lines: 2,

@@ -335,9 +335,9 @@ pub struct Sp3 {
     /// parser could not interpret those otherwise-unused line-1 fields; exact
     /// product validation rejects that condition.
     declared_start_j2000_s: Option<f64>,
-    /// Whether the parser encountered the mandatory terminal record.
-    had_eof: bool,
-    trailing_content_after_eof: bool,
+    /// Exact-integrity facts about the logical terminal record. The general
+    /// parser remains permissive; exact validation interprets this state.
+    terminal_record: TerminalRecordState,
     /// Raw mandatory header-record counts retained for exact validation.
     satellite_header_lines: usize,
     accuracy_header_lines: usize,
@@ -587,6 +587,64 @@ fn civil_to_julian_split(civil: validate::ValidCivil) -> Result<JulianDateSplit>
         .map_err(|error| Error::Parse(format!("invalid SP3 epoch Julian date: {error}")))
 }
 
+/// Conservative maximum for one logical SP3 record.
+///
+/// SP3-d defines the EOF field as `EOF` in columns 1-3 (`A3`) but does not
+/// explicitly prescribe padding after column 3. Official ESA products pad the
+/// record with ASCII spaces through column 80, official GFZ products have also
+/// been observed padding through column 40, and other official products stop
+/// at column 3. Sidereon accepts those interoperable forms while bounding the
+/// record at the conventional 80-column width.
+const SP3_RECORD_WIDTH: usize = 80;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EofRecordKind {
+    Valid,
+    Malformed,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MalformedEofRecord {
+    line_number: usize,
+    record_length: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TerminalRecordState {
+    had_valid_record: bool,
+    first_malformed_record: Option<MalformedEofRecord>,
+    had_trailing_content: bool,
+}
+
+impl TerminalRecordState {
+    const fn valid() -> Self {
+        Self {
+            had_valid_record: true,
+            first_malformed_record: None,
+            had_trailing_content: false,
+        }
+    }
+}
+
+/// Classify a complete logical record without performing a substring search.
+fn classify_eof_record(line: &str) -> EofRecordKind {
+    if let Some(padding) = line.strip_prefix("EOF") {
+        if line.len() <= SP3_RECORD_WIDTH && padding.bytes().all(|byte| byte == b' ') {
+            EofRecordKind::Valid
+        } else {
+            EofRecordKind::Malformed
+        }
+    } else if line
+        .trim_start_matches(|character: char| character.is_ascii_whitespace())
+        .starts_with("EOF")
+    {
+        EofRecordKind::Malformed
+    } else {
+        EofRecordKind::Other
+    }
+}
+
 /// Incremental line-driven SP3 parser state machine.
 struct Parser {
     version: Option<Sp3Version>,
@@ -644,9 +702,7 @@ struct Parser {
     epoch_state_record_sequence: Vec<Vec<(char, String)>>,
     comments: Vec<String>,
     diagnostics: Diagnostics,
-    done: bool,
-    had_eof: bool,
-    trailing_content_after_eof: bool,
+    terminal_record: TerminalRecordState,
 }
 
 impl Parser {
@@ -690,27 +746,37 @@ impl Parser {
             epoch_state_record_sequence: Vec::new(),
             comments: Vec::new(),
             diagnostics: Diagnostics::new(),
-            done: false,
-            had_eof: false,
-            trailing_content_after_eof: false,
+            terminal_record: TerminalRecordState::default(),
         }
     }
 
     fn feed(&mut self, raw: &str, line_number: usize) -> Result<()> {
-        if self.done {
-            if !raw.trim().is_empty() {
-                self.trailing_content_after_eof = true;
+        if self.terminal_record.had_valid_record {
+            if !raw.bytes().all(|byte| byte == b' ') {
+                self.terminal_record.had_trailing_content = true;
             }
             return Ok(());
         }
-        // SP3 is fixed-column ASCII; trim only the trailing CR / newline noise,
-        // never leading spaces (columns are significant).
-        let line = raw.trim_end_matches(['\r', '\n']);
+        // `str::lines` removes one LF or one CRLF separator. Any remaining CR,
+        // LF, leading whitespace, or other byte is record content; SP3 columns
+        // are significant, so it must not be trimmed here.
+        let line = raw;
 
-        if line == "EOF" {
-            self.done = true;
-            self.had_eof = true;
-            return Ok(());
+        match classify_eof_record(line) {
+            EofRecordKind::Valid => {
+                self.terminal_record.had_valid_record = true;
+                return Ok(());
+            }
+            EofRecordKind::Malformed => {
+                self.terminal_record
+                    .first_malformed_record
+                    .get_or_insert(MalformedEofRecord {
+                        line_number,
+                        record_length: line.len(),
+                    });
+                return Ok(());
+            }
+            EofRecordKind::Other => {}
         }
         if line.starts_with("/*") {
             if self.integer_header_lines >= 2 && self.epochs.is_empty() {
@@ -1209,8 +1275,7 @@ impl Parser {
             epochs: self.epochs,
             declared_num_epochs: self.num_epochs,
             declared_start_j2000_s: self.declared_start_j2000_s,
-            had_eof: self.had_eof,
-            trailing_content_after_eof: self.trailing_content_after_eof,
+            terminal_record: self.terminal_record,
             satellite_header_lines: self.satellite_header_lines,
             accuracy_header_lines: self.accuracy_header_lines,
             time_system_header_lines: self.pc_count as usize,

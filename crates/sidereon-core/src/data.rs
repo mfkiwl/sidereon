@@ -809,6 +809,159 @@ const GFZ_ULTRA_5M_START_DATE: ProductDate = ProductDate {
     day: 16,
 };
 
+/// Final primarily 15-minute GFZ ultra-rapid date.
+///
+/// Its `0000` issue is the documented transition overlap and publishes both
+/// 15-minute and 5-minute objects; later issues that day publish only 15-minute
+/// objects.
+const GFZ_ULTRA_15M_LAST_DATE: ProductDate = ProductDate {
+    year: 2021,
+    month: 5,
+    day: 15,
+};
+
+/// First and last dates of GFZ's ultra-rapid content-start transition.
+///
+/// Before this window, the first SP3 epoch is one day before the epoch encoded
+/// by the filename. After the window, the two epochs are equal. GFZ's official
+/// objects show a non-monotonic, issue-by-issue transition inside the window,
+/// so those sixteen products are cataloged explicitly below.
+const GFZ_ULTRA_START_TRANSITION_FIRST_DATE: ProductDate = ProductDate {
+    year: 2022,
+    month: 9,
+    day: 7,
+};
+const GFZ_ULTRA_START_TRANSITION_LAST_DATE: ProductDate = ProductDate {
+    year: 2022,
+    month: 9,
+    day: 8,
+};
+
+/// Relationship between the epoch in an SP3 filename and its first content
+/// epoch, established from the cataloged public product line.
+///
+/// This is archive metadata, not a value inferred from product bytes. Exact
+/// validation uses it to select one required start instant without relaxing
+/// equality against that instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Sp3ContentStartConvention {
+    /// The first content epoch equals the epoch encoded by the filename.
+    FilenameEpoch,
+    /// The first content epoch is exactly 24 hours before the filename epoch.
+    FilenameEpochMinusOneDay,
+}
+
+impl Sp3ContentStartConvention {
+    /// Stable catalog code for serialization by language interfaces.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FilenameEpoch => "filename_epoch",
+            Self::FilenameEpochMinusOneDay => "filename_epoch_minus_one_day",
+        }
+    }
+
+    /// Whole seconds added to the filename epoch to obtain the first content
+    /// epoch.
+    #[must_use]
+    pub const fn content_start_offset_s(self) -> i64 {
+        match self {
+            Self::FilenameEpoch => 0,
+            Self::FilenameEpochMinusOneDay => -86_400,
+        }
+    }
+}
+
+/// Official GFZ objects for every issue in the two-day transition window.
+///
+/// The source URLs and access date are recorded in
+/// `docs/public-gnss-distribution-sources.md`. Keeping this as an exhaustive
+/// table prevents an appealing date/issue threshold from silently
+/// misclassifying the two reversions visible in the archive.
+const GFZ_ULTRA_START_TRANSITION: [(ProductDate, &str, Sp3ContentStartConvention); 16] = [
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "0000",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "0300",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "0600",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "0900",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "1200",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "1500",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "1800",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_FIRST_DATE,
+        "2100",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "0000",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "0300",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "0600",
+        Sp3ContentStartConvention::FilenameEpochMinusOneDay,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "0900",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "1200",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "1500",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "1800",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+    (
+        GFZ_ULTRA_START_TRANSITION_LAST_DATE,
+        "2100",
+        Sp3ContentStartConvention::FilenameEpoch,
+    ),
+];
+
 const CENTER_ORDER: [AnalysisCenter; 11] = [
     AnalysisCenter::CodRap,
     AnalysisCenter::CodPrd1,
@@ -1443,7 +1596,7 @@ impl UltraIssue {
 /// One generated ultra-rapid SP3 archive candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UltraSp3Location {
-    /// Stable catalog label identifying the primary, alternate, or alias rule.
+    /// Stable catalog label identifying the primary or overlapping dated rule.
     pub pattern: String,
     /// Product span token used by the candidate.
     pub span: String,
@@ -1456,98 +1609,6 @@ pub struct UltraSp3Location {
     /// Archive compression for this candidate.
     pub compression: ArchiveCompression,
 }
-
-#[derive(Debug, Clone, Copy)]
-struct UltraSp3Pattern {
-    label: &'static str,
-    span: &'static str,
-    sample: &'static str,
-    alias_filename: Option<&'static str>,
-}
-
-const IGS_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
-    UltraSp3Pattern {
-        label: "primary_02D_15M",
-        span: "02D",
-        sample: "15M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_02D_05M",
-        span: "02D",
-        sample: "05M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_01D_15M",
-        span: "01D",
-        sample: "15M",
-        alias_filename: None,
-    },
-];
-
-const COD_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
-    UltraSp3Pattern {
-        label: "primary_01D_05M",
-        span: "01D",
-        sample: "05M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_02D_05M",
-        span: "02D",
-        sample: "05M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alias_latest",
-        span: "01D",
-        sample: "05M",
-        alias_filename: Some("COD0OPSULT.SP3"),
-    },
-];
-
-const ESA_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
-    UltraSp3Pattern {
-        label: "primary_02D_05M",
-        span: "02D",
-        sample: "05M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_02D_15M",
-        span: "02D",
-        sample: "15M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_01D_05M",
-        span: "01D",
-        sample: "05M",
-        alias_filename: None,
-    },
-];
-
-const GFZ_ULT_SP3_PATTERNS: [UltraSp3Pattern; 3] = [
-    UltraSp3Pattern {
-        label: "primary_02D_05M",
-        span: "02D",
-        sample: "05M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_02D_15M",
-        span: "02D",
-        sample: "15M",
-        alias_filename: None,
-    },
-    UltraSp3Pattern {
-        label: "alternate_01D_05M",
-        span: "01D",
-        sample: "05M",
-        alias_filename: None,
-    },
-];
 
 /// Exact identity of one public GNSS product, independent of distributor.
 ///
@@ -1568,9 +1629,13 @@ pub struct ProductIdentity {
     pub campaign: ProductCampaign,
     /// Product-line version encoded by the long filename.
     pub version: u8,
-    /// Nominal product start date.
+    /// Product epoch encoded by the official filename.
+    ///
+    /// This is also the content start for most SP3 products. Cataloged
+    /// historical products whose first epoch differs retain the filename epoch
+    /// here; exact validation derives their required content start separately.
     pub date: ProductDate,
-    /// Optional `HHMM` issue/start time.
+    /// Optional `HHMM` issue/epoch time encoded by the official filename.
     pub issue: Option<String>,
     /// Intended coverage period token, for example `01D`.
     pub span: String,
@@ -1610,13 +1675,16 @@ impl ProductIdentity {
         // center publishes that product family.
         let convention = product_convention(self.analysis_center, self.family)?;
         validate_product_date(self.analysis_center, self.family, self.date)?;
-        if self.analysis_center == AnalysisCenter::Igs
-            && self.family == ProductType::Sp3
-            && self.span != convention.span
-        {
+        if self.span != convention.span {
             return Err(DataCatalogError::InconsistentProductIdentity { field: "span" });
         }
-        validate_catalog_sample(self.analysis_center, self.family, &self.sample, convention)?;
+        validate_catalog_sample(
+            self.analysis_center,
+            self.family,
+            self.date,
+            &self.sample,
+            self.issue.as_deref(),
+        )?;
 
         if self.format != product_format(self.family) {
             return Err(DataCatalogError::InconsistentProductIdentity { field: "format" });
@@ -1814,6 +1882,82 @@ impl ProductIdentity {
     pub fn cache_relpath(&self, source: DistributionSource) -> Result<String, DataCatalogError> {
         Ok(format!("products/v1/{}/{}", source.code(), self.key()?))
     }
+}
+
+/// Required first-content offset for a validated exact SP3 identity.
+///
+/// This is catalog data, not a property inferred from the bytes under test.
+/// Keeping the lookup identity-based prevents a caller from weakening exact
+/// start validation with an arbitrary override.
+pub(crate) fn exact_sp3_content_start_offset_s(
+    identity: &ProductIdentity,
+) -> Result<i64, DataCatalogError> {
+    identity.validate()?;
+    if identity.family != ProductType::Sp3 {
+        return Err(DataCatalogError::InconsistentProductIdentity { field: "family" });
+    }
+
+    let entry =
+        center_catalog(identity.analysis_center).expect("a validated identity has a catalog entry");
+    // Sampled non-issue identities encode midnight as `Some("0000")`, while
+    // the public catalog query follows ProductSpec construction and accepts no
+    // issue for those centers.
+    let catalog_issue = if entry.issues.is_empty() {
+        None
+    } else {
+        identity.issue.as_deref()
+    };
+    Ok(
+        sp3_content_start_convention(identity.analysis_center, identity.date, catalog_issue)?
+            .content_start_offset_s(),
+    )
+}
+
+/// Return the official content-start convention for one cataloged SP3 product.
+///
+/// `issue` follows the same rules as [`product`]: it is required for
+/// ultra-rapid centers, must be one of that center's published issues, and must
+/// be absent for product lines without issue times. Sampling cadence is not an
+/// input because the cataloged content-start convention is shared by every
+/// supported cadence of the same product issue.
+pub fn sp3_content_start_convention(
+    center: AnalysisCenter,
+    date: ProductDate,
+    issue: Option<&str>,
+) -> Result<Sp3ContentStartConvention, DataCatalogError> {
+    ProductDate::new(date.year, date.month, date.day)?;
+    product_convention(center, ProductType::Sp3)?;
+    validate_product_date(center, ProductType::Sp3, date)?;
+    validate_issue_for_center(center, issue)?;
+
+    sp3_content_start_convention_inner(center, date, issue).ok_or_else(|| {
+        DataCatalogError::UnsupportedIssue {
+            center,
+            issue: issue.unwrap_or_default().to_owned(),
+        }
+    })
+}
+
+fn sp3_content_start_convention_inner(
+    center: AnalysisCenter,
+    date: ProductDate,
+    issue: Option<&str>,
+) -> Option<Sp3ContentStartConvention> {
+    if center != AnalysisCenter::GfzUlt {
+        return Some(Sp3ContentStartConvention::FilenameEpoch);
+    }
+    if date < GFZ_ULTRA_START_TRANSITION_FIRST_DATE {
+        return Some(Sp3ContentStartConvention::FilenameEpochMinusOneDay);
+    }
+    if date > GFZ_ULTRA_START_TRANSITION_LAST_DATE {
+        return Some(Sp3ContentStartConvention::FilenameEpoch);
+    }
+
+    let issue = issue?;
+    GFZ_ULTRA_START_TRANSITION
+        .iter()
+        .find(|(entry_date, entry_issue, _)| *entry_date == date && *entry_issue == issue)
+        .map(|(_, _, convention)| *convention)
 }
 
 /// Distribution metadata for an exact product identity.
@@ -2034,8 +2178,7 @@ impl ProductSpec {
         issue: Option<&str>,
     ) -> Result<Self, DataCatalogError> {
         ProductDate::new(date.year, date.month, date.day)?;
-        validate_product(center, product_type, sample, issue)?;
-        validate_product_date(center, product_type, date)?;
+        validate_product(center, product_type, date, sample, issue)?;
         Ok(Self {
             center,
             product_type,
@@ -2066,10 +2209,10 @@ impl ProductSpec {
         let convention = validate_product(
             self.center,
             self.product_type,
+            self.date,
             &self.sample,
             self.issue.as_deref(),
         )?;
-        validate_product_date(self.center, self.product_type, self.date)?;
         if uses_legacy_igs_final_name(self.center, self.product_type, self.date)? {
             return Ok(format!(
                 "igs{:04}{}.sp3",
@@ -2105,6 +2248,7 @@ impl ProductSpec {
         let convention = validate_product(
             self.center,
             self.product_type,
+            self.date,
             &self.sample,
             self.issue.as_deref(),
         )?;
@@ -2138,6 +2282,7 @@ impl ProductSpec {
         let convention = validate_product(
             self.center,
             self.product_type,
+            self.date,
             &self.sample,
             self.issue.as_deref(),
         )?;
@@ -2621,9 +2766,10 @@ pub fn distribution_location(
 
 /// Resolve one explicit distributor from a complete exact product identity.
 ///
-/// Unlike [`distribution_location`], this retains alternate catalog cadence and
-/// duration fields already carried by `identity` instead of reconstructing a
-/// default product specification. The function performs no network or file IO.
+/// Unlike [`distribution_location`], this retains the already validated exact
+/// center, date, issue, cadence, span, and filename carried by `identity`
+/// instead of reconstructing a default product specification. The function
+/// performs no network or file IO.
 pub fn distribution_location_for_identity(
     identity: &ProductIdentity,
     source: DistributionSource,
@@ -2814,12 +2960,15 @@ pub fn ops_ultra_sp3(
     product(center, ProductType::Sp3, date, sample, Some(issue))
 }
 
-/// Generate the current primary ultra-rapid SP3 location followed by known
-/// duration/sampling alternates and documented latest-product aliases.
+/// Generate the officially cataloged ultra-rapid SP3 locations for one issue.
 ///
-/// Candidate order is deterministic and center-specific. Callers should try
-/// the next location only when the prior archive URL is absent; transport and
-/// retry policy remain outside the pure core catalog.
+/// The dated locations use only spans and sampling intervals evidenced for the
+/// exact center, date, and issue. A second dated location is returned only for
+/// an archive-observed overlap such as GFZ's 2021-05-15 `0000` issue. Moving
+/// latest-product snapshots are not exact dated identities and are therefore
+/// outside this API. Callers should try the next location only when the prior
+/// URL is absent; transport and retry policy remain outside the pure core
+/// catalog.
 pub fn ultra_sp3_locations(
     center: AnalysisCenter,
     date: ProductDate,
@@ -2827,11 +2976,11 @@ pub fn ultra_sp3_locations(
 ) -> Result<Vec<UltraSp3Location>, DataCatalogError> {
     validate_issue_for_center(center, Some(issue))?;
     validate_product_date(center, ProductType::Sp3, date)?;
-    let patterns: &[UltraSp3Pattern] = match center {
-        AnalysisCenter::IgsUlt => &IGS_ULT_SP3_PATTERNS,
-        AnalysisCenter::CodUlt => &COD_ULT_SP3_PATTERNS,
-        AnalysisCenter::EsaUlt => &ESA_ULT_SP3_PATTERNS,
-        AnalysisCenter::GfzUlt => &GFZ_ULT_SP3_PATTERNS,
+    match center {
+        AnalysisCenter::IgsUlt
+        | AnalysisCenter::CodUlt
+        | AnalysisCenter::EsaUlt
+        | AnalysisCenter::GfzUlt => {}
         other => {
             return Err(DataCatalogError::UnsupportedProduct {
                 center: other,
@@ -2839,57 +2988,42 @@ pub fn ultra_sp3_locations(
             })
         }
     };
-    let convention = product_convention(center, ProductType::Sp3)?;
     let default_sample =
         default_sample_for_product_issue(center, ProductType::Sp3, date, Some(issue))?;
-    let entry = center_catalog(center).expect("catalog entry exists for enum variant");
-    let directory = dir_path(convention.layout, date)?;
-    let date = date_block(date, Some(issue));
+    let mut samples = supported_samples(center, ProductType::Sp3, date, Some(issue))?.to_vec();
+    samples.sort_by_key(|sample| *sample != default_sample);
 
-    let mut patterns = patterns.to_vec();
-    patterns.sort_by_key(|pattern| {
-        !(pattern.alias_filename.is_none()
-            && pattern.span == convention.span
-            && pattern.sample == default_sample)
-    });
-
-    Ok(patterns
-        .iter()
-        .map(|pattern| {
-            let is_primary = pattern.alias_filename.is_none()
-                && pattern.span == convention.span
-                && pattern.sample == default_sample;
-            let filename = pattern.alias_filename.map_or_else(
-                || {
-                    format!(
-                        "{}_{}_{}_{}_ORB.SP3",
-                        convention.token, date, pattern.span, pattern.sample
-                    )
-                },
-                ToOwned::to_owned,
-            );
-            UltraSp3Location {
-                pattern: if is_primary {
-                    format!("primary_{}_{}", pattern.span, pattern.sample)
-                } else if pattern.alias_filename.is_some() {
-                    pattern.label.to_string()
+    samples
+        .into_iter()
+        .map(|sample| {
+            // Reuse the single-product catalog path so candidate enumeration
+            // cannot drift from canonical filename, URL, identity, or
+            // date-dependent compression derivation.
+            let spec = ops_ultra_sp3(center, date, Some(sample), Some(issue))?;
+            let identity = spec.identity()?;
+            let filename = spec.canonical_filename()?;
+            let url = spec.archive_url()?;
+            let convention = product_convention(center, ProductType::Sp3)?;
+            let compression = product_archive_compression(
+                center,
+                ProductType::Sp3,
+                date,
+                convention.compression,
+            )?;
+            Ok(UltraSp3Location {
+                pattern: if sample == default_sample {
+                    format!("primary_{}_{}", identity.span, sample)
                 } else {
-                    format!("alternate_{}_{}", pattern.span, pattern.sample)
+                    format!("alternate_{}_{}", identity.span, sample)
                 },
-                span: pattern.span.to_string(),
-                sample: pattern.sample.to_string(),
-                url: format!(
-                    "{}/{}/{}{}",
-                    entry.root_url,
-                    directory,
-                    filename,
-                    convention.compression.suffix()
-                ),
+                span: identity.span,
+                sample: sample.to_string(),
+                url,
                 filename,
-                compression: convention.compression,
-            }
+                compression,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Build an ultra-rapid OPS clock product for a date and issue time.
@@ -3122,37 +3256,118 @@ fn validate_official_filename(filename: &str) -> Result<(), DataCatalogError> {
 fn validate_product(
     center: AnalysisCenter,
     product_type: ProductType,
+    date: ProductDate,
     sample: &str,
     issue: Option<&str>,
 ) -> Result<&'static CenterProductConvention, DataCatalogError> {
     let convention = product_convention(center, product_type)?;
     validate_sample(sample)?;
-    validate_catalog_sample(center, product_type, sample, convention)?;
     validate_issue_for_center(center, issue)?;
+    validate_product_date(center, product_type, date)?;
+    validate_catalog_sample(center, product_type, date, sample, issue)?;
     Ok(convention)
 }
 
 fn validate_catalog_sample(
     center: AnalysisCenter,
     product_type: ProductType,
+    date: ProductDate,
     sample: &str,
-    convention: &CenterProductConvention,
+    issue: Option<&str>,
 ) -> Result<(), DataCatalogError> {
-    // The combined IGS final-orbit series is cataloged only at the official
-    // 15-minute cadence. Other catalog lines retain their existing caller-
-    // selectable cadence behavior until their complete published variants are
-    // modeled explicitly.
-    if center == AnalysisCenter::Igs
-        && product_type == ProductType::Sp3
-        && sample != convention.default_sample
-    {
-        return Err(DataCatalogError::UnsupportedSample {
-            center,
-            product_type,
-            sample: sample.to_string(),
+    let supported = supported_samples_inner(center, product_type, date, issue)?;
+    if supported.contains(&sample) {
+        return Ok(());
+    }
+    Err(DataCatalogError::UnsupportedSample {
+        center,
+        product_type,
+        sample: sample.to_string(),
+    })
+}
+
+/// Officially evidenced sampling tokens for one exact catalog product.
+///
+/// Syntax alone is not publication evidence: this query reports only cadences
+/// backed by the official product line for the selected center, family, date,
+/// and issue. Constructors enforce the same result before deriving a filename,
+/// URL, identity, or cache key.
+///
+/// For issue-based product lines, omitting `issue` selects the `0000` issue,
+/// matching [`default_sample_for_date`]. Product construction itself still
+/// requires an explicit issue.
+pub fn supported_samples(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+    issue: Option<&str>,
+) -> Result<&'static [&'static str], DataCatalogError> {
+    ProductDate::new(date.year, date.month, date.day)?;
+    product_convention(center, product_type)?;
+    validate_product_date(center, product_type, date)?;
+
+    let entry = center_catalog(center).expect("catalog entry exists for enum variant");
+    if entry.issues.is_empty() {
+        validate_issue_for_center(center, issue)?;
+    } else {
+        validate_issue_for_center(center, Some(issue.unwrap_or("0000")))?;
+    }
+    supported_samples_inner(center, product_type, date, issue)
+}
+
+fn supported_samples_inner(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+    issue: Option<&str>,
+) -> Result<&'static [&'static str], DataCatalogError> {
+    if product_type != ProductType::Sp3 {
+        let convention = product_convention(center, product_type)?;
+        return Ok(match convention.default_sample {
+            "30S" => &["30S"],
+            "01H" => &["01H"],
+            "02H" => &["02H"],
+            "01D" => &["01D"],
+            _ => &[],
         });
     }
-    Ok(())
+
+    Ok(match center {
+        AnalysisCenter::Igs | AnalysisCenter::IgsUlt => &["15M"],
+        AnalysisCenter::Esa | AnalysisCenter::Cod | AnalysisCenter::CodUlt => &["05M"],
+        AnalysisCenter::Gfz => {
+            if date < GFZ_RAPID_5M_START_DATE {
+                &["15M"]
+            } else {
+                &["05M"]
+            }
+        }
+        AnalysisCenter::EsaUlt => {
+            let issue = issue.unwrap_or("0000");
+            let at_or_before_last_15m = date < ESA_ULTRA_15M_LAST_DATE
+                || (date == ESA_ULTRA_15M_LAST_DATE
+                    && issue_minutes(issue)? <= ESA_ULTRA_15M_LAST_ISSUE_MINUTES);
+            if at_or_before_last_15m {
+                &["15M"]
+            } else {
+                &["05M"]
+            }
+        }
+        AnalysisCenter::GfzUlt => {
+            if date < GFZ_ULTRA_15M_LAST_DATE {
+                &["15M"]
+            } else if date == GFZ_ULTRA_15M_LAST_DATE {
+                if issue.unwrap_or("0000") == "0000" {
+                    &["15M", "05M"]
+                } else {
+                    &["15M"]
+                }
+            } else {
+                &["05M"]
+            }
+        }
+        AnalysisCenter::CodRap | AnalysisCenter::CodPrd1 | AnalysisCenter::CodPrd2 => &[],
+    })
 }
 
 fn validate_product_date(
@@ -3445,4 +3660,134 @@ fn product_date_from_jdn(jdn: i64) -> Result<ProductDate, DataCatalogError> {
     let month = u8::try_from(month).map_err(|_| DataCatalogError::DateOutOfRange)?;
     let day = u8::try_from(day).map_err(|_| DataCatalogError::DateOutOfRange)?;
     ProductDate::new(year, month, day).map_err(|_| DataCatalogError::DateOutOfRange)
+}
+
+#[cfg(test)]
+mod content_start_tests {
+    use super::*;
+
+    const GFZ_ISSUES: [&str; 8] = [
+        "0000", "0300", "0600", "0900", "1200", "1500", "1800", "2100",
+    ];
+
+    fn date(year: i32, month: u8, day: u8) -> ProductDate {
+        ProductDate::new(year, month, day).expect("test date")
+    }
+
+    fn offset(
+        center: AnalysisCenter,
+        product_date: ProductDate,
+        sample: &str,
+        issue: Option<&str>,
+    ) -> i64 {
+        let identity =
+            product_identity(center, ProductType::Sp3, product_date, Some(sample), issue)
+                .expect("cataloged SP3 identity");
+        exact_sp3_content_start_offset_s(&identity).expect("content-start convention")
+    }
+
+    #[test]
+    fn gfz_ultra_pre_transition_issues_start_one_day_before_filename_epoch() {
+        for issue in GFZ_ISSUES {
+            assert_eq!(
+                offset(AnalysisCenter::GfzUlt, date(2022, 9, 6), "05M", Some(issue)),
+                -86_400,
+                "2022-09-06 issue {issue}"
+            );
+        }
+    }
+
+    #[test]
+    fn gfz_ultra_transition_is_cataloged_per_issue() {
+        let day_seven = [
+            0, -86_400, -86_400, -86_400, -86_400, -86_400, -86_400, -86_400,
+        ];
+        let day_eight = [0, -86_400, -86_400, 0, 0, 0, 0, 0];
+
+        for (product_day, expected) in [(7, day_seven), (8, day_eight)] {
+            for (issue, expected_offset) in GFZ_ISSUES.iter().zip(expected) {
+                assert_eq!(
+                    offset(
+                        AnalysisCenter::GfzUlt,
+                        date(2022, 9, product_day),
+                        "05M",
+                        Some(issue)
+                    ),
+                    expected_offset,
+                    "2022-09-{product_day:02} issue {issue}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gfz_ultra_post_transition_and_other_product_lines_use_filename_epoch() {
+        for issue in GFZ_ISSUES {
+            assert_eq!(
+                offset(AnalysisCenter::GfzUlt, date(2022, 9, 9), "05M", Some(issue)),
+                0,
+                "2022-09-09 issue {issue}"
+            );
+        }
+
+        let current = date(2026, 7, 20);
+        let cases = [
+            (AnalysisCenter::Igs, "15M", None),
+            (AnalysisCenter::Esa, "05M", None),
+            (AnalysisCenter::Cod, "05M", None),
+            (AnalysisCenter::Gfz, "05M", None),
+            (AnalysisCenter::IgsUlt, "15M", Some("1200")),
+            (AnalysisCenter::CodUlt, "05M", Some("0000")),
+            (AnalysisCenter::EsaUlt, "05M", Some("1800")),
+            (AnalysisCenter::GfzUlt, "05M", Some("2100")),
+        ];
+        for (center, sample, issue) in cases {
+            assert_eq!(offset(center, current, sample, issue), 0, "{center:?}");
+        }
+    }
+
+    #[test]
+    fn gfz_ultra_content_start_is_independent_of_its_cadence_transition() {
+        assert_eq!(
+            offset(
+                AnalysisCenter::GfzUlt,
+                date(2021, 5, 15),
+                "15M",
+                Some("0000")
+            ),
+            -86_400
+        );
+        assert_eq!(
+            offset(
+                AnalysisCenter::GfzUlt,
+                date(2021, 5, 16),
+                "05M",
+                Some("0000")
+            ),
+            -86_400
+        );
+    }
+
+    #[test]
+    fn public_content_start_query_enforces_center_issue_rules() {
+        assert_eq!(
+            sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 7), Some("0130")),
+            Err(DataCatalogError::UnsupportedIssue {
+                center: AnalysisCenter::GfzUlt,
+                issue: "0130".to_owned(),
+            })
+        );
+        assert_eq!(
+            sp3_content_start_convention(AnalysisCenter::Gfz, date(2022, 9, 7), Some("0000")),
+            Err(DataCatalogError::UnexpectedIssue {
+                center: AnalysisCenter::Gfz,
+            })
+        );
+        assert_eq!(
+            sp3_content_start_convention(AnalysisCenter::GfzUlt, date(2022, 9, 7), None),
+            Err(DataCatalogError::MissingIssue {
+                center: AnalysisCenter::GfzUlt,
+            })
+        );
+    }
 }

@@ -1,4 +1,7 @@
-use sidereon_core::data::{mgex_nav, mgex_sp3, AnalysisCenter, ProductDate, ProductType};
+use serde::Deserialize;
+use sidereon_core::data::{
+    mgex_nav, mgex_sp3, ops_ultra_sp3, AnalysisCenter, ProductDate, ProductType,
+};
 use sidereon_core::ephemeris::{
     parse_exact_sp3, validate_exact_sp3, ExactSp3Coverage, ExactSp3Request,
     ExactSp3ValidationError, Sp3,
@@ -9,10 +12,31 @@ const START: ProductDate = ProductDate {
     month: 1,
     day: 1,
 };
+const SP3_RECORD_PADDING_MAX: usize = 77;
 const P_G01: &str = "PG01  15000.000000 -20000.000000   5000.000000    123.456789\n";
 const P_G02: &str = "PG02  16000.000000 -21000.000000   6000.000000    124.456789\n";
 const V_G01: &str = "VG01      1.000000      2.000000      3.000000      4.000000\n";
 const V_G02: &str = "VG02      5.000000      6.000000      7.000000      8.000000\n";
+
+#[derive(Debug, Deserialize)]
+struct TerminalRecordCorpus {
+    schema: String,
+    record_width: usize,
+    record_width_authority: String,
+    cases: Vec<TerminalRecordCase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalRecordCase {
+    name: String,
+    leading_hex: String,
+    marker: Option<String>,
+    padding_spaces: usize,
+    suffix_hex: String,
+    separator_hex: String,
+    trailing_hex: String,
+    expect: String,
+}
 
 fn request(sample: &str) -> Result<ExactSp3Request, ExactSp3ValidationError> {
     ExactSp3Request::new(START, Some("0000"), "01D", sample)
@@ -20,6 +44,110 @@ fn request(sample: &str) -> Result<ExactSp3Request, ExactSp3ValidationError> {
 
 fn regular_offsets(count: usize, cadence_s: i64) -> Vec<i64> {
     (0..count).map(|index| index as i64 * cadence_s).collect()
+}
+
+fn spaces(count: usize) -> String {
+    " ".repeat(count)
+}
+
+fn with_terminal(base: &str, terminal: &str) -> String {
+    format!("{}{terminal}", base.strip_suffix("EOF\n").unwrap())
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    assert!(value.len().is_multiple_of(2), "odd-length hex {value:?}");
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).expect("fixture hex is ASCII");
+            u8::from_str_radix(text, 16).expect("fixture hex is valid")
+        })
+        .collect()
+}
+
+fn terminal_case_bytes(base: &str, case: &TerminalRecordCase) -> Vec<u8> {
+    let mut bytes = base
+        .strip_suffix("EOF\n")
+        .expect("fixture has canonical terminal record")
+        .as_bytes()
+        .to_vec();
+    bytes.extend(decode_hex(&case.leading_hex));
+    if let Some(marker) = &case.marker {
+        bytes.extend(marker.as_bytes());
+    }
+    bytes.extend(std::iter::repeat_n(b' ', case.padding_spaces));
+    bytes.extend(decode_hex(&case.suffix_hex));
+    bytes.extend(decode_hex(&case.separator_hex));
+    bytes.extend(decode_hex(&case.trailing_hex));
+    bytes
+}
+
+fn terminal_result_class(
+    result: Result<(Sp3, ExactSp3Coverage), ExactSp3ValidationError>,
+) -> &'static str {
+    match result {
+        Ok(_) => "accept",
+        Err(ExactSp3ValidationError::MalformedEofRecord { .. }) => "malformed_eof_record",
+        Err(ExactSp3ValidationError::MissingEof) => "missing_eof",
+        Err(ExactSp3ValidationError::TrailingContentAfterEof) => "trailing_content_after_eof",
+        Err(error) => panic!("terminal corpus reached unrelated exact error: {error:?}"),
+    }
+}
+
+fn option_bits(value: Option<f64>) -> Option<u64> {
+    value.map(f64::to_bits)
+}
+
+fn assert_products_bit_identical(left: &Sp3, right: &Sp3) {
+    assert_eq!(left.header, right.header);
+    assert_eq!(left.epochs, right.epochs);
+    assert_eq!(left.declared_epoch_count(), right.declared_epoch_count());
+    assert_eq!(
+        left.declared_start_j2000_s().map(f64::to_bits),
+        right.declared_start_j2000_s().map(f64::to_bits)
+    );
+
+    for epoch_index in 0..left.epoch_count() {
+        let left_states = left.states_at(epoch_index).expect("left epoch");
+        let right_states = right.states_at(epoch_index).expect("right epoch");
+        assert_eq!(
+            left_states.keys().collect::<Vec<_>>(),
+            right_states.keys().collect::<Vec<_>>()
+        );
+        for (satellite, left_state) in left_states {
+            let right_state = right_states.get(satellite).expect("matching satellite");
+            assert_eq!(
+                left_state.position.as_array().map(f64::to_bits),
+                right_state.position.as_array().map(f64::to_bits)
+            );
+            assert_eq!(
+                option_bits(left_state.clock_s),
+                option_bits(right_state.clock_s)
+            );
+            assert_eq!(
+                left_state.velocity.map(|velocity| {
+                    [
+                        velocity.vx_m_s.to_bits(),
+                        velocity.vy_m_s.to_bits(),
+                        velocity.vz_m_s.to_bits(),
+                    ]
+                }),
+                right_state.velocity.map(|velocity| {
+                    [
+                        velocity.vx_m_s.to_bits(),
+                        velocity.vy_m_s.to_bits(),
+                        velocity.vz_m_s.to_bits(),
+                    ]
+                })
+            );
+            assert_eq!(
+                option_bits(left_state.clock_rate_s_s),
+                option_bits(right_state.clock_rate_s_s)
+            );
+            assert_eq!(left_state.flags, right_state.flags);
+        }
+    }
 }
 
 fn remove_first_line_with_prefix(text: &str, prefix: &str) -> String {
@@ -49,17 +177,44 @@ fn exact_sp3(
     header_cadence: &str,
     declared_day: u8,
 ) -> String {
+    exact_sp3_at(
+        offsets_s,
+        declared_count,
+        header_cadence,
+        2020,
+        1,
+        declared_day,
+        2086,
+        259_200.0,
+        58_849,
+        "TST",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_sp3_at(
+    offsets_s: &[i64],
+    declared_count: usize,
+    header_cadence: &str,
+    year: i32,
+    month: u8,
+    declared_day: u8,
+    gnss_week: u16,
+    seconds_of_week: f64,
+    mjd: i64,
+    agency: &str,
+) -> String {
     let dt = format!(
         "{:4} {:>2} {:>2} {:>2} {:>2} {:11.8}",
-        2020, 1, declared_day, 0, 0, 0.0
+        year, month, declared_day, 0, 0, 0.0
     );
     let mut text = format!(
         "#dP{dt} {declared_count:>7} {:<5}{:>6}{:>4} {}\n",
-        "ORBIT", "IGS20", "FIT", "TST"
+        "ORBIT", "IGS20", "FIT", agency
     );
     text.push_str(&format!(
         "## {:>4} {:15.8} {header_cadence:>14} {:>5} {:.13}\n",
-        2086, 259_200.0, 58_849, 0.0
+        gnss_week, seconds_of_week, mjd, 0.0
     ));
     text.push_str("+    2   G01G02");
     for _ in 2..17 {
@@ -98,9 +253,9 @@ fn exact_sp3(
         let second = second_of_day % 60;
         text.push_str(&format!(
             "*  {:4} {:>2} {:>2} {:>2} {:>2} {:11.8}\n",
-            2020,
-            1,
-            1 + day_offset,
+            year,
+            month,
+            i64::from(declared_day) + day_offset,
             hour,
             minute,
             second as f64
@@ -252,6 +407,52 @@ fn request_from_identity_uses_exact_igs_final_fields_and_rejects_nav() {
 }
 
 #[test]
+fn historical_gfz_ultra_identity_requires_its_cataloged_content_start() {
+    // This issue crosses a GPS-week boundary: the filename epoch is Sunday in
+    // week 2226, while the required first content epoch is Saturday in 2225.
+    let filename_date = ProductDate::new(2022, 9, 4).expect("filename date");
+    let identity = ops_ultra_sp3(
+        AnalysisCenter::GfzUlt,
+        filename_date,
+        Some("05M"),
+        Some("0000"),
+    )
+    .expect("historical GFZ ultra product")
+    .identity()
+    .expect("historical GFZ identity");
+    let from_identity = ExactSp3Request::from_identity(&identity).expect("exact request");
+
+    // The official filename names 2022-09-04 00:00, while this historical
+    // series begins at 2022-09-03 00:00 (GPS week 2225, SOW 518400, MJD 59825).
+    let text = exact_sp3_at(
+        &regular_offsets(576, 300),
+        576,
+        "300.00000000",
+        2022,
+        9,
+        3,
+        2225,
+        518_400.0,
+        59_825,
+        "GFZ",
+    );
+
+    assert_eq!(
+        parse_exact_sp3(text.as_bytes(), &from_identity)
+            .expect("catalog-derived historical request")
+            .1,
+        ExactSp3Coverage::HalfOpen
+    );
+
+    let filename_epoch_request =
+        ExactSp3Request::new(filename_date, Some("0000"), "02D", "05M").expect("same-date request");
+    assert!(matches!(
+        parse_exact_sp3(text.as_bytes(), &filename_epoch_request),
+        Err(ExactSp3ValidationError::DeclaredStartMismatch { .. })
+    ));
+}
+
+#[test]
 fn expected_agency_is_optional_but_terminal_when_requested() {
     let text = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
     let required = request("05M").unwrap().with_expected_agency("IGS").unwrap();
@@ -287,6 +488,177 @@ fn rejects_noncanonical_fixed_duration_tokens() {
     for sample in ["30S", "05M", "01D"] {
         assert!(request(sample).is_ok());
     }
+}
+
+#[test]
+fn shared_terminal_record_corpus_matches_exact_parser_contract() {
+    let corpus: TerminalRecordCorpus =
+        serde_json::from_str(include_str!("../golden/sp3-terminal-record-v1.json"))
+            .expect("terminal-record corpus is valid JSON");
+    assert_eq!(corpus.schema, "sidereon-sp3-terminal-record-v1");
+    assert_eq!(corpus.record_width, 80);
+    assert_eq!(
+        corpus.record_width_authority,
+        "sidereon-interoperability-policy"
+    );
+
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    let exact_request = request("05M").unwrap();
+    for case in &corpus.cases {
+        let bytes = terminal_case_bytes(&base, case);
+        assert!(
+            Sp3::parse(&bytes).is_ok(),
+            "the general parser must remain permissive for corpus case {}",
+            case.name
+        );
+        assert_eq!(
+            terminal_result_class(parse_exact_sp3(&bytes, &exact_request)),
+            case.expect,
+            "terminal-record corpus case {}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn eof_padding_does_not_change_any_parsed_numeric_value() {
+    let bare = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    let padded = with_terminal(&bare, &format!("EOF{}\r\n", spaces(77)));
+    let exact_request = request("05M").unwrap();
+
+    let (bare_product, bare_coverage) =
+        parse_exact_sp3(bare.as_bytes(), &exact_request).expect("bare product");
+    let (padded_product, padded_coverage) =
+        parse_exact_sp3(padded.as_bytes(), &exact_request).expect("padded product");
+
+    assert_eq!(bare_coverage, padded_coverage);
+    assert_products_bit_identical(&bare_product, &padded_product);
+}
+
+#[test]
+fn accepts_supported_eof_padding_and_line_endings() {
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    let terminals = [
+        "EOF\n".to_owned(),
+        "EOF\r\n".to_owned(),
+        "EOF".to_owned(),
+        format!("EOF{}\n", spaces(1)),
+        format!("EOF{}\n", spaces(37)),
+        format!("EOF{}\n", spaces(SP3_RECORD_PADDING_MAX)),
+        format!("EOF{}\r\n", spaces(SP3_RECORD_PADDING_MAX)),
+        format!("EOF{}", spaces(SP3_RECORD_PADDING_MAX)),
+    ];
+
+    for terminal in terminals {
+        let text = with_terminal(&base, &terminal);
+        let (_, coverage) = parse_exact_sp3(text.as_bytes(), &request("05M").unwrap())
+            .unwrap_or_else(|error| panic!("terminal {terminal:?} must be accepted: {error:?}"));
+        assert_eq!(coverage, ExactSp3Coverage::HalfOpen);
+    }
+}
+
+#[test]
+fn malformed_eof_like_records_have_a_distinct_integrity_error() {
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    let terminals = [
+        format!("EOF{}\n", spaces(SP3_RECORD_PADDING_MAX + 1)),
+        "EOF\t\n".to_owned(),
+        "EOF \t \n".to_owned(),
+        "EOFX\n".to_owned(),
+        "EOF X\n".to_owned(),
+        "EOF.\n".to_owned(),
+        " EOF\n".to_owned(),
+        "\tEOF\n".to_owned(),
+        "EOF\r".to_owned(),
+        "EOF\r\r\n".to_owned(),
+    ];
+
+    for terminal in terminals {
+        let text = with_terminal(&base, &terminal);
+        match parse_exact_sp3(text.as_bytes(), &request("05M").unwrap()).unwrap_err() {
+            ExactSp3ValidationError::MalformedEofRecord {
+                line_number,
+                record_length,
+            } => {
+                assert!(line_number > 0);
+                assert!(record_length >= 3);
+            }
+            error => panic!("terminal {terminal:?} returned the wrong error: {error:?}"),
+        }
+    }
+}
+
+#[test]
+fn trailing_ascii_blank_records_are_tolerated_but_other_data_is_not() {
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    for tail in ["\n", "\n\n\n", "   \n", "\n   \n"] {
+        let text = format!("{base}{tail}");
+        assert!(
+            parse_exact_sp3(text.as_bytes(), &request("05M").unwrap()).is_ok(),
+            "ASCII-blank tail {tail:?} must be tolerated"
+        );
+    }
+
+    for tail in ["\t\n", " \t \n", "EOFX\n", "non-whitespace\n"] {
+        let text = format!("{base}{tail}");
+        assert_eq!(
+            parse_exact_sp3(text.as_bytes(), &request("05M").unwrap()).unwrap_err(),
+            ExactSp3ValidationError::TrailingContentAfterEof,
+            "tail {tail:?} must be rejected as trailing content"
+        );
+    }
+}
+
+#[test]
+fn padded_eof_preserves_trailing_content_detection() {
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    for terminal in ["EOF\n".to_owned(), format!("EOF{}\n", spaces(77))] {
+        let text = format!(
+            "{}*  2020  1  2  0  0  0.00000000\n{P_G01}{P_G02}",
+            with_terminal(&base, &terminal)
+        );
+        assert_eq!(
+            parse_exact_sp3(text.as_bytes(), &request("05M").unwrap()).unwrap_err(),
+            ExactSp3ValidationError::TrailingContentAfterEof
+        );
+    }
+}
+
+#[test]
+fn premature_padded_eof_is_rejected_by_the_exact_epoch_count() {
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    let body = base.strip_suffix("EOF\n").unwrap();
+    let cut = body
+        .find("*  2020  1  1 12  0")
+        .expect("midday epoch record");
+
+    for terminal in ["EOF\n".to_owned(), format!("EOF{}\n", spaces(77))] {
+        let text = format!("{}{terminal}", &body[..cut]);
+        assert_eq!(
+            parse_exact_sp3(text.as_bytes(), &request("05M").unwrap()).unwrap_err(),
+            ExactSp3ValidationError::DeclaredEpochCountMismatch {
+                declared: 288,
+                parsed: 144,
+            }
+        );
+    }
+}
+
+#[test]
+fn eof_text_embedded_in_another_record_is_not_a_terminal_record() {
+    let base = exact_sp3(&regular_offsets(288, 300), 288, "300.00000000", 1);
+    let valid = base.replacen(
+        "/* EXACT VALIDATION TEST FIXTURE\n",
+        "/* EOF APPEARS IN THIS COMMENT TEXT\n",
+        1,
+    );
+    assert!(parse_exact_sp3(valid.as_bytes(), &request("05M").unwrap()).is_ok());
+
+    let missing_terminal = with_terminal(&valid, "");
+    assert_eq!(
+        parse_exact_sp3(missing_terminal.as_bytes(), &request("05M").unwrap()).unwrap_err(),
+        ExactSp3ValidationError::MissingEof
+    );
 }
 
 #[test]
