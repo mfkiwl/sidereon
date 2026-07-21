@@ -2,17 +2,17 @@ use std::process::Command;
 
 use sidereon_core::data::{
     allowed_hosts, archive_url, canonical_filename, catalog, cddis_archive_url, default_sample,
-    default_sample_for_date, dted_block_dir, dted_cache_relpath, dted_tile_filename,
-    gim_date_candidates, latest_ops_ultra_sp3, mgex_clk, mgex_ionex, mgex_nav, mgex_sp3,
-    no_open_mirrors, open_mirror_code, ops_ultra_sp3, parse_skadi_tile_id, predicted_ionex,
-    product_convention, product_solution_class, rapid_ionex, skadi_archive_url, skadi_band,
-    skadi_source_entry, skadi_tile_id, space_weather_archive_url, space_weather_cache_relpath,
-    space_weather_filename, space_weather_source_entry, station_obs, station_obs_filename,
-    station_obs_protocol, station_obs_url, terrain_tile_index, ultra_sp3_locations,
-    validate_exact_product_set, AnalysisCenter, ArchiveCompression, ArchiveProtocol,
-    DataCatalogError, DistributionSource, ExactProductSetError, ProductCampaign, ProductDate,
-    ProductDateTime, ProductFormat, ProductPublisher, ProductRequest, ProductType, SolutionClass,
-    SpaceWeatherProduct, UltraIssue,
+    default_sample_for_date, distribution_location_for_identity, dted_block_dir,
+    dted_cache_relpath, dted_tile_filename, gim_date_candidates, latest_ops_ultra_sp3, mgex_clk,
+    mgex_ionex, mgex_nav, mgex_sp3, no_open_mirrors, open_mirror_code, ops_ultra_sp3,
+    parse_skadi_tile_id, predicted_ionex, product_convention, product_solution_class, rapid_ionex,
+    skadi_archive_url, skadi_band, skadi_source_entry, skadi_tile_id, space_weather_archive_url,
+    space_weather_cache_relpath, space_weather_filename, space_weather_source_entry, station_obs,
+    station_obs_filename, station_obs_protocol, station_obs_url, terrain_tile_index,
+    ultra_issue_candidates, ultra_sp3_locations, validate_exact_product_set, AnalysisCenter,
+    ArchiveCompression, ArchiveProtocol, DataCatalogError, DistributionSource,
+    ExactProductSetError, ProductCampaign, ProductDate, ProductDateTime, ProductFormat,
+    ProductPublisher, ProductRequest, ProductType, SolutionClass, SpaceWeatherProduct, UltraIssue,
 };
 
 fn date(year: i32, month: u8, day: u8) -> ProductDate {
@@ -217,6 +217,216 @@ fn igs_final_sp3_starts_at_week_0730_and_cddis_week_directories_are_padded() {
 }
 
 #[test]
+fn cataloged_sp3_series_enforce_their_first_published_date() {
+    let cases = [
+        (
+            AnalysisCenter::Esa,
+            date(2014, 1, 4),
+            date(2014, 1, 5),
+            None,
+            "https://navigation-office.esa.int/products/gnss-products/1774/\
+ESA0MGNFIN_20140050000_01D_05M_ORB.SP3.gz",
+        ),
+        (
+            AnalysisCenter::Gfz,
+            date(2020, 5, 12),
+            date(2020, 5, 13),
+            None,
+            "https://isdc-data.gfz.de/gnss/products/rapid/w2105/\
+GFZ0OPSRAP_20201340000_01D_15M_ORB.SP3.gz",
+        ),
+        (
+            AnalysisCenter::IgsUlt,
+            date(2022, 11, 26),
+            date(2022, 11, 27),
+            Some("0000"),
+            "https://igs.bkg.bund.de/root_ftp/IGS/products/2238/\
+IGS0OPSULT_20223310000_02D_15M_ORB.SP3.gz",
+        ),
+        (
+            AnalysisCenter::EsaUlt,
+            date(2022, 10, 3),
+            date(2022, 10, 4),
+            Some("0000"),
+            "https://navigation-office.esa.int/products/gnss-products/2230/\
+ESA0OPSULT_20222770000_02D_15M_ORB.SP3.gz",
+        ),
+        (
+            AnalysisCenter::GfzUlt,
+            date(2020, 10, 5),
+            date(2020, 10, 6),
+            Some("0000"),
+            "https://isdc-data.gfz.de/gnss/products/ultra/w2126/\
+GFZ0OPSULT_20202800000_02D_15M_ORB.SP3.gz",
+        ),
+    ];
+
+    for (center, before, first, issue, first_url) in cases {
+        assert_eq!(
+            sidereon_core::data::product(center, ProductType::Sp3, before, None, issue),
+            Err(DataCatalogError::UnsupportedProductEra {
+                center,
+                product_type: ProductType::Sp3,
+                date: before,
+            })
+        );
+        assert_eq!(
+            sidereon_core::data::product(center, ProductType::Sp3, first, None, issue)
+                .expect("first product")
+                .archive_url()
+                .expect("first direct URL"),
+            first_url
+        );
+    }
+
+    let last_pretransition =
+        ProductDate::from_gps_week_day(2237, 6).expect("last pre-transition date");
+    assert_eq!(
+        ops_ultra_sp3(
+            AnalysisCenter::CodUlt,
+            last_pretransition,
+            None,
+            Some("0000")
+        ),
+        Err(DataCatalogError::UnsupportedProductEra {
+            center: AnalysisCenter::CodUlt,
+            product_type: ProductType::Sp3,
+            date: last_pretransition,
+        })
+    );
+    let first_long_date = ProductDate::from_gps_week_day(2238, 0).expect("week 2238");
+    assert_eq!(
+        ops_ultra_sp3(AnalysisCenter::CodUlt, first_long_date, None, Some("0000"))
+            .expect("first modeled CODE ultra product")
+            .canonical_filename()
+            .expect("CODE ultra filename"),
+        "COD0OPSULT_20223310000_01D_05M_ORB.SP3"
+    );
+}
+
+#[test]
+fn cataloged_clock_series_share_their_verified_orbit_family_floors() {
+    for (center, before, first, first_url) in [
+        (
+            AnalysisCenter::Esa,
+            date(2014, 1, 4),
+            date(2014, 1, 5),
+            "https://navigation-office.esa.int/products/gnss-products/1774/\
+ESA0MGNFIN_20140050000_01D_30S_CLK.CLK.gz",
+        ),
+        (
+            AnalysisCenter::Gfz,
+            date(2020, 5, 12),
+            date(2020, 5, 13),
+            "https://isdc-data.gfz.de/gnss/products/rapid/w2105/\
+GFZ0OPSRAP_20201340000_01D_30S_CLK.CLK.gz",
+        ),
+    ] {
+        assert_eq!(
+            mgex_clk(center, before, None),
+            Err(DataCatalogError::UnsupportedProductEra {
+                center,
+                product_type: ProductType::Clk,
+                date: before,
+            })
+        );
+        assert_eq!(
+            mgex_clk(center, first, None)
+                .expect("first clock product")
+                .archive_url()
+                .expect("first direct clock URL"),
+            first_url
+        );
+    }
+}
+
+#[test]
+fn ultra_issue_candidates_stop_at_each_product_series_floor() {
+    for (center, before, first) in [
+        (
+            AnalysisCenter::IgsUlt,
+            date(2022, 11, 26),
+            date(2022, 11, 27),
+        ),
+        (AnalysisCenter::EsaUlt, date(2022, 10, 3), date(2022, 10, 4)),
+        (AnalysisCenter::GfzUlt, date(2020, 10, 5), date(2020, 10, 6)),
+    ] {
+        let target = ProductDateTime::new(first, 1, 0, 0).expect("target on first day");
+        let candidates = ultra_issue_candidates(center, target).expect("first-day candidates");
+        assert_eq!(
+            candidates,
+            vec![UltraIssue::new(first, "0000").expect("first issue")]
+        );
+
+        let before_target = ProductDateTime::new(before, 23, 59, 0).expect("pre-floor target");
+        assert_eq!(
+            ultra_issue_candidates(center, before_target),
+            Err(DataCatalogError::UnsupportedProductEra {
+                center,
+                product_type: ProductType::Sp3,
+                date: before,
+            })
+        );
+    }
+}
+
+#[test]
+fn cddis_rejects_pretransition_long_sp3_names_but_keeps_igs_legacy() {
+    let last_legacy_date = ProductDate::from_gps_week_day(2237, 0).expect("week 2237");
+    let long_name_identities = [
+        mgex_sp3(AnalysisCenter::Esa, last_legacy_date, None)
+            .expect("valid direct ESA product")
+            .identity()
+            .expect("ESA identity"),
+        mgex_sp3(AnalysisCenter::Gfz, last_legacy_date, None)
+            .expect("valid direct GFZ product")
+            .identity()
+            .expect("GFZ identity"),
+        ops_ultra_sp3(AnalysisCenter::EsaUlt, last_legacy_date, None, Some("0000"))
+            .expect("valid direct ESA ultra product")
+            .identity()
+            .expect("ESA ultra identity"),
+        ops_ultra_sp3(AnalysisCenter::GfzUlt, last_legacy_date, None, Some("0000"))
+            .expect("valid direct GFZ ultra product")
+            .identity()
+            .expect("GFZ ultra identity"),
+    ];
+    for identity in long_name_identities {
+        let expected = DataCatalogError::UnsupportedDistributionEra {
+            source: DistributionSource::NasaCddis,
+            center: identity.analysis_center,
+            product_type: ProductType::Sp3,
+            date: last_legacy_date,
+        };
+        assert_eq!(cddis_archive_url(&identity), Err(expected.clone()));
+        assert_eq!(
+            distribution_location_for_identity(&identity, DistributionSource::NasaCddis),
+            Err(expected)
+        );
+    }
+
+    let legacy_igs = mgex_sp3(AnalysisCenter::Igs, last_legacy_date, None)
+        .expect("IGS legacy product")
+        .identity()
+        .expect("IGS legacy identity");
+    assert_eq!(
+        cddis_archive_url(&legacy_igs).expect("legacy CDDIS URL"),
+        "https://cddis.nasa.gov/archive/gnss/products/2237/igs22370.sp3.Z"
+    );
+
+    let first_long_date = ProductDate::from_gps_week_day(2238, 0).expect("week 2238");
+    let igs_long = mgex_sp3(AnalysisCenter::Igs, first_long_date, None)
+        .expect("first IGS long-name date")
+        .identity()
+        .expect("IGS identity");
+    assert_eq!(
+        cddis_archive_url(&igs_long).expect("long-name CDDIS URL"),
+        "https://cddis.nasa.gov/archive/gnss/products/2238/\
+IGS0OPSFIN_20223310000_01D_15M_ORB.SP3.gz"
+    );
+}
+
+#[test]
 fn igs_product_solution_class_is_family_aware_and_preserves_legacy_api() {
     assert_eq!(
         AnalysisCenter::Igs.solution_class(),
@@ -413,7 +623,7 @@ fn ionex_urls_match_binding_catalog_examples() {
 #[test]
 fn product_identity_is_independent_of_distributor() {
     let product =
-        mgex_sp3(AnalysisCenter::Esa, date(2020, 6, 24), None).expect("ESA final SP3 product");
+        mgex_sp3(AnalysisCenter::Esa, date(2024, 6, 24), None).expect("ESA final SP3 product");
     let identity = product.identity().expect("identity");
 
     assert_eq!(identity.family, ProductType::Sp3);
@@ -426,26 +636,58 @@ fn product_identity_is_independent_of_distributor() {
     assert_eq!(identity.sample, "05M");
     assert_eq!(
         identity.official_filename,
-        "ESA0MGNFIN_20201760000_01D_05M_ORB.SP3"
+        "ESA0MGNFIN_20241760000_01D_05M_ORB.SP3"
     );
 
     let direct = product
         .distribution_location(DistributionSource::Direct)
         .expect("direct location");
-    let cddis = product
-        .distribution_location(DistributionSource::NasaCddis)
-        .expect("CDDIS location");
+    let in_memory = product
+        .distribution_location(DistributionSource::InMemory)
+        .expect("in-memory location");
     assert_eq!(product.identity().expect("identity"), identity);
     assert_eq!(direct.source, DistributionSource::Direct);
-    assert_eq!(cddis.source, DistributionSource::NasaCddis);
+    assert_eq!(in_memory.source, DistributionSource::InMemory);
     assert_eq!(direct.compression, ArchiveCompression::Gzip);
-    assert_eq!(cddis.compression, ArchiveCompression::Gzip);
+    assert_eq!(in_memory.compression, ArchiveCompression::None);
+    assert_eq!(in_memory.original_url, None);
+}
+
+#[test]
+fn cddis_does_not_substitute_for_esa_mgex_final_sp3() {
+    let product =
+        mgex_sp3(AnalysisCenter::Esa, date(2024, 6, 24), None).expect("ESA final SP3 product");
+    let identity = product.identity().expect("identity");
+    let expected = DataCatalogError::UnsupportedDistributionEra {
+        source: DistributionSource::NasaCddis,
+        center: AnalysisCenter::Esa,
+        product_type: ProductType::Sp3,
+        date: date(2024, 6, 24),
+    };
+    assert_eq!(cddis_archive_url(&identity), Err(expected.clone()));
     assert_eq!(
-        cddis.original_url.as_deref(),
-        Some(
-            "https://cddis.nasa.gov/archive/gnss/products/2111/\
-ESA0MGNFIN_20201760000_01D_05M_ORB.SP3.gz"
-        )
+        product.distribution_location(DistributionSource::NasaCddis),
+        Err(expected)
+    );
+}
+
+#[test]
+fn cddis_rejects_unmodeled_pretransition_long_ionex_names() {
+    let pretransition = ProductDate::from_gps_week_day(2237, 6).expect("week 2237");
+    let identity = mgex_ionex(AnalysisCenter::Esa, pretransition, None)
+        .expect("ESA direct IONEX")
+        .identity()
+        .expect("ESA IONEX identity");
+    let expected = DataCatalogError::UnsupportedDistributionEra {
+        source: DistributionSource::NasaCddis,
+        center: AnalysisCenter::Esa,
+        product_type: ProductType::Ionex,
+        date: pretransition,
+    };
+    assert_eq!(cddis_archive_url(&identity), Err(expected.clone()));
+    assert_eq!(
+        distribution_location_for_identity(&identity, DistributionSource::NasaCddis),
+        Err(expected)
     );
 }
 
@@ -860,7 +1102,7 @@ fn ultra_rapid_sp3_urls_match_binding_catalog_examples() {
         .expect("ESA ultra SP3 product");
     assert_eq!(
         esa.archive_url().expect("url"),
-        "https://navigation-office.esa.int/products/gnss-products/2330/ESA0OPSULT_20242470600_02D_05M_ORB.SP3.gz"
+        "https://navigation-office.esa.int/products/gnss-products/2330/ESA0OPSULT_20242470600_02D_15M_ORB.SP3.gz"
     );
 
     let cod = ops_ultra_sp3(AnalysisCenter::CodUlt, date(2026, 7, 14), None, None)
@@ -923,6 +1165,69 @@ fn ultra_rapid_sp3_locations_include_current_patterns_and_fallbacks() {
         sidereon_core::data::ultra_issue_candidates(AnalysisCenter::GfzUlt, gfz_target)
             .expect("GFZ issues");
     assert_eq!(gfz_issues[0].issue, "0900");
+}
+
+#[test]
+fn ultra_sp3_defaults_and_candidate_order_follow_issue_cadence_eras() {
+    let esa_transition = date(2025, 2, 2);
+    assert_eq!(
+        default_sample_for_date(AnalysisCenter::EsaUlt, ProductType::Sp3, esa_transition),
+        Ok("15M")
+    );
+    let esa_0600 = ops_ultra_sp3(AnalysisCenter::EsaUlt, esa_transition, None, Some("0600"))
+        .expect("last ESA 15M issue");
+    assert_eq!(esa_0600.sample, "15M");
+    assert_eq!(
+        esa_0600.canonical_filename().expect("0600 filename"),
+        "ESA0OPSULT_20250330600_02D_15M_ORB.SP3"
+    );
+    let esa_1200 = ops_ultra_sp3(AnalysisCenter::EsaUlt, esa_transition, None, Some("1200"))
+        .expect("first ESA 05M issue");
+    assert_eq!(esa_1200.sample, "05M");
+    assert_eq!(
+        esa_1200.canonical_filename().expect("1200 filename"),
+        "ESA0OPSULT_20250331200_02D_05M_ORB.SP3"
+    );
+
+    let esa_0600_locations = ultra_sp3_locations(AnalysisCenter::EsaUlt, esa_transition, "0600")
+        .expect("ESA 0600 candidates");
+    assert_eq!(esa_0600_locations[0].pattern, "primary_02D_15M");
+    assert_eq!(esa_0600_locations[1].pattern, "alternate_02D_05M");
+    let esa_1200_locations = ultra_sp3_locations(AnalysisCenter::EsaUlt, esa_transition, "1200")
+        .expect("ESA 1200 candidates");
+    assert_eq!(esa_1200_locations[0].pattern, "primary_02D_05M");
+    assert_eq!(esa_1200_locations[1].pattern, "alternate_02D_15M");
+
+    let gfz_last_15m = date(2021, 5, 15);
+    let gfz_first_5m = date(2021, 5, 16);
+    assert_eq!(
+        default_sample_for_date(AnalysisCenter::GfzUlt, ProductType::Sp3, gfz_last_15m),
+        Ok("15M")
+    );
+    assert_eq!(
+        default_sample_for_date(AnalysisCenter::GfzUlt, ProductType::Sp3, gfz_first_5m),
+        Ok("05M")
+    );
+    assert_eq!(
+        ops_ultra_sp3(AnalysisCenter::GfzUlt, gfz_last_15m, None, Some("2100"))
+            .expect("last GFZ 15M default")
+            .sample,
+        "15M"
+    );
+    assert_eq!(
+        ops_ultra_sp3(AnalysisCenter::GfzUlt, gfz_first_5m, None, Some("0000"))
+            .expect("first GFZ 05M default")
+            .sample,
+        "05M"
+    );
+    let gfz_legacy_locations = ultra_sp3_locations(AnalysisCenter::GfzUlt, gfz_last_15m, "2100")
+        .expect("GFZ legacy candidates");
+    assert_eq!(gfz_legacy_locations[0].pattern, "primary_02D_15M");
+    assert_eq!(gfz_legacy_locations[1].pattern, "alternate_02D_05M");
+    let gfz_current_locations = ultra_sp3_locations(AnalysisCenter::GfzUlt, gfz_first_5m, "0000")
+        .expect("GFZ current candidates");
+    assert_eq!(gfz_current_locations[0].pattern, "primary_02D_05M");
+    assert_eq!(gfz_current_locations[1].pattern, "alternate_02D_15M");
 }
 
 #[test]

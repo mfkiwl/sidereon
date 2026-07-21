@@ -766,6 +766,49 @@ const GFZ_RAPID_5M_START_DATE: ProductDate = ProductDate {
     day: 18,
 };
 
+/// First date in the cataloged ESA final-orbit and clock series.
+const ESA_FINAL_SERIES_START_DATE: ProductDate = ProductDate {
+    year: 2014,
+    month: 1,
+    day: 5,
+};
+
+/// First date in the cataloged GFZ rapid-orbit and clock series.
+const GFZ_RAPID_SERIES_START_DATE: ProductDate = ProductDate {
+    year: 2020,
+    month: 5,
+    day: 13,
+};
+
+/// First date in the cataloged ESA ultra-rapid SP3 series.
+const ESA_ULTRA_SP3_START_DATE: ProductDate = ProductDate {
+    year: 2022,
+    month: 10,
+    day: 4,
+};
+
+/// Last ESA ultra-rapid issue that uses the 15-minute sampling token.
+const ESA_ULTRA_15M_LAST_DATE: ProductDate = ProductDate {
+    year: 2025,
+    month: 2,
+    day: 2,
+};
+const ESA_ULTRA_15M_LAST_ISSUE_MINUTES: u16 = 6 * 60;
+
+/// First date in the cataloged GFZ ultra-rapid SP3 series.
+const GFZ_ULTRA_SP3_START_DATE: ProductDate = ProductDate {
+    year: 2020,
+    month: 10,
+    day: 6,
+};
+
+/// First date for which GFZ ultra-rapid SP3 defaults to five-minute sampling.
+const GFZ_ULTRA_5M_START_DATE: ProductDate = ProductDate {
+    year: 2021,
+    month: 5,
+    day: 16,
+};
+
 const CENTER_ORDER: [AnalysisCenter; 11] = [
     AnalysisCenter::CodRap,
     AnalysisCenter::CodPrd1,
@@ -2493,24 +2536,16 @@ pub fn default_sample(
 /// Published default sampling token for a center/product pair on a date.
 ///
 /// Most catalog families use one sampling token across their modeled history.
-/// GFZ rapid SP3 changed within GPS week 2158: dates through 2021 day 137 use
-/// `15M`, and dates from day 138 use `05M`.
+/// For issue-based products this date-only query represents the `0000` issue;
+/// product construction uses its actual issue and can therefore select a
+/// within-day transition. GFZ rapid and ultra-rapid SP3 and ESA ultra-rapid SP3
+/// have cataloged cadence transitions.
 pub fn default_sample_for_date(
     center: AnalysisCenter,
     product_type: ProductType,
     date: ProductDate,
 ) -> Result<&'static str, DataCatalogError> {
-    ProductDate::new(date.year, date.month, date.day)?;
-    let current = default_sample(center, product_type)?;
-    validate_product_date(center, product_type, date)?;
-    if center == AnalysisCenter::Gfz
-        && product_type == ProductType::Sp3
-        && date < GFZ_RAPID_5M_START_DATE
-    {
-        Ok("15M")
-    } else {
-        Ok(current)
-    }
+    default_sample_for_product_issue(center, product_type, date, None)
 }
 
 /// GPS week number for a product date.
@@ -2534,7 +2569,7 @@ pub fn product(
 ) -> Result<ProductSpec, DataCatalogError> {
     let sample = match sample {
         Some(sample) => sample,
-        None => default_sample_for_date(center, product_type, date)?,
+        None => default_sample_for_product_issue(center, product_type, date, issue)?,
     };
     ProductSpec::new(center, product_type, date, sample, issue)
 }
@@ -2629,6 +2664,7 @@ pub fn distribution_location_for_identity(
             })
         }
         DistributionSource::NasaCddis => {
+            validate_cddis_distribution_era(identity)?;
             let compression = product_archive_compression(
                 identity.analysis_center,
                 identity.family,
@@ -2653,10 +2689,15 @@ pub fn distribution_location_for_identity(
 
 /// Build the official NASA CDDIS HTTPS URL for an exact SP3 or IONEX identity.
 ///
-/// CDDIS stores current SP3 products by GPS week and current IONEX products by
-/// year/day-of-year. The decompressed official filename is unchanged.
+/// CDDIS stores supported current SP3 products by GPS week and current IONEX
+/// products by year/day-of-year. The decompressed official filename is
+/// unchanged. Before GPS week 2238, only the modeled IGS combined-final legacy
+/// short-name SP3 series has a verified mapping; unmodeled long-name SP3 and
+/// IONEX identities are rejected. ESA's `ESA0MGNFIN` final SP3 line is not
+/// projected onto CDDIS because no exact CDDIS mapping is cataloged for it.
 pub fn cddis_archive_url(identity: &ProductIdentity) -> Result<String, DataCatalogError> {
     identity.validate()?;
+    validate_cddis_distribution_era(identity)?;
     match identity.family {
         ProductType::Sp3 => {
             let compression = product_archive_compression(
@@ -2785,6 +2826,7 @@ pub fn ultra_sp3_locations(
     issue: &str,
 ) -> Result<Vec<UltraSp3Location>, DataCatalogError> {
     validate_issue_for_center(center, Some(issue))?;
+    validate_product_date(center, ProductType::Sp3, date)?;
     let patterns: &[UltraSp3Pattern] = match center {
         AnalysisCenter::IgsUlt => &IGS_ULT_SP3_PATTERNS,
         AnalysisCenter::CodUlt => &COD_ULT_SP3_PATTERNS,
@@ -2798,13 +2840,25 @@ pub fn ultra_sp3_locations(
         }
     };
     let convention = product_convention(center, ProductType::Sp3)?;
+    let default_sample =
+        default_sample_for_product_issue(center, ProductType::Sp3, date, Some(issue))?;
     let entry = center_catalog(center).expect("catalog entry exists for enum variant");
     let directory = dir_path(convention.layout, date)?;
     let date = date_block(date, Some(issue));
 
+    let mut patterns = patterns.to_vec();
+    patterns.sort_by_key(|pattern| {
+        !(pattern.alias_filename.is_none()
+            && pattern.span == convention.span
+            && pattern.sample == default_sample)
+    });
+
     Ok(patterns
         .iter()
         .map(|pattern| {
+            let is_primary = pattern.alias_filename.is_none()
+                && pattern.span == convention.span
+                && pattern.sample == default_sample;
             let filename = pattern.alias_filename.map_or_else(
                 || {
                     format!(
@@ -2815,7 +2869,13 @@ pub fn ultra_sp3_locations(
                 ToOwned::to_owned,
             );
             UltraSp3Location {
-                pattern: pattern.label.to_string(),
+                pattern: if is_primary {
+                    format!("primary_{}_{}", pattern.span, pattern.sample)
+                } else if pattern.alias_filename.is_some() {
+                    pattern.label.to_string()
+                } else {
+                    format!("alternate_{}_{}", pattern.span, pattern.sample)
+                },
                 span: pattern.span.to_string(),
                 sample: pattern.sample.to_string(),
                 url: format!(
@@ -2867,9 +2927,15 @@ pub fn ultra_issue_candidates(
             product_type: ProductType::Sp3,
         });
     }
+    validate_product_date(center, ProductType::Sp3, target.date)?;
 
     let mut candidates = Vec::new();
     for date in [target.date, target.date.add_days(-1)?] {
+        match validate_product_date(center, ProductType::Sp3, date) {
+            Ok(()) => {}
+            Err(DataCatalogError::UnsupportedProductEra { .. }) => continue,
+            Err(error) => return Err(error),
+        }
         for issue in entry.issues.iter().rev() {
             if issue_ordering_minutes(date, issue)? <= target.ordering_minutes() {
                 candidates.push(UltraIssue::new(date, issue)?);
@@ -3125,7 +3191,85 @@ fn validate_product_date(
             date,
         });
     }
+
+    let start_date = match (center, product_type) {
+        (AnalysisCenter::Esa, ProductType::Sp3 | ProductType::Clk) => {
+            Some(ESA_FINAL_SERIES_START_DATE)
+        }
+        (AnalysisCenter::Gfz, ProductType::Sp3 | ProductType::Clk) => {
+            Some(GFZ_RAPID_SERIES_START_DATE)
+        }
+        (AnalysisCenter::EsaUlt, ProductType::Sp3) => Some(ESA_ULTRA_SP3_START_DATE),
+        (AnalysisCenter::GfzUlt, ProductType::Sp3) => Some(GFZ_ULTRA_SP3_START_DATE),
+        _ => None,
+    };
+    let before_long_name_start = matches!(center, AnalysisCenter::IgsUlt | AnalysisCenter::CodUlt)
+        && product_type == ProductType::Sp3
+        && date.gps_week()? < IGS_LONG_FILENAME_START_GPS_WEEK;
+    if before_long_name_start || start_date.is_some_and(|start| date < start) {
+        return Err(DataCatalogError::UnsupportedProductEra {
+            center,
+            product_type,
+            date,
+        });
+    }
     Ok(())
+}
+
+fn default_sample_for_product_issue(
+    center: AnalysisCenter,
+    product_type: ProductType,
+    date: ProductDate,
+    issue: Option<&str>,
+) -> Result<&'static str, DataCatalogError> {
+    ProductDate::new(date.year, date.month, date.day)?;
+    let current = default_sample(center, product_type)?;
+    validate_product_date(center, product_type, date)?;
+
+    if product_type != ProductType::Sp3 {
+        return Ok(current);
+    }
+    match center {
+        AnalysisCenter::Gfz if date < GFZ_RAPID_5M_START_DATE => Ok("15M"),
+        AnalysisCenter::EsaUlt => {
+            // A date-only query represents the 0000/start-of-day issue. Product
+            // construction supplies the actual issue and therefore observes
+            // the within-day transition on 2025-02-02.
+            let issue = issue.unwrap_or("0000");
+            validate_issue_for_center(center, Some(issue))?;
+            let at_or_before_last_15m = date < ESA_ULTRA_15M_LAST_DATE
+                || (date == ESA_ULTRA_15M_LAST_DATE
+                    && issue_minutes(issue)? <= ESA_ULTRA_15M_LAST_ISSUE_MINUTES);
+            if at_or_before_last_15m {
+                Ok("15M")
+            } else {
+                Ok(current)
+            }
+        }
+        AnalysisCenter::GfzUlt if date < GFZ_ULTRA_5M_START_DATE => Ok("15M"),
+        _ => Ok(current),
+    }
+}
+
+fn validate_cddis_distribution_era(identity: &ProductIdentity) -> Result<(), DataCatalogError> {
+    let gps_week = identity.date.gps_week()?;
+    let esa_mgex_final_sp3 =
+        identity.analysis_center == AnalysisCenter::Esa && identity.family == ProductType::Sp3;
+    let unmodeled_pretransition_sp3 = identity.family == ProductType::Sp3
+        && gps_week < IGS_LONG_FILENAME_START_GPS_WEEK
+        && !uses_legacy_igs_final_name(identity.analysis_center, identity.family, identity.date)?;
+    let unmodeled_pretransition_ionex =
+        identity.family == ProductType::Ionex && gps_week < IGS_LONG_FILENAME_START_GPS_WEEK;
+    if esa_mgex_final_sp3 || unmodeled_pretransition_sp3 || unmodeled_pretransition_ionex {
+        Err(DataCatalogError::UnsupportedDistributionEra {
+            source: DistributionSource::NasaCddis,
+            center: identity.analysis_center,
+            product_type: identity.family,
+            date: identity.date,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_issue_for_center(

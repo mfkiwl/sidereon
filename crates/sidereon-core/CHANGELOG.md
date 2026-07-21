@@ -18,6 +18,12 @@ All notable changes to `sidereon-core` are documented here.
 - Added `default_sample_for_date` for product lines whose published sampling
   interval changed over time. GFZ rapid SP3 resolves to `15M` through 2021 day
   137 and `05M` from day 138.
+- Added verified series floors for ESA final SP3/clock, GFZ rapid SP3/clock,
+  and IGS, CODE, ESA, and GFZ ultra-rapid SP3 products. Ultra issue lookback
+  stops at the applicable floor instead of emitting a previous-day identity.
+- Made omitted ultra-rapid SP3 cadence issue-aware. ESA uses `15M` through the
+  2025-02-02 0600 issue and `05M` from 1200; GFZ uses `15M` through 2021-05-15
+  and `05M` from 2021-05-16. Candidate order follows the issue-era default.
 - Added `ExactSp3Request`, `parse_exact_sp3`, and `validate_exact_sp3`. Exact
   validation binds the line-1 start/count, line-2 GPS-week/seconds-of-week/MJD
   start metadata, mandatory header/EOF records, producing agency, complete
@@ -42,6 +48,10 @@ All notable changes to `sidereon-core` are documented here.
 - IGS combined final-SP3 requests now reject dates before the official start at
   GPS week 0730 (1994-01-02), and legacy CDDIS product paths zero-pad the GPS
   week directory to four digits.
+- CDDIS location derivation rejects pre-week-2238 long-name SP3 and IONEX
+  identities while retaining the verified IGS final short-name `.Z` series.
+  It also refuses to substitute a different CDDIS product for ESA's exact
+  `ESA0MGNFIN` final-SP3 identity.
 - Corrected the current GFZ rapid-SP3 catalog default to `05M`. Date-derived
   requests preserve the historical `15M` default through 2021 day 137 and use
   the published `05M` convention from day 138, including current products.
@@ -64,8 +74,10 @@ All notable changes to `sidereon-core` are documented here.
   catalog and scoreboard errors add typed public variants. The legacy
   date-free `default_sample` now reports GFZ's current `05M` rapid-SP3 cadence;
   dated default derivation remains `15M` for historical products through 2021
-  day 137. Invalid identities, unsupported combinations, unmodeled historical
-  CODE products, and integrity-invalid exact SP3 content now fail earlier.
+  day 137. For issue-based products, the date-only default represents the 0000
+  issue while product construction uses the actual issue. Invalid identities,
+  pre-series dates, unsupported combinations, unmodeled historical CODE
+  products, and integrity-invalid exact SP3 content now fail earlier.
   Serialized SP3 text with fewer than four semantic comments gains blank
   mandatory comment records; blank structural padding is no longer surfaced as
   semantic text in `Sp3::comments`.

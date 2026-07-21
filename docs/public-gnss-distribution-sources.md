@@ -89,6 +89,19 @@ under `IGS/products/2236` and only a partial legacy set under
 location instead of guessing. The same exact historical identity can be
 resolved through the verified CDDIS layout.
 
+The long-name transition is also a distributor boundary. CDDIS resolution
+rejects every long-name SP3 or IONEX identity dated before week 2238,
+regardless of analysis center. The only pre-2238 SP3 identity modeled for
+CDDIS is the IGS combined final product's verified legacy short name and `.Z`
+packaging. This prevents a valid direct-archive long name from being projected
+into an unverified historical CDDIS path.
+
+CDDIS support is exact-product specific, not publisher-wide. Sidereon does not
+map ESA's `ESA0MGNFIN` final SP3 identity to CDDIS: the official ESA archive
+serves that line directly, while the public CDDIS catalog evidence used in this
+audit does not establish an exact `ESA0MGNFIN` object. This is an unsupported
+distribution, not permission to substitute another ESA final-orbit family.
+
 Current long-name IONEX products resolve to:
 
 ```text
@@ -148,6 +161,46 @@ sampling token remains explicit and is not silently rewritten.
 through 2021-05-17: https://isdc-data.gfz.de/gnss/products/rapid/w2158/GFZ0OPSRAP_20211370000_01D_15M_ORB.SP3.gz
 from 2021-05-18:    https://isdc-data.gfz.de/gnss/products/rapid/w2158/GFZ0OPSRAP_20211380000_01D_05M_ORB.SP3.gz
 current example:    https://isdc-data.gfz.de/gnss/products/rapid/w2428/GFZ0OPSRAP_20262000000_01D_05M_ORB.SP3.gz
+```
+
+## SP3 product-era floors and ultra-rapid cadence
+
+The catalog does not extend a verified long-name series backward merely
+because its filename can be formatted. Direct product derivation starts at the
+first official archive object established for each modeled line:
+
+```text
+ESA final SP3/clock: 2014-01-05
+GFZ rapid SP3/clock: 2020-05-13
+IGS ultra SP3:       GPS week 2238 (2022-11-27)
+CODE ultra SP3:      GPS week 2238 (2022-11-27)
+ESA ultra SP3:       2022-10-04
+GFZ ultra SP3:       2020-10-06
+```
+
+Earlier requests return `UnsupportedProductEra`. Ultra-rapid issue selection
+also applies the floor: a target on the first publication date never fabricates
+previous-day candidates, and a target before the floor is rejected.
+
+ESA ultra-rapid SP3 used `15M` through the 0600 issue on 2025-02-02 and `05M`
+from that day's 1200 issue onward. GFZ ultra-rapid SP3 defaults to `15M` through
+2021-05-15 and `05M` from 2021-05-16. The GFZ listing contains one overlapping
+`05M` object at the 0000 issue on 2021-05-15; the rest of that day's published
+issues remain `15M`, so the deterministic default remains `15M` for that date
+and `05M` remains an explicit alternate candidate.
+
+`default_sample_for_date` keeps its date-only signature. For an issue-based
+product it reports the `0000`/start-of-day convention; consequently ESA ultra
+returns `15M` for 2025-02-02. Product construction uses the actual issue, so an
+omitted sample resolves to `15M` at 0600 and `05M` at 1200. Ultra-SP3 location
+candidates put that issue's default cadence first and retain the other cadence
+as an alternate.
+
+```text
+ESA last 15M issue:  https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250330600_02D_15M_ORB.SP3.gz
+ESA first 05M issue: https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250331200_02D_05M_ORB.SP3.gz
+GFZ last 15M date:   https://isdc-data.gfz.de/gnss/products/ultra/w2157/GFZ0OPSULT_20211352100_02D_15M_ORB.SP3.gz
+GFZ first 05M date:  https://isdc-data.gfz.de/gnss/products/ultra/w2158/GFZ0OPSULT_20211360000_02D_05M_ORB.SP3.gz
 ```
 
 ## Exact SP3 acceptance
@@ -308,12 +361,15 @@ The product-aware solution-class query and exact-SP3 validator are additive.
 Existing IGS broadcast-navigation derivation and the legacy center-only
 solution-class query retain their signatures. The additive
 `default_sample_for_date` query preserves historical GFZ derivation, while the
-legacy date-free query now returns GFZ's corrected current `05M` value.
-Behavior is deliberately stricter for invalid caller-built identities,
+legacy date-free query now returns GFZ's corrected current `05M` value. For
+issue-based products, the date-only query represents the 0000 issue; product
+construction and candidate ordering use the actual issue. Behavior is
+deliberately stricter for invalid caller-built identities, pre-series dates,
 unsupported center/product combinations, pre-transition `cod` long-name
-requests, and acquired SP3 bytes that do not meet an exact request. Serialized
-SP3 text now includes at least four comment records; blank structural padding
-is not returned as semantic `Sp3::comments` text. The new
+requests, unverified pre-transition CDDIS long-name paths, and acquired SP3
+bytes that do not meet an exact request. Serialized SP3 text now includes at
+least four comment records; blank structural padding is not returned as
+semantic `Sp3::comments` text. The new
 `ArchiveCompression::UnixCompress` variant and the added typed catalog and
 scoreboard error variants are source-visible API additions for exhaustive Rust
 matches.
@@ -334,6 +390,7 @@ not a promise that it will remain mirrored by every distributor.
 | IGS final, rapid, and ultra-rapid products switched to long filenames at the start of GPS week 2238 on 2022-11-27; final orbit changed from `igs<week><day>.sp3.Z` to `IGS0OPSFIN_<epoch>_01D_15M_ORB.SP3.gz`. November 26 is the final day of week 2237. | [IGS transition guideline](https://files.igs.org/pub/resource/guidelines/Guideline_for_the_transition_of_the_IGS_products_to_IGS20_and_long_filenames_v2.0.pdf), [IGSMAIL-8256](https://lists.igs.org/pipermail/igsmail/2022/008252.html), [IGSMAIL-8274](https://lists.igs.org/pipermail/igsmail/2022/008270.html), [IGS products](https://igs.org/products/) | 2026-07-20 |
 | CDDIS documents operational orbit product paths as `WWWW/AAAWWWWD.TYP.Z`, with the GPS-week field represented by four characters. | [NASA CDDIS precise-orbit documentation](https://www.earthdata.nasa.gov/data/space-geodesy-techniques/gnss/precise-orbits-product) | 2026-07-20 |
 | CDDIS has the legacy week-2237 final object with Unix-compress packaging and the long-name week-2238 object with gzip packaging. | [week 2237 object](https://cddis.nasa.gov/archive/gnss/products/2237/igs22370.sp3.Z), [week 2238 object](https://cddis.nasa.gov/archive/gnss/products/2238/IGS0OPSFIN_20223310000_01D_15M_ORB.SP3.gz) | 2026-07-20 |
+| CDDIS's documented legacy orbit convention and the IGS week-2238 transition support one modeled pre-transition mapping: the IGS combined-final short name with `.Z`. Sidereon does not project other centers' pre-2238 long names into CDDIS. | [NASA precise-orbit convention](https://www.earthdata.nasa.gov/data/space-geodesy-techniques/gnss/precise-orbits-product), [IGS transition guideline](https://files.igs.org/pub/resource/guidelines/Guideline_for_the_transition_of_the_IGS_products_to_IGS20_and_long_filenames_v2.0.pdf), [week 2237 legacy object](https://cddis.nasa.gov/archive/gnss/products/2237/igs22370.sp3.Z), [week 2238 long-name object](https://cddis.nasa.gov/archive/gnss/products/2238/IGS0OPSFIN_20223310000_01D_15M_ORB.SP3.gz) | 2026-07-20 |
 | BKG's current direct layout is `IGS/products/<week>`; its transition-era listings do not support one uniform historical direct rule. | [week 2238 current listing](https://igs.bkg.bund.de/root_ftp/IGS/products/2238/), [week 2235 legacy listing](https://igs.bkg.bund.de/root_ftp/IGS/products/orbits/2235/), [week 2236 long-name listing](https://igs.bkg.bund.de/root_ftp/IGS/products/2236/), [week 2236 legacy listing](https://igs.bkg.bund.de/root_ftp/IGS/products/orbits/2236/) | 2026-07-20 |
 | Long-name LEN/SMP syntax documents `D`, `W`, `L`, and `Y` units, while the official archive publishes `07D` despite the guideline's longest-unit prose. Sidereon therefore does not invent `D`-to-`W` or `L`-to-`Y` rewriting. Exact sub-day equivalents such as `60M` and `24H` remain noncanonical, and `00U` is unspecified rather than an exact positive cadence. | [IGS long product filename guidelines v2.2](https://files.igs.org/pub/resource/guidelines/Guidelines_for_Long_Product_Filenames_in_the_IGS_v2.2_EN.pdf), [official week-2420 `07D` product](https://igs.bkg.bund.de/root_ftp/IGS/products/2420/IGS0OPSFIN_20261440000_07D_01D_ERP.ERP.gz) | 2026-07-20 |
 | SP3 line 1 declares start and epoch count; line 2 repeats the start as GPS week/seconds-of-week and MJD/fraction and declares an epoch interval strictly between 0 and 100,000 seconds. | [SP3-d specification](https://files.igs.org/pub/data/format/sp3d.pdf) | 2026-07-20 |
@@ -344,6 +401,15 @@ not a promise that it will remain mirrored by every distributor.
 | Current AIUB listings confirm MGEX final SP3/clock under `CODE_MGEX/CODE/<year>`, final products under `CODE/<year>`, and rapid/ultra-rapid products at `CODE`. | [MGEX 2026 listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE_MGEX%2FCODE%2F2026), [CODE 2026 listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE%2F2026), [CODE current listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE) | 2026-07-20 |
 | AIUB's P1 and P2 predicted IONEX tiers are separate paths. | [P1 2026 listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE%2FIONO%2FP1%2F2026), [P2 2026 listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE%2FIONO%2FP2%2F2026) | 2026-07-20 |
 | GFZ rapid SP3 used `15M` through 2021 day 137 and `05M` from day 138 within GPS week 2158; its current rapid series remains `05M`. The current day-200 `05M` object returned HTTP 200 while the corresponding `15M` URL returned 404. | [GFZ week-2158 listing](https://isdc-data.gfz.de/gnss/products/rapid/w2158/), [GFZ current week-2428 listing](https://isdc-data.gfz.de/gnss/products/rapid/w2428/), [current 05M object](https://isdc-data.gfz.de/gnss/products/rapid/w2428/GFZ0OPSRAP_20262000000_01D_05M_ORB.SP3.gz), [absent 15M path](https://isdc-data.gfz.de/gnss/products/rapid/w2428/GFZ0OPSRAP_20262000000_01D_15M_ORB.SP3.gz) | 2026-07-20 |
+| ESA's MGEX final SP3 and clock archive begins on 2014-01-05; the preceding week has no corresponding final-orbit or clock object. | [preceding week 1773](https://navigation-office.esa.int/products/gnss-products/1773/), [first week 1774 listing](https://navigation-office.esa.int/products/gnss-products/1774/), [first SP3 object](https://navigation-office.esa.int/products/gnss-products/1774/ESA0MGNFIN_20140050000_01D_05M_ORB.SP3.gz), [first clock object](https://navigation-office.esa.int/products/gnss-products/1774/ESA0MGNFIN_20140050000_01D_30S_CLK.CLK.gz) | 2026-07-20 |
+| GFZ's rapid SP3 and clock listing begins on 2020-05-13 (2020 day 134). | [GFZ week-2105 listing](https://isdc-data.gfz.de/gnss/products/rapid/w2105/), [first rapid SP3 object](https://isdc-data.gfz.de/gnss/products/rapid/w2105/GFZ0OPSRAP_20201340000_01D_15M_ORB.SP3.gz), [first rapid clock object](https://isdc-data.gfz.de/gnss/products/rapid/w2105/GFZ0OPSRAP_20201340000_01D_30S_CLK.CLK.gz) | 2026-07-20 |
+| IGS operational ultra-rapid long names start with the week-2238 transition. | [IGS transition guideline](https://files.igs.org/pub/resource/guidelines/Guideline_for_the_transition_of_the_IGS_products_to_IGS20_and_long_filenames_v2.0.pdf), [BKG week-2238 listing](https://igs.bkg.bund.de/root_ftp/IGS/products/2238/), [first long-name ultra SP3 object](https://igs.bkg.bund.de/root_ftp/IGS/products/2238/IGS0OPSULT_20223310000_02D_15M_ORB.SP3.gz) | 2026-07-20 |
+| CODE ultra-rapid SP3 is modeled from the week-2238 long-name transition; earlier CODE ultra identities require a distinct legacy convention that this catalog does not invent. | [IGS transition guideline](https://files.igs.org/pub/resource/guidelines/Guideline_for_the_transition_of_the_IGS_products_to_IGS20_and_long_filenames_v2.0.pdf), [AIUB CODE listing](https://code.aiub.unibe.ch/s3_script/aiub_s3_bucket_listing.php?path=CODE) | 2026-07-20 |
+| ESA's operational ultra-rapid SP3 line begins on 2022-10-04 (day 277); the preceding week contains final products but no ultra-rapid SP3. | [preceding week 2229](https://navigation-office.esa.int/products/gnss-products/2229/), [week-2230 listing](https://navigation-office.esa.int/products/gnss-products/2230/), [first ultra SP3 object](https://navigation-office.esa.int/products/gnss-products/2230/ESA0OPSULT_20222770000_02D_15M_ORB.SP3.gz) | 2026-07-20 |
+| GFZ's operational ultra-rapid SP3 listing begins on 2020-10-06 (day 280). | [GFZ week-2126 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2126/), [first ultra SP3 object](https://isdc-data.gfz.de/gnss/products/ultra/w2126/GFZ0OPSULT_20202800000_02D_15M_ORB.SP3.gz) | 2026-07-20 |
+| ESA ultra-rapid SP3 changes from `15M` at the 2025-02-02 0600 issue to `05M` at 1200. | [ESA week-2352 listing](https://navigation-office.esa.int/products/gnss-products/2352/), [0600 15M object](https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250330600_02D_15M_ORB.SP3.gz), [1200 05M object](https://navigation-office.esa.int/products/gnss-products/2352/ESA0OPSULT_20250331200_02D_05M_ORB.SP3.gz) | 2026-07-20 |
+| GFZ ultra-rapid SP3 defaults to `15M` through 2021-05-15 and `05M` from 2021-05-16. One 0000 `05M` object overlaps the otherwise-`15M` final day. | [GFZ week-2157 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2157/), [last 15M issue](https://isdc-data.gfz.de/gnss/products/ultra/w2157/GFZ0OPSULT_20211352100_02D_15M_ORB.SP3.gz), [overlapping 05M object](https://isdc-data.gfz.de/gnss/products/ultra/w2157/GFZ0OPSULT_20211350000_02D_05M_ORB.SP3.gz), [GFZ week-2158 listing](https://isdc-data.gfz.de/gnss/products/ultra/w2158/), [first next-day 05M object](https://isdc-data.gfz.de/gnss/products/ultra/w2158/GFZ0OPSULT_20211360000_02D_05M_ORB.SP3.gz) | 2026-07-20 |
+| CDDIS IONEX filenames transitioned from historical short names toward long names beginning at week 2238, with center-specific timing. Sidereon therefore does not derive a pre-transition CDDIS URL for a caller's long-name IONEX identity. | [IGS ionospheric products](https://igs.org/products/#ionosphere), [NASA Earthdata support clarification](https://forum.earthdata.nasa.gov/viewtopic.php?t=4779) | 2026-07-20 |
 
 The archive and format sources above do not document a general permission to
 continue after an exact candidate fails integrity validation. This audit found
