@@ -63,7 +63,7 @@ use crate::astro::constants::units::MM_PER_M;
 use crate::astro::math::vec3::norm3_ref as norm;
 use crate::validate;
 
-use super::{cal2jd, invalid_tide_input, TideError};
+use super::{gregorian_to_two_part_julian_date, invalid_tide_input, TideError};
 
 /// IERS (2018) linear secular pole coefficients, in milliarcseconds and
 /// milliarcseconds per year (revised IERS Conventions 2010, updated Chapter 7).
@@ -192,7 +192,7 @@ fn solid_earth_pole_tide_unchecked(
 /// IERS (2018) linear secular mean pole at the given UTC epoch, in arcseconds.
 fn mean_pole_arcsec(year: i32, month: i32, day: i32, fhr: f64) -> (f64, f64) {
     // Epoch in years since J2000.0 (RTKLIB-compatible Julian-year measure).
-    let (jd0, jd1) = cal2jd(year, month, day);
+    let (jd0, jd1) = gregorian_to_two_part_julian_date(year, month, day);
     let years = ((jd0 - J2000_JD) + jd1 + fhr / 24.0) / DAYS_PER_JULIAN_YEAR;
 
     let x_bar_mas = MEAN_POLE_X0_MAS + MEAN_POLE_X_RATE_MAS_PER_YR * years;

@@ -75,7 +75,7 @@ use crate::astro::math::vec3::norm3_ref as norm;
 use crate::validate;
 use std::fmt::Write as _;
 
-use super::{cal2jd, invalid_tide_input, BlqParseErrorKind, TideError};
+use super::{gregorian_to_two_part_julian_date, invalid_tide_input, BlqParseErrorKind, TideError};
 
 /// Number of BLQ tidal constituents (M2 S2 N2 K2 K1 O1 P1 Q1 Mf Mm Ssa).
 pub const NUM_OCEAN_CONSTITUENTS: usize = 11;
@@ -676,7 +676,7 @@ fn arg2_angles(year: i32, month: i32, day: i32, fhr: f64) -> [f64; NUM_OCEAN_CON
 /// 1-based UTC day of year (ARG2 `ID`), from the IERS/SOFA `CAL2JD` MJD diff
 /// (the `djm` return is in days, so the difference is the day-of-year minus 1).
 fn day_of_year(year: i32, month: i32, day: i32) -> i32 {
-    let (_, mjd) = cal2jd(year, month, day);
-    let (_, mjd_jan1) = cal2jd(year, 1, 1);
+    let (_, mjd) = gregorian_to_two_part_julian_date(year, month, day);
+    let (_, mjd_jan1) = gregorian_to_two_part_julian_date(year, 1, 1);
     (mjd - mjd_jan1).round() as i32 + 1
 }

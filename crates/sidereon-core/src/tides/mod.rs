@@ -20,14 +20,21 @@
 //! * The routine names are changed from the IERS originals (per the IERS
 //!   Conventions Software License), and the Fortran subroutine structure is
 //!   inlined into private helpers.
+//! * The bundled IERS routine incorporates the SOFA `CAL2JD` and `DAT`
+//!   companion routines. Their Rust translations are likewise private and
+//!   renamed, while retaining SOFA-compatible numerical behavior.
 //!
 //! The Sun and Moon geocentric positions are inputs (metres, ECEF/ITRF); the
 //! caller supplies them, e.g. from [`crate::astro::bodies::sun_moon_ecef`].
 //!
+//! This Sidereon derived work is neither distributed by nor endorsed by the
+//! IERS Conventions Center.
+//!
 //! IERS Conventions Software License: permission is granted to use this software
 //! for any purpose, including commercial applications, free of charge, and to
-//! distribute derived works subject to the conditions reproduced above. Results
-//! obtained with this software acknowledge use of the IERS Conventions software.
+//! distribute derived works subject to its conditions. The intact notice ships
+//! as `IERS-CONVENTIONS-SOFTWARE-LICENSE.txt`. Results obtained with this
+//! software acknowledge use of the IERS Conventions software.
 
 #[cfg(all(test, sidereon_repo_tests))]
 mod tests;
@@ -627,31 +634,31 @@ fn solid_earth_tide_unchecked(
     }
 
     // Out-of-phase corrections (diurnal, semi-diurnal) and latitude dependence.
-    let c = st1idiu(xsta, xsun, xmon, fac2sun, fac2mon);
+    let c = out_of_phase_diurnal_correction(xsta, xsun, xmon, fac2sun, fac2mon);
     for i in 0..3 {
         dxtide[i] += c[i];
     }
-    let c = st1isem(xsta, xsun, xmon, fac2sun, fac2mon);
+    let c = out_of_phase_semidiurnal_correction(xsta, xsun, xmon, fac2sun, fac2mon);
     for i in 0..3 {
         dxtide[i] += c[i];
     }
-    let c = st1l1(xsta, xsun, xmon, fac2sun, fac2mon);
+    let c = latitude_dependence_correction(xsta, xsun, xmon, fac2sun, fac2mon);
     for i in 0..3 {
         dxtide[i] += c[i];
     }
 
     // Step 2 corrections need the date in Julian centuries (TT).
-    let (jjm0, jjm1) = cal2jd(year, month, day);
+    let (jjm0, jjm1) = gregorian_to_two_part_julian_date(year, month, day);
     let fhrd = fhr / 24.0;
     let mut t = ((jjm0 - J2000_JD) + jjm1 + fhrd) / DAYS_PER_JULIAN_CENTURY;
-    let dtt = dat(year, month, day) + TT_MINUS_TAI_S;
+    let dtt = tai_minus_utc_seconds(year, month, day) + TT_MINUS_TAI_S;
     t += dtt / (SECONDS_PER_DAY * DAYS_PER_JULIAN_CENTURY);
 
-    let c = step2diu(xsta, fhr, t);
+    let c = frequency_dependent_diurnal_correction(xsta, fhr, t);
     for i in 0..3 {
         dxtide[i] += c[i];
     }
-    let c = step2lon(xsta, t);
+    let c = frequency_dependent_long_period_correction(xsta, t);
     for i in 0..3 {
         dxtide[i] += c[i];
     }
@@ -663,7 +670,7 @@ fn solid_earth_tide_unchecked(
 }
 
 /// Out-of-phase part of the Love numbers, diurnal band (ST1IDIU).
-fn st1idiu(
+fn out_of_phase_diurnal_correction(
     xsta: &[f64; 3],
     xsun: &[f64; 3],
     xmon: &[f64; 3],
@@ -708,7 +715,7 @@ fn st1idiu(
 }
 
 /// Out-of-phase part of the Love numbers, semi-diurnal band (ST1ISEM).
-fn st1isem(
+fn out_of_phase_semidiurnal_correction(
     xsta: &[f64; 3],
     xsun: &[f64; 3],
     xmon: &[f64; 3],
@@ -780,7 +787,7 @@ fn st1isem(
 }
 
 /// Latitude dependence of the Love numbers, part L^(1) (ST1L1).
-fn st1l1(
+fn latitude_dependence_correction(
     xsta: &[f64; 3],
     xsun: &[f64; 3],
     xmon: &[f64; 3],
@@ -870,7 +877,7 @@ fn st1l1(
 
 /// In-phase / out-of-phase frequency-dependent corrections, diurnal band
 /// (STEP2DIU). `fhr` is UTC fractional hour, `t` is Julian centuries (TT).
-fn step2diu(xsta: &[f64; 3], fhr: f64, t: f64) -> [f64; 3] {
+fn frequency_dependent_diurnal_correction(xsta: &[f64; 3], fhr: f64, t: f64) -> [f64; 3] {
     // DATDI(9,31): {l, l', F, D, Omega(Ps), Adr, Adi, Anr, Ani} per wave.
     #[rustfmt::skip]
     const DATDI: [[f64; 9]; 31] = [
@@ -957,7 +964,7 @@ fn step2diu(xsta: &[f64; 3], fhr: f64, t: f64) -> [f64; 3] {
 
 /// In-phase / out-of-phase frequency-dependent corrections, long-period band
 /// (STEP2LON). `t` is Julian centuries (TT).
-fn step2lon(xsta: &[f64; 3], t: f64) -> [f64; 3] {
+fn frequency_dependent_long_period_correction(xsta: &[f64; 3], t: f64) -> [f64; 3] {
     #[rustfmt::skip]
     const DATDI: [[f64; 9]; 5] = [
         [0.0, 0.0, 0.0, 1.0, 0.0, 0.47, 0.23, 0.16, 0.07],
@@ -1018,7 +1025,7 @@ fn step2lon(xsta: &[f64; 3], t: f64) -> [f64; 3] {
 /// SOFA's `iauCal2jd` exactly. It is kept local under this tides-specific name
 /// so it is not mistaken for a duplicate of the canonical civil conversions and
 /// is never consolidated into them.
-fn cal2jd(iy: i32, im: i32, id: i32) -> (f64, f64) {
+fn gregorian_to_two_part_julian_date(iy: i32, im: i32, id: i32) -> (f64, f64) {
     let my = (im - 14) / 12;
     let iypmy = iy + my;
     let djm0 = 2400000.5;
@@ -1029,10 +1036,10 @@ fn cal2jd(iy: i32, im: i32, id: i32) -> (f64, f64) {
     (djm0, djm)
 }
 
-/// TAI-UTC (Delta(AT)) in seconds for the given date (SOFA DAT, leap-second
-/// table only; the four golden dates are all post-1972 so the pre-1972 drift
-/// branch is not exercised, but it is retained for completeness).
-fn dat(iy: i32, im: i32, _id: i32) -> f64 {
+/// TAI-UTC (Delta(AT)) in seconds for the given date (SOFA DAT, post-1972
+/// leap-second table only). The four golden dates are all post-1972; SOFA's
+/// pre-1972 drift terms are not implemented here.
+fn tai_minus_utc_seconds(iy: i32, im: i32, _id: i32) -> f64 {
     // Post-1972 leap-second table: (year, month, Delta(AT) seconds).
     const IDAT: [(i32, i32, f64); 28] = [
         (1972, 1, 10.0),

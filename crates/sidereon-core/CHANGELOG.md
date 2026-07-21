@@ -4,6 +4,22 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-07-20
+
+### Fixed
+
+- Included the repository MIT license, the intact IERS Conventions derived-work
+  notice, and the applicable ERFA and RTKLIB notices in the crates.io source
+  package. The tide source now points directly to the packaged IERS terms.
+- Renamed the private Rust translations of the IERS/SOFA companion routines and
+  added the license-required statement that the derived work is not distributed
+  or endorsed by the IERS Conventions Center.
+
+### Compatibility
+
+- Packaging, licensing documentation, and private source identifiers only;
+  public APIs and numerical behavior are unchanged from 0.33.0.
+
 ## [0.33.0] - 2026-07-20
 
 ### Added

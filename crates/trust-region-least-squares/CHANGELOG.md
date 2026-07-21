@@ -2,6 +2,12 @@
 
 All notable changes to `trust-region-least-squares` are documented here.
 
+## [0.9.2] - 2026-07-20
+
+- Included the repository MIT license and SciPy's full BSD 3-Clause terms in
+  the crates.io source package. Numerical behavior and public APIs are
+  unchanged.
+
 ## [0.9.1]
 
 ### Added

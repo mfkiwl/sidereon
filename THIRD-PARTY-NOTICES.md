@@ -35,16 +35,17 @@ The integer least-squares (MLAMBDA/LAMBDA) routine is a Rust port of RTKLIB's
 Nutation/precession coefficient tables and conventions are derived from ERFA
 (Essential Routines for Fundamental Astronomy), itself derived from IAU SOFA.
 
-  Copyright (C) 2013-2023, NumFOCUS Foundation. All rights reserved.
+  Copyright (C) 2013-2021, NumFOCUS Foundation. All rights reserved.
   Licensed under the BSD 3-Clause License.
 
 --------------------------------------------------------------------------------
 ## SciPy (BSD 3-Clause)
 
-The trust-region least-squares solver (`trust-region-least-squares`)
-reimplements algorithms equivalent to SciPy's least-squares routines.
+The trust-region least-squares solver (`trust-region-least-squares`) contains
+Rust ports of corresponding SciPy least-squares routines.
 
-  Copyright (c) 2001-2024, SciPy Developers. All rights reserved.
+  Copyright (c) 2001-2002 Enthought, Inc. 2003, SciPy Developers.
+  All rights reserved.
   Licensed under the BSD 3-Clause License.
 
 --------------------------------------------------------------------------------
@@ -52,7 +53,11 @@ reimplements algorithms equivalent to SciPy's least-squares routines.
 
 The solid-earth / ocean / pole tide displacement follows the IERS Conventions
 reference routines (e.g. DEHANTTIDEINEL), used under the IERS Conventions
-Software License. The IERS acknowledgment is retained in the relevant source.
+Software License. The IERS acknowledgment and derived-work description are
+retained in the relevant source, and the intact license notice is reproduced in
+`crates/sidereon-core/IERS-CONVENTIONS-SOFTWARE-LICENSE.txt`.
+This Sidereon derived work is neither distributed by nor endorsed by the IERS
+Conventions Center.
 
 --------------------------------------------------------------------------------
 ## Reference algorithms (no code copied)
