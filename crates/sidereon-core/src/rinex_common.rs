@@ -63,14 +63,27 @@ pub(crate) fn obs_epoch_seconds(epoch: ObsEpochTime) -> f64 {
     )
 }
 
+/// Whether a declared RINEX observation interval can be used as a cadence.
+///
+/// `INTERVAL` is optional product metadata. RINEX permits zero to represent an
+/// unknown header item; zero and other unusable values remain available to lint
+/// and repair but must never be used for gap calculations.
+pub(crate) fn usable_obs_interval_s(interval_s: f64) -> bool {
+    interval_s.is_finite() && interval_s > 0.0
+}
+
 pub(crate) fn dominant_obs_interval_s(times: &[ObsEpochTime]) -> Option<f64> {
     let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
     for pair in times.windows(2) {
-        let delta_ms =
-            ((obs_epoch_seconds(pair[1]) - obs_epoch_seconds(pair[0])) * 1000.0).round() as i64;
-        if delta_ms > 0 {
-            *counts.entry(delta_ms).or_default() += 1;
+        let delta_s = obs_epoch_seconds(pair[1]) - obs_epoch_seconds(pair[0]);
+        if !delta_s.is_finite() || delta_s <= 0.0 {
+            continue;
         }
+        let delta_ms = (delta_s * 1000.0).round();
+        if !delta_ms.is_finite() || delta_ms < 1.0 || delta_ms > i64::MAX as f64 {
+            continue;
+        }
+        *counts.entry(delta_ms as i64).or_default() += 1;
     }
     counts
         .into_iter()
@@ -114,5 +127,30 @@ mod tests {
     fn unknown_label_is_none() {
         assert_eq!(time_scale_label("XYZ"), None);
         assert_eq!(time_scale_label(""), None);
+    }
+
+    #[test]
+    fn usable_observation_interval_requires_positive_finite_seconds() {
+        assert!(usable_obs_interval_s(30.0));
+        for unusable in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!usable_obs_interval_s(unusable), "{unusable:?}");
+        }
+    }
+
+    #[test]
+    fn dominant_observation_interval_never_rounds_to_zero() {
+        let epoch = |second| ObsEpochTime {
+            year: 2026,
+            month: 7,
+            day: 24,
+            hour: 0,
+            minute: 0,
+            second,
+        };
+        assert_eq!(dominant_obs_interval_s(&[epoch(0.0), epoch(0.0004)]), None);
+        assert_eq!(
+            dominant_obs_interval_s(&[epoch(0.0), epoch(0.0006)]),
+            Some(0.001)
+        );
     }
 }

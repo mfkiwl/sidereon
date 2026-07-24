@@ -887,6 +887,20 @@ fn rejects_malformed_receiver_metadata_numbers() {
 }
 
 #[test]
+fn blank_optional_interval_is_parsed_as_unavailable() {
+    let obs = RinexObs::parse(&minimal_obs(&[header_line("", "INTERVAL")], ""))
+        .expect("RINEX permits an unknown optional header item to be blank");
+    assert_eq!(obs.header().interval_s, None);
+}
+
+#[test]
+fn zero_optional_interval_is_retained_as_unavailable_metadata() {
+    let obs = RinexObs::parse(&minimal_obs(&[header_line("     0.000", "INTERVAL")], ""))
+        .expect("RINEX permits an unknown optional header item to be zero");
+    assert_eq!(obs.header().interval_s, Some(0.0));
+}
+
+#[test]
 fn rejects_malformed_glonass_slot_records() {
     for header in [
         header_line("  1 R01 bad", "GLONASS SLOT / FRQ #"),

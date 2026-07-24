@@ -220,6 +220,130 @@ fn obs_lint_reports_time_interval_order_and_repair_fixes_them() {
 }
 
 #[test]
+fn zero_interval_is_standards_compatible_unavailable_metadata() {
+    let headers = [header_line("     0.000", "INTERVAL")];
+    let body = [
+        gps_epoch(0, 0.0, "  20000000.000  "),
+        gps_epoch(0, 30.0, "  20000001.000  "),
+    ]
+    .join("\n");
+    let obs = RinexObs::parse(&obs_text(&headers, &body)).expect("parse OBS");
+
+    let lint = lint_obs(&obs);
+    assert_finding_counts(&lint, &[("OBS-H19", 1)]);
+    let finding = lint
+        .findings
+        .iter()
+        .find(|finding| finding.code() == "OBS-H19")
+        .expect("unavailable INTERVAL finding");
+    assert_eq!(finding.severity(), Severity::Info);
+    assert!(finding.is_repairable());
+    assert!(lint.is_clean());
+
+    let unchanged = repair_obs(&obs, &RepairOptions::default());
+    assert!(unchanged.actions.is_empty());
+    assert_eq!(unchanged.repaired.header.interval_s, Some(0.0));
+
+    let repaired = repair_obs(
+        &obs,
+        &RepairOptions {
+            set_interval: true,
+            ..RepairOptions::default()
+        },
+    );
+    assert_eq!(repaired.repaired.header.interval_s, Some(30.0));
+    assert_eq!(
+        repaired
+            .actions
+            .iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>(),
+        vec!["A6"]
+    );
+    assert_finding_counts(&repaired.remaining, &[]);
+}
+
+#[test]
+fn explicit_interval_repair_removes_unresolved_zero_metadata() {
+    let headers = [header_line("    -0.000", "INTERVAL")];
+    let obs = RinexObs::parse(&obs_text(&headers, "")).expect("parse OBS");
+
+    let unchanged = repair_obs(&obs, &RepairOptions::default());
+    assert_eq!(unchanged.repaired.header.interval_s, Some(-0.0));
+    assert!(unchanged.actions.is_empty());
+
+    let repaired = repair_obs(
+        &obs,
+        &RepairOptions {
+            set_interval: true,
+            ..RepairOptions::default()
+        },
+    );
+    assert_eq!(repaired.repaired.header.interval_s, None);
+    assert_eq!(repaired.actions.len(), 1);
+    assert_eq!(repaired.actions[0].id, "A6");
+    assert!(repaired.actions[0].message.contains("unusable INTERVAL"));
+    assert_finding_counts(&repaired.remaining, &[]);
+
+    let repeated = repair_obs(
+        &repaired.repaired,
+        &RepairOptions {
+            set_interval: true,
+            ..RepairOptions::default()
+        },
+    );
+    assert!(repeated.actions.is_empty());
+}
+
+#[test]
+fn negative_and_nonfinite_intervals_are_errors_and_never_used_as_cadence() {
+    let headers = [header_line("   -30.000", "INTERVAL")];
+    let body = [
+        gps_epoch(0, 0.0, "  20000000.000  "),
+        gps_epoch(0, 30.0, "  20000001.000  "),
+    ]
+    .join("\n");
+    let original = RinexObs::parse(&obs_text(&headers, &body)).expect("parse OBS");
+
+    for invalid in [-30.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut obs = original.clone();
+        obs.header.interval_s = Some(invalid);
+
+        let lint = lint_obs(&obs);
+        let finding = lint
+            .findings
+            .iter()
+            .find(|finding| finding.code() == "OBS-H20")
+            .expect("invalid INTERVAL finding");
+        assert_eq!(finding.severity(), Severity::Error, "{invalid:?}");
+        assert!(finding.is_repairable());
+        assert!(!lint.is_clean());
+
+        let unchanged = repair_obs(&obs, &RepairOptions::default());
+        let retained = unchanged.repaired.header.interval_s.unwrap();
+        if invalid.is_nan() {
+            assert!(retained.is_nan());
+        } else {
+            assert_eq!(retained, invalid);
+        }
+
+        let repaired = repair_obs(
+            &obs,
+            &RepairOptions {
+                set_interval: true,
+                ..RepairOptions::default()
+            },
+        );
+        assert_eq!(repaired.repaired.header.interval_s, Some(30.0));
+        assert!(!repaired
+            .remaining
+            .findings
+            .iter()
+            .any(|finding| finding.code() == "OBS-H20"));
+    }
+}
+
+#[test]
 fn obs_lint_reports_time_scale_mismatch_and_repair_fixes_it() {
     // RINEX 3.05: TIME OF FIRST OBS defines the file time system, so it is
     // authoritative. A TIME OF LAST OBS declaring a different system is the
@@ -622,6 +746,36 @@ fn repair_is_idempotent_for_scheduled_fuzz_non_ascii_header_regression() {
 }
 
 #[test]
+fn repair_is_total_for_scheduled_fuzz_zero_interval_regression() {
+    let input = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/qc/",
+        "rinex_qc_repair_roundtrip-zero-interval-unknown.rnx"
+    ));
+    assert_eq!(
+        sha256_hex(input),
+        "5fb8bee02018479d441792d13aa9acaf45a27e03ddaaf67773a376809ba6d748"
+    );
+    assert_repair_roundtrip_is_total(input);
+}
+
+#[test]
+fn repair_is_total_for_exact_scheduled_fuzz_crash_artifact() {
+    let encoded = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/qc/",
+        "rinex_qc_repair_roundtrip-crash-207bfdaa15c81f885d3cc9c0bee4f82daabc20b3.hex"
+    ));
+    let input = decode_hex(encoded);
+    assert_eq!(input.len(), 583);
+    assert_eq!(
+        sha256_hex(&input),
+        "8091e235ba62ac613623e4d3c1856e8d0b9e04685584e42bed993fe8f9c2838a"
+    );
+    assert_repair_roundtrip_is_total(&input);
+}
+
+#[test]
 fn repair_is_idempotent_and_byte_stable_on_committed_nav_fixtures() {
     let fixtures = [
         "BRDC00GOP_R_20210010000_01D_MN.rnx",
@@ -681,6 +835,50 @@ fn repair_oracle_options() -> RepairOptions {
         drop_unsupported: true,
         ..RepairOptions::default()
     }
+}
+
+fn assert_repair_roundtrip_is_total(input: &[u8]) {
+    let text = String::from_utf8_lossy(input);
+    let obs = RinexObs::parse(&text).expect("parse scheduled-fuzz regression");
+
+    let report = crate::observation_qc::observation_qc(&obs);
+    assert_ne!(
+        report.interval_source,
+        crate::observation_qc::IntervalSource::Header
+    );
+    assert!(report
+        .lint_findings
+        .iter()
+        .any(|finding| finding.code == "OBS-H19"));
+
+    let options = repair_oracle_options();
+    let repaired_text = repair_obs(&obs, &options).repaired.to_rinex_string();
+    let reparsed = RinexObs::parse(&repaired_text).expect("reparse scheduled-fuzz regression");
+    let _ = crate::observation_qc::observation_qc(&reparsed);
+    let repeated_text = repair_obs(&reparsed, &options).repaired.to_rinex_string();
+    assert_eq!(repeated_text.as_bytes(), repaired_text.as_bytes());
+}
+
+fn decode_hex(encoded: &[u8]) -> Vec<u8> {
+    let digits: Vec<u8> = encoded
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    assert_eq!(digits.len() % 2, 0, "hex fixture must have complete bytes");
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).expect("hex high nibble");
+            let low = (pair[1] as char).to_digit(16).expect("hex low nibble");
+            ((high << 4) | low) as u8
+        })
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn obs_fixture_text(fixture: &str) -> String {

@@ -24,7 +24,9 @@ use crate::precise_positioning::{
     DualFrequencyObservation,
 };
 use crate::rinex::observations::{ObsEpochTime, RinexObs};
-use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds, time_scale_rinex_label};
+use crate::rinex_common::{
+    dominant_obs_interval_s, obs_epoch_seconds, time_scale_rinex_label, usable_obs_interval_s,
+};
 use crate::rinex_qc::{lint_obs, Severity};
 
 /// Default receiver-clock jump threshold, in seconds.
@@ -335,18 +337,28 @@ pub struct SnrStats {
 }
 
 /// Build a QC report with default options.
+///
+/// A zero, negative, or non-finite source `INTERVAL` is never used as cadence.
+/// The report carries the corresponding lint finding and either infers cadence
+/// from finite positive epoch deltas or marks it [`IntervalSource::Unresolved`].
 pub fn observation_qc(obs: &RinexObs) -> ObservationQcReport {
-    observation_qc_with_options(obs, ObservationQcOptions::default())
-        .expect("default observation QC options are valid")
+    observation_qc_validated(obs, ObservationQcOptions::default())
 }
 
 /// Build a QC report with explicit options.
+///
+/// Source metadata follows the same fail-visible behavior as
+/// [`observation_qc`]. An unusable caller-supplied interval override is instead
+/// rejected as [`ObservationQcError::InvalidInterval`].
 pub fn observation_qc_with_options(
     obs: &RinexObs,
     options: ObservationQcOptions,
 ) -> Result<ObservationQcReport, ObservationQcError> {
     validate_options(options)?;
+    Ok(observation_qc_validated(obs, options))
+}
 
+fn observation_qc_validated(obs: &RinexObs, options: ObservationQcOptions) -> ObservationQcReport {
     let mut satellites: BTreeMap<GnssSatelliteId, SatelliteAccum> = BTreeMap::new();
     let mut systems: BTreeMap<GnssSystem, SystemObservationAccum> = BTreeMap::new();
     let mut satellite_signals: BTreeMap<(GnssSatelliteId, String), SignalAccum> = BTreeMap::new();
@@ -424,15 +436,18 @@ pub fn observation_qc_with_options(
 
     let mut notes = non_monotonic_notes(&observation_epoch_times);
     let (interval_s, interval_source) =
-        resolve_interval(obs, options, &observation_epoch_times, &mut notes)?;
-    let data_gaps = detect_gaps(options, &observation_epoch_times, interval_s)?;
-    let missing_epochs = data_gaps.iter().map(|gap| gap.missing_epochs).sum();
+        resolve_interval(obs, options, &observation_epoch_times, &mut notes);
+    let data_gaps = detect_gaps(options, &observation_epoch_times, interval_s);
+    let missing_epochs = data_gaps
+        .iter()
+        .map(|gap| gap.missing_epochs)
+        .fold(0_usize, usize::saturating_add);
     let clock_jumps = detect_clock_jumps(obs, options.clock_jump_threshold_s);
     let cycle_slips = aggregate_cycle_slips(obs);
     let multipath = multipath_stats(obs, &CycleSlipConfig::default());
-    let systems = finish_system_observation_qc(systems, &system_epoch_times, options, interval_s)?;
+    let systems = finish_system_observation_qc(systems, &system_epoch_times, options, interval_s);
 
-    Ok(ObservationQcReport {
+    ObservationQcReport {
         header: observation_qc_header(obs, &observation_epoch_times),
         total_epoch_records: obs.epochs().len(),
         observation_epochs,
@@ -477,7 +492,7 @@ pub fn observation_qc_with_options(
             .collect(),
         lint_findings: observation_qc_findings(obs),
         notes,
-    })
+    }
 }
 
 fn validate_options(options: ObservationQcOptions) -> Result<(), ObservationQcError> {
@@ -496,7 +511,7 @@ fn validate_options(options: ObservationQcOptions) -> Result<(), ObservationQcEr
 }
 
 fn validate_interval(interval_s: f64) -> Result<(), ObservationQcError> {
-    if interval_s.is_finite() && interval_s > 0.0 {
+    if usable_obs_interval_s(interval_s) {
         Ok(())
     } else {
         Err(ObservationQcError::InvalidInterval)
@@ -571,7 +586,7 @@ fn finish_system_observation_qc(
     system_epoch_times: &BTreeMap<GnssSystem, Vec<ObsEpochTime>>,
     options: ObservationQcOptions,
     interval_s: Option<f64>,
-) -> Result<Vec<SystemObservationQc>, ObservationQcError> {
+) -> Vec<SystemObservationQc> {
     systems
         .into_iter()
         .map(|(system, acc)| {
@@ -579,13 +594,13 @@ fn finish_system_observation_qc(
                 .get(&system)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let gaps = detect_gaps(options, times, interval_s)?;
+            let gaps = detect_gaps(options, times, interval_s);
             let total_gap_s = gaps
                 .iter()
                 .map(|gap| gap.missing_epochs as f64 * gap.nominal_interval_s)
                 .sum::<f64>();
             let total_gap_s = if total_gap_s == 0.0 { 0.0 } else { total_gap_s };
-            Ok(SystemObservationQc {
+            SystemObservationQc {
                 system,
                 satellites_seen: acc.satellites.len(),
                 epochs_with_observations: acc.epochs_with_observations,
@@ -595,7 +610,7 @@ fn finish_system_observation_qc(
                     .then(|| acc.value_observations as f64 / acc.expected_observations as f64),
                 gap_count: gaps.len(),
                 total_gap_s,
-            })
+            }
         })
         .collect()
 }
@@ -617,29 +632,31 @@ fn resolve_interval(
     options: ObservationQcOptions,
     observation_epoch_times: &[ObsEpochTime],
     notes: &mut Vec<ObservationQcNote>,
-) -> Result<(Option<f64>, IntervalSource), ObservationQcError> {
+) -> (Option<f64>, IntervalSource) {
     let Some(interval_s) = options.interval_override_s else {
-        if let Some(interval_s) = obs.header().interval_s {
-            validate_interval(interval_s)?;
-            return Ok((Some(interval_s), IntervalSource::Header));
+        if let Some(interval_s) = obs
+            .header()
+            .interval_s
+            .filter(|interval_s| usable_obs_interval_s(*interval_s))
+        {
+            return (Some(interval_s), IntervalSource::Header);
         }
         if let Some(interval_s) = dominant_obs_interval_s(observation_epoch_times) {
-            return Ok((Some(interval_s), IntervalSource::Inferred));
+            return (Some(interval_s), IntervalSource::Inferred);
         }
         notes.push(ObservationQcNote::IntervalUnresolved);
-        return Ok((None, IntervalSource::Unresolved));
+        return (None, IntervalSource::Unresolved);
     };
-    validate_interval(interval_s)?;
-    Ok((Some(interval_s), IntervalSource::Override))
+    (Some(interval_s), IntervalSource::Override)
 }
 
 fn detect_gaps(
     options: ObservationQcOptions,
     observation_epoch_times: &[ObsEpochTime],
     interval_s: Option<f64>,
-) -> Result<Vec<ObservationDataGap>, ObservationQcError> {
+) -> Vec<ObservationDataGap> {
     let Some(interval_s) = interval_s else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
 
     let mut gaps = Vec::new();
@@ -647,11 +664,14 @@ fn detect_gaps(
         let start_epoch = window[0];
         let end_epoch = window[1];
         let observed_delta_s = obs_epoch_seconds(end_epoch) - obs_epoch_seconds(start_epoch);
-        if observed_delta_s <= 0.0 || observed_delta_s <= interval_s * options.gap_factor {
+        if !observed_delta_s.is_finite()
+            || observed_delta_s <= 0.0
+            || observed_delta_s <= interval_s * options.gap_factor
+        {
             continue;
         }
 
-        let missing_epochs = ((observed_delta_s / interval_s).round() as isize - 1) as usize;
+        let missing_epochs = ((observed_delta_s / interval_s).round() - 1.0).max(0.0) as usize;
         gaps.push(ObservationDataGap {
             start_epoch,
             end_epoch,
@@ -661,7 +681,7 @@ fn detect_gaps(
         });
     }
 
-    Ok(gaps)
+    gaps
 }
 
 fn non_monotonic_notes(observation_epoch_times: &[ObsEpochTime]) -> Vec<ObservationQcNote> {
@@ -1338,6 +1358,142 @@ mod tests {
     }
 
     #[test]
+    fn observation_qc_does_not_use_zero_header_interval_as_cadence() {
+        let g01 = sat(1);
+        let observations = BTreeMap::from([(g01, vec![obs_value(Some(1.0), Some(5))])]);
+        let mut obs = observation_file(vec![
+            epoch(0, 0.0, 0, observations.clone()),
+            epoch(0, 30.0, 0, observations.clone()),
+            epoch(1, 0.0, 0, observations.clone()),
+            epoch(2, 30.0, 0, observations),
+        ]);
+        obs.header.interval_s = Some(0.0);
+
+        let report = observation_qc(&obs);
+
+        assert_eq!(report.interval_s, Some(30.0));
+        assert_eq!(report.interval_source, IntervalSource::Inferred);
+        assert_eq!(report.missing_epochs, 2);
+        assert_eq!(report.data_gaps.len(), 1);
+        assert!(report
+            .lint_findings
+            .iter()
+            .any(|finding| { finding.code == "OBS-H19" && finding.severity == Severity::Info }));
+    }
+
+    #[test]
+    fn observation_qc_reports_unresolved_zero_header_interval_without_calculating_gaps() {
+        let mut obs = observation_file(Vec::new());
+        obs.header.interval_s = Some(-0.0);
+
+        let report = observation_qc(&obs);
+
+        assert_eq!(report.interval_s, None);
+        assert_eq!(report.interval_source, IntervalSource::Unresolved);
+        assert!(report.data_gaps.is_empty());
+        assert_eq!(report.missing_epochs, 0);
+        assert!(report
+            .notes
+            .contains(&ObservationQcNote::IntervalUnresolved));
+        assert!(report
+            .lint_findings
+            .iter()
+            .any(|finding| { finding.code == "OBS-H19" && finding.severity == Severity::Info }));
+    }
+
+    #[test]
+    fn observation_qc_ignores_and_reports_invalid_source_intervals() {
+        let g01 = sat(1);
+        let original = observation_file(vec![
+            epoch(
+                0,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(1.0), Some(5))])]),
+            ),
+            epoch(
+                0,
+                30.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(2.0), Some(6))])]),
+            ),
+        ]);
+
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut obs = original.clone();
+            obs.header.interval_s = Some(invalid);
+
+            let report = observation_qc(&obs);
+
+            assert_eq!(report.interval_s, Some(30.0), "{invalid:?}");
+            assert_eq!(
+                report.interval_source,
+                IntervalSource::Inferred,
+                "{invalid:?}"
+            );
+            assert!(report.lint_findings.iter().any(|finding| {
+                finding.code == "OBS-H20" && finding.severity == Severity::Error
+            }));
+        }
+    }
+
+    #[test]
+    fn observation_qc_saturates_missing_epoch_counts_for_tiny_positive_interval() {
+        let g01 = sat(1);
+        let observations = BTreeMap::from([(g01, vec![obs_value(Some(1.0), Some(5))])]);
+        let mut obs = observation_file(vec![
+            epoch(0, 0.0, 0, observations.clone()),
+            epoch(0, 30.0, 0, observations.clone()),
+            epoch(1, 0.0, 0, observations.clone()),
+            epoch(1, 30.0, 0, observations),
+        ]);
+        obs.header.interval_s = Some(f64::MIN_POSITIVE);
+
+        let report = observation_qc(&obs);
+
+        assert_eq!(report.data_gaps.len(), 3);
+        assert!(report
+            .data_gaps
+            .iter()
+            .all(|gap| gap.missing_epochs == usize::MAX));
+        assert_eq!(report.missing_epochs, usize::MAX);
+    }
+
+    #[test]
+    fn observation_qc_skips_nonfinite_public_epoch_deltas_without_panicking() {
+        let g01 = sat(1);
+        let original = observation_file(vec![
+            epoch(
+                0,
+                0.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(1.0), Some(5))])]),
+            ),
+            epoch(
+                0,
+                30.0,
+                0,
+                BTreeMap::from([(g01, vec![obs_value(Some(2.0), Some(6))])]),
+            ),
+        ]);
+
+        for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut obs = original.clone();
+            obs.header.interval_s = None;
+            obs.epochs[1].epoch.second = nonfinite;
+            let report = observation_qc(&obs);
+            assert_eq!(report.interval_s, None, "{nonfinite:?}");
+            assert_eq!(
+                report.interval_source,
+                IntervalSource::Unresolved,
+                "{nonfinite:?}"
+            );
+            assert!(report.data_gaps.is_empty(), "{nonfinite:?}");
+            assert_eq!(report.missing_epochs, 0, "{nonfinite:?}");
+        }
+    }
+
+    #[test]
     fn observation_qc_notes_non_monotonic_epochs_and_excludes_them_from_gaps() {
         let g01 = sat(1);
         let obs = observation_file(vec![
@@ -1368,15 +1524,17 @@ mod tests {
     fn observation_qc_rejects_invalid_options() {
         let obs = observation_file(Vec::new());
 
-        let err = observation_qc_with_options(
-            &obs,
-            ObservationQcOptions {
-                interval_override_s: Some(0.0),
-                ..ObservationQcOptions::default()
-            },
-        )
-        .expect_err("invalid interval");
-        assert_eq!(err, ObservationQcError::InvalidInterval);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = observation_qc_with_options(
+                &obs,
+                ObservationQcOptions {
+                    interval_override_s: Some(invalid),
+                    ..ObservationQcOptions::default()
+                },
+            )
+            .expect_err("invalid interval");
+            assert_eq!(err, ObservationQcError::InvalidInterval, "{invalid:?}");
+        }
 
         let err = observation_qc_with_options(
             &obs,

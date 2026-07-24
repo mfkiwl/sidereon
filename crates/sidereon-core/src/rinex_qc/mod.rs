@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::astro::time::model::TimeScale;
 use crate::crinex;
 use crate::id::{GnssSatelliteId, GnssSystem};
-use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds};
+use crate::rinex_common::{dominant_obs_interval_s, obs_epoch_seconds, usable_obs_interval_s};
 use crate::rinex_nav::{
     parse_iono_corrections, parse_leap_seconds, parse_nav, parse_nav_lenient, BroadcastRecord,
     IonoCorrections, NavMessage, NavParseError,
@@ -247,6 +247,10 @@ pub enum Finding {
         class: String,
         count: usize,
     },
+    /// INTERVAL is zero, a standards-defined representation of unavailable metadata.
+    ObsIntervalUnavailable { at: FindingRef },
+    /// INTERVAL is negative, or non-finite in a caller-constructed product.
+    ObsInvalidInterval { at: FindingRef, declared_s: f64 },
 }
 
 impl Finding {
@@ -271,6 +275,8 @@ impl Finding {
             Self::ObsIdentityFieldIssue { .. } => "OBS-H16",
             Self::ObsImplausibleApproxPosition { .. } => "OBS-H17",
             Self::ObsImplausibleAntennaDelta { .. } => "OBS-H18",
+            Self::ObsIntervalUnavailable { .. } => "OBS-H19",
+            Self::ObsInvalidInterval { .. } => "OBS-H20",
             Self::ObsUnretainedHeader { .. } => "OBS-H90",
             Self::ObsEpochOrder { .. } => "OBS-B01",
             Self::ObsDuplicateEpoch { .. } => "OBS-B02",
@@ -316,6 +322,7 @@ impl Finding {
             Self::ObsEventEpoch { .. }
             | Self::ObsEmptySatelliteRecord { .. }
             | Self::ObsEpochGap { .. }
+            | Self::ObsIntervalUnavailable { .. }
             | Self::ObsUnretainedHeader { .. }
             | Self::NavLeapSecondsAbsent { .. }
             | Self::NavUnsortedRecords { .. }
@@ -353,6 +360,12 @@ impl Finding {
             Self::ObsIdentityFieldIssue { .. } => "RINEX 3.05 Table A2 identity fields",
             Self::ObsImplausibleApproxPosition { .. } => "RINEX 3.05 Table A2",
             Self::ObsImplausibleAntennaDelta { .. } => "RINEX 3.05 Table A2",
+            Self::ObsIntervalUnavailable { .. } => {
+                "RINEX 2.11 section 5.3; RINEX 3.05/4.02 section 6.5 and Table A2, INTERVAL"
+            }
+            Self::ObsInvalidInterval { .. } => {
+                "RINEX 2.11 Table A2; RINEX 3.05/4.02 Table A2, INTERVAL"
+            }
             Self::ObsUnretainedHeader { .. } => "RINEX 3.05 section 6.6",
             Self::ObsEpochOrder { .. } => "RINEX 3.05 Table A3",
             Self::ObsDuplicateEpoch { .. } => "RINEX 3.05 Table A3",
@@ -397,6 +410,8 @@ impl Finding {
             | Self::ObsIdentityFieldIssue { at, .. }
             | Self::ObsImplausibleApproxPosition { at, .. }
             | Self::ObsImplausibleAntennaDelta { at, .. }
+            | Self::ObsIntervalUnavailable { at }
+            | Self::ObsInvalidInterval { at, .. }
             | Self::ObsUnretainedHeader { at, .. }
             | Self::ObsEpochOrder { at, .. }
             | Self::ObsDuplicateEpoch { at, .. }
@@ -427,6 +442,8 @@ impl Finding {
             Self::ObsTimeOfFirstMismatch { .. }
                 | Self::ObsTimeOfLastMismatch { .. }
                 | Self::ObsIntervalMismatch { .. }
+                | Self::ObsIntervalUnavailable { .. }
+                | Self::ObsInvalidInterval { .. }
                 | Self::ObsSatelliteCountMismatch { .. }
                 | Self::ObsPrnObsCountMismatch { .. }
                 | Self::ObsEpochOrder { .. }
@@ -474,6 +491,9 @@ pub struct RepairOptions {
     /// Caller-supplied PGM/RUN BY/DATE stamp for A8.
     pub file_stamp: Option<PgmRunByDate>,
     /// Set `INTERVAL` to the dominant normal-epoch spacing.
+    ///
+    /// When no cadence can be inferred, an unusable present value is removed.
+    /// When false, source interval metadata is preserved.
     pub set_interval: bool,
     /// Set `TIME OF LAST OBS` when absent or wrong.
     pub set_time_of_last_obs: bool,
@@ -1120,6 +1140,18 @@ fn lint_obs_header(header: &ObsHeader, findings: &mut Vec<Finding>) {
             at: FindingRef::field("SYS / # / OBS TYPES"),
         });
     }
+    if let Some(declared_s) = header.interval_s {
+        if declared_s == 0.0 {
+            findings.push(Finding::ObsIntervalUnavailable {
+                at: FindingRef::field("INTERVAL"),
+            });
+        } else if !usable_obs_interval_s(declared_s) {
+            findings.push(Finding::ObsInvalidInterval {
+                at: FindingRef::field("INTERVAL"),
+                declared_s,
+            });
+        }
+    }
     for (&system, codes) in &header.obs_codes {
         let mut seen = BTreeSet::new();
         for code in codes {
@@ -1267,19 +1299,20 @@ fn lint_obs_body(obs: &RinexObs, findings: &mut Vec<Finding>) {
     }
     lint_obs_counts(obs, findings);
     lint_obs_epoch_order(obs, findings);
-    if let (Some(declared), Some(observed)) = (
-        obs.header.interval_s,
-        dominant_interval_for_epochs(&obs.epochs),
-    ) {
-        if (declared - observed).abs() > 1.0e-6 {
-            findings.push(Finding::ObsIntervalMismatch {
-                at: FindingRef::field("INTERVAL"),
-                declared_s: declared,
-                observed_s: observed,
-            });
+    if let Some(observed) = dominant_interval_for_epochs(&obs.epochs) {
+        if let Some(declared) = obs
+            .header
+            .interval_s
+            .filter(|interval_s| usable_obs_interval_s(*interval_s))
+        {
+            if (declared - observed).abs() > 1.0e-6 {
+                findings.push(Finding::ObsIntervalMismatch {
+                    at: FindingRef::field("INTERVAL"),
+                    declared_s: declared,
+                    observed_s: observed,
+                });
+            }
         }
-        lint_obs_gaps(obs, observed, findings);
-    } else if let Some(observed) = dominant_interval_for_epochs(&obs.epochs) {
         lint_obs_gaps(obs, observed, findings);
     }
     lint_obs_glonass_slots(obs, findings);
@@ -1884,13 +1917,23 @@ fn repair_obs_unsupported_records(
 
 fn repair_obs_interval(obs: &mut RinexObs, actions: &mut Vec<RepairAction>) {
     let Some(interval) = dominant_interval_for_epochs(&obs.epochs) else {
+        if obs
+            .header
+            .interval_s
+            .is_some_and(|declared| !usable_obs_interval_s(declared))
+        {
+            obs.header.interval_s = None;
+            actions.push(RepairAction {
+                id: "A6",
+                message: "removed unusable INTERVAL because no cadence could be inferred"
+                    .to_string(),
+            });
+        }
         return;
     };
-    if obs
-        .header
-        .interval_s
-        .is_none_or(|declared| (declared - interval).abs() > 1.0e-6)
-    {
+    if obs.header.interval_s.is_none_or(|declared| {
+        !usable_obs_interval_s(declared) || (declared - interval).abs() > 1.0e-6
+    }) {
         obs.header.interval_s = Some(interval);
         actions.push(RepairAction {
             id: "A6",

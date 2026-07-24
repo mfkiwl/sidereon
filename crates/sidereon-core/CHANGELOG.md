@@ -4,6 +4,37 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-07-24
+
+### Fixed
+
+- Observation QC no longer panics when a successfully parsed RINEX OBS product
+  carries `INTERVAL = 0`. RINEX 2.11 section 5.3 and RINEX 3.05/4.02 section
+  6.5 permit zero, a blank field, or an omitted optional record when metadata is
+  unknown. Blank `INTERVAL` fields are now parsed as absent; zero is retained
+  as unavailable metadata and reported as informational `OBS-H19`.
+- An unavailable source interval is never used as cadence. QC instead labels a
+  cadence inferred from the actual epoch grid as `Inferred`, or reports
+  `Unresolved` and skips interval-dependent gap calculations. Negative or
+  caller-constructed non-finite source intervals produce error `OBS-H20`.
+  Explicit zero, negative, or non-finite caller overrides continue to return
+  `InvalidInterval`, and interval repair remains opt-in.
+- Gap accounting now saturates instead of overflowing for an extremely small
+  positive caller interval, ignores non-finite public-structure epoch deltas,
+  and never rounds a sub-millisecond inferred interval down to zero.
+- Added the exact 583-byte scheduled-fuzz crash artifact, its human-readable
+  reduction, core and CLI regressions, and a committed fuzz-corpus seed. The
+  scheduled workflow timeout is now 90 minutes: its 31 two-minute target
+  budgets alone require 62 minutes before runner setup and compilation.
+
+### Compatibility
+
+- Parser and QC compatibility patch. `Finding` gains the additive,
+  non-exhaustive `ObsIntervalUnavailable` and `ObsInvalidInterval` variants.
+  Existing positive source intervals and explicit positive overrides behave as
+  before. Solver, orbit, propagation, positioning, frame, timing, and other
+  numerical kernels are unchanged.
+
 ## [0.34.0] - 2026-07-21
 
 ### Added

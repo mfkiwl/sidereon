@@ -337,9 +337,7 @@ fn gap_start_epoch_indices(obs: &RinexObs) -> BTreeSet<usize> {
         .interval_s
         .filter(|interval_s| interval_s.is_finite() && *interval_s > 0.0)
         .or_else(|| dominant_obs_interval_s(&epoch_times));
-    let Ok(gaps) = detect_gaps(ObservationQcOptions::default(), &epoch_times, interval_s) else {
-        return BTreeSet::new();
-    };
+    let gaps = detect_gaps(ObservationQcOptions::default(), &epoch_times, interval_s);
 
     gaps.into_iter()
         .filter_map(|gap| epoch_times.iter().position(|epoch| *epoch == gap.end_epoch))

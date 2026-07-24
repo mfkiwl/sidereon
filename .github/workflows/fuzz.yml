@@ -64,7 +64,10 @@ jobs:
     name: scheduled bounded fuzz
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The 31 targets have 62 minutes of fuzz budget before checkout, toolchain,
+    # cargo-fuzz installation, and compilation. Leave enough headroom for cold
+    # runners while preserving the full two-minute gate per target.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

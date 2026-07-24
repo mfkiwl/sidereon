@@ -188,6 +188,39 @@ fn qc_json_includes_lint_counts_and_qc_report() {
 }
 
 #[test]
+fn qc_json_reports_unknown_zero_interval_without_panicking_or_using_it() {
+    let obs = fixture(&["qc", "rinex_qc_repair_roundtrip-zero-interval-unknown.rnx"]);
+    let output = run(&[
+        "qc",
+        "--obs",
+        obs.to_str().expect("fixture path utf8"),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("qc JSON");
+    assert_eq!(json["parse_error"], Value::Null);
+    assert_eq!(json["qc"]["interval_s"], Value::Null);
+    assert_eq!(json["qc"]["interval_source"], "Unresolved");
+    assert_eq!(json["lint"]["counts"]["info"], 1);
+    assert!(json["lint"]["findings"]
+        .as_array()
+        .expect("lint findings")
+        .iter()
+        .any(|finding| {
+            finding["code"] == "OBS-H19"
+                && finding["severity"] == "info"
+                && finding["at"]["field"] == "INTERVAL"
+        }));
+}
+
+#[test]
 fn solve_json_reports_successful_epochs_and_metrics() {
     let obs = fixture(&["obs", "ESBC00DNK_R_20201770000_01D_30S_MO_trim.rnx"]);
     let nav = fixture(&["nav", "ESBC00DNK_R_20201770000_01D_MN.rnx"]);

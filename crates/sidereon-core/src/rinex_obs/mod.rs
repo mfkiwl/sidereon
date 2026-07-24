@@ -251,6 +251,9 @@ pub struct ObsHeader {
     /// Antenna information, if present.
     pub antenna: Option<AntennaInfo>,
     /// Nominal epoch spacing in seconds (`INTERVAL`), if present.
+    ///
+    /// RINEX permits zero when this optional metadata is unknown. Consumers
+    /// must not use a non-positive value as cadence.
     pub interval_s: Option<f64>,
     /// First observation epoch and its time system (`TIME OF FIRST OBS`).
     pub time_of_first_obs: Option<(ObsEpochTime, TimeScale)>,
@@ -827,7 +830,7 @@ impl Parser {
                 "TIME OF FIRST OBS" => self.parse_time_of_first_obs(line)?,
                 "TIME OF LAST OBS" => self.parse_time_of_last_obs(line)?,
                 "INTERVAL" => {
-                    self.interval_s = Some(strict_f64_field(line, 0, 10, "interval_s")?);
+                    self.interval_s = optional_f64_field(line, 0, 10, "interval_s")?;
                 }
                 "GLONASS SLOT / FRQ #" => self.parse_glonass_slots(line)?,
                 "GLONASS COD/PHS/BIS" => self.parse_glonass_cod_phs_bis(line)?,
@@ -2178,8 +2181,18 @@ fn strict_vec3_tokens(body: &str, line: &str, fields: [&'static str; 3]) -> Resu
     ])
 }
 
-fn strict_f64_field(line: &str, start: usize, end: usize, field_name: &'static str) -> Result<f64> {
-    strict_f64_token(field(line, start, end), field_name, line)
+fn optional_f64_field(
+    line: &str,
+    start: usize,
+    end: usize,
+    field_name: &'static str,
+) -> Result<Option<f64>> {
+    let token = field(line, start, end).trim();
+    if token.is_empty() {
+        Ok(None)
+    } else {
+        strict_f64_token(token, field_name, line).map(Some)
+    }
 }
 
 fn optional_i64_field(
