@@ -4,6 +4,28 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- RINEX observation headers now reject a code list the fixed-column format
+  cannot carry, instead of parsing into a product that cannot be serialized.
+  Observation descriptors are `A3` fields in `SYS / # / OBS TYPES`,
+  `# / TYPES OF OBSERV`, `SYS / SCALE FACTOR`, and `SYS / PHASE SHIFT`
+  (RINEX 2.11 section 5.1, RINEX 3.05/4.02 section 5.1), and the
+  `SYS / # / OBS TYPES` count is an `I3` field. A wider descriptor or count is
+  now a typed `Error::Parse` at the record that carries it. Previously such a
+  header re-emitted a record that overran its 60-column content area, was
+  truncated, and re-parsed with fewer codes than its own count declared, so
+  `repair -> to_rinex_string -> parse` failed on input the parser had accepted.
+- Added the exact 632-byte scheduled-fuzz crash artifact (run 30197879510) as a
+  core regression and a committed fuzz-corpus seed.
+
+### Compatibility
+
+- Parser compatibility patch. Conforming RINEX 2/3/4 observation files are
+  unaffected: their descriptors already fit the `A3` code fields and their
+  per-system counts the `I3` field. No public API, numerical kernel, or output
+  formatting changed.
+
 ## [0.35.0] - 2026-07-24
 
 ### Fixed

@@ -69,6 +69,15 @@ const OBS_FIELD_WIDTH: usize = 16;
 const OBS_VALUE_WIDTH: usize = 14;
 /// Largest record count representable by a RINEX epoch `I3` field.
 const MAX_EPOCH_RECORD_COUNT: usize = 999;
+/// Width of one observation descriptor in every header code list: the `A3`
+/// fields of `SYS / # / OBS TYPES` (`13(1X,A3)`), `SYS / SCALE FACTOR`, and
+/// `SYS / PHASE SHIFT`. Legacy RINEX-2 `A2` codes are mapped into the same
+/// three-character strings, so this bounds them too.
+const OBS_CODE_FIELD_WIDTH: usize = 3;
+/// Largest observation-type count representable by the `SYS / # / OBS TYPES`
+/// `I3` count field. RINEX-2 `# / TYPES OF OBSERV` lists are re-emitted through
+/// that same field, so they share the bound.
+const MAX_OBS_TYPE_COUNT: usize = 999;
 const HEADER_LABELS: &[&str] = &[
     "RINEX VERSION / TYPE",
     "PGM / RUN BY / DATE",
@@ -984,6 +993,7 @@ impl Parser {
             let system = GnssSystem::from_letter(letter).ok_or_else(|| {
                 Error::Parse(format!("RINEX OBS unknown system letter {letter:?}"))
             })?;
+            self.ensure_obs_type_count_fits(system, count, line)?;
             self.current_obs_sys = Some(system);
             self.obs_codes_remaining = count;
             self.obs_codes.entry(system).or_default();
@@ -1001,7 +1011,7 @@ impl Parser {
                     "RINEX OBS {system} SYS / # / OBS TYPES lists more codes than declared in {line:?}"
                 )));
             }
-            list.push(tok.to_string());
+            list.push(obs_code_token(tok, "SYS / # / OBS TYPES", line)?);
             self.obs_codes_remaining -= 1;
         }
         Ok(())
@@ -1014,9 +1024,14 @@ impl Parser {
             }
         } else {
             self.ensure_obs_type_count_complete_v2(line)?;
+            let count = strict_int_field::<usize>(line, 0, 6, "rinex2.obs_type_count")?;
+            if count > MAX_OBS_TYPE_COUNT {
+                return Err(Error::Parse(format!(
+                    "RINEX OBS # / TYPES OF OBSERV declares {count} codes, exceeding the {MAX_OBS_TYPE_COUNT} the SYS / # / OBS TYPES I3 field can carry, in {line:?}"
+                )));
+            }
             self.rinex2_obs_codes.clear();
-            self.rinex2_obs_codes_remaining =
-                strict_int_field::<usize>(line, 0, 6, "rinex2.obs_type_count")?;
+            self.rinex2_obs_codes_remaining = count;
         }
         for code in field(line, 6, 60).split_whitespace() {
             if self.rinex2_obs_codes_remaining == 0 {
@@ -1024,7 +1039,8 @@ impl Parser {
                     "RINEX OBS # / TYPES OF OBSERV lists more codes than declared in {line:?}"
                 )));
             }
-            self.rinex2_obs_codes.push(code.to_string());
+            self.rinex2_obs_codes
+                .push(obs_code_token(code, "# / TYPES OF OBSERV", line)?);
             self.rinex2_obs_codes_remaining -= 1;
         }
         Ok(())
@@ -1048,6 +1064,7 @@ impl Parser {
                     Error::Parse(format!("RINEX OBS unknown system letter {letter:?}"))
                 })?;
                 self.ensure_obs_type_count_complete(line)?;
+                self.ensure_obs_type_count_fits(system, count, line)?;
                 self.current_obs_sys = Some(system);
                 self.obs_codes_remaining = count;
                 self.obs_codes.entry(system).or_default();
@@ -1081,8 +1098,26 @@ impl Parser {
                     "RINEX OBS {system} SYS / # / OBS TYPES lists more codes than declared in {line:?}"
                 )));
             }
-            list.push((*code).to_string());
+            list.push(obs_code_token(code, "SYS / # / OBS TYPES", line)?);
             self.obs_codes_remaining -= 1;
+        }
+        Ok(())
+    }
+
+    /// Reject a `SYS / # / OBS TYPES` count - including codes already collected
+    /// for the system - that the record's `I3` count field cannot carry.
+    fn ensure_obs_type_count_fits(
+        &self,
+        system: GnssSystem,
+        count: usize,
+        line: &str,
+    ) -> Result<()> {
+        let collected = self.obs_codes.get(&system).map_or(0, Vec::len);
+        let total = collected.saturating_add(count);
+        if total > MAX_OBS_TYPE_COUNT {
+            return Err(Error::Parse(format!(
+                "RINEX OBS {system} SYS / # / OBS TYPES declares {total} codes, exceeding the I3 field maximum of {MAX_OBS_TYPE_COUNT} in {line:?}"
+            )));
         }
         Ok(())
     }
@@ -1132,7 +1167,7 @@ impl Parser {
                     "RINEX OBS phase-shift system unparsable in {line:?}"
                 ))
             })?;
-        let code = tokens[1].to_string();
+        let code = obs_code_token(tokens[1], "SYS / PHASE SHIFT", line)?;
         let correction_cycles = match tokens.get(2) {
             Some(token) => strict_f64_token(token, "phase_shift.correction_cycles", line)?,
             None => 0.0,
@@ -1214,7 +1249,9 @@ impl Parser {
                     "RINEX OBS SYS / SCALE FACTOR lists more codes than declared in {line:?}"
                 )));
             }
-            record.codes.push(code.to_string());
+            record
+                .codes
+                .push(obs_code_token(code, "SYS / SCALE FACTOR", line)?);
             continuation.remaining -= 1;
         }
         self.scale_factor_continuation = (continuation.remaining > 0).then_some(continuation);
@@ -1941,6 +1978,23 @@ fn expand_rinex2_year(year: i32) -> i32 {
     } else {
         2000 + year
     }
+}
+
+/// Accept one observation descriptor from a header code list, rejecting a token
+/// the format's `A3` code field cannot carry.
+///
+/// The header code lists are fixed-column: every writer emits a descriptor into
+/// a `1X,A3` field, and the parser reads those lists out of the 60-column
+/// content area. A wider token is not a RINEX descriptor, and a header carrying
+/// one cannot be serialized - the record would overrun its content area and
+/// re-parse with fewer codes than its own count field declares.
+fn obs_code_token(token: &str, record: &str, line: &str) -> Result<String> {
+    if token.len() > OBS_CODE_FIELD_WIDTH {
+        return Err(Error::Parse(format!(
+            "RINEX OBS {record} code {token:?} exceeds the A{OBS_CODE_FIELD_WIDTH} field width in {line:?}"
+        )));
+    }
+    Ok(token.to_string())
 }
 
 fn parse_epoch_record_count(token: &str, line: &str) -> Result<usize> {

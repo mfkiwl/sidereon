@@ -856,6 +856,124 @@ fn rejects_v3_epoch_count_that_exceeds_its_i3_field() {
 }
 
 #[test]
+fn rejects_obs_type_code_wider_than_its_a3_field() {
+    // Exact shape from scheduled fuzz run 30197879510: a first SYS / # / OBS
+    // TYPES record whose single "code" spills across the whole content area,
+    // then a second record for the same system. The over-width descriptor
+    // cannot be written back into a 1X,A3 field, so the re-emitted record
+    // overran its 60 columns and re-parsed one code short of its own count.
+    let long_code = format!("C{}", "t".repeat(51));
+    let text = obs_with_code_headers(
+        &[
+            header_line(&format!("G    1 {long_code}"), "SYS / # / OBS TYPES"),
+            header_line("G    1 C1C", "SYS / # / OBS TYPES"),
+        ],
+        "",
+    );
+
+    let err = RinexObs::parse(&text).expect_err("an over-width obs descriptor must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("SYS / # / OBS TYPES code")
+                && message.contains("exceeds the A3 field width")),
+        "{err}"
+    );
+}
+
+#[test]
+fn accepts_obs_type_codes_up_to_the_a3_field_width() {
+    let text = obs_with_code_headers(
+        &[
+            header_line("G    2 C1C L1C", "SYS / # / OBS TYPES"),
+            header_line("R    1  C1", "SYS / # / OBS TYPES"),
+        ],
+        "",
+    );
+    let obs = RinexObs::parse(&text).expect("A3-width descriptors stay accepted");
+    assert_eq!(
+        obs.obs_codes(GnssSystem::Gps).expect("GPS codes"),
+        ["C1C".to_string(), "L1C".to_string()]
+    );
+    assert_eq!(
+        obs.obs_codes(GnssSystem::Glonass).expect("GLONASS codes"),
+        ["C1".to_string()]
+    );
+}
+
+#[test]
+fn rejects_scale_factor_code_wider_than_its_a3_field() {
+    let header = header_line("G    1   1 C1CX", "SYS / SCALE FACTOR");
+    let err = RinexObs::parse(&minimal_obs(&[header], ""))
+        .expect_err("an over-width scale-factor descriptor must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("SYS / SCALE FACTOR code")
+                && message.contains("exceeds the A3 field width")),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejects_phase_shift_code_wider_than_its_a3_field() {
+    let err = RinexObs::parse(&minimal_obs_with_phase_shift("G L1CX 0.0 1 G01"))
+        .expect_err("an over-width phase-shift descriptor must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("SYS / PHASE SHIFT code")
+                && message.contains("exceeds the A3 field width")),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejects_v2_obs_type_code_wider_than_its_a3_field() {
+    let text = obs_with_version_and_code_headers(
+        2.11,
+        &[header_line("     1    C1CX", "# / TYPES OF OBSERV")],
+        "",
+    );
+    let err =
+        RinexObs::parse(&text).expect_err("an over-width RINEX-2 descriptor must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("# / TYPES OF OBSERV code")
+                && message.contains("exceeds the A3 field width")),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejects_obs_type_count_that_exceeds_its_i3_field() {
+    // The count sits in a 3-column field, so an over-wide count only reaches
+    // the parser through the whitespace-tolerant form of the record.
+    let text = obs_with_code_headers(&[header_line("G      1000 C1C", "SYS / # / OBS TYPES")], "");
+    let err = RinexObs::parse(&text).expect_err("an over-width obs-type count must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("declares 1000 codes")
+                && message.contains("I3 field maximum of 999")),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejects_v2_obs_type_count_that_exceeds_the_i3_field_it_is_written_to() {
+    let text = obs_with_version_and_code_headers(
+        2.11,
+        &[header_line("  1000    C1", "# / TYPES OF OBSERV")],
+        "",
+    );
+    let err = RinexObs::parse(&text)
+        .expect_err("a RINEX-2 count beyond the RINEX-3 I3 field must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("# / TYPES OF OBSERV declares 1000 codes")
+                && message.contains("SYS / # / OBS TYPES I3 field can carry")),
+        "{err}"
+    );
+}
+
+#[test]
 fn rejects_malformed_phase_shift_headers() {
     for body in [
         "G L1C bad",

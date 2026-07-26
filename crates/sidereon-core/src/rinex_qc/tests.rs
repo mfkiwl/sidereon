@@ -776,6 +776,63 @@ fn repair_is_total_for_exact_scheduled_fuzz_crash_artifact() {
 }
 
 #[test]
+fn scheduled_fuzz_over_width_obs_type_code_is_rejected_before_repair() {
+    let encoded = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/qc/",
+        "rinex_qc_repair_roundtrip-crash-eb54697fed8ee6948066ac7f5b35025242feed9b.hex"
+    ));
+    let input = decode_hex(encoded);
+    assert_eq!(input.len(), 632);
+    assert_eq!(
+        sha256_hex(&input),
+        "b85dbaf667a9867e5650a69dca8ce1fb2d26ccfccf249566d7fe7b01d93d5e0c"
+    );
+
+    // The header declares one SYS / # / OBS TYPES code that spans the whole
+    // content area, then a second record for the same system. Such a header
+    // cannot be serialized into 1X,A3 code fields: the re-emitted record
+    // overran its 60 columns and re-parsed one code short of its own count,
+    // which made repair -> write -> parse fail instead of round-tripping.
+    let text = String::from_utf8_lossy(&input);
+    let err = RinexObs::parse(&text).expect_err("an unrepresentable header must be rejected");
+    assert!(
+        matches!(err, crate::Error::Parse(ref message)
+            if message.contains("SYS / # / OBS TYPES code")
+                && message.contains("exceeds the A3 field width")),
+        "{err}"
+    );
+}
+
+#[test]
+fn repair_round_trips_repeated_obs_type_records_for_one_system() {
+    // The accepted shape of the same header: two SYS / # / OBS TYPES records
+    // for one system accumulate into a single re-emitted record whose count
+    // covers both codes, so repair stays byte-idempotent.
+    // `obs_text` already declares `G    1 C1C`; this adds a second record for
+    // the same system.
+    let text = obs_text(&[header_line("G    1 L1C", "SYS / # / OBS TYPES")], "");
+    let obs = RinexObs::parse(&text).expect("parse repeated obs-type records");
+    assert_eq!(
+        obs.obs_codes(crate::id::GnssSystem::Gps)
+            .expect("GPS codes"),
+        ["C1C".to_string(), "L1C".to_string()]
+    );
+
+    let options = repair_oracle_options();
+    let first = repair_obs(&obs, &options).repaired.to_rinex_string();
+    let reparsed = RinexObs::parse(&first).expect("reparse repaired obs-type records");
+    assert_eq!(
+        reparsed
+            .obs_codes(crate::id::GnssSystem::Gps)
+            .expect("reparsed GPS codes"),
+        ["C1C".to_string(), "L1C".to_string()]
+    );
+    let second = repair_obs(&reparsed, &options).repaired.to_rinex_string();
+    assert_eq!(second.as_bytes(), first.as_bytes());
+}
+
+#[test]
 fn repair_is_idempotent_and_byte_stable_on_committed_nav_fixtures() {
     let fixtures = [
         "BRDC00GOP_R_20210010000_01D_MN.rnx",

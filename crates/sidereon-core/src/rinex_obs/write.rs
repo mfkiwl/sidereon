@@ -253,6 +253,12 @@ fn format_first_obs(epoch: ObsEpochTime, scale_label: &str) -> String {
 
 /// Write the `SYS / # / OBS TYPES` record(s) for one constellation, wrapping the
 /// declared codes across continuation lines as the parser expects.
+///
+/// The 60-column content area holds the `A1,2X,I3` prefix plus `13(1X,A3)` code
+/// fields, so a chunk fits exactly when each descriptor is at most `A3` wide and
+/// the count fits its `I3` field. [`RinexObs::parse`] rejects a header that
+/// breaks either bound, since a wider record would be truncated here and
+/// re-parse with fewer codes than its count declares.
 fn write_obs_types(out: &mut String, system: GnssSystem, codes: &[String]) {
     let count = codes.len();
     for (chunk_index, chunk) in codes.chunks(OBS_CODES_PER_LINE).enumerate() {
