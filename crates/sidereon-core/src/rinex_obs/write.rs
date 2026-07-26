@@ -22,6 +22,10 @@ use crate::id::GnssSystem;
 
 use super::{ObsEpoch, ObsEpochTime, ObsValue, RinexObs, OBS_FIELD_WIDTH, OBS_VALUE_WIDTH};
 
+/// Columns a header record's content occupies before its 20-column label.
+pub(super) const HEADER_CONTENT_WIDTH: usize = 60;
+/// Width of the `SYS / PHASE SHIFT` correction field (`F8.5`).
+const PHASE_SHIFT_CORRECTION_WIDTH: usize = 8;
 /// RINEX-3 observation codes per `SYS / # / OBS TYPES` line before continuation.
 const OBS_CODES_PER_LINE: usize = 13;
 /// RINEX-3 observation codes per `SYS / SCALE FACTOR` line after its 10-column prefix.
@@ -223,14 +227,14 @@ impl RinexObs {
 /// 20-column record label.
 fn push_header_line(out: &mut String, content: &str, label: &str) {
     let content = header_content_60(content);
-    let _ = writeln!(out, "{content:<60}{label}");
+    let _ = writeln!(out, "{content:<HEADER_CONTENT_WIDTH$}{label}");
 }
 
 fn header_content_60(content: &str) -> std::borrow::Cow<'_, str> {
-    if content.len() <= 60 {
+    if content.len() <= HEADER_CONTENT_WIDTH {
         return std::borrow::Cow::Borrowed(content);
     }
-    let mut end = 60;
+    let mut end = HEADER_CONTENT_WIDTH;
     while !content.is_char_boundary(end) {
         end -= 1;
     }
@@ -285,6 +289,15 @@ fn write_obs_types(out: &mut String, system: GnssSystem, codes: &[String]) {
 /// Write one `SYS / PHASE SHIFT` record. The optional satellite list is emitted
 /// with its count when present (otherwise the correction applies system-wide).
 fn write_phase_shift(out: &mut String, shift: &super::ObsPhaseShift) {
+    push_header_line(out, &phase_shift_content(shift), "SYS / PHASE SHIFT");
+}
+
+/// The 60-column content of one `SYS / PHASE SHIFT` record.
+///
+/// [`RinexObs::parse`] measures a record with this before accepting it, so a
+/// list it could not re-emit inside the content area is rejected there instead
+/// of being truncated here.
+pub(super) fn phase_shift_content(shift: &super::ObsPhaseShift) -> String {
     let mut content = format!(
         "{} {} {}",
         shift.system.letter(),
@@ -297,7 +310,7 @@ fn write_phase_shift(out: &mut String, shift: &super::ObsPhaseShift) {
             let _ = write!(content, " {sat}");
         }
     }
-    push_header_line(out, &content, "SYS / PHASE SHIFT");
+    content
 }
 
 /// Write one `SYS / SCALE FACTOR` record (factor at columns 2-5, code count at
@@ -418,9 +431,26 @@ fn push_indicator(line: &mut String, indicator: Option<u8>) {
     }
 }
 
-/// Shortest decimal that round-trips back to the same `f64`.
+/// Shortest spelling that round-trips back to the same `f64`, keeping the plain
+/// decimal whenever it fits the record's `F8.5` field.
+///
+/// Rust's `Display` never switches to an exponent, so a correction far from
+/// unity renders as hundreds of digits - wider than the content area, where it
+/// would be truncated into a different value and take the satellite list with
+/// it. Exponent form is the shortest round-tripping spelling at those
+/// magnitudes and the parser reads it back exactly. A conforming correction
+/// fits the `F8.5` field and is unaffected.
 fn fmt_shortest(value: f64) -> String {
-    format!("{value}")
+    let plain = format!("{value}");
+    if plain.len() <= PHASE_SHIFT_CORRECTION_WIDTH {
+        return plain;
+    }
+    let exponent = format!("{value:e}");
+    if exponent.len() < plain.len() {
+        exponent
+    } else {
+        plain
+    }
 }
 
 const _: () = assert!(OBS_FIELD_WIDTH == OBS_VALUE_WIDTH + 2);

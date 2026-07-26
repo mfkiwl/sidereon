@@ -18,6 +18,16 @@ All notable changes to `sidereon-core` are documented here.
   `repair -> to_rinex_string -> parse` failed on input the parser had accepted.
 - Added the exact 632-byte scheduled-fuzz crash artifact (run 30197879510) as a
   core regression and a committed fuzz-corpus seed.
+- A `SYS / PHASE SHIFT` correction far from unity is now written in exponent
+  form. Rust's `Display` never switches to an exponent, so a value such as
+  `1e-300` rendered as 302 columns of plain decimal: the record was truncated
+  into the content area, the correction collapsed to zero, and the satellite
+  list disappeared. Corrections that fit the record's `F8.5` field keep their
+  existing plain-decimal spelling byte for byte.
+- A `SYS / PHASE SHIFT` satellite list that cannot be re-emitted inside the
+  60-column content area is now a typed `Error::Parse`. Single-digit PRNs are
+  read from two-column tokens (`G1`) but written into `1X,A3` fields, so a
+  readable record was not always a writable one.
 
 ### Compatibility
 

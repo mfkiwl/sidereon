@@ -974,6 +974,66 @@ fn rejects_v2_obs_type_count_that_exceeds_the_i3_field_it_is_written_to() {
 }
 
 #[test]
+fn conforming_phase_shift_corrections_keep_their_plain_decimal() {
+    for (body, expected) in [
+        ("G L1C 0.0 1 G01", "G L1C 0 1 G01"),
+        ("G L1C 0.25000", "G L1C 0.25"),
+        ("G L1C -0.25000", "G L1C -0.25"),
+        ("G L1C 0.12345", "G L1C 0.12345"),
+    ] {
+        let obs = RinexObs::parse(&minimal_obs_with_phase_shift(body)).expect("parse phase shift");
+        let written = obs.to_rinex_string();
+        let line = written
+            .lines()
+            .find(|line| line.contains("SYS / PHASE SHIFT"))
+            .expect("phase-shift record written");
+        assert_eq!(
+            line.trim_end_matches("SYS / PHASE SHIFT").trim_end(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn phase_shift_correction_far_from_unity_round_trips_in_exponent_form() {
+    // `Display` renders 1e-300 as 302 columns of plain decimal, which the
+    // 60-column content area used to truncate: the value collapsed to zero and
+    // the satellite list vanished, so the product no longer round-tripped.
+    let obs = RinexObs::parse(&minimal_obs_with_phase_shift("G L1C 1e-300 1 G01"))
+        .expect("parse phase shift far from unity");
+    let written = obs.to_rinex_string();
+    let line = written
+        .lines()
+        .find(|line| line.contains("SYS / PHASE SHIFT"))
+        .expect("phase-shift record written");
+    assert_eq!(line.len(), 60 + "SYS / PHASE SHIFT".len());
+
+    let reparsed = RinexObs::parse(&written).expect("reparse phase shift far from unity");
+    let shift = &reparsed.header().phase_shifts[0];
+    assert_eq!(shift.correction_cycles, 1e-300);
+    assert_eq!(shift.satellites.len(), 1);
+    assert_eq!(reparsed.to_rinex_string().as_bytes(), written.as_bytes());
+}
+
+#[test]
+fn rejects_phase_shift_satellite_list_that_cannot_be_written() {
+    // Single-digit PRNs arrive in two-column tokens, so 14 satellites fit the
+    // 60 columns the parser reads; re-emitted as `1X,A3` fields they need 66.
+    let sats: Vec<String> = (1..=14).map(|prn| format!("G{prn}")).collect();
+    let body = format!("G C1C 0 14 {}", sats.join(" "));
+    assert_eq!(body.len(), 57, "the record must be readable in 60 columns");
+
+    let err = RinexObs::parse(&minimal_obs_with_phase_shift(&body))
+        .expect_err("an unwritable phase-shift record must be rejected");
+    assert!(
+        matches!(err, Error::Parse(ref message)
+            if message.contains("SYS / PHASE SHIFT record needs")
+                && message.contains("exceeding the 60")),
+        "{err}"
+    );
+}
+
+#[test]
 fn rejects_malformed_phase_shift_headers() {
     for body in [
         "G L1C bad",

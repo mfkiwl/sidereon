@@ -1196,12 +1196,24 @@ impl Parser {
             Vec::new()
         };
 
-        self.phase_shifts.push(ObsPhaseShift {
+        let shift = ObsPhaseShift {
             system,
             code,
             correction_cycles,
             satellites,
-        });
+        };
+        // Satellite tokens may be written more compactly than the `1X,A3` fields
+        // they are re-emitted in ("G1" for "G01"), so a record the parser can
+        // read is not always one it can write back. Reject what would overrun
+        // the content area rather than truncate it into a shorter list.
+        let content_width = write::phase_shift_content(&shift).len();
+        if content_width > write::HEADER_CONTENT_WIDTH {
+            return Err(Error::Parse(format!(
+                "RINEX OBS SYS / PHASE SHIFT record needs {content_width} columns, exceeding the {} a header record carries, in {line:?}",
+                write::HEADER_CONTENT_WIDTH
+            )));
+        }
+        self.phase_shifts.push(shift);
         Ok(())
     }
 

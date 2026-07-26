@@ -10,3 +10,5 @@
 !/corpus/rinex_qc_repair_roundtrip/regression-non-ascii-header-fixed-columns
 !/corpus/rinex_qc_repair_roundtrip/regression-zero-interval-unknown
 !/corpus/rinex_qc_repair_roundtrip/regression-over-width-obs-type-code
+!/corpus/rinex_qc_repair_roundtrip/regression-phase-shift-exponent-width
+!/corpus/rinex_qc_repair_roundtrip/regression-phase-shift-unwritable-satellites
