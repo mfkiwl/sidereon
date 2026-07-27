@@ -29,6 +29,30 @@ All notable changes to `sidereon-core` are documented here.
   read from two-column tokens (`G1`) but written into `1X,A3` fields, so a
   readable record was not always a writable one.
 
+- SP3 now rejects a value its own fixed-column field cannot re-emit unchanged.
+  Record positions, velocities, clocks, and clock rates are `F14.6` fields, and
+  the header line-2 (`##`) seconds-of-week, epoch interval, and MJD fraction are
+  `F15.8`, `F14.8`, and 13-decimal fields (SP3-c section 3, SP3-d Hilla 2016).
+  A value carrying more precision than its field expresses, or one too wide for
+  its columns, is now a typed `Error::Parse`. Previously such a value fit the
+  columns but not the format, so `parse -> to_sp3_string -> parse` silently
+  changed it (`36.019431257` km came back as `36.019431`). Conforming files are
+  unaffected: their values already round-trip through their own fields exactly.
+
+### Documentation
+
+- Pinned the SP3 serialization contract for unrepresentable satellites:
+  `Sp3::skipped_records` counts entries the input text carried but the product
+  cannot represent (an extended GLONASS slot such as `R28` beyond the engine's
+  PRN cap). They are deliberately dropped rather than aborting the parse, so
+  nothing of them reaches the writer and a re-encoded product always re-parses
+  with no skips. The `sp3_round_trip` fuzz target asserted that the two counts
+  matched, which no correct implementation can satisfy for such a file; it now
+  asserts the re-encode reports zero skips - stricter, since the writer must
+  never emit a record the parser cannot represent - while still comparing every
+  other field. Added a core regression and two committed fuzz-corpus seeds from
+  scheduled run 30262991024. No parser, writer, or numerical behavior changed.
+
 ### Compatibility
 
 - Parser compatibility patch. Conforming RINEX 2/3/4 observation files are

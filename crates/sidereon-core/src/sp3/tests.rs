@@ -1290,3 +1290,217 @@ fn round_trips_plus_line_padded_with_00_zero_fill() {
         "parse -> write -> parse changed product"
     );
 }
+
+/// Regression (fuzz `sp3_round_trip`, scheduled run 30262991024): a product that
+/// dropped an unrepresentable satellite re-encodes to a file that carries no
+/// trace of it, so the reparse reports no skips while every other field is
+/// unchanged.
+///
+/// `skipped_records` is evidence about the input text: an `R28` record has no
+/// [`GnssSatelliteId`] to store and is deliberately skipped rather than
+/// aborting the parse, so serialization cannot re-emit it. The writer must
+/// still never *invent* one - a re-encode that re-parses with a skip would mean
+/// it emitted a record the parser cannot represent.
+#[test]
+fn unrepresentable_satellites_are_absent_from_the_re_encoded_product() {
+    const FILE: &str = "\
+#cP2020  6 24  0  0  0.00000000       1 ORBIT IGS14 FIT  TST
+## 2111 432000.00000000   900.00000000 59024 0.0000000000000
++    1   G01  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+++         5  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+%c G  cc GPS ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc
+%c cc cc ccc ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc
+%f  1.2500000  1.025000000  0.00000000000  0.000000000000000
+%f  0.0000000  0.000000000  0.00000000000  0.000000000000000
+%i    0    0    0    0      0      0      0      0         0
+%i    0    0    0    0      0      0      0      0         0
+/* TEST SP3-c FIXTURE
+*  2020  6 24  0  0  0.00000000
+PG01  15000.000000 -20000.000000   5000.000000    123.456789
+PR28  16000.000000 -21000.000000   6000.000000    222.222222
+EOF
+";
+    let original = Sp3::parse(FILE.as_bytes()).expect("file with an R28 record must parse");
+    assert_eq!(
+        original.skipped_records, 1,
+        "the R28 record must be counted"
+    );
+
+    let encoded = original.to_sp3_string();
+    assert!(
+        !encoded.contains("R28"),
+        "the writer must not re-emit an unrepresentable satellite"
+    );
+
+    let reparsed = Sp3::parse(encoded.as_bytes()).expect("re-encoded product must reparse");
+    assert_eq!(
+        reparsed.skipped_records, 0,
+        "a re-encoded product carries nothing the parser cannot represent"
+    );
+
+    let mut expected = original;
+    expected.skipped_records = 0;
+    assert_eq!(
+        reparsed, expected,
+        "parse -> write -> parse changed the canonical product"
+    );
+}
+
+/// Regression (fuzz `sp3_round_trip`): a record value carrying more precision
+/// than its fixed-column field expresses. `36.019431257` km fits the 14 columns
+/// but not the `F14.6` format the writer re-emits it through, so the value came
+/// back as `36.019431` and the product silently changed across
+/// parse -> write -> parse. Conforming six-decimal values are unaffected.
+#[test]
+fn rejects_record_values_their_f14_6_field_cannot_re_emit() {
+    fn file_with_record(record: &str) -> String {
+        format!(
+            "\
+#cP2020  6 24  0  0  0.00000000       1 ORBIT IGS14 FIT  TST
+## 2111 432000.00000000   900.00000000 59024 0.0000000000000
++    1   G01  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+++         5  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+%c G  cc GPS ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc
+%c cc cc ccc ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc
+%f  1.2500000  1.025000000  0.00000000000  0.000000000000000
+%f  0.0000000  0.000000000  0.00000000000  0.000000000000000
+%i    0    0    0    0      0      0      0      0         0
+%i    0    0    0    0      0      0      0      0         0
+/* TEST SP3-c FIXTURE
+*  2020  6 24  0  0  0.00000000
+{record}
+EOF
+"
+        )
+    }
+
+    // Exact coordinate from the scheduled-fuzz artifact, plus the same defect in
+    // the clock column.
+    for (record, what) in [
+        (
+            "PG01      1.000000  36.019431257      3.000000    123.456789",
+            "coordinate",
+        ),
+        (
+            "PG01      1.000000      2.000000      3.000000   123.4567891",
+            "clock",
+        ),
+    ] {
+        let err = Sp3::parse(file_with_record(record).as_bytes())
+            .expect_err("an over-precision record value must be rejected");
+        assert!(
+            matches!(err, Error::Parse(ref message)
+                if message.contains(what) && message.contains("F14.6 field")),
+            "{record}: {err}"
+        );
+    }
+
+    // The conforming six-decimal record still parses and round-trips.
+    let text = file_with_record("PG01      1.000000  36.019431      3.000000    123.456789");
+    let original = Sp3::parse(text.as_bytes()).expect("six-decimal values stay accepted");
+    let reparsed =
+        Sp3::parse(original.to_sp3_string().as_bytes()).expect("re-encoded product must reparse");
+    assert_eq!(
+        reparsed, original,
+        "parse -> write -> parse changed product"
+    );
+}
+
+/// A non-finite header start value stays permissive at parse time - exact
+/// validation is what rejects it - so the representability guard must let it
+/// through, and serialization must still be byte-idempotent for it. Such a
+/// product is not equal to itself (`NaN != NaN`), which is why the round-trip
+/// fuzz target asserts byte idempotence separately from structural equality.
+#[test]
+fn non_finite_header_start_metadata_stays_permissive_and_byte_idempotent() {
+    let file = [
+        "#cP2020  6 24  0  0  0.00000000       1 ORBIT IGS14 FIT  TST",
+        "## 2111             NaN   900.00000000 59024 0.0000000000000",
+        "+    1   G01  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0",
+        "++         5  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0",
+        "%c G  cc GPS ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc",
+        "%c cc cc ccc ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc",
+        "%f  1.2500000  1.025000000  0.00000000000  0.000000000000000",
+        "%f  0.0000000  0.000000000  0.00000000000  0.000000000000000",
+        "%i    0    0    0    0      0      0      0      0         0",
+        "%i    0    0    0    0      0      0      0      0         0",
+        "/* TEST SP3-c FIXTURE",
+        "*  2020  6 24  0  0  0.00000000",
+        "PG01      1.000000      2.000000      3.000000    123.456789",
+        "EOF",
+        "",
+    ]
+    .join("\n");
+
+    let original = Sp3::parse(file.as_bytes()).expect("a non-finite start value stays permissive");
+    assert!(original.header.seconds_of_week.is_nan());
+
+    let encoded = original.to_sp3_string();
+    let reparsed = Sp3::parse(encoded.as_bytes()).expect("re-encoded product must reparse");
+    assert!(reparsed.header.seconds_of_week.is_nan());
+    assert_eq!(
+        reparsed.to_sp3_string(),
+        encoded,
+        "serialization must be byte-idempotent for a non-finite header value"
+    );
+}
+
+/// The header line-2 (`##`) values are re-emitted through `F15.8` / `F14.8` /
+/// 13-decimal formats, so a value carrying more precision than its own field
+/// silently changes across parse -> write -> parse the same way a record value
+/// does.
+#[test]
+fn rejects_header_line2_values_their_field_cannot_re_emit() {
+    fn file_with_line2(line2: &str) -> String {
+        format!(
+            "\
+#cP2020  6 24  0  0  0.00000000       1 ORBIT IGS14 FIT  TST
+{line2}
++    1   G01  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+++         5  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0
+%c G  cc GPS ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc
+%c cc cc ccc ccc cccc cccc cccc cccc ccccc ccccc ccccc ccccc
+%f  1.2500000  1.025000000  0.00000000000  0.000000000000000
+%f  0.0000000  0.000000000  0.00000000000  0.000000000000000
+%i    0    0    0    0      0      0      0      0         0
+%i    0    0    0    0      0      0      0      0         0
+/* TEST SP3-c FIXTURE
+*  2020  6 24  0  0  0.00000000
+PG01      1.000000      2.000000      3.000000    123.456789
+EOF
+"
+        )
+    }
+
+    for (line2, what) in [
+        (
+            "## 2111  4320.123456789   900.00000000 59024 0.0000000000000",
+            "seconds-of-week",
+        ),
+        (
+            "## 2111 432000.00000000  900.000000001 59024 0.0000000000000",
+            "epoch interval",
+        ),
+        (
+            "## 2111 432000.00000000   900.00000000 59024 0.00000000000001",
+            "MJD fraction",
+        ),
+    ] {
+        let err = Sp3::parse(file_with_line2(line2).as_bytes())
+            .expect_err("an over-precision header value must be rejected");
+        assert!(
+            matches!(err, Error::Parse(ref message)
+                if message.contains(what) && message.contains("not representable")),
+            "{line2}: {err}"
+        );
+    }
+
+    let text = file_with_line2("## 2111 432000.00000000   900.00000000 59024 0.0000000000000");
+    let original = Sp3::parse(text.as_bytes()).expect("conforming header values stay accepted");
+    let reparsed =
+        Sp3::parse(original.to_sp3_string().as_bytes()).expect("re-encoded product must reparse");
+    assert_eq!(
+        reparsed, original,
+        "parse -> write -> parse changed product"
+    );
+}

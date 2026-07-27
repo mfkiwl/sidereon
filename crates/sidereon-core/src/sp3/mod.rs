@@ -84,6 +84,18 @@ const BAD_CLOCK_US: f64 = 999_999.999_999;
 const DM_S_TO_M_S: f64 = 1.0e-1;
 /// SP3 clock-rate is in 1e-4 microseconds/second; -> s/s is `* 1e-10`.
 const CLOCK_RATE_TO_S_PER_S: f64 = 1.0e-10;
+/// Columns and decimal places of an SP3 record value field (`F14.6`): positions
+/// in km, velocities in dm/s, clock and clock-rate in microseconds.
+const RECORD_VALUE_WIDTH: usize = 14;
+const RECORD_VALUE_DECIMALS: usize = 6;
+/// Columns and decimals of the header line-2 (`##`) seconds-of-week (`F15.8`),
+/// epoch-interval (`F14.8`), and MJD-fraction (13 decimals, unbounded columns
+/// as the last field on the line) values.
+const LINE2_SECONDS_OF_WEEK_WIDTH: usize = 15;
+const LINE2_SECONDS_OF_WEEK_DECIMALS: usize = 8;
+const LINE2_INTERVAL_WIDTH: usize = 14;
+const LINE2_INTERVAL_DECIMALS: usize = 8;
+const LINE2_MJD_FRACTION_DECIMALS: usize = 13;
 
 /// SP3 format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -890,20 +902,41 @@ impl Parser {
             .trim()
             .parse::<u32>()
             .map_err(|_| Error::Parse(format!("SP3 GNSS week unparsable in {line:?}")))?;
-        self.seconds_of_week = field(line, 8, 23)
+        let seconds_of_week = field(line, 8, 23)
             .trim()
             .parse::<f64>()
             .map_err(|_| Error::Parse(format!("SP3 seconds-of-week unparsable in {line:?}")))?;
-        self.epoch_interval_s = field(line, 24, 38)
+        self.seconds_of_week = exact_in_field(
+            seconds_of_week,
+            Some(LINE2_SECONDS_OF_WEEK_WIDTH),
+            LINE2_SECONDS_OF_WEEK_DECIMALS,
+            "seconds-of-week",
+            line,
+        )?;
+        let epoch_interval_s = field(line, 24, 38)
             .trim()
             .parse::<f64>()
             .map_err(|_| Error::Parse(format!("SP3 epoch interval unparsable in {line:?}")))?;
+        self.epoch_interval_s = exact_in_field(
+            epoch_interval_s,
+            Some(LINE2_INTERVAL_WIDTH),
+            LINE2_INTERVAL_DECIMALS,
+            "epoch interval",
+            line,
+        )?;
         self.mjd = field(line, 39, 44)
             .trim()
             .parse::<u32>()
             .map_err(|_| Error::Parse(format!("SP3 MJD unparsable in {line:?}")))?;
-        self.mjd_fraction = strict_f64(field_from(line, 45), "mjd_fraction")
+        let mjd_fraction = strict_f64(field_from(line, 45), "mjd_fraction")
             .map_err(|error| map_field_error(error, line))?;
+        self.mjd_fraction = exact_in_field(
+            mjd_fraction,
+            None,
+            LINE2_MJD_FRACTION_DECIMALS,
+            "MJD fraction",
+            line,
+        )?;
         self.have_line2 = true;
         Ok(())
     }
@@ -1332,7 +1365,51 @@ fn parse_declared_start_j2000_s(line: &str) -> Option<f64> {
 /// that names the offending text.
 fn parse_coord(line: &str, start: usize, end: usize) -> Result<f64> {
     let raw = field(line, start, end).trim();
-    strict_f64(raw, "coordinate").map_err(|error| map_field_error(error, line))
+    let value = strict_f64(raw, "coordinate").map_err(|error| map_field_error(error, line))?;
+    exact_in_field(
+        value,
+        Some(RECORD_VALUE_WIDTH),
+        RECORD_VALUE_DECIMALS,
+        "coordinate",
+        line,
+    )
+}
+
+/// Reject a value the record's fixed-column field cannot re-emit unchanged.
+///
+/// Every parsed value is written back through the same `Fw.d` format, so one
+/// carrying more precision than the field expresses - or one too wide for its
+/// columns - re-parses as a different number and the parse -> write -> parse
+/// identity breaks. This is the same rule the satellite-list check applies:
+/// never accept a record the writer cannot reproduce. `width` is `None` for a
+/// field the format does not column-bound.
+///
+/// Non-finite values are left to the callers that already model them: the
+/// record fields reject them through [`strict_f64`], and the permissive header
+/// path carries them to exact validation, which reports them as the typed
+/// non-finite start-metadata / cadence integrity failures.
+fn exact_in_field(
+    value: f64,
+    width: Option<usize>,
+    decimals: usize,
+    what: &str,
+    line: &str,
+) -> Result<f64> {
+    if !value.is_finite() {
+        return Ok(value);
+    }
+    let text = format!("{value:.decimals$}");
+    let overflows = width.is_some_and(|width| text.len() > width);
+    if overflows || text.parse::<f64>() != Ok(value) {
+        let field = match width {
+            Some(width) => format!("F{width}.{decimals}"),
+            None => format!("F.{decimals}"),
+        };
+        return Err(Error::Parse(format!(
+            "SP3 {what} {value} is not representable in its {field} field in {line:?}"
+        )));
+    }
+    Ok(value)
 }
 
 /// Parse the clock column (chars 46..60). Returns `None` for the bad-clock
@@ -1350,7 +1427,14 @@ fn parse_clock_us(line: &str) -> Result<Option<f64>> {
     if value.abs() >= BAD_CLOCK_US {
         return Ok(None);
     }
-    Ok(Some(value))
+    exact_in_field(
+        value,
+        Some(RECORD_VALUE_WIDTH),
+        RECORD_VALUE_DECIMALS,
+        "clock",
+        line,
+    )
+    .map(Some)
 }
 
 fn map_field_error(error: validate::FieldError, line: &str) -> Error {

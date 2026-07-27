@@ -344,12 +344,6 @@ fn rejects_zero_nonfinite_out_of_range_and_mismatched_header_cadence() {
         ("NaN", ExactSp3ValidationError::NonFiniteHeaderCadence),
         ("inf", ExactSp3ValidationError::NonFiniteHeaderCadence),
         (
-            "100000.000000",
-            ExactSp3ValidationError::UnsupportedHeaderCadence {
-                actual_s: 100_000.0,
-            },
-        ),
-        (
             "900.00000000",
             ExactSp3ValidationError::CadenceMismatch {
                 requested_s: 300.0,
@@ -365,6 +359,20 @@ fn rejects_zero_nonfinite_out_of_range_and_mismatched_header_cadence() {
             expected
         );
     }
+
+    // The format bound and the field width coincide: the interval is an `F14.8`
+    // field, so the first unsupported cadence is also the first one the writer
+    // cannot re-emit inside its 14 columns. `Sp3::parse` rejects it there, so
+    // this file never reaches cadence validation. `UnsupportedHeaderCadence`
+    // still covers a caller-requested cadence and a merged product.
+    let text = exact_sp3(&offsets, 288, "100000.000000", 1);
+    let err = parse_exact_sp3(text.as_bytes(), &request("05M").unwrap()).unwrap_err();
+    assert!(
+        matches!(err, ExactSp3ValidationError::Parse(ref parse)
+            if parse.to_string().contains("epoch interval")
+                && parse.to_string().contains("F14.8 field")),
+        "{err}"
+    );
 }
 
 #[test]

@@ -12,3 +12,9 @@
 !/corpus/rinex_qc_repair_roundtrip/regression-over-width-obs-type-code
 !/corpus/rinex_qc_repair_roundtrip/regression-phase-shift-exponent-width
 !/corpus/rinex_qc_repair_roundtrip/regression-phase-shift-unwritable-satellites
+# Same for the SP3 round-trip gate's committed reproducers.
+!/corpus/sp3_round_trip/
+/corpus/sp3_round_trip/*
+!/corpus/sp3_round_trip/regression-corrupt-plus-slot-skip-count
+!/corpus/sp3_round_trip/regression-r28-record-skip-count
+!/corpus/sp3_round_trip/regression-over-precision-coordinate
