@@ -4,6 +4,8 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.35.1] - 2026-08-01
+
 ### Fixed
 
 - The RTK double-difference row builder now rejects a rover position that
