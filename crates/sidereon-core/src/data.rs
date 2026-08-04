@@ -3611,6 +3611,13 @@ pub fn published_issue_age_minutes(
 /// through AIUB's whole-tree CSV listing, one URL. The caller fetches in
 /// order and interprets each body with [`parse_archive_listing`] and
 /// [`newest_published_product`].
+///
+/// Transport note for callers wiring their own fetch: AIUB's listing URL
+/// 302-redirects to its object store (the same redirect its product
+/// downloads use), so the fetch must follow bounded redirects; treating the
+/// 3xx as failure misreports every CODE line as unreachable. WUM listing
+/// URLs are `ftp://` directory listings whose `LIST` text
+/// [`parse_archive_listing`] parses directly.
 pub fn publication_listing_urls(
     center: AnalysisCenter,
     product_type: ProductType,
