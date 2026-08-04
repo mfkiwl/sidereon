@@ -416,6 +416,12 @@ pub enum ArchiveProtocol {
     Https,
     /// Anonymous FTP. Wuhan University's IGS data center serves its open
     /// archive over `ftp://` only; there is no HTTP surface for these paths.
+    ///
+    /// Transport support is per interface: the Elixir interface acquires
+    /// `ftp://` archives natively (OTP `:ftp`, from its 0.36.1); the Python,
+    /// C, and WASM interfaces derive these URLs but leave FTP transport to
+    /// the caller. Check an interface's documentation before wiring an
+    /// FTP-only center into its acquisition path.
     Ftp,
 }
 
