@@ -4,6 +4,15 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.36.2] - 2026-08-04
+
+### Changed
+
+- Version-alignment release; no engine changes. The Python interface's
+  0.36.2 adds anonymous-FTP transport for the `wum_nrt` line (parity with
+  Elixir 0.36.1) and its release gate enforces exact engine-version
+  lockstep.
+
 ## [0.36.1] - 2026-08-04
 
 ### Changed
