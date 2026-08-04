@@ -4,6 +4,16 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.36.1] - 2026-08-04
+
+### Changed
+
+- Version-alignment release; no engine changes. The Python and WASM
+  interfaces enforce exact version lockstep with the engine crates, and
+  their 0.36.1 patch (accepting the `WUM` publisher and `near_real_time`
+  solution-class tokens in caller-built identities) requires matching
+  engine versions on the registry.
+
 ## [0.36.0] - 2026-08-04
 
 ### Added
