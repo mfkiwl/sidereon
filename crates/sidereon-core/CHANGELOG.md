@@ -4,6 +4,8 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-08-04
+
 ### Added
 
 - Added an opt-in cross-line candidate walk for CODE's predicted ionosphere:
