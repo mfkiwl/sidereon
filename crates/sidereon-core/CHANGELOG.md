@@ -4,6 +4,21 @@ All notable changes to `sidereon-core` are documented here.
 
 ## [Unreleased]
 
+## [0.36.3] - 2026-08-04
+
+### Fixed
+
+- `parse_archive_listing` no longer rejects an AIUB whole-tree CSV listing
+  over a path containing spaces. `;` is the field delimiter, so a space is
+  legal path content, and the live 426k-row listing carries unrelated
+  objects (conference PDFs, tarballs) with spaces in their names; one such
+  row rejected the entire listing, so `publication_status` for every CODE
+  line followed the redirect and then died at the parser. The four-field
+  structure remains the malformed-row signal; closed dialect detection is
+  unchanged. Found by downstream 0.36.1 verification; the recorded fixture
+  now ends with the verbatim offending row, and the full live listing
+  (425,132 objects) is the reproduction.
+
 ## [0.36.2] - 2026-08-04
 
 ### Changed

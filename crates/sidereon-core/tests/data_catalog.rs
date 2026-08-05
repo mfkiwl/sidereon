@@ -1375,6 +1375,26 @@ fn publication_status_walks_back_one_week_for_the_recorded_bkg_state() {
     );
 }
 
+/// A space is legal CSV path content (`;` delimits fields): AIUB's live
+/// whole-tree listing carries unrelated objects with spaces in their names
+/// (the recorded fixture ends with a verbatim conference-PDF row), and one
+/// such row must not reject the listing - it is an ordinary object that
+/// never matches a product filename.
+#[test]
+fn aiub_csv_rows_with_spaces_are_objects_not_grammar_violations() {
+    let objects = parse_archive_listing(&listing_fixture("aiub-iono-p1p2-20260804.csv"))
+        .expect("recognized listing");
+    assert!(objects
+        .iter()
+        .any(|object| object.path.contains(' ') && object.path.ends_with(".pdf")));
+
+    // The space-path object changes nothing for product selection.
+    let newest = newest_published_product(AnalysisCenter::CodPrd2, ProductType::Ionex, &objects)
+        .expect("supported line")
+        .expect("published objects exist");
+    assert_eq!(newest.date, date(2026, 8, 5));
+}
+
 /// Dialect detection is closed: a body that fits no recognized listing
 /// grammar is a typed error, never a best-effort empty result. A silent
 /// empty parse would read as "nothing published" - exactly the wrong answer

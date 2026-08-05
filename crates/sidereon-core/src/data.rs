@@ -3366,9 +3366,15 @@ pub fn parse_archive_listing(body: &str) -> Result<Vec<PublishedObject>, DataCat
             else {
                 return Err(unrecognized("CSV row without its four fields"));
             };
-            if path.is_empty() || path.contains(' ') {
+            if path.is_empty() {
                 return Err(unrecognized("CSV row without an archive path"));
             }
+            // A space is legal path content: `;` is the field delimiter, so
+            // the four-field structure above is the malformed-row signal.
+            // AIUB's live whole-tree listing carries unrelated objects with
+            // spaces in their names (conference PDFs, tarballs); rejecting
+            // them rejected the entire 426k-row listing. They are ordinary
+            // listed objects that simply never match a product filename.
             // Directory rows carry `-1` sentinels and a trailing slash.
             if path.ends_with('/') {
                 continue;
